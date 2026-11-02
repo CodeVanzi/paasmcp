@@ -3,15 +3,30 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  BackupRecord,
   DatabaseRecord,
   DOCKER_NETWORK,
+  ensureDirectories,
   loadState,
+  PAAS_BACKUPS_DIR,
   PAAS_DB_DIR,
   PAAS_REDIS_DIR,
   sanitizeSlug,
   saveState,
 } from "./config.js";
-import { getSecrets, setSecretEntries } from "./vault.js";
+import {
+  decryptBinaryPayload,
+  encryptBinaryPayload,
+  getSecrets,
+  setSecretEntries,
+} from "./vault.js";
+
+function assertSafeSqlIdentifier(id: string): string {
+  if (!/^[a-z0-9_]{1,63}$/.test(id)) {
+    throw new Error(`Unsafe SQL identifier rejected: "${id}"`);
+  }
+  return id;
+}
 
 export function ensureDockerNetwork(): void {
   try {
@@ -135,13 +150,13 @@ export function provisionDatabase(
   injectedKeys: string[];
 } {
   const slug = sanitizeSlug(appName);
-  const dbIdentifier = slug.replace(/-/g, "_");
+  const dbIdentifier = assertSafeSqlIdentifier(slug.replace(/-/g, "_"));
   const state = loadState();
 
   if (engine === "postgres") {
     ensureSharedPostgresCluster();
-    const dbName = `db_${dbIdentifier}`;
-    const dbUser = `user_${dbIdentifier}`;
+    const dbName = assertSafeSqlIdentifier(`db_${dbIdentifier}`);
+    const dbUser = assertSafeSqlIdentifier(`user_${dbIdentifier}`);
     const dbPass = crypto.randomBytes(20).toString("hex");
 
     // Create or update role and database idempotently
@@ -241,7 +256,6 @@ $$;`;
     return { record, injectedKeys };
   } else {
     const { redisPass } = ensureSharedRedisCluster();
-    // Allocate a logical Redis DB index (1-15) based on existing redis DBs
     const existingRedisCount = Object.values(state.databases).filter(
       (d) => d.engine === "redis"
     ).length;
@@ -275,4 +289,153 @@ $$;`;
 
     return { record, injectedKeys };
   }
+}
+
+export function listDatabaseBackups(appName?: string): BackupRecord[] {
+  const state = loadState();
+  const all = Object.values(state.backups || {});
+  const filtered = appName
+    ? all.filter((b) => b.appName === sanitizeSlug(appName))
+    : all;
+  return filtered.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export function backupDatabase(
+  appName: string,
+  engine: "postgres" | "redis" = "postgres"
+): BackupRecord {
+  ensureDirectories();
+  const slug = sanitizeSlug(appName);
+  const state = loadState();
+  const dbRecordName = `${slug}-${engine}`;
+  const dbRecord = state.databases[dbRecordName];
+
+  if (!dbRecord) {
+    throw new Error(
+      `Database '${dbRecordName}' not found in PaaSMCP state. Provision it first via paas_db_provision.`
+    );
+  }
+
+  let rawDump: Buffer;
+  if (process.env.PAASMCP_OFFLINE_TEST === "1") {
+    rawDump = Buffer.from(
+      `-- PaaSMCP Synthetic Dump for ${dbRecord.dbName} (${engine}) at ${new Date().toISOString()}\nSELECT 1;\n`,
+      "utf-8"
+    );
+  } else if (engine === "postgres") {
+    const safeDbName = assertSafeSqlIdentifier(dbRecord.dbName);
+    rawDump = execFileSync(
+      "docker",
+      [
+        "exec",
+        "paasmcp-postgres",
+        "pg_dump",
+        "-U",
+        "paasmcp_admin",
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--no-privileges",
+        safeDbName,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 256 * 1024 * 1024 }
+    );
+  } else {
+    const sysSecrets = getSecrets("system");
+    const redisPass = sysSecrets.REDIS_ROOT_PASSWORD || "";
+    execFileSync(
+      "docker",
+      ["exec", "paasmcp-redis", "redis-cli", "-a", redisPass, "SAVE"],
+      { stdio: "ignore" }
+    );
+    rawDump = execFileSync(
+      "docker",
+      ["exec", "paasmcp-redis", "cat", "/data/dump.rdb"],
+      { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 256 * 1024 * 1024 }
+    );
+  }
+
+  const encryptedBuf = encryptBinaryPayload(rawDump);
+  const sha256 = crypto.createHash("sha256").update(encryptedBuf).digest("hex");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupId = `${slug}-${engine}-${timestamp}`;
+  const filePath = path.join(PAAS_BACKUPS_DIR, `${backupId}.enc.bak`);
+
+  fs.writeFileSync(filePath, encryptedBuf, { mode: 0o600 });
+
+  const backupRecord: BackupRecord = {
+    id: backupId,
+    appName: slug,
+    databaseName: dbRecord.dbName,
+    engine,
+    filePath,
+    sizeBytes: encryptedBuf.length,
+    sha256,
+    encrypted: true,
+    createdAt: new Date().toISOString(),
+  };
+
+  if (!state.backups) state.backups = {};
+  state.backups[backupId] = backupRecord;
+  saveState(state);
+
+  return backupRecord;
+}
+
+export function restoreDatabase(backupId: string): {
+  restored: boolean;
+  backup: BackupRecord;
+  restoredBytes: number;
+} {
+  ensureDirectories();
+  const cleanId = backupId.replace(/[^a-zA-Z0-9._-]/g, "");
+  const state = loadState();
+  const backup = state.backups?.[cleanId];
+  if (!backup) {
+    throw new Error(`Backup '${cleanId}' not found in PaaSMCP state.`);
+  }
+
+  const resolvedPath = path.resolve(backup.filePath);
+  const allowedDir = path.resolve(PAAS_BACKUPS_DIR);
+  if (!resolvedPath.startsWith(allowedDir + path.sep)) {
+    throw new Error("Security violation: backup file path is outside PAAS_BACKUPS_DIR.");
+  }
+
+  if (!fs.existsSync(resolvedPath)) {
+    throw new Error(`Encrypted backup file missing on disk: ${resolvedPath}`);
+  }
+
+  const encryptedBuf = fs.readFileSync(resolvedPath);
+  const currentHash = crypto.createHash("sha256").update(encryptedBuf).digest("hex");
+  if (currentHash !== backup.sha256) {
+    throw new Error("Backup SHA-256 integrity check failed! File may have been tampered with.");
+  }
+
+  // Decrypt and verify AES-256-GCM authentication tag in memory
+  const decryptedDump = decryptBinaryPayload(encryptedBuf);
+
+  if (process.env.PAASMCP_OFFLINE_TEST !== "1") {
+    if (backup.engine === "postgres") {
+      const safeDbName = assertSafeSqlIdentifier(backup.databaseName);
+      execFileSync(
+        "docker",
+        ["exec", "-i", "paasmcp-postgres", "psql", "-U", "paasmcp_admin", "-d", safeDbName],
+        {
+          input: decryptedDump,
+          stdio: ["pipe", "pipe", "pipe"],
+          maxBuffer: 256 * 1024 * 1024,
+        }
+      );
+    } else {
+      throw new Error(
+        "Live Redis binary RDB restore requires stopping the shared Redis cluster; use PostgreSQL logical restore or export decrypted RDB manually."
+      );
+    }
+  }
+
+  return {
+    restored: true,
+    backup,
+    restoredBytes: decryptedDump.length,
+  };
 }

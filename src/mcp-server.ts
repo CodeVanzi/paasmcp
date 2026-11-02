@@ -11,32 +11,52 @@ import {
   ensureDirectories,
   loadState,
   PAAS_APPS_DIR,
+  PAAS_BACKUPS_DIR,
   PAAS_DATA_DIR,
+  saveState,
   updatePlatformConfig,
 } from "./config.js";
 import {
+  backupDatabase,
   ensureDockerNetwork,
   ensureSharedPostgresCluster,
   ensureSharedRedisCluster,
+  listDatabaseBackups,
   provisionDatabase,
+  restoreDatabase,
 } from "./database.js";
 import { ensureDashboardBackgroundService, getOrCreateDashboardToken } from "./dashboard.js";
-import { deployApp, manageAppLifecycle } from "./deployer.js";
+import {
+  deployApp,
+  getContainerMetrics,
+  manageAppLifecycle,
+  runPaaSDoctor,
+} from "./deployer.js";
 import { exposeApplication } from "./exposure.js";
+import {
+  applyEncryptedFederationSyncBundle,
+  buildEncryptedFederationSyncBundle,
+  generateFederationJoinToken,
+  getOrCreateWebhookSecret,
+  parseAndVerifyFederationJoinToken,
+  registerFederationPeer,
+} from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import {
   deleteSecretKey,
   importDotEnvFile,
   listMaskedSecrets,
+   maskSecretValue,
   setSecretEntries,
   setSecretFromFile,
 } from "./vault.js";
 
-export function getSystemStatusSummary() {
+export function getSystemStatusSummary(includeMetrics = true) {
   ensureDirectories();
   const state = loadState();
   const keyInfo = getOrCreateSshDeployKey();
   const sysSecrets = listMaskedSecrets("system");
+  const containerMetrics = includeMetrics ? getContainerMetrics() : {};
 
   let diskFree = "unknown";
   try {
@@ -58,21 +78,29 @@ export function getSystemStatusSummary() {
     rootDisk: diskFree,
     paasDataDir: PAAS_DATA_DIR,
     paasAppsDir: PAAS_APPS_DIR,
+    paasBackupsDir: PAAS_BACKUPS_DIR,
     sshPublicKey: keyInfo.publicKey,
+    sshKeyFingerprint: keyInfo.fingerprint,
     systemSecretsConfigured: sysSecrets,
+    webhookEndpointPath: "/api/webhooks/github",
+    webhookSecretMasked: maskSecretValue(getOrCreateWebhookSecret()),
     tailscaleDomain: state.tailscaleDomain,
     cloudflare: state.cloudflare,
+    federation: state.federation,
     appsCount: Object.keys(state.apps).length,
     databasesCount: Object.keys(state.databases).length,
+    backupsCount: Object.keys(state.backups || {}).length,
     apps: state.apps,
+    containerMetrics,
     databases: state.databases,
+    backups: listDatabaseBackups(),
   };
 }
 
 const server = new Server(
   {
     name: "paasmcp-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -87,10 +115,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "paas_system_status",
         description:
-          "Returns full status of PaaSMCP on the server: CPU/RAM/Disk, configured system tokens (masked), SSH deploy public key, provisioned databases, and deployed applications.",
+          "Returns full status of PaaSMCP on the server: CPU/RAM/Disk, live container metrics (docker stats snapshot), configured system tokens (masked), SSH deploy public key, databases, encrypted backups, multi-node federation status, and deployed applications.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: {
+            includeMetrics: {
+              type: "boolean",
+              description: "Include live docker stats CPU/RAM snapshot per container (default: true).",
+            },
+          },
         },
       },
       {
@@ -174,7 +207,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "paas_secret_set",
         description:
-          "Encrypts and stores environment variables / secrets in the AES-256-GCM Vault for a given app (or 'system' scope for CF_API_TOKEN / GITHUB_TOKEN). Supports direct key-value pairs, reading a single secret from a file path (compatible with T3 request_secret file delivery), or importing a .env file.",
+          "Encrypts and stores environment variables / secrets in the AES-256-GCM Vault for a given app (or 'system' scope for CF_API_TOKEN / GITHUB_TOKEN). Supports direct key-value pairs, reading a single secret from a file path (out-of-band file delivery), or importing a .env file.",
         inputSchema: {
           type: "object",
           properties: {
@@ -254,9 +287,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "paas_db_backup",
+        description:
+          "Creates, lists, or restores AES-256-GCM encrypted database snapshots (pg_dump / Redis RDB) stored in /opt/homelab/paasmcp/backups.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: ["create", "list", "restore"],
+              description: "'create' a new encrypted snapshot, 'list' existing backups, or 'restore' from backupId.",
+            },
+            appName: {
+              type: "string",
+              description: "Application slug (required when action='create', optional filter when action='list').",
+            },
+            engine: {
+              type: "string",
+              enum: ["postgres", "redis"],
+              description: "Database engine for 'create' (default: postgres).",
+            },
+            backupId: {
+              type: "string",
+              description: "Backup ID to restore (required when action='restore').",
+            },
+          },
+          required: ["action"],
+        },
+      },
+      {
         name: "paas_app_deploy",
         description:
-          "Deploys an application from a GitHub repository ('owner/repo' or git URL) or local directory path. Automatically detects the stack (or uses Dockerfile), injects encrypted secrets and database URLs, binds to an isolated 127.0.0.1 port + homelab-network, and updates the Homelab Homepage dashboard.",
+          "Deploys an application from a GitHub repository ('owner/repo' or git URL) or local directory path. Supports single-container buildpacks (Node, Next.js, Python, Go, Static) and multi-service docker-compose.yml pass-through with automatic Vault injection, loopback security hardening, resource limits, and rollback image tagging.",
         inputSchema: {
           type: "object",
           properties: {
@@ -287,6 +349,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "boolean",
               description:
                 "Automatically provision and link a Redis database before deploying.",
+            },
+            memoryLimit: {
+              type: "string",
+              description: "Optional container memory limit (e.g., '512m', '1g').",
+            },
+            cpuLimit: {
+              type: "string",
+              description: "Optional container CPU limit (e.g., '0.5', '1.0', '2').",
             },
             env: {
               type: "object",
@@ -326,7 +396,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "paas_app_lifecycle",
         description:
-          "View container logs, restart, stop, start, or destroy a deployed application.",
+          "View container logs, restart, stop, start, rollback to the previous working image, or destroy a deployed application.",
         inputSchema: {
           type: "object",
           properties: {
@@ -336,7 +406,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             action: {
               type: "string",
-              enum: ["logs", "restart", "stop", "start", "destroy"],
+              enum: ["logs", "restart", "stop", "start", "rollback", "destroy"],
             },
             tailLines: {
               type: "number",
@@ -345,6 +415,62 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["appName", "action"],
+        },
+      },
+      {
+        name: "paas_doctor",
+        description:
+          "Runs automated diagnostics across deployed applications: detects OOMKilled containers, crash-loops, non-zero exit codes, resource pressure, and returns actionable remediation advice.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            appName: {
+              type: "string",
+              description: "Optional application slug to inspect (inspects all apps if omitted).",
+            },
+          },
+        },
+      },
+      {
+        name: "paas_node_federation",
+        description:
+          "Manages Multi-Server High Availability (HA) Handshake and Redundancy: generates signed pairing Join Tokens ('paasmcp-join://...'), verifies peer handshakes, and exports/imports AES-256-GCM encrypted Vault & State sync bundles for active-active Cloudflare Tunnel or warm-standby server clusters.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: {
+              type: "string",
+              enum: [
+                "status",
+                "create-join-token",
+                "join-cluster",
+                "export-sync-bundle",
+                "import-sync-bundle",
+              ],
+            },
+            endpointUrl: {
+              type: "string",
+              description: "Primary node URL or Tailscale address when creating a join token or joining.",
+            },
+            mode: {
+              type: "string",
+              enum: ["active-active-tunnel", "warm-standby"],
+              description: "Redundancy mode: 'active-active-tunnel' (Cloudflare Tunnel multi-connector) or 'warm-standby'.",
+            },
+            joinToken: {
+              type: "string",
+              description: "Signed 'paasmcp-join://...' token when action='join-cluster'.",
+            },
+            encryptedBase64: {
+              type: "string",
+              description: "Encrypted sync bundle payload when action='import-sync-bundle'.",
+            },
+            hmacSignature: {
+              type: "string",
+              description: "HMAC-SHA256 signature when action='import-sync-bundle'.",
+            },
+          },
+          required: ["action"],
         },
       },
     ],
@@ -356,7 +482,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "paas_system_status": {
-        const status = getSystemStatusSummary();
+        const includeMetrics = args.includeMetrics !== false;
+        const status = getSystemStatusSummary(includeMetrics);
         return {
           content: [{ type: "text", text: JSON.stringify(status, null, 2) }],
         };
@@ -385,6 +512,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   paasDataDir: PAAS_DATA_DIR,
                   dockerNetwork: "homelab-network",
                   sshPublicKey: keyInfo.publicKey,
+                  sshKeyFingerprint: keyInfo.fingerprint,
                   servicesStarted,
                 },
                 null,
@@ -470,6 +598,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 {
                   publicKey: keyInfo.publicKey,
                   publicKeyPath: keyInfo.publicKeyPath,
+                  fingerprint: keyInfo.fingerprint,
                 },
                 null,
                 2
@@ -564,6 +693,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "paas_db_backup": {
+        const action = String(args.action || "list");
+        if (action === "list") {
+          const backups = listDatabaseBackups(
+            args.appName ? String(args.appName) : undefined
+          );
+          return {
+            content: [{ type: "text", text: JSON.stringify({ backups }, null, 2) }],
+          };
+        }
+        if (action === "create") {
+          if (!args.appName) {
+            throw new Error("'appName' is required when action='create'.");
+          }
+          const engine = (args.engine as "postgres" | "redis") || "postgres";
+          const record = backupDatabase(String(args.appName), engine);
+          return {
+            content: [{ type: "text", text: JSON.stringify(record, null, 2) }],
+          };
+        }
+        if (action === "restore") {
+          if (!args.backupId) {
+            throw new Error("'backupId' is required when action='restore'.");
+          }
+          const result = restoreDatabase(String(args.backupId));
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          };
+        }
+        throw new Error(`Unsupported paas_db_backup action: ${action}`);
+      }
+
       case "paas_app_deploy": {
         const result = deployApp({
           appName: String(args.appName),
@@ -572,6 +733,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           internalPort: args.internalPort ? Number(args.internalPort) : undefined,
           withPostgres: Boolean(args.withPostgres),
           withRedis: Boolean(args.withRedis),
+          memoryLimit: args.memoryLimit ? String(args.memoryLimit) : undefined,
+          cpuLimit: args.cpuLimit ? String(args.cpuLimit) : undefined,
           env: (args.env as Record<string, string>) || undefined,
         });
         return {
@@ -593,12 +756,109 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "paas_app_lifecycle": {
         const output = manageAppLifecycle(
           String(args.appName),
-          args.action as "logs" | "restart" | "stop" | "start" | "destroy",
+          args.action as "logs" | "restart" | "stop" | "start" | "rollback" | "destroy",
           args.tailLines ? Number(args.tailLines) : 80
         );
         return {
           content: [{ type: "text", text: output }],
         };
+      }
+
+      case "paas_doctor": {
+        const report = runPaaSDoctor(
+          args.appName ? String(args.appName) : undefined
+        );
+        return {
+          content: [{ type: "text", text: JSON.stringify(report, null, 2) }],
+        };
+      }
+
+      case "paas_node_federation": {
+        const action = String(args.action);
+        const state = loadState();
+        if (action === "status") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(state.federation || {}, null, 2),
+              },
+            ],
+          };
+        }
+        if (action === "create-join-token") {
+          const endpointUrl = String(args.endpointUrl || "https://paas.example.com");
+          const mode =
+            (args.mode as "active-active-tunnel" | "warm-standby") ||
+            "active-active-tunnel";
+          const tokenInfo = generateFederationJoinToken({
+            endpointUrl,
+            mode,
+          });
+          return {
+            content: [{ type: "text", text: JSON.stringify(tokenInfo, null, 2) }],
+          };
+        }
+        if (action === "join-cluster") {
+          if (!args.joinToken) {
+            throw new Error("'joinToken' is required when action='join-cluster'.");
+          }
+          const verified = parseAndVerifyFederationJoinToken(String(args.joinToken));
+          setSecretEntries("system", {
+            FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
+          });
+          const peer = registerFederationPeer({
+            nodeId: verified.primaryNodeId,
+            name: verified.primaryName,
+            endpointUrl: verified.endpointUrl,
+            mode: verified.mode,
+            publicKeyFingerprint: verified.fingerprint,
+          });
+          const latest = loadState();
+          if (latest.federation) {
+            latest.federation.role = "replica";
+            latest.federation.redundancyMode = verified.mode;
+            saveState(latest);
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    joined: true,
+                    role: "replica",
+                    redundancyMode: verified.mode,
+                    primaryPeer: peer,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        if (action === "export-sync-bundle") {
+          const bundle = buildEncryptedFederationSyncBundle();
+          return {
+            content: [{ type: "text", text: JSON.stringify(bundle, null, 2) }],
+          };
+        }
+        if (action === "import-sync-bundle") {
+          if (!args.encryptedBase64 || !args.hmacSignature) {
+            throw new Error(
+              "'encryptedBase64' and 'hmacSignature' are required when action='import-sync-bundle'."
+            );
+          }
+          const imported = applyEncryptedFederationSyncBundle(
+            String(args.encryptedBase64),
+            String(args.hmacSignature)
+          );
+          return {
+            content: [{ type: "text", text: JSON.stringify(imported, null, 2) }],
+          };
+        }
+        throw new Error(`Unsupported paas_node_federation action: ${action}`);
       }
 
       default:

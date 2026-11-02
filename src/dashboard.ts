@@ -4,16 +4,51 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, saveState } from "./config.js";
-import { ensureDockerNetwork, provisionDatabase } from "./database.js";
-import { deployApp, manageAppLifecycle, syncHomepageDashboard } from "./deployer.js";
+import {
+  backupDatabase,
+  ensureDockerNetwork,
+  listDatabaseBackups,
+  provisionDatabase,
+  restoreDatabase,
+} from "./database.js";
+import {
+  deployApp,
+  manageAppLifecycle,
+  runPaaSDoctor,
+  syncHomepageDashboard,
+} from "./deployer.js";
 import { exposeApplication } from "./exposure.js";
+import {
+  applyEncryptedFederationSyncBundle,
+  buildEncryptedFederationSyncBundle,
+  generateFederationJoinToken,
+  getOrCreateWebhookSecret,
+  handleGitHubPushWebhook,
+  parseAndVerifyFederationJoinToken,
+  registerFederationPeer,
+  verifyGitHubWebhookSignature,
+} from "./federation.js";
 import { getSystemStatusSummary } from "./mcp-server.js";
 import {
   deleteSecretKey,
   getSecrets,
   listMaskedSecrets,
   setSecretEntries,
+  timingSafeCompare,
 } from "./vault.js";
+
+const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
+
+function checkLoginRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = LOGIN_ATTEMPTS.get(ip);
+  if (!entry || now > entry.resetAt) {
+    LOGIN_ATTEMPTS.set(ip, { count: 1, resetAt: now + 5 * 60 * 1000 });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= 12;
+}
 
 export function getOrCreateDashboardToken(): string {
   const sys = getSecrets("system");
@@ -36,46 +71,113 @@ function parseCookies(cookieHeader?: string): Record<string, string> {
   return out;
 }
 
-function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+function readRawBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 1_000_000) {
+      if (body.length > 2_000_000) {
         reject(new Error("Payload too large"));
       }
     });
-    req.on("end", () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (err) {
-        reject(err);
-      }
-    });
+    req.on("end", () => resolve(body));
     req.on("error", reject);
   });
 }
 
+async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(req);
+  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+}
+
 function isAuthenticated(req: http.IncomingMessage, expectedToken: string): boolean {
   const authHeader = req.headers.authorization;
-  if (authHeader === `Bearer ${expectedToken}`) return true;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const provided = authHeader.slice("Bearer ".length).trim();
+    if (timingSafeCompare(provided, expectedToken)) return true;
+  }
   const cookies = parseCookies(req.headers.cookie);
-  if (cookies.paasmcp_token === expectedToken) return true;
+  if (cookies.paasmcp_token && timingSafeCompare(cookies.paasmcp_token, expectedToken)) {
+    return true;
+  }
   return false;
+}
+
+function setSecurityHeaders(res: http.ServerResponse): void {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
+  );
 }
 
 export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Server {
   const expectedToken = getOrCreateDashboardToken();
 
   const server = http.createServer(async (req, res) => {
+    setSecurityHeaders(res);
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const pathname = url.pathname;
 
-    // Login endpoint
-    if (pathname === "/api/login" && req.method === "POST") {
+    // 1. Public HMAC-Authenticated GitHub Webhook Receiver
+    if (pathname === "/api/webhooks/github" && req.method === "POST") {
+      try {
+        const rawBody = await readRawBody(req);
+        const sig = req.headers["x-hub-signature-256"] as string | undefined;
+        if (!verifyGitHubWebhookSignature(rawBody, sig)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid X-Hub-Signature-256" }));
+          return;
+        }
+        const eventName = req.headers["x-github-event"] || "push";
+        if (eventName === "ping") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, pong: true }));
+          return;
+        }
+        const payload = JSON.parse(rawBody || "{}") as Record<string, unknown>;
+        const result = handleGitHubPushWebhook(payload);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, ...result }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+      return;
+    }
+
+    // 2. Public HMAC-Authenticated Multi-Node Federation Sync Endpoint
+    if (pathname === "/api/federation/sync" && req.method === "POST") {
       try {
         const body = await readJsonBody(req);
-        if (body.token === expectedToken) {
+        const encryptedBase64 = String(body.encryptedBase64 || "");
+        const hmacSignature = String(body.hmacSignature || "");
+        const result = applyEncryptedFederationSyncBundle(encryptedBase64, hmacSignature);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, ...result }));
+      } catch (err) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+      return;
+    }
+
+    // 3. Login endpoint with rate limiting & constant-time token compare
+    if (pathname === "/api/login" && req.method === "POST") {
+      const clientIp =
+        (req.headers["cf-connecting-ip"] as string) ||
+        req.socket.remoteAddress ||
+        "unknown";
+      if (!checkLoginRateLimit(clientIp)) {
+        res.writeHead(429, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Too many login attempts. Try again in 5 minutes." }));
+        return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        if (typeof body.token === "string" && timingSafeCompare(body.token.trim(), expectedToken)) {
           res.writeHead(200, {
             "Content-Type": "application/json",
             "Set-Cookie": `paasmcp_token=${encodeURIComponent(
@@ -118,7 +220,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       return;
     }
 
-    // Protect all /api/* routes
+    // Protect all authenticated /api/* routes
     if (pathname.startsWith("/api/")) {
       if (!isAuthenticated(req, expectedToken)) {
         res.writeHead(401, { "Content-Type": "application/json" });
@@ -128,9 +230,23 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
       try {
         if (pathname === "/api/status" && req.method === "GET") {
-          const status = getSystemStatusSummary();
+          const status = getSystemStatusSummary(true);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
+          return;
+        }
+
+        if (pathname === "/api/doctor" && req.method === "GET") {
+          const appName = url.searchParams.get("app") || undefined;
+          const report = runPaaSDoctor(appName);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(report));
+          return;
+        }
+
+        if (pathname === "/api/webhook-secret" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ webhookSecret: getOrCreateWebhookSecret() }));
           return;
         }
 
@@ -188,6 +304,76 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
 
+        if (pathname === "/api/backups" && req.method === "GET") {
+          const appName = url.searchParams.get("app") || undefined;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ backups: listDatabaseBackups(appName) }));
+          return;
+        }
+
+        if (pathname === "/api/backups" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const appName = String(body.appName || "");
+          const engine = (body.engine as "postgres" | "redis") || "postgres";
+          const backup = backupDatabase(appName, engine);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(backup));
+          return;
+        }
+
+        if (pathname === "/api/backups/restore" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const backupId = String(body.backupId || "");
+          const result = restoreDatabase(backupId);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        if (pathname === "/api/federation/invite" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const endpointUrl = String(body.endpointUrl || `https://${req.headers.host || "localhost"}`);
+          const mode =
+            (body.mode as "active-active-tunnel" | "warm-standby") ||
+            "active-active-tunnel";
+          const invite = generateFederationJoinToken({ endpointUrl, mode });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(invite));
+          return;
+        }
+
+        if (pathname === "/api/federation/join" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const joinToken = String(body.joinToken || "");
+          const verified = parseAndVerifyFederationJoinToken(joinToken);
+          setSecretEntries("system", {
+            FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
+          });
+          const peer = registerFederationPeer({
+            nodeId: verified.primaryNodeId,
+            name: verified.primaryName,
+            endpointUrl: verified.endpointUrl,
+            mode: verified.mode,
+            publicKeyFingerprint: verified.fingerprint,
+          });
+          const latest = loadState();
+          if (latest.federation) {
+            latest.federation.role = "replica";
+            latest.federation.redundancyMode = verified.mode;
+            saveState(latest);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ joined: true, primaryPeer: peer }));
+          return;
+        }
+
+        if (pathname === "/api/federation/export" && req.method === "POST") {
+          const bundle = buildEncryptedFederationSyncBundle();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(bundle));
+          return;
+        }
+
         if (pathname === "/api/deploy" && req.method === "POST") {
           const body = await readJsonBody(req);
           const result = deployApp({
@@ -197,6 +383,8 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             internalPort: body.internalPort ? Number(body.internalPort) : undefined,
             withPostgres: Boolean(body.withPostgres),
             withRedis: Boolean(body.withRedis),
+            memoryLimit: body.memoryLimit ? String(body.memoryLimit) : undefined,
+            cpuLimit: body.cpuLimit ? String(body.cpuLimit) : undefined,
           });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
@@ -219,7 +407,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const body = await readJsonBody(req);
           const output = manageAppLifecycle(
             String(body.appName),
-            body.action as "logs" | "restart" | "stop" | "start" | "destroy",
+            body.action as "logs" | "restart" | "stop" | "start" | "rollback" | "destroy",
             body.tailLines ? Number(body.tailLines) : 120
           );
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -245,77 +433,95 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   return server;
 }
 
+function escapeHtmlServer(s?: string): string {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
+  const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
   const sharedCss = `
     :root, [data-theme="dark"] {
-      --bg: #090d16;
-      --bg-subtle: #0d1322;
-      --card: #111827;
-      --card-hover: #161f33;
-      --border: #1f2937;
+      --bg: #090a0f;
+      --bg-elevated: #0e1017;
+      --bg-subtle: #141722;
+      --card: #11131c;
+      --card-hover: #181b28;
+      --border: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.15);
       --text: #f3f4f6;
-      --muted: #9ca3af;
-      --input-bg: #030712;
+      --muted: #8e95a9;
+      --input-bg: #07080c;
       --accent: #6366f1;
       --accent-hover: #4f46e5;
       --accent-soft: rgba(99, 102, 241, 0.14);
       --accent-text: #a5b4fc;
       --success: #10b981;
       --success-soft: rgba(16, 185, 129, 0.14);
+      --warning: #f59e0b;
+      --warning-soft: rgba(245, 158, 11, 0.14);
       --danger: #ef4444;
-      --danger-soft: rgba(239, 68, 68, 0.15);
-      --code-bg: #030712;
-      --code-text: #a5b4fc;
-      --shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+      --danger-soft: rgba(239, 68, 68, 0.14);
+      --code-bg: #07080c;
+      --code-text: #c7d2fe;
+      --shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
     }
     [data-theme="light"] {
       --bg: #f8fafc;
+      --bg-elevated: #ffffff;
       --bg-subtle: #f1f5f9;
       --card: #ffffff;
       --card-hover: #f8fafc;
       --border: #e2e8f0;
+      --border-strong: #cbd5e1;
       --text: #0f172a;
       --muted: #64748b;
       --input-bg: #f8fafc;
       --accent: #4f46e5;
       --accent-hover: #4338ca;
-      --accent-soft: rgba(79, 70, 229, 0.1);
+      --accent-soft: rgba(79, 70, 229, 0.09);
       --accent-text: #4338ca;
       --success: #059669;
       --success-soft: rgba(5, 150, 105, 0.12);
+      --warning: #d97706;
+      --warning-soft: rgba(217, 119, 6, 0.12);
       --danger: #dc2626;
       --danger-soft: rgba(220, 38, 38, 0.1);
       --code-bg: #f1f5f9;
-      --code-text: #3730a3;
+      --code-text: #312e81;
       --shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
     }
-    * { box-sizing: border-box; font-family: Inter, system-ui, -apple-system, sans-serif; }
+    * { box-sizing: border-box; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body {
       margin: 0;
       background: var(--bg);
       color: var(--text);
-      transition: background 0.2s ease, color 0.2s ease;
+      -webkit-font-smoothing: antialiased;
     }
-    a { color: var(--accent); text-decoration: none; font-weight: 500; }
+    a { color: var(--accent-text); text-decoration: none; font-weight: 500; }
     a:hover { text-decoration: underline; }
     code, pre {
       background: var(--code-bg);
       color: var(--code-text);
       border: 1px solid var(--border);
-      padding: 3px 7px;
+      padding: 2px 6px;
       border-radius: 6px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 12px;
     }
     pre {
       padding: 14px;
       overflow-x: auto;
-      max-height: 340px;
-      line-height: 1.5;
+      max-height: 360px;
+      line-height: 1.55;
       margin: 8px 0 0;
     }
-    input, select {
-      padding: 10px 12px;
+    input, select, textarea {
+      padding: 9px 12px;
       border-radius: 8px;
       border: 1px solid var(--border);
       background: var(--input-bg);
@@ -323,38 +529,43 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       font-size: 13px;
       width: 100%;
       outline: none;
-      transition: border-color 0.15s ease;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
-    input:focus, select:focus { border-color: var(--accent); }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
     button {
-      padding: 9px 14px;
+      padding: 8px 14px;
       border-radius: 8px;
       border: 1px solid transparent;
       background: var(--accent);
       color: #ffffff;
       font-weight: 600;
-      font-size: 13px;
+      font-size: 12.5px;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
-      transition: all 0.15s ease;
+      transition: all 0.14s ease;
+      white-space: nowrap;
     }
     button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
     button.secondary {
       background: var(--bg-subtle);
       border-color: var(--border);
       color: var(--text);
     }
-    button.secondary:hover { background: var(--card-hover); border-color: var(--accent); }
+    button.secondary:hover { background: var(--card-hover); border-color: var(--border-strong); }
     button.danger {
       background: var(--danger-soft);
-      border-color: rgba(239, 68, 68, 0.35);
+      border-color: rgba(239, 68, 68, 0.3);
       color: var(--danger);
     }
     button.chip {
-      padding: 5px 10px;
+      padding: 4px 10px;
       font-size: 11px;
       border-radius: 999px;
       background: var(--accent-soft);
@@ -366,10 +577,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     .badge {
       background: var(--accent-soft);
       color: var(--accent-text);
-      border: 1px solid rgba(99, 102, 241, 0.3);
-      padding: 4px 10px;
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      padding: 3px 9px;
       border-radius: 999px;
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 600;
       display: inline-flex;
       align-items: center;
@@ -380,11 +591,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       color: var(--success);
       border-color: rgba(16, 185, 129, 0.3);
     }
-    .toolbar-controls {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
+    .badge.warning {
+      background: var(--warning-soft);
+      color: var(--warning);
+      border-color: rgba(245, 158, 11, 0.3);
+    }
+    .badge.danger {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border-color: rgba(239, 68, 68, 0.3);
     }
     .toast {
       position: fixed;
@@ -409,10 +624,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PaaSMCP — Login</title>
+  <title>PaaSMCP — Control Plane Login</title>
   <style>
     ${sharedCss}
-    body { display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 20px; }
+    body { display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 20px; background: radial-gradient(circle at 50% 0%, rgba(99,102,241,0.14), transparent 55%), var(--bg); }
     .login-card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -422,9 +637,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       max-width: 440px;
       box-shadow: var(--shadow);
     }
-    .login-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    h1 { margin: 0 0 8px; font-size: 22px; display: flex; align-items: center; gap: 10px; }
-    p { margin: 0 0 20px; color: var(--muted); font-size: 14px; line-height: 1.55; }
+    .login-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+    h1 { margin: 0 0 8px; font-size: 22px; display: flex; align-items: center; gap: 10px; letter-spacing: -0.02em; }
+    p { margin: 0 0 20px; color: var(--muted); font-size: 13.5px; line-height: 1.55; }
     .err { color: var(--danger); font-size: 13px; margin-top: 12px; display: none; }
     .help-box {
       margin-top: 20px;
@@ -442,14 +657,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
   <div class="login-card">
     <div class="login-top">
       <span class="badge">Agent-First Micro-PaaS</span>
-      <div class="toolbar-controls">
-        <button class="secondary" onclick="toggleLang()" id="langBtn" style="padding:6px 10px;font-size:12px;">🌐 PT / EN</button>
-        <button class="secondary" onclick="toggleTheme()" id="themeBtn" style="padding:6px 10px;font-size:12px;">🌓</button>
+      <div style="display:flex;gap:6px;">
+        <button class="secondary" onclick="toggleLang()" id="langBtn" style="padding:5px 10px;font-size:11.5px;">🇧🇷 PT-BR</button>
+        <button class="secondary" onclick="toggleTheme()" id="themeBtn" style="padding:5px 10px;font-size:11.5px;">☀️ Light</button>
       </div>
     </div>
     <h1>🚀 PaaSMCP</h1>
     <p id="loginDesc"></p>
-    ${cfEmail ? `<div style="margin-bottom:16px;"><span class="badge success">✓ Cloudflare Zero Trust: ${cfEmail}</span></div>` : ""}
+    ${safeCfEmail ? `<div style="margin-bottom:16px;"><span class="badge success">✓ Cloudflare Zero Trust: ${safeCfEmail}</span></div>` : ""}
     <input type="password" id="token" placeholder="Token..." autofocus style="margin-bottom: 14px;" />
     <button onclick="doLogin()" style="width:100%; padding: 11px;" id="loginBtn"></button>
     <div class="err" id="err"></div>
@@ -461,26 +676,24 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
   <script>
     const I18N_LOGIN = {
       pt: {
-        desc: "Painel de Controle auto-hospedado para deploys, bancos PostgreSQL/Redis, cofre AES-256-GCM e túneis Cloudflare.",
+        desc: "Workspace de infraestrutura para Agentes de IA e Humanos. Gerencie deploys GitHub, bancos PostgreSQL/Redis, Cofre AES-256-GCM, Webhooks e Cluster Multi-Servidor.",
         placeholder: "Cole seu DASHBOARD_TOKEN...",
-        btn: "Acessar Painel de Controle",
-        err: "Token inválido. Verifique e tente novamente.",
-        help: "💡 Como obter seu token no terminal do servidor:"
+        btn: "Entrar no Control Plane",
+        err: "Token inválido ou limite de tentativas excedido.",
+        help: "💡 Consulte o token no terminal do servidor:"
       },
       en: {
-        desc: "Self-hosted Control Plane for GitHub deployments, PostgreSQL/Redis databases, AES-256-GCM secret vault, and Cloudflare Tunnels.",
+        desc: "Infrastructure workspace for AI Agents and Humans. Manage GitHub deploys, PostgreSQL/Redis, AES-256-GCM Vault, Webhooks, and Multi-Server HA Clusters.",
         placeholder: "Paste your DASHBOARD_TOKEN...",
         btn: "Sign In to Control Plane",
-        err: "Invalid access token. Please try again.",
-        help: "💡 How to retrieve your token in the server terminal:"
+        err: "Invalid access token or rate limit exceeded.",
+        help: "💡 Retrieve your token in the server terminal:"
       }
     };
     let currentLang = localStorage.getItem('paasmcp_lang') || ((navigator.language || '').toLowerCase().startsWith('pt') ? 'pt' : 'en');
     let currentTheme = localStorage.getItem('paasmcp_theme') || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-
     function applyPrefs() {
       document.documentElement.setAttribute('data-theme', currentTheme);
-      document.documentElement.lang = currentLang === 'pt' ? 'pt-BR' : 'en';
       document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌙 Dark';
       document.getElementById('langBtn').textContent = currentLang === 'pt' ? '🇧🇷 PT-BR' : '🇺🇸 EN';
       const t = I18N_LOGIN[currentLang];
@@ -490,23 +703,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       document.getElementById('err').textContent = t.err;
       document.getElementById('helpTitle').textContent = t.help;
     }
-    function toggleTheme() {
-      currentTheme = currentTheme === 'dark' ? 'light' : 'dark';
-      localStorage.setItem('paasmcp_theme', currentTheme);
-      applyPrefs();
-    }
-    function toggleLang() {
-      currentLang = currentLang === 'pt' ? 'en' : 'pt';
-      localStorage.setItem('paasmcp_lang', currentLang);
-      applyPrefs();
-    }
+    function toggleTheme() { currentTheme = currentTheme === 'dark' ? 'light' : 'dark'; localStorage.setItem('paasmcp_theme', currentTheme); applyPrefs(); }
+    function toggleLang() { currentLang = currentLang === 'pt' ? 'en' : 'pt'; localStorage.setItem('paasmcp_lang', currentLang); applyPrefs(); }
     async function doLogin() {
       const token = document.getElementById('token').value.trim();
-      const res = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ token })
-      });
+      const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
       if (res.ok) location.reload();
       else document.getElementById('err').style.display = 'block';
     }
@@ -522,72 +723,122 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PaaSMCP — Control Plane Dashboard</title>
+  <title>PaaSMCP — Workspace & Control Plane</title>
   <style>
     ${sharedCss}
-    body { padding: 24px 32px; max-width: 1380px; margin: 0 auto; }
-    @media (max-width: 768px) { body { padding: 16px; } }
-    header {
+    .app-shell {
+      display: grid;
+      grid-template-columns: 250px 1fr;
+      min-height: 100vh;
+    }
+    @media (max-width: 960px) {
+      .app-shell { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid var(--border); padding: 14px 16px; }
+    }
+    .sidebar {
+      background: var(--bg-elevated);
+      border-right: 1px solid var(--border);
+      padding: 20px 14px;
       display: flex;
+      flex-direction: column;
       justify-content: space-between;
-      align-items: center;
-      margin-bottom: 24px;
-      padding-bottom: 16px;
+      gap: 20px;
+    }
+    .brand-box {
+      padding: 4px 10px 14px;
       border-bottom: 1px solid var(--border);
-      flex-wrap: wrap;
-      gap: 14px;
     }
-    .brand { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-    h1 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
-    .guide-banner {
-      background: linear-gradient(135deg, var(--accent-soft), var(--card));
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 20px 24px;
-      margin-bottom: 24px;
-      box-shadow: var(--shadow);
+    .brand-title {
+      font-size: 17px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      letter-spacing: -0.02em;
     }
-    .guide-header {
+    .brand-sub {
+      font-size: 11.5px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+    .nav-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 12px;
+    }
+    .nav-btn {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid transparent;
+      justify-content: flex-start;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      border-radius: 8px;
+      width: 100%;
+    }
+    .nav-btn:hover {
+      background: var(--bg-subtle);
+      color: var(--text);
+    }
+    .nav-btn.active {
+      background: var(--accent-soft);
+      color: var(--accent-text);
+      border-color: rgba(99, 102, 241, 0.28);
+      font-weight: 600;
+    }
+    .sidebar-footer {
+      padding: 12px 10px 4px;
+      border-top: 1px solid var(--border);
+      font-size: 11.5px;
+      color: var(--muted);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .main-area {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .topbar {
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 28px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 12px;
       flex-wrap: wrap;
     }
-    .guide-header h2 { margin: 0; font-size: 17px; }
-    .guide-steps {
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .content-wrap {
+      padding: 24px 28px;
+      max-width: 1360px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .grid-stats {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 14px;
-      margin-top: 16px;
+      margin-bottom: 22px;
     }
-    .step-box {
+    .stat-card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 14px;
+      border-radius: 12px;
+      padding: 16px 18px;
     }
-    .step-num {
-      display: inline-flex;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: var(--accent);
-      color: #fff;
-      font-size: 12px;
-      font-weight: 700;
-      align-items: center;
-      justify-content: center;
-      margin-right: 6px;
-    }
-    .step-box h3 { margin: 0 0 6px; font-size: 14px; display: flex; align-items: center; }
-    .step-box p { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.45; }
-    .grid-stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px;
-      margin-bottom: 24px;
-    }
+    .stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+    .stat-value { font-size: 20px; font-weight: 700; margin-top: 6px; letter-spacing: -0.02em; }
+    .stat-meta { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
     .card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -596,30 +847,22 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       margin-bottom: 20px;
       box-shadow: var(--shadow);
     }
-    .card-header {
-      margin-bottom: 14px;
-    }
+    .card-header { margin-bottom: 14px; }
     .card-header h2 {
       margin: 0 0 4px;
-      font-size: 16.5px;
+      font-size: 16px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
+      flex-wrap: wrap;
     }
-    .card-desc {
-      margin: 0;
-      font-size: 12.5px;
-      color: var(--muted);
-      line-height: 1.45;
-    }
-    .stat-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-    .stat-value { font-size: 22px; font-weight: 700; margin-top: 6px; }
+    .card-desc { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    @media (max-width: 960px) { .row { grid-template-columns: 1fr; } }
+    @media (max-width: 980px) { .row { grid-template-columns: 1fr; } }
     .form-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
       gap: 10px;
       margin-bottom: 12px;
     }
@@ -640,466 +883,436 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       border-radius: 8px;
       background: var(--bg-subtle);
       border: 1px dashed var(--border);
-      font-size: 12px;
+      font-size: 11.5px;
       color: var(--muted);
     }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-    th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.03em; }
-    .actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .actions { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
     .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 7px; }
-    .prompt-grid {
+    .status-dot.stopped { background: var(--danger); }
+    .arch-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
       gap: 12px;
       margin-top: 12px;
     }
-    .prompt-card {
+    .arch-box {
       background: var(--bg-subtle);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 12px 14px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 10px;
+      padding: 14px;
     }
-    .prompt-card p {
-      margin: 0;
-      font-size: 12.5px;
-      line-height: 1.5;
-      color: var(--text);
-      font-style: italic;
-    }
+    .arch-box h3 { margin: 0 0 6px; font-size: 13.5px; }
+    .arch-box p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <h1>🚀 PaaSMCP</h1>
-      <span class="badge" id="badgeSubtitle">Agent-First Micro-PaaS</span>
-      ${cfEmail ? `<span class="badge success">🔒 Zero Trust: ${cfEmail}</span>` : ""}
-    </div>
-    <div class="toolbar-controls">
-      <button class="secondary" onclick="toggleGuide()" id="btnToggleGuide">💡 Guia Rápido</button>
-      <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
-      <button class="secondary" onclick="toggleTheme()" id="themeBtn">☀️ Light</button>
-      <button class="secondary" onclick="loadAll()" id="btnRefresh">🔄 Atualizar</button>
-      <button class="danger" onclick="logout()" id="btnLogout">Sair</button>
-    </div>
-  </header>
-
-  <!-- Interactive Quick Start Guide -->
-  <div class="guide-banner" id="guideBanner">
-    <div class="guide-header">
+  <div class="app-shell">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar">
       <div>
-        <h2 id="guideTitle">👋 Bem-vindo ao seu Micro-PaaS Pessoal (Estilo Render / Vercel)</h2>
-        <p class="card-desc" id="guideSubtitle">Publique qualquer repositório do GitHub com banco de dados isolado, variáveis criptografadas e HTTPS automático em 4 passos simples:</p>
+        <div class="brand-box">
+          <div class="brand-title">
+            <span>🚀 PaaSMCP</span>
+            <span class="badge" style="font-size:10px;padding:2px 7px;">v1.1</span>
+          </div>
+          <div class="brand-sub" id="sidebarSubtitle">Agent-First Micro-PaaS</div>
+        </div>
+        <nav class="nav-list">
+          <button class="nav-btn active" onclick="switchTab('overview', this)" id="navOverview">📦 Aplicações & Deploy</button>
+          <button class="nav-btn" onclick="switchTab('vault', this)" id="navVault">🔐 Cofre AES-256-GCM</button>
+          <button class="nav-btn" onclick="switchTab('databases', this)" id="navDatabases">🗄️ Bancos & Backups</button>
+          <button class="nav-btn" onclick="switchTab('federation', this)" id="navFederation">🌐 Multi-Server HA & Webhook</button>
+          <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Doctor & Diagnóstico</button>
+          <button class="nav-btn" onclick="switchTab('agents', this)" id="navAgents">🤖 Studio IA (MCP) & Guia</button>
+        </nav>
       </div>
-      <button class="secondary" onclick="toggleGuide()" style="font-size:12px;padding:6px 10px;" id="btnHideGuide">Ocultar Guia</button>
-    </div>
-    <div class="guide-steps">
-      <div class="step-box">
-        <h3><span class="step-num">1</span> <span id="step1Title">Variáveis & Segredos</span></h3>
-        <p id="step1Desc">Salve chaves de API (OpenAI, Stripe, etc.) no Cofre AES-256-GCM usando o nome do seu app como escopo antes ou depois do deploy.</p>
+      <div class="sidebar-footer">
+        <div>🔒 <strong>Loopback-First</strong> (127.0.0.1)</div>
+        <div>⚡ <strong>0 MB</strong> Idle Daemon Overhead</div>
+        <div id="nodeRoleFooter">Node: standalone</div>
       </div>
-      <div class="step-box">
-        <h3><span class="step-num">2</span> <span id="step2Title">Build & Deploy do GitHub</span></h3>
-        <p id="step2Desc">Informe seu repositório <code>owner/repo</code>. Se não houver Dockerfile, o PaaSMCP gera um automaticamente (Node, Next, Python, Go, SPA).</p>
-      </div>
-      <div class="step-box">
-        <h3><span class="step-num">3</span> <span id="step3Title">Banco de Dados 1-Click</span></h3>
-        <p id="step3Desc">Marque PostgreSQL ou Redis no deploy (ou crie depois). A variável <code>DATABASE_URL</code> é injetada automaticamente no container.</p>
-      </div>
-      <div class="step-box">
-        <h3><span class="step-num">4</span> <span id="step4Title">Domínio HTTPS Seguro</span></h3>
-        <p id="step4Desc">Exponha na internet em <code>subdominio.{domain}</code> (Público ou protegido com login PIN por e-mail no Cloudflare Zero Trust).</p>
-      </div>
-    </div>
-  </div>
+    </aside>
 
-  <!-- Stats -->
-  <div class="grid-stats" id="statsGrid"></div>
+    <!-- Main Workspace Area -->
+    <div class="main-area">
+      <header class="topbar">
+        <div class="topbar-left">
+          <span class="badge success" id="topHealthBadge">● System Online</span>
+          <span class="badge" id="topDomainBadge">Domain: -</span>
+          ${safeCfEmail ? `<span class="badge success">🛡️ Zero Trust: ${safeCfEmail}</span>` : ""}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+          <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
+          <button class="secondary" onclick="toggleTheme()" id="themeBtn">☀️ Light</button>
+          <button class="secondary" onclick="loadAll()" id="btnRefresh">🔄 Atualizar</button>
+          <button class="danger" onclick="logout()" id="btnLogout">Sair</button>
+        </div>
+      </header>
 
-  <!-- Hosted Applications Table -->
-  <div class="card">
-    <div class="card-header">
-      <h2>
-        <span id="appsTitle">📦 Aplicações Hospedadas</span>
-        <span class="badge" id="appsBadgeCount">0 apps</span>
-      </h2>
-      <p class="card-desc" id="appsDesc">Todos os containers rodam isolados em <code>127.0.0.1:4000-4999</code> e conectados à rede <code>homelab-network</code>.</p>
-    </div>
-    <div style="overflow-x:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th id="thApp">Aplicação</th>
-            <th id="thStack">Stack Detectada</th>
-            <th id="thPort">Porta Local</th>
-            <th id="thDb">Bancos Vinculados</th>
-            <th id="thDomains">Domínios / Endereços</th>
-            <th id="thActions">Ações Rápidas</th>
-          </tr>
-        </thead>
-        <tbody id="appsTable">
-          <tr><td colspan="6">...</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
+      <div class="content-wrap">
+        <!-- Global Hardware & Cluster Summary -->
+        <div class="grid-stats" id="statsGrid"></div>
 
-  <!-- Deploy & Expose Row -->
-  <div class="row">
-    <div class="card">
-      <div class="card-header">
-        <h2 id="deployTitle">➕ Novo Deploy (GitHub ou Diretório Local)</h2>
-        <p class="card-desc" id="deployDesc">Clona o repositório via SSH/Token, detecta a linguagem, constrói a imagem Docker e inicia o serviço.</p>
-      </div>
-      <div class="examples-bar">
-        <span id="lblQuickFillDeploy">⚡ Preencher exemplo:</span>
-        <button class="chip" onclick="fillDeployExample('meu-saas', 'seu-usuario/meu-saas', 'main', true, false)">SaaS Node/Next + Postgres</button>
-        <button class="chip" onclick="fillDeployExample('api-python', 'seu-usuario/api-fastapi', 'main', true, true)">API Python + PG + Redis</button>
-        <button class="chip" onclick="fillDeployExample('landing-page', 'seu-usuario/landing', 'main', false, false)">Site Estático / SPA</button>
-      </div>
-      <div class="form-grid">
-        <div>
-          <label class="field-label" id="lblDepApp">Identificador do App (slug)</label>
-          <input id="depApp" placeholder="ex: meu-saas" />
-        </div>
-        <div>
-          <label class="field-label" id="lblDepRepo">Repositório GitHub ou Caminho</label>
-          <input id="depRepo" placeholder="ex: seu-usuario/meu-repo" />
-        </div>
-        <div>
-          <label class="field-label" id="lblDepBranch">Branch Git</label>
-          <input id="depBranch" placeholder="main" value="main" />
-        </div>
-      </div>
-      <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; font-size:13px; flex-wrap:wrap;">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="depPg" style="width:auto;" />
-          <span id="lblDepPg">Provisionar PostgreSQL 16 (+ injetar <code>DATABASE_URL</code>)</span>
-        </label>
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-          <input type="checkbox" id="depRedis" style="width:auto;" />
-          <span id="lblDepRedis">Provisionar Redis 7 (+ injetar <code>REDIS_URL</code>)</span>
-        </label>
-      </div>
-      <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
-    </div>
+        <!-- TAB 1: OVERVIEW, APPS, DEPLOY & EXPOSE -->
+        <div class="tab-pane active" id="tab-overview">
+          <div class="card">
+            <div class="card-header">
+              <h2>
+                <span id="appsTitle">📦 Aplicações Hospedadas & Métricas em Tempo Real</span>
+                <span class="badge" id="appsBadgeCount">0 apps</span>
+              </h2>
+              <p class="card-desc" id="appsDesc">Containers isolados em <code>127.0.0.1:4000-4998</code> com suporte a Rollback em 1s, limites de CPU/RAM e Docker Compose multi-serviço.</p>
+            </div>
+            <div style="overflow-x:auto;">
+              <table>
+                <thead>
+                  <tr>
+                    <th id="thApp">Aplicação</th>
+                    <th id="thStack">Stack / Commit</th>
+                    <th id="thMetrics">CPU / RAM (Live)</th>
+                    <th id="thPort">Porta / DBs</th>
+                    <th id="thDomains">Domínios HTTPS</th>
+                    <th id="thActions">Ações Rápidas</th>
+                  </tr>
+                </thead>
+                <tbody id="appsTable">
+                  <tr><td colspan="6">...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
 
-    <div class="card">
-      <div class="card-header">
-        <h2 id="exposeTitle">🌐 Expor Aplicação na Internet ou Tailnet</h2>
-        <p class="card-desc" id="exposeDesc">Cria automaticamente a rota no Cloudflare Tunnel + registro DNS CNAME sem abrir portas no seu roteador.</p>
-      </div>
-      <div class="examples-bar">
-        <span id="lblQuickFillExpose">⚡ Modos de exposição:</span>
-        <button class="chip" onclick="fillExposeMode('public')" id="chipModePublic">🌍 Público (Qualquer pessoa acessa)</button>
-        <button class="chip" onclick="fillExposeMode('zero-trust')" id="chipModeZT">🛡️ Zero Trust (Pede PIN no seu e-mail)</button>
-        <button class="chip" onclick="fillExposeMode('tailscale')" id="chipModeTS">🔒 Tailscale (Só sua VPN)</button>
-      </div>
-      <div class="form-grid">
-        <div>
-          <label class="field-label" id="lblExpApp">Aplicação já hospedada</label>
-          <input id="expApp" list="hostedAppsList" placeholder="ex: meu-saas" />
-          <datalist id="hostedAppsList"></datalist>
-        </div>
-        <div>
-          <label class="field-label" id="lblExpMode">Modo de Segurança</label>
-          <select id="expMode">
-            <option value="public" id="optPublic">Cloudflare Público (HTTPS aberto)</option>
-            <option value="zero-trust" id="optZT">Cloudflare Zero Trust (Login OTP por E-mail)</option>
-            <option value="tailscale" id="optTS">Tailscale Serve (Privado na sua Tailnet)</option>
-          </select>
-        </div>
-        <div>
-          <label class="field-label" id="lblExpSub">Subdomínio desejado</label>
-          <input id="expSub" placeholder="ex: app (vira app.seudominio.com)" />
-        </div>
-      </div>
-      <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
-    </div>
-  </div>
+          <div class="row">
+            <div class="card">
+              <div class="card-header">
+                <h2 id="deployTitle">➕ Novo Deploy (GitHub, Multi-Service Compose ou Local)</h2>
+                <p class="card-desc" id="deployDesc">Detecta automaticamente Node, Next.js, Python, Go, SPA, Dockerfile ou <code>docker-compose.yml</code> (injetando segredos do Vault com segurança).</p>
+              </div>
+              <div class="examples-bar">
+                <span id="lblQuickFillDeploy">⚡ Presets:</span>
+                <button class="chip" onclick="fillDeployExample('meu-saas', 'seu-usuario/meu-saas', 'main', true, false, '512m', '1.0')">SaaS Next.js + PG (512MB)</button>
+                <button class="chip" onclick="fillDeployExample('api-worker', 'seu-usuario/api-compose', 'main', true, true, '1g', '2.0')">Multi-Service Compose + PG + Redis</button>
+                <button class="chip" onclick="fillDeployExample('landing', 'seu-usuario/landing', 'main', false, false, '256m', '0.5')">SPA / Site Estático</button>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" id="lblDepApp">Slug da Aplicação</label>
+                  <input id="depApp" placeholder="ex: meu-saas" />
+                </div>
+                <div>
+                  <label class="field-label" id="lblDepRepo">Repositório GitHub ou Caminho</label>
+                  <input id="depRepo" placeholder="ex: seu-usuario/meu-repo" />
+                </div>
+                <div>
+                  <label class="field-label" id="lblDepBranch">Branch Git</label>
+                  <input id="depBranch" placeholder="main" value="main" />
+                </div>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" id="lblDepMem">Limite de RAM (Opcional)</label>
+                  <input id="depMem" placeholder="ex: 512m ou 1g" />
+                </div>
+                <div>
+                  <label class="field-label" id="lblDepCpu">Limite de vCPUs (Opcional)</label>
+                  <input id="depCpu" placeholder="ex: 0.5 ou 1.0" />
+                </div>
+              </div>
+              <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; font-size:12.5px; flex-wrap:wrap;">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="depPg" style="width:auto;" />
+                  <span id="lblDepPg">Provisionar PostgreSQL 16 (injeta <code>DATABASE_URL</code>)</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="depRedis" style="width:auto;" />
+                  <span id="lblDepRedis">Provisionar Redis 7 (injeta <code>REDIS_URL</code>)</span>
+                </label>
+              </div>
+              <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
+            </div>
 
-  <!-- Vault & Databases Row -->
-  <div class="row">
-    <div class="card">
-      <div class="card-header">
-        <h2 id="vaultTitle">🔐 Cofre de Variáveis (AES-256-GCM Vault)</h2>
-        <p class="card-desc" id="vaultDesc">Criptografia autenticada em disco. Use o escopo <code>system</code> para tokens globais ou o <strong>nome do app</strong> para variáveis daquele container.</p>
-      </div>
-      <div class="examples-bar">
-        <span id="lblQuickScope">⚡ Escopos rápidos:</span>
-        <button class="chip" onclick="setVaultScope('system')">⚙️ system (Global)</button>
-        <span id="dynamicScopeChips"></span>
-      </div>
-      <div class="form-grid">
-        <div>
-          <label class="field-label" id="lblSecScope">Escopo (system ou slug do app)</label>
-          <input id="secScope" placeholder="system" value="system" onchange="loadSecrets()" />
+            <div class="card">
+              <div class="card-header">
+                <h2 id="exposeTitle">🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)</h2>
+                <p class="card-desc" id="exposeDesc">Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.</p>
+              </div>
+              <div class="examples-bar">
+                <span id="lblQuickFillExpose">⚡ Modos:</span>
+                <button class="chip" onclick="fillExposeMode('public')" id="chipModePublic">🌍 Público (HTTPS Aberto)</button>
+                <button class="chip" onclick="fillExposeMode('zero-trust')" id="chipModeZT">🛡️ Zero Trust (OTP por E-mail)</button>
+                <button class="chip" onclick="fillExposeMode('tailscale')" id="chipModeTS">🔒 Tailscale (VPN Privada)</button>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" id="lblExpApp">Aplicação</label>
+                  <input id="expApp" list="hostedAppsList" placeholder="ex: meu-saas" />
+                  <datalist id="hostedAppsList"></datalist>
+                </div>
+                <div>
+                  <label class="field-label" id="lblExpMode">Modo de Segurança</label>
+                  <select id="expMode">
+                    <option value="public" id="optPublic">Cloudflare Público (HTTPS aberto)</option>
+                    <option value="zero-trust" id="optZT">Cloudflare Zero Trust (Login PIN por E-mail)</option>
+                    <option value="tailscale" id="optTS">Tailscale Serve (Privado na Tailnet)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="field-label" id="lblExpSub">Subdomínio</label>
+                  <input id="expSub" placeholder="ex: app" />
+                </div>
+              </div>
+              <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
+            </div>
+          </div>
         </div>
-        <div>
-          <label class="field-label" id="lblSecKey">Nome da Variável (ENV)</label>
-          <input id="secKey" placeholder="ex: OPENAI_API_KEY" />
-        </div>
-        <div>
-          <label class="field-label" id="lblSecVal">Valor Secreto</label>
-          <input id="secVal" type="password" placeholder="••••••••••••" />
-        </div>
-      </div>
-      <div class="actions" style="margin-bottom:14px;">
-        <button onclick="saveSecret()" id="btnSaveSecret">💾 Criptografar & Salvar</button>
-        <button class="secondary" onclick="loadSecrets()" id="btnLoadSecrets">🔍 Recarregar Escopo</button>
-      </div>
-      <div id="secretsList"></div>
-    </div>
 
-    <div class="card">
-      <div class="card-header">
-        <h2 id="dbTitle">🗄️ Bancos de Dados & Chave SSH GitHub</h2>
-        <p class="card-desc" id="dbDesc">Provisiona bancos e credenciais exclusivas por aplicação e exibe sua Deploy Key para repositórios privados.</p>
-      </div>
-      <div class="form-grid">
-        <div>
-          <label class="field-label" id="lblDbApp">Vincular banco ao App</label>
-          <input id="dbApp" list="hostedAppsList" placeholder="ex: meu-saas" />
+        <!-- TAB 2: ENCRYPTED VAULT -->
+        <div class="tab-pane" id="tab-vault">
+          <div class="card">
+            <div class="card-header">
+              <h2 id="vaultTitle">🔐 Cofre Criptografado de Variáveis (AES-256-GCM Vault)</h2>
+              <p class="card-desc" id="vaultDesc">Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.</p>
+            </div>
+            <div class="examples-bar">
+              <span>⚡ Escopos:</span>
+              <button class="chip" onclick="setVaultScope('system')">⚙️ system (Global Tokens)</button>
+              <span id="dynamicScopeChips"></span>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label class="field-label" id="lblSecScope">Escopo (system ou slug do app)</label>
+                <input id="secScope" placeholder="system" value="system" onchange="loadSecrets()" />
+              </div>
+              <div>
+                <label class="field-label" id="lblSecKey">Chave (A-Z, 0-9, _)</label>
+                <input id="secKey" placeholder="ex: STRIPE_SECRET_KEY" />
+              </div>
+              <div>
+                <label class="field-label" id="lblSecVal">Valor Secreto</label>
+                <input id="secVal" type="password" placeholder="••••••••••••" />
+              </div>
+            </div>
+            <div class="actions" style="margin-bottom:16px;">
+              <button onclick="saveSecret()" id="btnSaveSecret">💾 Criptografar & Salvar</button>
+              <button class="secondary" onclick="loadSecrets()" id="btnLoadSecrets">🔍 Recarregar Escopo</button>
+            </div>
+            <div id="secretsList"></div>
+          </div>
         </div>
-        <div>
-          <label class="field-label" id="lblDbEngine">Motor do Banco</label>
-          <select id="dbEngine">
-            <option value="postgres">PostgreSQL 16 (Cria DB + User + DATABASE_URL)</option>
-            <option value="redis">Redis 7 (Aloca DB lógico + REDIS_URL)</option>
-          </select>
-        </div>
-      </div>
-      <button onclick="createDb()" style="margin-bottom:18px;" id="btnCreateDb">+ Provisionar Banco Isolado</button>
-      <div id="dbList" style="margin-bottom:18px; font-size:13px;"></div>
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span class="stat-label" id="lblSshKey">Chave SSH Pública de Deploy (GitHub Deploy Key):</span>
-        <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
-      </div>
-      <pre id="sshKeyBox" style="margin-top:6px; user-select:all;"></pre>
-    </div>
-  </div>
 
-  <!-- AI Agent Prompts & CLI Examples Card -->
-  <div class="card">
-    <div class="card-header">
-      <h2 id="examplesTitle">🤖 Exemplos de Uso com Agentes de IA (MCP) & Terminal</h2>
-      <p class="card-desc" id="examplesDesc">Como o PaaSMCP possui servidor MCP nativo, você pode pedir em linguagem natural no T3 Code / Claude / Cursor ou usar a CLI:</p>
-    </div>
-    <div class="prompt-grid">
-      <div class="prompt-card">
-        <div>
-          <span class="badge" style="margin-bottom:8px;">💬 Prompt — Deploy Completo</span>
-          <p id="prompt1Text">"Faça o deploy do meu repositório seu-usuario/meu-app na branch main com um banco PostgreSQL e publique em meuapp.{domain}"</p>
-        </div>
-        <button class="secondary" style="font-size:12px;padding:6px 10px;" onclick="copyText(document.getElementById('prompt1Text').textContent)">📋 Copiar Prompt</button>
-      </div>
-      <div class="prompt-card">
-        <div>
-          <span class="badge" style="margin-bottom:8px;">💬 Prompt — App Privado Zero Trust</span>
-          <p id="prompt2Text">"Suba o repositório seu-usuario/painel-admin e exponha em admin.{domain} protegido com login por e-mail no Cloudflare Zero Trust"</p>
-        </div>
-        <button class="secondary" style="font-size:12px;padding:6px 10px;" onclick="copyText(document.getElementById('prompt2Text').textContent)">📋 Copiar Prompt</button>
-      </div>
-      <div class="prompt-card">
-        <div>
-          <span class="badge" style="margin-bottom:8px;">💻 Equivalente no Terminal (CLI)</span>
-          <code style="display:block;padding:8px;margin-top:4px;white-space:pre-wrap;" id="cliExampleBox">paasmcp deploy meu-app seu-usuario/meu-app --postgres
-paasmcp expose meu-app public meuapp</code>
-        </div>
-        <button class="secondary" style="font-size:12px;padding:6px 10px;" onclick="copyText(document.getElementById('cliExampleBox').textContent)">📋 Copiar Comandos</button>
-      </div>
-    </div>
-  </div>
+        <!-- TAB 3: DATABASES & ENCRYPTED BACKUPS -->
+        <div class="tab-pane" id="tab-databases">
+          <div class="row">
+            <div class="card">
+              <div class="card-header">
+                <h2 id="dbTitle">🗄️ Provisionar Banco Multi-Tenant Isolado</h2>
+                <p class="card-desc" id="dbDesc">Cria banco, role exclusiva e injeta <code>DATABASE_URL</code> / <code>REDIS_URL</code> diretamente no Cofre do app.</p>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label">Aplicação</label>
+                  <input id="dbApp" list="hostedAppsList" placeholder="ex: meu-saas" />
+                </div>
+                <div>
+                  <label class="field-label">Engine</label>
+                  <select id="dbEngine">
+                    <option value="postgres">PostgreSQL 16 (Isolado por DB + Role)</option>
+                    <option value="redis">Redis 7 (DB Lógico Isolado)</option>
+                  </select>
+                </div>
+              </div>
+              <button onclick="createDb()" style="margin-bottom:16px;">+ Provisionar Banco</button>
+              <div id="dbList"></div>
+            </div>
 
-  <!-- Container Logs Viewer -->
-  <div class="card" id="logsCard" style="display:none;">
-    <div class="card-header">
-      <h2>
-        <span id="logsTitle">📜 Logs do Container</span>
-        <button class="secondary" onclick="document.getElementById('logsCard').style.display='none'" id="btnCloseLogs">Fechar</button>
-      </h2>
+            <div class="card">
+              <div class="card-header">
+                <h2>🛡️ Snapshots & Restore Criptografados (AES-256-GCM)</h2>
+                <p class="card-desc">Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.</p>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label">App para Backup</label>
+                  <input id="bakApp" list="hostedAppsList" placeholder="ex: meu-saas" />
+                </div>
+                <div>
+                  <label class="field-label">Engine</label>
+                  <select id="bakEngine">
+                    <option value="postgres">PostgreSQL 16 (pg_dump)</option>
+                    <option value="redis">Redis 7 (RDB)</option>
+                  </select>
+                </div>
+              </div>
+              <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Criar Snapshot Criptografado</button>
+              <div id="backupsList"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 4: MULTI-SERVER HA FEDERATION & GITHUB WEBHOOKS -->
+        <div class="tab-pane" id="tab-federation">
+          <div class="row">
+            <div class="card">
+              <div class="card-header">
+                <h2>🌐 Handshake Multi-Servidor & Redundância (HA Federation)</h2>
+                <p class="card-desc">Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.</p>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label">URL deste Servidor (Primary)</label>
+                  <input id="fedUrl" placeholder="https://paas.seudominio.com" />
+                </div>
+                <div>
+                  <label class="field-label">Modo de Redundância</label>
+                  <select id="fedMode">
+                    <option value="active-active-tunnel">Active-Active (Cloudflare Tunnel Multi-Connector)</option>
+                    <option value="warm-standby">Warm Standby (Sync Criptografado de Vault & Apps)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="actions" style="margin-bottom:12px;">
+                <button onclick="generateInvite()">🔑 Gerar Join Token (15 min)</button>
+                <button class="secondary" onclick="exportSyncBundle()">📦 Exportar Bundle Criptografado</button>
+              </div>
+              <pre id="fedTokenBox" style="display:none;user-select:all;"></pre>
+              <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;" />
+              <label class="field-label">Conectar este servidor como Réplica (Cole um Join Token):</label>
+              <div style="display:flex;gap:8px;margin-bottom:14px;">
+                <input id="fedJoinInput" placeholder="paasmcp-join://..." />
+                <button class="secondary" onclick="joinFederation()">🤝 Fazer Handshake</button>
+              </div>
+              <div id="fedPeersList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <h2>⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
+                <p class="card-desc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
+              </div>
+              <div style="margin-bottom:14px;">
+                <span class="field-label">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
+                <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
+              </div>
+              <div style="margin-bottom:16px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <span class="field-label" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
+                  <button class="chip" onclick="revealWebhookSecret()">👁️ Revelar / Copiar Secret</button>
+                </div>
+                <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span class="field-label" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
+                <button class="chip" onclick="copySshKey()">📋 Copiar Chave SSH</button>
+              </div>
+              <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 5: DOCTOR & DIAGNOSTICS -->
+        <div class="tab-pane" id="tab-doctor">
+          <div class="card">
+            <div class="card-header">
+              <h2>
+                <span>🩺 PaaSMCP Doctor — Diagnóstico Automático de Containers</span>
+                <button onclick="runDoctor()">🔍 Executar Diagnóstico Agora</button>
+              </h2>
+              <p class="card-desc">Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.</p>
+            </div>
+            <div id="doctorReportBox"></div>
+          </div>
+        </div>
+
+        <!-- TAB 6: AI AGENT STUDIO & ARCHITECTURE -->
+        <div class="tab-pane" id="tab-agents">
+          <div class="card">
+            <div class="card-header">
+              <h2>🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)</h2>
+              <p class="card-desc">O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:</p>
+            </div>
+            <pre id="mcpConfigBox" style="user-select:all;">{
+  "mcpServers": {
+    "paasmcp": {
+      "command": "paasmcp-mcp"
+    }
+  }
+}</pre>
+            <div class="arch-grid" style="margin-top:16px;">
+              <div class="arch-box">
+                <h3>💬 Deploy & Banco 1-Click</h3>
+                <p>"Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>"</p>
+              </div>
+              <div class="arch-box">
+                <h3>💬 Backup & Rollback</h3>
+                <p>"Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro"</p>
+              </div>
+              <div class="arch-box">
+                <h3>💬 Diagnóstico & Multi-Node</h3>
+                <p>"Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA"</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>🏛️ Arquitetura & Modelo de Segurança (Por dentro do PaaSMCP)</h2>
+              <p class="card-desc">Projetado para máxima segurança e zero desperdício de recursos:</p>
+            </div>
+            <div class="arch-grid">
+              <div class="arch-box">
+                <h3>1. Isolamento Loopback (127.0.0.1)</h3>
+                <p>Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.</p>
+              </div>
+              <div class="arch-box">
+                <h3>2. Cofre & Backups AES-256-GCM</h3>
+                <p>Variáveis de ambiente e dumps de banco (<code>pg_dump</code>) são criptografados em repouso com chave mestra <code>0600</code> e mascarados nas respostas do MCP.</p>
+              </div>
+              <div class="arch-box">
+                <h3>3. Sanitização de Docker Compose</h3>
+                <p>Repositórios multi-serviço têm seus arquivos Compose auditados automaticamente, removendo <code>privileged: true</code>, <code>network_mode: host</code> e mounts inseguros.</p>
+              </div>
+              <div class="arch-box">
+                <h3>4. Redundância Multi-Servidor</h3>
+                <p>Dois servidores podem parear via handshake HMAC-SHA256 e operar em <strong>Active-Active</strong> no mesmo Cloudflare Tunnel ou em <strong>Warm Standby</strong>.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Container Logs Drawer -->
+        <div class="card" id="logsCard" style="display:none;">
+          <div class="card-header">
+            <h2>
+              <span id="logsTitle">📜 Logs do Container</span>
+              <button class="secondary" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
+            </h2>
+          </div>
+          <pre id="logsBox"></pre>
+        </div>
+      </div>
     </div>
-    <pre id="logsBox"></pre>
   </div>
 
   <div class="toast" id="toast"></div>
 
   <script>
-    const I18N = {
-      pt: {
-        badgeSubtitle: "Micro-PaaS para Agentes & Humanos",
-        btnToggleGuide: "💡 Guia Rápido",
-        btnHideGuide: "Ocultar Guia",
-        btnRefresh: "🔄 Atualizar",
-        btnLogout: "Sair",
-        guideTitle: "👋 Bem-vindo ao seu Micro-PaaS Pessoal (Estilo Render / Vercel)",
-        guideSubtitle: "Publique qualquer repositório do GitHub com banco de dados isolado, variáveis criptografadas e HTTPS automático em 4 passos simples:",
-        step1Title: "Variáveis & Segredos",
-        step1Desc: "Salve chaves de API (OpenAI, Stripe, etc.) no Cofre AES-256-GCM usando o nome do seu app como escopo antes ou depois do deploy.",
-        step2Title: "Build & Deploy do GitHub",
-        step2Desc: "Informe seu repositório <code>owner/repo</code>. Se não houver Dockerfile, o PaaSMCP gera um automaticamente (Node, Next, Python, Go, SPA).",
-        step3Title: "Banco de Dados 1-Click",
-        step3Desc: "Marque PostgreSQL ou Redis no deploy (ou crie depois). A variável <code>DATABASE_URL</code> é injetada automaticamente no container.",
-        step4Title: "Domínio HTTPS Seguro",
-        step4Desc: "Exponha na internet em <code>subdominio.{domain}</code> (Público ou protegido com login PIN por e-mail no Cloudflare Zero Trust).",
-        statServer: "Servidor Host",
-        statMem: "Memória Livre / Total",
-        statApps: "Aplicações & Bancos",
-        statBaseDomain: "Domínio Base Cloudflare",
-        appsTitle: "📦 Aplicações Hospedadas",
-        appsDesc: "Todos os containers rodam isolados em 127.0.0.1:4000-4999 e conectados à rede homelab-network.",
-        thApp: "Aplicação",
-        thStack: "Stack Detectada",
-        thPort: "Porta Local",
-        thDb: "Bancos Vinculados",
-        thDomains: "Domínios / Endereços",
-        thActions: "Ações Rápidas",
-        emptyApps: "Nenhuma aplicação hospedada ainda. Clique em um dos exemplos abaixo para preencher e testar!",
-        deployTitle: "➕ Novo Deploy (GitHub ou Diretório Local)",
-        deployDesc: "Clona o repositório via SSH/Token, detecta a linguagem, constrói a imagem Docker e inicia o serviço.",
-        lblQuickFillDeploy: "⚡ Preencher exemplo:",
-        lblDepApp: "Identificador do App (slug)",
-        lblDepRepo: "Repositório GitHub ou Caminho",
-        lblDepBranch: "Branch Git",
-        lblDepPg: "Provisionar PostgreSQL 16 (+ injetar DATABASE_URL)",
-        lblDepRedis: "Provisionar Redis 7 (+ injetar REDIS_URL)",
-        btnDeploy: "🚀 Fazer Build & Deploy",
-        btnDeploying: "⏳ Fazendo Build & Deploy...",
-        exposeTitle: "🌐 Expor Aplicação na Internet ou Tailnet",
-        exposeDesc: "Cria automaticamente a rota no Cloudflare Tunnel + registro DNS CNAME sem abrir portas no seu roteador.",
-        lblQuickFillExpose: "⚡ Modos de exposição:",
-        chipModePublic: "🌍 Público (Aberto)",
-        chipModeZT: "🛡️ Zero Trust (PIN por E-mail)",
-        chipModeTS: "🔒 Tailscale (VPN Privada)",
-        lblExpApp: "Aplicação já hospedada",
-        lblExpMode: "Modo de Segurança",
-        optPublic: "Cloudflare Público (HTTPS aberto para todos)",
-        optZT: "Cloudflare Zero Trust (Exige PIN no seu e-mail)",
-        optTS: "Tailscale Serve (Privado apenas na sua Tailnet)",
-        lblExpSub: "Subdomínio desejado",
-        btnExpose: "🔗 Publicar Endereço",
-        vaultTitle: "🔐 Cofre de Variáveis (AES-256-GCM Vault)",
-        vaultDesc: "Criptografia autenticada em disco. Use o escopo 'system' para tokens globais ou o nome do app para variáveis daquele container.",
-        lblQuickScope: "⚡ Esculha um escopo:",
-        lblSecScope: "Escopo (system ou slug do app)",
-        lblSecKey: "Nome da Variável (ENV)",
-        lblSecVal: "Valor Secreto",
-        btnSaveSecret: "💾 Criptografar & Salvar",
-        btnLoadSecrets: "🔍 Recarregar Escopo",
-        emptySecrets: "Nenhuma variável salva neste escopo.",
-        btnRemoveSecret: "Remover",
-        dbTitle: "🗄️ Bancos de Dados & Chave SSH GitHub",
-        dbDesc: "Provisiona bancos e credenciais exclusivas por aplicação e exibe sua Deploy Key para repositórios privados.",
-        lblDbApp: "Vincular banco ao App",
-        lblDbEngine: "Motor do Banco",
-        btnCreateDb: "+ Provisionar Banco Isolado",
-        emptyDbs: "Nenhum banco de dados provisionado ainda.",
-        lblSshKey: "Chave SSH Pública de Deploy (GitHub Deploy Key):",
-        btnCopySsh: "📋 Copiar Chave SSH",
-        examplesTitle: "🤖 Exemplos de Uso com Agentes de IA (MCP) & Terminal",
-        examplesDesc: "Como o PaaSMCP possui servidor MCP nativo, você pode pedir em linguagem natural no T3 Code / Claude / Cursor ou usar a CLI:",
-        prompt1Text: "\x27Faça o deploy do meu repositório seu-usuario/meu-app na branch main com um banco PostgreSQL e publique em meuapp.{domain}\x27",
-        prompt2Text: "\x27Suba o repositório seu-usuario/painel-admin e exponha em admin.{domain} protegido com login por e-mail no Cloudflare Zero Trust\x27",
-        logsTitle: "📜 Logs do Container",
-        btnCloseLogs: "Fechar",
-        btnDestroy: "Excluir",
-        confirmDestroy: "Tem certeza que deseja destruir o container e os arquivos de ",
-        toastCopied: "✅ Copiado para a área de transferência!",
-        toastSaved: "✅ Segredo criptografado com sucesso!",
-        toastExposed: "🌐 Endereço publicado: "
-      },
-      en: {
-        badgeSubtitle: "Agent-First & Human-Friendly Micro-PaaS",
-        btnToggleGuide: "💡 Quick Guide",
-        btnHideGuide: "Hide Guide",
-        btnRefresh: "🔄 Refresh",
-        btnLogout: "Sign Out",
-        guideTitle: "👋 Welcome to your Self-Hosted Micro-PaaS (Render / Vercel Style)",
-        guideSubtitle: "Deploy any GitHub repository with isolated databases, encrypted secrets, and automatic HTTPS in 4 simple steps:",
-        step1Title: "Environment Secrets",
-        step1Desc: "Store API keys (OpenAI, Stripe, etc.) in the AES-256-GCM Vault using your app name as the scope before or after deployment.",
-        step2Title: "GitHub Build & Deploy",
-        step2Desc: "Enter your <code>owner/repo</code>. If no Dockerfile exists, PaaSMCP auto-generates one for Node.js, Next.js, Python, Go, or static SPAs.",
-        step3Title: "1-Click Databases",
-        step3Desc: "Check PostgreSQL or Redis when deploying (or provision later). <code>DATABASE_URL</code> is automatically injected into the container.",
-        step4Title: "Secure HTTPS Domains",
-        step4Desc: "Expose to the internet on <code>subdomain.{domain}</code> (Public HTTPS or protected by Cloudflare Zero Trust Email OTP).",
-        statServer: "Host Server",
-        statMem: "Free / Total Memory",
-        statApps: "Active Apps & Databases",
-        statBaseDomain: "Cloudflare Base Domain",
-        appsTitle: "📦 Hosted Applications",
-        appsDesc: "All containers run isolated on 127.0.0.1:4000-4999 and connect to the homelab-network bridge.",
-        thApp: "Application",
-        thStack: "Detected Stack",
-        thPort: "Local Port",
-        thDb: "Linked Databases",
-        thDomains: "Domains / Routes",
-        thActions: "Quick Actions",
-        emptyApps: "No applications deployed yet. Click one of the example chips below to test!",
-        deployTitle: "➕ New Deployment (GitHub or Local Path)",
-        deployDesc: "Clones the repository via SSH/Token, detects the runtime stack, builds the Docker image, and starts the container.",
-        lblQuickFillDeploy: "⚡ Quick fill example:",
-        lblDepApp: "App Identifier (slug)",
-        lblDepRepo: "GitHub Repo (owner/repo) or Path",
-        lblDepBranch: "Git Branch",
-        lblDepPg: "Provision PostgreSQL 16 (+ inject DATABASE_URL)",
-        lblDepRedis: "Provision Redis 7 (+ inject REDIS_URL)",
-        btnDeploy: "🚀 Build & Deploy",
-        btnDeploying: "⏳ Building & Deploying...",
-        exposeTitle: "🌐 Expose Application (Cloudflare Tunnel / Tailscale)",
-        exposeDesc: "Automatically configures Cloudflare Tunnel ingress + proxied DNS CNAME without opening router ports.",
-        lblQuickFillExpose: "⚡ Exposure presets:",
-        chipModePublic: "🌍 Public (Open HTTPS)",
-        chipModeZT: "🛡️ Zero Trust (Email OTP PIN)",
-        chipModeTS: "🔒 Tailscale (Private VPN)",
-        lblExpApp: "Hosted Application",
-        lblExpMode: "Security Mode",
-        optPublic: "Cloudflare Public (Open HTTPS to everyone)",
-        optZT: "Cloudflare Zero Trust (Requires Email OTP login)",
-        optTS: "Tailscale Serve (Private to your Tailnet)",
-        lblExpSub: "Desired Subdomain",
-        btnExpose: "🔗 Publish Domain",
-        vaultTitle: "🔐 Encrypted Environment Vault (AES-256-GCM)",
-        vaultDesc: "Authenticated encryption at rest. Use 'system' scope for platform tokens or your app slug for container variables.",
-        lblQuickScope: "⚡ Quick scopes:",
-        lblSecScope: "Scope (system or app slug)",
-        lblSecKey: "Variable Name (ENV)",
-        lblSecVal: "Secret Value",
-        btnSaveSecret: "💾 Encrypt & Save",
-        btnLoadSecrets: "🔍 Reload Scope",
-        emptySecrets: "No encrypted variables stored in this scope.",
-        btnRemoveSecret: "Delete",
-        dbTitle: "🗄️ Databases & GitHub SSH Deploy Key",
-        dbDesc: "Provisions isolated databases & credentials per app and displays your SSH public key for private GitHub repos.",
-        lblDbApp: "Bind Database to App",
-        lblDbEngine: "Database Engine",
-        btnCreateDb: "+ Provision Isolated Database",
-        emptyDbs: "No databases provisioned yet.",
-        lblSshKey: "Public SSH Deploy Key (GitHub Deploy Key):",
-        btnCopySsh: "📋 Copy SSH Key",
-        examplesTitle: "🤖 AI Agent (MCP) Prompts & CLI Examples",
-        examplesDesc: "Since PaaSMCP includes a native MCP server, you can ask your AI agent in natural language or run CLI commands:",
-        prompt1Text: "\x27Deploy my repository seu-usuario/my-app on branch main with a PostgreSQL database and expose it on myapp.{domain}\x27",
-        prompt2Text: "\x27Deploy seu-usuario/admin-panel and expose it on admin.{domain} protected by Cloudflare Zero Trust email login\x27",
-        logsTitle: "📜 Container Logs",
-        btnCloseLogs: "Close",
-        btnDestroy: "Destroy",
-        confirmDestroy: "Are you sure you want to destroy the container and files for ",
-        toastCopied: "✅ Copied to clipboard!",
-        toastSaved: "✅ Secret encrypted and saved!",
-        toastExposed: "🌐 Published at: "
-      }
-    };
-
     let currentLang = localStorage.getItem('paasmcp_lang') || ((navigator.language || '').toLowerCase().startsWith('pt') ? 'pt' : 'en');
     let currentTheme = localStorage.getItem('paasmcp_theme') || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     let lastStatus = null;
+
+    function esc(str) {
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
 
     function getBaseDomain() {
       const configured = lastStatus && lastStatus.cloudflare && lastStatus.cloudflare.baseDomain;
@@ -1110,10 +1323,6 @@ paasmcp expose meu-app public meuapp</code>
         return parts.slice(1).join(".");
       }
       return currentLang === "pt" ? "seudominio.com" : "yourdomain.com";
-    }
-    function t(key) {
-      const raw = (I18N[currentLang] && I18N[currentLang][key]) || I18N.pt[key] || key;
-      return String(raw).replace(/\{domain\}/g, getBaseDomain());
     }
 
     function showToast(msg) {
@@ -1126,44 +1335,20 @@ paasmcp expose meu-app public meuapp</code>
 
     function copyText(text) {
       navigator.clipboard.writeText(text || '');
-      showToast(t('toastCopied'));
+      showToast(currentLang === 'pt' ? '✅ Copiado para a área de transferência!' : '✅ Copied to clipboard!');
     }
 
     function copySshKey() {
       copyText(document.getElementById('sshKeyBox').textContent);
     }
 
-    function applyPreferences() {
-      document.documentElement.setAttribute('data-theme', currentTheme);
-      document.documentElement.lang = currentLang === 'pt' ? 'pt-BR' : 'en';
-      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌙 Dark';
-      document.getElementById('langBtn').textContent = currentLang === 'pt' ? '🇧🇷 PT-BR' : '🇺🇸 EN';
-
-      const ids = [
-        'badgeSubtitle','btnToggleGuide','btnHideGuide','btnRefresh','btnLogout',
-        'guideTitle','guideSubtitle','step1Title','step1Desc','step2Title','step2Desc',
-        'step3Title','step3Desc','step4Title','step4Desc','appsTitle','appsDesc',
-        'thApp','thStack','thPort','thDb','thDomains','thActions','deployTitle','deployDesc',
-        'lblQuickFillDeploy','lblDepApp','lblDepRepo','lblDepBranch','lblDepPg','lblDepRedis',
-        'btnDeploy','exposeTitle','exposeDesc','lblQuickFillExpose','chipModePublic','chipModeZT',
-        'chipModeTS','lblExpApp','lblExpMode','optPublic','optZT','optTS','lblExpSub','btnExpose',
-        'vaultTitle','vaultDesc','lblQuickScope','lblSecScope','lblSecKey','lblSecVal',
-        'btnSaveSecret','btnLoadSecrets','dbTitle','dbDesc','lblDbApp','lblDbEngine',
-        'btnCreateDb','lblSshKey','btnCopySsh','examplesTitle','examplesDesc',
-        'prompt1Text','prompt2Text','logsTitle','btnCloseLogs'
-      ];
-      for (const id of ids) {
-        const el = document.getElementById(id);
-        if (el) { if (id.startsWith("step") && id.endsWith("Desc")) el.innerHTML = t(id); else el.textContent = t(id); }
-      }
-
-      const guideHidden = localStorage.getItem('paasmcp_hide_guide') === '1';
-      document.getElementById('guideBanner').style.display = guideHidden ? 'none' : 'block';
-
-      const expSubEl = document.getElementById("expSub");
-      if (expSubEl) expSubEl.placeholder = currentLang === "pt" ? "ex: app (vira app." + getBaseDomain() + ")" : "e.g. app (becomes app." + getBaseDomain() + ")";
-      if (lastStatus) renderStatusData(lastStatus);
-      loadSecrets();
+    function switchTab(tabName, btnEl) {
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      const pane = document.getElementById('tab-' + tabName);
+      if (pane) pane.classList.add('active');
+      if (btnEl) btnEl.classList.add('active');
+      if (tabName === 'doctor') runDoctor();
     }
 
     function toggleTheme() {
@@ -1178,19 +1363,25 @@ paasmcp expose meu-app public meuapp</code>
       applyPreferences();
     }
 
-    function toggleGuide() {
-      const banner = document.getElementById('guideBanner');
-      const isHidden = banner.style.display === 'none';
-      banner.style.display = isHidden ? 'block' : 'none';
-      localStorage.setItem('paasmcp_hide_guide', isHidden ? '0' : '1');
+    function applyPreferences() {
+      document.documentElement.setAttribute('data-theme', currentTheme);
+      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌙 Dark';
+      document.getElementById('langBtn').textContent = currentLang === 'pt' ? '🇧🇷 PT-BR' : '🇺🇸 EN';
+      document.getElementById('webhookUrlBox').textContent = window.location.origin + '/api/webhooks/github';
+      const fedUrlEl = document.getElementById('fedUrl');
+      if (fedUrlEl && !fedUrlEl.value) fedUrlEl.value = window.location.origin;
+      if (lastStatus) renderStatusData(lastStatus);
+      loadSecrets();
     }
 
-    function fillDeployExample(app, repo, branch, pg, redis) {
+    function fillDeployExample(app, repo, branch, pg, redis, mem, cpu) {
       document.getElementById('depApp').value = app;
       document.getElementById('depRepo').value = repo;
       document.getElementById('depBranch').value = branch;
       document.getElementById('depPg').checked = Boolean(pg);
       document.getElementById('depRedis').checked = Boolean(redis);
+      document.getElementById('depMem').value = mem || '';
+      document.getElementById('depCpu').value = cpu || '';
     }
 
     function fillExposeMode(mode) {
@@ -1200,6 +1391,8 @@ paasmcp expose meu-app public meuapp</code>
     function setVaultScope(scope) {
       document.getElementById('secScope').value = scope;
       loadSecrets();
+      const vaultBtn = document.getElementById('navVault');
+      switchTab('vault', vaultBtn);
     }
 
     function selectAppForExpose(appName) {
@@ -1209,47 +1402,118 @@ paasmcp expose meu-app public meuapp</code>
     }
 
     function renderStatusData(s) {
+      const domain = getBaseDomain();
+      document.getElementById('topDomainBadge').textContent = '🌐 ' + domain;
+      const role = s.federation?.role || 'standalone';
+      const peersCount = Object.keys(s.federation?.peers || {}).length;
+      document.getElementById('nodeRoleFooter').textContent = 'Node: ' + role + ' (' + peersCount + ' peers)';
+
       document.getElementById('statsGrid').innerHTML = \`
-        <div class="card" style="margin:0"><div class="stat-label">\${t('statServer')}</div><div class="stat-value">🖥️ \${s.hostname}</div><div style="color:var(--muted);font-size:12px;margin-top:4px">\${s.platform}</div></div>
-        <div class="card" style="margin:0"><div class="stat-label">\${t('statMem')}</div><div class="stat-value">⚡ \${s.freeMemGb} GB / \${s.totalMemGb} GB</div><div style="color:var(--muted);font-size:12px;margin-top:4px">\${s.cpus} vCPUs</div></div>
-        <div class="card" style="margin:0"><div class="stat-label">\${t('statApps')}</div><div class="stat-value">📦 \${s.appsCount} Apps · \${s.databasesCount} DBs</div><div style="color:var(--muted);font-size:12px;margin-top:4px">\${t('statBaseDomain')}: <strong>\${s.cloudflare?.baseDomain || '-'}</strong></div></div>
+        <div class="stat-card">
+          <div class="stat-label">Servidor Host</div>
+          <div class="stat-value">🖥️ \${esc(s.hostname)}</div>
+          <div class="stat-meta">\${esc(s.platform)} · Disco: \${esc(s.rootDisk)}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Memória Livre / Total</div>
+          <div class="stat-value">⚡ \${esc(s.freeMemGb)} / \${esc(s.totalMemGb)} GB</div>
+          <div class="stat-meta">\${esc(s.cpus)} vCPUs · 0 MB Idle Daemon</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Apps & Bancos Isolados</div>
+          <div class="stat-value">📦 \${esc(s.appsCount)} Apps · \${esc(s.databasesCount)} DBs</div>
+          <div class="stat-meta">🛡️ \${esc(s.backupsCount || 0)} Snapshots Criptografados</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Segurança & Federação</div>
+          <div class="stat-value">🔒 \${esc(role.toUpperCase())}</div>
+          <div class="stat-meta">SSH: <code>\${esc((s.sshKeyFingerprint || '').slice(0, 22))}...</code></div>
+        </div>
       \`;
 
       document.getElementById('sshKeyBox').textContent = s.sshPublicKey || '';
+      document.getElementById('webhookSecretBox').textContent = s.webhookSecretMasked || '••••••••';
 
       const apps = Object.values(s.apps || {});
+      const metricsMap = s.containerMetrics || {};
       document.getElementById('appsBadgeCount').textContent = apps.length + ' apps';
 
-      // Populate datalist and dynamic scope chips
-      document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${a.name}"></option>\`).join('');
-      document.getElementById('dynamicScopeChips').innerHTML = apps.map(a => \`<button class="chip" onclick="setVaultScope('\${a.name}')">📦 \${a.name}</button>\`).join(' ');
+      document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
+      document.getElementById('dynamicScopeChips').innerHTML = apps.map(a => \`<button class="chip" onclick="setVaultScope('\${esc(a.name)}')">📦 \${esc(a.name)}</button>\`).join(' ');
 
       const tbody = document.getElementById('appsTable');
       if (apps.length === 0) {
-        tbody.innerHTML = \`<tr><td colspan="6" style="color:var(--muted)">\${t('emptyApps')}</td></tr>\`;
+        tbody.innerHTML = \`<tr><td colspan="6" style="color:var(--muted)">Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!</td></tr>\`;
       } else {
-        tbody.innerHTML = apps.map(a => \`
-          <tr>
-            <td><span class="status-dot"></span><strong>\${a.name}</strong></td>
-            <td><code>\${a.runtimeType}</code></td>
-            <td><code>127.0.0.1:\${a.localPort}</code></td>
-            <td>\${(a.databases || []).map(d => \`<code>\${d}</code>\`).join(' ') || '<span style="color:var(--muted)">-</span>'}</td>
-            <td>\${(a.domains || []).map(d => \`<div style="margin-bottom:3px;"><a href="\${d.url}" target="_blank">🔗 \${d.url}</a> <span class="badge" style="padding:1px 7px;font-size:10.5px;">\${d.mode}</span></div>\`).join('') || '<span style="color:var(--muted)">Local only</span>'}</td>
-            <td class="actions">
-              <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="selectAppForExpose('\${a.name}')">🌐 Expor</button>
-              <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="setVaultScope('\${a.name}')">🔐 ENV</button>
-              <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="appAction('\${a.name}','logs')">📜 Logs</button>
-              <button class="secondary" style="padding:5px 10px;font-size:12px;" onclick="appAction('\${a.name}','restart')">🔄 Restart</button>
-              <button class="danger" style="padding:5px 10px;font-size:12px;" onclick="if(confirm(t('confirmDestroy') + a.name + '?')) appAction('\${a.name}','destroy')">\${t('btnDestroy')}</button>
-            </td>
-          </tr>
-        \`).join('');
+        tbody.innerHTML = apps.map(a => {
+          const m = metricsMap[a.containerName];
+          const metricHtml = m
+            ? \`<div><code>CPU: \${esc(m.cpuPercent)}</code></div><div style="margin-top:3px;"><code>RAM: \${esc(m.memUsage)}</code></div>\`
+            : \`<span style="color:var(--muted);font-size:11.5px;">\${a.status === 'stopped' ? 'Parado' : 'Sob demanda'}</span>\`;
+          const limitsHtml = (a.memoryLimit || a.cpuLimit)
+            ? \`<div style="margin-top:3px;font-size:11px;color:var(--muted);">Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU</div>\`
+            : '';
+          const rollbackBtn = a.previousImageTag
+            ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">⏪ Rollback</button>\`
+            : '';
+
+          return \`
+            <tr>
+              <td>
+                <span class="status-dot \${a.status === 'stopped' ? 'stopped' : ''}"></span>
+                <strong>\${esc(a.name)}</strong>
+                \${a.lastWebhookAt ? \`<div style="font-size:10.5px;color:var(--muted);">⚡ Webhook: \${esc(a.lastWebhookAt.slice(0,19))}</div>\` : ''}
+              </td>
+              <td>
+                <code>\${esc(a.runtimeType)}</code>
+                \${a.lastCommit ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">commit: <code>\${esc(a.lastCommit)}</code></div>\` : ''}
+              </td>
+              <td>\${metricHtml}\${limitsHtml}</td>
+              <td>
+                <div><code>127.0.0.1:\${esc(a.localPort)}</code></div>
+                <div style="margin-top:3px;">\${(a.databases || []).map(d => \`<span class="badge" style="font-size:10px;padding:1px 6px;">\${esc(d)}</span>\`).join(' ') || ''}</div>
+              </td>
+              <td>\${(a.domains || []).map(d => \`<div style="margin-bottom:3px;"><a href="\${esc(d.url)}" target="_blank" rel="noopener noreferrer">🔗 \${esc(d.url)}</a> <span class="badge" style="padding:1px 6px;font-size:10px;">\${esc(d.mode)}</span></div>\`).join('') || '<span style="color:var(--muted)">Local only</span>'}</td>
+              <td class="actions">
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="selectAppForExpose('\${esc(a.name)}')">🌐 Expor</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="setVaultScope('\${esc(a.name)}')">🔐 ENV</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">📜 Logs</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restart')">🔄 Restart</button>
+                \${rollbackBtn}
+                <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="if(confirm('Destruir container e arquivos de ' + '\${esc(a.name)}' + '?')) appAction('\${esc(a.name)}','destroy')">Excluir</button>
+              </td>
+            </tr>
+          \`;
+        }).join('');
       }
 
       const dbs = Object.values(s.databases || {});
       document.getElementById('dbList').innerHTML = dbs.length
-        ? dbs.map(d => \`<div style="margin-bottom:6px;padding:6px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);">🗄️ <strong>\${d.name}</strong> (\${d.engine}) → DB: <code>\${d.dbName}</code> | User: <code>\${d.dbUser}</code></div>\`).join('')
-        : \`<span style="color:var(--muted)">\${t('emptyDbs')}</span>\`;
+        ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">🗄️ <strong>\${esc(d.name)}</strong> (\${esc(d.engine)}) → DB: <code>\${esc(d.dbName)}</code> | User: <code>\${esc(d.dbUser)}</code></div>\`).join('')
+        : '<span style="color:var(--muted);font-size:12.5px;">Nenhum banco provisionado ainda.</span>';
+
+      const backups = s.backups || [];
+      document.getElementById('backupsList').innerHTML = backups.length
+        ? backups.map(b => \`
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12px;gap:8px;flex-wrap:wrap;">
+            <div>
+              🔒 <strong>\${esc(b.id)}</strong> (\${esc(b.engine)})<br/>
+              <span style="color:var(--muted);">Tamanho: \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code></span>
+            </div>
+            <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="restoreBackup('\${esc(b.id)}')">⏪ Restaurar Dump</button>
+          </div>
+        \`).join('')
+        : '<span style="color:var(--muted);font-size:12.5px;">Nenhum snapshot criptografado criado ainda.</span>';
+
+      const peers = Object.values(s.federation?.peers || {});
+      document.getElementById('fedPeersList').innerHTML = peers.length
+        ? peers.map(p => \`
+          <div style="padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">
+            🤝 <strong>\${esc(p.name)}</strong> (<code>\${esc(p.nodeId)}</code>) — <span class="badge success">\${esc(p.mode)}</span><br/>
+            <span style="color:var(--muted);font-size:11.5px;">Endpoint: \${esc(p.endpointUrl)} · Key: <code>\${esc(p.publicKeyFingerprint)}</code></span>
+          </div>
+        \`).join('')
+        : '<span style="color:var(--muted);font-size:12.5px;">Nenhum servidor secundário pareado ainda.</span>';
     }
 
     async function loadAll() {
@@ -1266,8 +1530,8 @@ paasmcp expose meu-app public meuapp</code>
       const data = await res.json();
       const entries = Object.entries(data.secrets || {});
       document.getElementById('secretsList').innerHTML = entries.length
-        ? entries.map(([k, v]) => \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;"><span>🔑 <strong>\${k}</strong> = <code>\${v}</code></span><button class="danger" style="padding:3px 9px;font-size:11px" onclick="delSecret('\${scope}','\${k}')">\${t('btnRemoveSecret')}</button></div>\`).join('')
-        : \`<div style="color:var(--muted);font-size:13px">\${t('emptySecrets')}</div>\`;
+        ? entries.map(([k, v]) => \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;"><span>🔑 <strong>\${esc(k)}</strong> = <code>\${esc(v)}</code></span><button class="danger" style="padding:3px 9px;font-size:11px" onclick="delSecret('\${esc(scope)}','\${esc(k)}')">Remover</button></div>\`).join('')
+        : '<div style="color:var(--muted);font-size:12.5px">Nenhuma variável salva neste escopo.</div>';
     }
 
     async function saveSecret() {
@@ -1275,14 +1539,16 @@ paasmcp expose meu-app public meuapp</code>
       const key = document.getElementById('secKey').value.trim();
       const value = document.getElementById('secVal').value;
       if (!key) return;
-      await fetch('/api/secrets', {
+      const res = await fetch('/api/secrets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope, key, value })
       });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
       document.getElementById('secKey').value = '';
       document.getElementById('secVal').value = '';
-      showToast(t('toastSaved'));
+      showToast('✅ Segredo criptografado no Vault!');
       loadSecrets();
     }
 
@@ -1306,30 +1572,128 @@ paasmcp expose meu-app public meuapp</code>
       });
       const data = await res.json();
       if (!res.ok) return alert(data.error);
+      showToast('✅ Banco isolado provisionado!');
       loadAll();
+    }
+
+    async function createBackup() {
+      const appName = document.getElementById('bakApp').value.trim();
+      const engine = document.getElementById('bakEngine').value;
+      if (!appName) return;
+      const res = await fetch('/api/backups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appName, engine })
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      showToast('📸 Backup criptografado salvo: ' + data.id);
+      loadAll();
+    }
+
+    async function restoreBackup(backupId) {
+      if (!confirm('Restaurar o backup criptografado ' + backupId + '?')) return;
+      const res = await fetch('/api/backups/restore', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ backupId })
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      showToast('✅ Banco restaurado com sucesso (' + data.restoredBytes + ' bytes)!');
+    }
+
+    async function generateInvite() {
+      const endpointUrl = document.getElementById('fedUrl').value.trim();
+      const mode = document.getElementById('fedMode').value;
+      const res = await fetch('/api/federation/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpointUrl, mode })
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      const box = document.getElementById('fedTokenBox');
+      box.style.display = 'block';
+      box.textContent = data.joinToken;
+      copyText(data.joinToken);
+      loadAll();
+    }
+
+    async function exportSyncBundle() {
+      const res = await fetch('/api/federation/export', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      const box = document.getElementById('fedTokenBox');
+      box.style.display = 'block';
+      box.textContent = JSON.stringify(data, null, 2);
+      showToast('📦 Bundle criptografado gerado (' + data.scopesCount + ' escopos Vault)!');
+    }
+
+    async function joinFederation() {
+      const joinToken = document.getElementById('fedJoinInput').value.trim();
+      if (!joinToken) return;
+      const res = await fetch('/api/federation/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ joinToken })
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      showToast('🤝 Handshake concluído com o nó primário!');
+      loadAll();
+    }
+
+    async function revealWebhookSecret() {
+      const res = await fetch('/api/webhook-secret');
+      if (!res.ok) return;
+      const data = await res.json();
+      document.getElementById('webhookSecretBox').textContent = data.webhookSecret;
+      copyText(data.webhookSecret);
+    }
+
+    async function runDoctor() {
+      const res = await fetch('/api/doctor');
+      if (!res.ok) return;
+      const data = await res.json();
+      const items = data.diagnostics || [];
+      document.getElementById('doctorReportBox').innerHTML = items.length
+        ? items.map(d => \`
+          <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <strong>\${esc(d.target)}</strong>
+              <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(d.severity.toUpperCase())}</span>
+            </div>
+            <div style="font-size:13px;margin-top:6px;">\${esc(d.summary)}</div>
+            \${d.recommendation ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(d.recommendation)}</div>\` : ''}
+          </div>
+        \`).join('')
+        : '<div style="color:var(--muted);font-size:13px;">Nenhum container registrado para diagnóstico.</div>';
     }
 
     async function deployNewApp() {
       const appName = document.getElementById('depApp').value.trim();
       const repoSource = document.getElementById('depRepo').value.trim();
       const branch = document.getElementById('depBranch').value.trim() || 'main';
+      const memoryLimit = document.getElementById('depMem').value.trim() || undefined;
+      const cpuLimit = document.getElementById('depCpu').value.trim() || undefined;
       const withPostgres = document.getElementById('depPg').checked;
       const withRedis = document.getElementById('depRedis').checked;
       if (!appName || !repoSource) return;
       const btn = document.getElementById('btnDeploy');
-      btn.textContent = t('btnDeploying');
+      btn.textContent = '⏳ Fazendo Build & Deploy...';
       btn.disabled = true;
       try {
         const res = await fetch('/api/deploy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis })
+          body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit })
         });
         const data = await res.json();
         if (!res.ok) alert('Error: ' + data.error);
-        else loadAll();
+        else { showToast('🚀 Deploy concluído: ' + appName); loadAll(); }
       } finally {
-        btn.textContent = t('btnDeploy');
+        btn.textContent = '🚀 Fazer Build & Deploy';
         btn.disabled = false;
       }
     }
@@ -1346,7 +1710,7 @@ paasmcp expose meu-app public meuapp</code>
       });
       const data = await res.json();
       if (!res.ok) return alert('Error: ' + data.error);
-      showToast(t('toastExposed') + data.url);
+      showToast('🌐 Publicado em: ' + data.url);
       loadAll();
     }
 
@@ -1364,6 +1728,7 @@ paasmcp expose meu-app public meuapp</code>
         document.getElementById('logsBox').textContent = data.output || '(empty logs)';
         card.scrollIntoView({ behavior: 'smooth' });
       } else {
+        showToast('✅ ' + data.output);
         loadAll();
       }
     }

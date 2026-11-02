@@ -1,18 +1,28 @@
 #!/usr/bin/env node
-import { ensureDirectories, updatePlatformConfig } from "./config.js";
+import { ensureDirectories, loadState, saveState, updatePlatformConfig } from "./config.js";
 import {
   ensureDashboardBackgroundService,
   getOrCreateDashboardToken,
   startDashboardServer,
 } from "./dashboard.js";
 import {
+  backupDatabase,
   ensureDockerNetwork,
   ensureSharedPostgresCluster,
   ensureSharedRedisCluster,
+  listDatabaseBackups,
   provisionDatabase,
+  restoreDatabase,
 } from "./database.js";
-import { deployApp, manageAppLifecycle } from "./deployer.js";
+import { deployApp, manageAppLifecycle, runPaaSDoctor } from "./deployer.js";
 import { exposeApplication } from "./exposure.js";
+import {
+  applyEncryptedFederationSyncBundle,
+  buildEncryptedFederationSyncBundle,
+  generateFederationJoinToken,
+  parseAndVerifyFederationJoinToken,
+  registerFederationPeer,
+} from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { getSystemStatusSummary } from "./mcp-server.js";
 import {
@@ -37,6 +47,12 @@ async function runCli() {
       break;
     }
 
+    case "doctor": {
+      const [appName] = rest;
+      console.log(JSON.stringify(runPaaSDoctor(appName), null, 2));
+      break;
+    }
+
     case "init":
     case "bootstrap": {
       ensureDirectories();
@@ -56,6 +72,7 @@ async function runCli() {
           {
             status: "initialized",
             sshDeployPublicKey: key.publicKey,
+            sshKeyFingerprint: key.fingerprint,
             postgresStarted: withPg,
             redisStarted: withRedis,
             dashboard: dashboardInfo,
@@ -181,16 +198,86 @@ async function runCli() {
       break;
     }
 
+    case "db-backup": {
+      const [sub, arg1, arg2] = rest;
+      if (!sub || sub === "list") {
+        console.log(JSON.stringify(listDatabaseBackups(arg1), null, 2));
+      } else if (sub === "create") {
+        if (!arg1) throw new Error("Usage: paasmcp db-backup create <appName> [postgres|redis]");
+        const engine = (arg2 as "postgres" | "redis") || "postgres";
+        console.log(JSON.stringify(backupDatabase(arg1, engine), null, 2));
+      } else if (sub === "restore") {
+        if (!arg1) throw new Error("Usage: paasmcp db-backup restore <backupId>");
+        console.log(JSON.stringify(restoreDatabase(arg1), null, 2));
+      } else {
+        // Shorthand: paasmcp db-backup <appName>
+        const engine = (arg1 as "postgres" | "redis") || "postgres";
+        console.log(JSON.stringify(backupDatabase(sub, engine), null, 2));
+      }
+      break;
+    }
+
+    case "node": {
+      const [sub, arg1] = rest;
+      const state = loadState();
+      if (!sub || sub === "status") {
+        console.log(JSON.stringify(state.federation || {}, null, 2));
+      } else if (sub === "invite") {
+        const endpointUrl = arg1 || getFlagValue(rest, "--url") || "https://paas.example.com";
+        const mode =
+          (getFlagValue(rest, "--mode") as "active-active-tunnel" | "warm-standby") ||
+          "active-active-tunnel";
+        console.log(
+          JSON.stringify(generateFederationJoinToken({ endpointUrl, mode }), null, 2)
+        );
+      } else if (sub === "join") {
+        if (!arg1) throw new Error("Usage: paasmcp node join <paasmcp-join://...>");
+        const verified = parseAndVerifyFederationJoinToken(arg1);
+        setSecretEntries("system", {
+          FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
+        });
+        const peer = registerFederationPeer({
+          nodeId: verified.primaryNodeId,
+          name: verified.primaryName,
+          endpointUrl: verified.endpointUrl,
+          mode: verified.mode,
+          publicKeyFingerprint: verified.fingerprint,
+        });
+        const latest = loadState();
+        if (latest.federation) {
+          latest.federation.role = "replica";
+          latest.federation.redundancyMode = verified.mode;
+          saveState(latest);
+        }
+        console.log(JSON.stringify({ joined: true, primaryPeer: peer }, null, 2));
+      } else if (sub === "export-sync") {
+        console.log(JSON.stringify(buildEncryptedFederationSyncBundle(), null, 2));
+      } else if (sub === "import-sync") {
+        const sig = getFlagValue(rest, "--sig") || "";
+        if (!arg1 || !sig) {
+          throw new Error("Usage: paasmcp node import-sync <encryptedBase64> --sig <hmac>");
+        }
+        console.log(
+          JSON.stringify(applyEncryptedFederationSyncBundle(arg1, sig), null, 2)
+        );
+      } else {
+        throw new Error("Usage: paasmcp node <status|invite|join|export-sync|import-sync>");
+      }
+      break;
+    }
+
     case "deploy": {
       const [appName, repoSource] = rest;
       if (!appName || !repoSource) {
         throw new Error(
-          "Usage: paasmcp deploy <appName> <repoSource> [--branch main] [--port 3000] [--postgres] [--redis]"
+          "Usage: paasmcp deploy <appName> <repoSource> [--branch main] [--port 3000] [--postgres] [--redis] [--memory 512m] [--cpus 1.0]"
         );
       }
       const branch = getFlagValue(rest, "--branch") || "main";
       const portStr = getFlagValue(rest, "--port");
       const internalPort = portStr ? Number(portStr) : undefined;
+      const memoryLimit = getFlagValue(rest, "--memory");
+      const cpuLimit = getFlagValue(rest, "--cpus");
       const withPostgres = rest.includes("--postgres");
       const withRedis = rest.includes("--redis");
 
@@ -201,6 +288,8 @@ async function runCli() {
         internalPort,
         withPostgres,
         withRedis,
+        memoryLimit,
+        cpuLimit,
       });
       console.log(JSON.stringify(res, null, 2));
       break;
@@ -226,13 +315,14 @@ async function runCli() {
     case "restart":
     case "stop":
     case "start":
+    case "rollback":
     case "destroy": {
       const [appName] = rest;
       if (!appName) throw new Error(`Usage: paasmcp ${cmd} <appName>`);
       console.log(
         manageAppLifecycle(
           appName,
-          cmd as "logs" | "restart" | "stop" | "start" | "destroy"
+          cmd as "logs" | "restart" | "stop" | "start" | "rollback" | "destroy"
         )
       );
       break;
@@ -244,16 +334,19 @@ Commands:
   paasmcp init [--postgres] [--redis] [--dashboard]  Initialize PaaS storage, SSH key & services
   paasmcp dashboard [start|token] [--expose zero-trust --subdomain paas]  Start & expose Web Control Plane
   paasmcp config [options]                           Configure Cloudflare Tunnel, Base Domain & Zero Trust
-  paasmcp status                                     Show full system, apps, and databases status
+  paasmcp status                                     Show full system, metrics, apps, DBs & federation status
+  paasmcp doctor [appName]                           Diagnose OOMKills, crashes, and container health
   paasmcp github-key [owner/repo]                    Show or register GitHub SSH Deploy Key
   paasmcp secret set <scope> KEY=VAL ...             Encrypt & store secrets in AES-256-GCM Vault
   paasmcp secret set-file <scope> <KEY> <path>       Store secret from file without printing it
   paasmcp secret import-env <scope> <.env>           Import .env file into encrypted Vault
   paasmcp secret list <scope>                        List masked secrets in scope
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
-  paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo to /opt/homelab/apps/<app>
+  paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database snapshots & restore
+  paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo (or multi-service compose.yaml)
   paasmcp expose <app> <public|zero-trust|tailscale> [subdomain]
-  paasmcp <logs|restart|stop|start|destroy> <app>`);
+  paasmcp <logs|restart|stop|start|rollback|destroy> <app>
+  paasmcp node <status|invite|join|export-sync>      Multi-Server HA Handshake & Federation`);
       break;
     }
   }
