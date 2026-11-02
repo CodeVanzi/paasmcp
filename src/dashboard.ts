@@ -1079,7 +1079,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               <p class="card-desc" id="vaultDesc">Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.</p>
             </div>
             <div class="examples-bar">
-              <span>⚡ Escopos:</span>
+              <span id="lblVaultScopes">⚡ Escopos:</span>
               <button class="chip" onclick="setVaultScope('system')">⚙️ system (Global Tokens)</button>
               <span id="dynamicScopeChips"></span>
             </div>
@@ -1115,36 +1115,36 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               </div>
               <div class="form-grid">
                 <div>
-                  <label class="field-label">Aplicação</label>
+                  <label class="field-label" id="lblDbApp">Aplicação</label>
                   <input id="dbApp" list="hostedAppsList" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label">Engine</label>
+                  <label class="field-label" id="lblDbEngine">Engine</label>
                   <select id="dbEngine">
-                    <option value="postgres">PostgreSQL 16 (Isolado por DB + Role)</option>
-                    <option value="redis">Redis 7 (DB Lógico Isolado)</option>
+                    <option value="postgres" id="optDbPg">PostgreSQL 16 (Isolado por DB + Role)</option>
+                    <option value="redis" id="optDbRedis">Redis 7 (DB Lógico Isolado)</option>
                   </select>
                 </div>
               </div>
-              <button onclick="createDb()" style="margin-bottom:16px;">+ Provisionar Banco</button>
+              <button onclick="createDb()" id="btnCreateDb" style="margin-bottom:16px;">+ Provisionar Banco</button>
               <div id="dbList"></div>
             </div>
 
             <div class="card">
               <div class="card-header">
-                <h2>🛡️ Snapshots & Restore Criptografados (AES-256-GCM)</h2>
-                <p class="card-desc">Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.</p>
+                <h2 id="backupsTitle">🛡️ Snapshots & Restore Criptografados (AES-256-GCM)</h2>
+                <p class="card-desc" id="backupsDesc">Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.</p>
               </div>
               <div class="form-grid">
                 <div>
-                  <label class="field-label">App para Backup</label>
+                  <label class="field-label" id="lblBakApp">App para Backup</label>
                   <input id="bakApp" list="hostedAppsList" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label">Engine</label>
+                  <label class="field-label" id="lblBakEngine">Engine</label>
                   <select id="bakEngine">
-                    <option value="postgres">PostgreSQL 16 (pg_dump)</option>
-                    <option value="redis">Redis 7 (RDB)</option>
+                    <option value="postgres" id="optBakPg">PostgreSQL 16 (pg_dump)</option>
+                    <option value="redis" id="optBakRedis">Redis 7 (RDB)</option>
                   </select>
                 </div>
               </div>
@@ -1159,55 +1159,55 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
           <div class="row">
             <div class="card">
               <div class="card-header">
-                <h2>🌐 Handshake Multi-Servidor & Redundância (HA Federation)</h2>
-                <p class="card-desc">Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.</p>
+                <h2 id="fedTitle">🌐 Handshake Multi-Servidor & Redundância (HA Federation)</h2>
+                <p class="card-desc" id="fedDesc">Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.</p>
               </div>
               <div class="form-grid">
                 <div>
-                  <label class="field-label">URL deste Servidor (Primary)</label>
+                  <label class="field-label" id="lblFedUrl">URL deste Servidor (Primary)</label>
                   <input id="fedUrl" placeholder="https://paas.seudominio.com" />
                 </div>
                 <div>
-                  <label class="field-label">Modo de Redundância</label>
+                  <label class="field-label" id="lblFedMode">Modo de Redundância</label>
                   <select id="fedMode">
-                    <option value="active-active-tunnel">Active-Active (Cloudflare Tunnel Multi-Connector)</option>
-                    <option value="warm-standby">Warm Standby (Sync Criptografado de Vault & Apps)</option>
+                    <option value="active-active-tunnel" id="optFedActive">Active-Active (Cloudflare Tunnel Multi-Connector)</option>
+                    <option value="warm-standby" id="optFedWarm">Warm Standby (Sync Criptografado de Vault & Apps)</option>
                   </select>
                 </div>
               </div>
               <div class="actions" style="margin-bottom:12px;">
-                <button onclick="generateInvite()">🔑 Gerar Join Token (15 min)</button>
-                <button class="secondary" onclick="exportSyncBundle()">📦 Exportar Bundle Criptografado</button>
+                <button onclick="generateInvite()" id="btnGenInvite">🔑 Gerar Join Token (15 min)</button>
+                <button class="secondary" onclick="exportSyncBundle()" id="btnExportSync">📦 Exportar Bundle Criptografado</button>
               </div>
               <pre id="fedTokenBox" style="display:none;user-select:all;"></pre>
               <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;" />
-              <label class="field-label">Conectar este servidor como Réplica (Cole um Join Token):</label>
+              <label class="field-label" id="lblJoinPeer">Conectar este servidor como Réplica (Cole um Join Token):</label>
               <div style="display:flex;gap:8px;margin-bottom:14px;">
                 <input id="fedJoinInput" placeholder="paasmcp-join://..." />
-                <button class="secondary" onclick="joinFederation()">🤝 Fazer Handshake</button>
+                <button class="secondary" onclick="joinFederation()" id="btnJoinPeer">🤝 Fazer Handshake</button>
               </div>
               <div id="fedPeersList"></div>
             </div>
 
             <div class="card">
               <div class="card-header">
-                <h2>⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
-                <p class="card-desc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
+                <h2 id="whTitle">⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
+                <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
               </div>
               <div style="margin-bottom:14px;">
-                <span class="field-label">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
+                <span class="field-label" id="lblWhUrl">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
                 <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
               </div>
               <div style="margin-bottom:16px;">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-                  <span class="field-label" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
-                  <button class="chip" onclick="revealWebhookSecret()">👁️ Revelar / Copiar Secret</button>
+                  <span class="field-label" id="lblWhSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
+                  <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
                 </div>
                 <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
               </div>
               <div style="display:flex;justify-content:space-between;align-items:center;">
-                <span class="field-label" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
-                <button class="chip" onclick="copySshKey()">📋 Copiar Chave SSH</button>
+                <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
+                <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
               </div>
               <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
             </div>
@@ -1219,10 +1219,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
           <div class="card">
             <div class="card-header">
               <h2>
-                <span>🩺 PaaSMCP Doctor — Diagnóstico Automático de Containers</span>
-                <button onclick="runDoctor()">🔍 Executar Diagnóstico Agora</button>
+                <span id="doctorTitle">🩺 PaaSMCP Doctor — Diagnóstico Automático de Containers</span>
+                <button id="btnRunDoctor" onclick="runDoctor(true)">🔍 Executar Diagnóstico Agora</button>
               </h2>
-              <p class="card-desc">Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.</p>
+              <p class="card-desc" id="doctorDesc">Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.</p>
             </div>
             <div id="doctorReportBox"></div>
           </div>
@@ -1232,8 +1232,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         <div class="tab-pane" id="tab-agents">
           <div class="card">
             <div class="card-header">
-              <h2>🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)</h2>
-              <p class="card-desc">O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:</p>
+              <h2 id="agentsTitle">🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)</h2>
+              <p class="card-desc" id="agentsDesc">O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:</p>
             </div>
             <pre id="mcpConfigBox" style="user-select:all;">{
   "mcpServers": {
@@ -1260,8 +1260,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 
           <div class="card">
             <div class="card-header">
-              <h2>🏛️ Arquitetura & Modelo de Segurança (Por dentro do PaaSMCP)</h2>
-              <p class="card-desc">Projetado para máxima segurança e zero desperdício de recursos:</p>
+              <h2 id="archTitle">🏛️ Arquitetura & Modelo de Segurança (Por dentro do PaaSMCP)</h2>
+              <p class="card-desc" id="archDesc">Projetado para máxima segurança e zero desperdício de recursos:</p>
             </div>
             <div class="arch-grid">
               <div class="arch-box">
@@ -1289,7 +1289,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
           <div class="card-header">
             <h2>
               <span id="logsTitle">📜 Logs do Container</span>
-              <button class="secondary" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
+              <button class="secondary" id="btnCloseLogs" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
             </h2>
           </div>
           <pre id="logsBox"></pre>
@@ -1304,6 +1304,295 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     let currentLang = localStorage.getItem('paasmcp_lang') || ((navigator.language || '').toLowerCase().startsWith('pt') ? 'pt' : 'en');
     let currentTheme = localStorage.getItem('paasmcp_theme') || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     let lastStatus = null;
+
+    const I18N = {
+      pt: {
+        sidebarSubtitle: "Agent-First Micro-PaaS",
+        navOverview: "📦 Aplicações & Deploy",
+        navVault: "🔐 Cofre AES-256-GCM",
+        navDatabases: "🗄️ Bancos & Backups",
+        navFederation: "🌐 Multi-Server HA & Webhook",
+        navDoctor: "🩺 Doctor & Diagnóstico",
+        navAgents: "🤖 Studio IA (MCP) & Guia",
+        topHealthBadge: "● System Online",
+        btnRefresh: "🔄 Atualizar",
+        btnLogout: "Sair",
+        appsTitle: "📦 Aplicações Hospedadas & Métricas em Tempo Real",
+        appsDesc: "Containers isolados em <code>127.0.0.1:4000-4998</code> com suporte a Rollback em 1s, limites de CPU/RAM e Docker Compose multi-serviço.",
+        thApp: "Aplicação",
+        thStack: "Stack / Commit",
+        thMetrics: "CPU / RAM (Live)",
+        thPort: "Porta / DBs",
+        thDomains: "Domínios HTTPS",
+        thActions: "Ações Rápidas",
+        deployTitle: "➕ Novo Deploy (GitHub, Multi-Service Compose ou Local)",
+        deployDesc: "Detecta automaticamente Node, Next.js, Python, Go, SPA, Dockerfile ou <code>docker-compose.yml</code> (injetando segredos do Vault com segurança).",
+        lblQuickFillDeploy: "⚡ Presets:",
+        lblDepApp: "Slug da Aplicação",
+        lblDepRepo: "Repositório GitHub ou Caminho",
+        lblDepBranch: "Branch Git",
+        lblDepMem: "Limite de RAM (Opcional)",
+        lblDepCpu: "Limite de vCPUs (Opcional)",
+        lblDepPg: "Provisionar PostgreSQL 16 (injeta <code>DATABASE_URL</code>)",
+        lblDepRedis: "Provisionar Redis 7 (injeta <code>REDIS_URL</code>)",
+        btnDeploy: "🚀 Fazer Build & Deploy",
+        exposeTitle: "🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)",
+        exposeDesc: "Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.",
+        lblQuickFillExpose: "⚡ Modos:",
+        chipModePublic: "🌍 Público (HTTPS Aberto)",
+        chipModeZT: "🛡️ Zero Trust (OTP por E-mail)",
+        chipModeTS: "🔒 Tailscale (VPN Privada)",
+        lblExpApp: "Aplicação",
+        lblExpMode: "Modo de Segurança",
+        optPublic: "Cloudflare Público (HTTPS aberto)",
+        optZT: "Cloudflare Zero Trust (Login PIN por E-mail)",
+        optTS: "Tailscale Serve (Privado na Tailnet)",
+        lblExpSub: "Subdomínio",
+        btnExpose: "🔗 Publicar Endereço",
+        vaultTitle: "🔐 Cofre Criptografado de Variáveis (AES-256-GCM Vault)",
+        vaultDesc: "Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.",
+        lblVaultScopes: "⚡ Escopos:",
+        lblSecScope: "Escopo (system ou slug do app)",
+        lblSecKey: "Chave (A-Z, 0-9, _)",
+        lblSecVal: "Valor Secreto",
+        btnSaveSecret: "💾 Criptografar & Salvar",
+        btnLoadSecrets: "🔍 Recarregar Escopo",
+        dbTitle: "🗄️ Provisionar Banco Multi-Tenant Isolado",
+        dbDesc: "Cria banco, role exclusiva e injeta <code>DATABASE_URL</code> / <code>REDIS_URL</code> diretamente no Cofre do app.",
+        lblDbApp: "Aplicação",
+        lblDbEngine: "Engine",
+        optDbPg: "PostgreSQL 16 (Isolado por DB + Role)",
+        optDbRedis: "Redis 7 (DB Lógico Isolado)",
+        btnCreateDb: "+ Provisionar Banco",
+        backupsTitle: "🛡️ Snapshots & Restore Criptografados (AES-256-GCM)",
+        backupsDesc: "Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.",
+        lblBakApp: "App para Backup",
+        lblBakEngine: "Engine",
+        optBakPg: "PostgreSQL 16 (pg_dump)",
+        optBakRedis: "Redis 7 (RDB)",
+        btnCreateBackup: "📸 Criar Snapshot Criptografado",
+        fedTitle: "🌐 Handshake Multi-Servidor & Redundância (HA Federation)",
+        fedDesc: "Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.",
+        lblFedUrl: "URL deste Servidor (Primary)",
+        lblFedMode: "Modo de Redundância",
+        optFedActive: "Active-Active (Cloudflare Tunnel Multi-Connector)",
+        optFedWarm: "Warm Standby (Sync Criptografado de Vault & Apps)",
+        btnGenInvite: "🔑 Gerar Join Token (15 min)",
+        btnExportSync: "📦 Exportar Bundle Criptografado",
+        lblJoinPeer: "Conectar este servidor como Réplica (Cole um Join Token):",
+        btnJoinPeer: "🤝 Fazer Handshake",
+        whTitle: "⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH",
+        whDesc: "Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.",
+        lblWhUrl: "Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):",
+        lblWhSecret: "Webhook Secret (HMAC-SHA256):",
+        btnRevealWhSecret: "👁️ Revelar / Copiar Secret",
+        lblSshKey: "Chave SSH Pública de Deploy (Ed25519):",
+        btnCopySsh: "📋 Copiar Chave SSH",
+        doctorTitle: "🩺 PaaSMCP Doctor — Diagnóstico Automático de Containers",
+        doctorDesc: "Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.",
+        btnRunDoctor: "🔍 Executar Diagnóstico Agora",
+        agentsTitle: "🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)",
+        agentsDesc: "O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:",
+        archTitle: "🏛️ Arquitetura & Modelo de Segurança (Por dentro do PaaSMCP)",
+        archDesc: "Projetado para máxima segurança e zero desperdício de recursos:",
+        logsTitle: "📜 Logs do Container",
+        btnCloseLogs: "Fechar",
+        statHost: "Servidor Host",
+        statDisk: "Disco:",
+        statMem: "Memória Livre / Total",
+        statIdle: "0 MB Idle Daemon",
+        statAppsDbs: "Apps & Bancos Isolados",
+        statSnapshots: "Snapshots Criptografados",
+        statSecurityFed: "Segurança & Federação",
+        emptyApps: "Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!",
+        emptyDbs: "Nenhum banco provisionado ainda.",
+        emptyBackups: "Nenhum snapshot criptografado criado ainda.",
+        emptyPeers: "Nenhum servidor secundário pareado ainda.",
+        emptySecrets: "Nenhuma variável salva neste escopo.",
+        emptyDoctor: "Nenhum container registrado para diagnóstico.",
+        actionExpose: "🌐 Expor",
+        actionEnv: "🔐 ENV",
+        actionLogs: "📜 Logs",
+        actionRestart: "🔄 Restart",
+        actionRollback: "⏪ Rollback",
+        actionDelete: "Excluir",
+        btnRestartContainer: "🔄 Reiniciar Container",
+        lastCheck: "\${esc(t('lastCheck'))}",
+        overallStatus: "\${esc(t('overallStatus'))}",
+        doctorChecking: "⏳ Verificando Containers...",
+        doctorDoneToast: "🩺 Diagnóstico concluído",
+        confirmDelete: "Destruir container e arquivos de ",
+        confirmRestore: "Restaurar o backup criptografado ",
+        toastSecretSaved: "✅ Segredo criptografado no Vault!",
+        toastDbCreated: "✅ Banco isolado provisionado!",
+        toastBackupSaved: "📸 Backup criptografado salvo: ",
+        toastDbRestored: "✅ Banco restaurado com sucesso",
+        toastExposed: "🌐 Publicado em: ",
+        toastDeploying: "⏳ Fazendo Build & Deploy...",
+        toastDeployDone: "🚀 Deploy concluído: ",
+        toastBundleGen: "📦 Bundle criptografado gerado",
+        toastHandshakeDone: "🤝 Handshake concluído com o nó primário!",
+        copiedToast: "✅ Copiado para a área de transferência!",
+        btnRestoreDump: "⏪ Restaurar Dump",
+        btnRemoveSecret: "Remover",
+        sizeLabel: "Tamanho:",
+        stoppedStatus: "Parado",
+        onDemandStatus: "Sob demanda"
+      },
+      en: {
+        sidebarSubtitle: "Agent-First Micro-PaaS",
+        navOverview: "📦 Applications & Deploy",
+        navVault: "🔐 AES-256-GCM Vault",
+        navDatabases: "🗄️ Databases & Backups",
+        navFederation: "🌐 Multi-Server HA & Webhook",
+        navDoctor: "🩺 Doctor & Diagnostics",
+        navAgents: "🤖 AI Studio (MCP) & Guide",
+        topHealthBadge: "● System Online",
+        btnRefresh: "🔄 Refresh",
+        btnLogout: "Log out",
+        appsTitle: "📦 Hosted Applications & Live Metrics",
+        appsDesc: "Isolated containers on <code>127.0.0.1:4000-4998</code> with 1s Rollback, CPU/RAM limits, and multi-service Docker Compose.",
+        thApp: "Application",
+        thStack: "Stack / Commit",
+        thMetrics: "CPU / RAM (Live)",
+        thPort: "Port / DBs",
+        thDomains: "HTTPS Domains",
+        thActions: "Quick Actions",
+        deployTitle: "➕ New Deploy (GitHub, Multi-Service Compose, or Local)",
+        deployDesc: "Auto-detects Node, Next.js, Python, Go, SPA, Dockerfile, or <code>docker-compose.yml</code> (safely injecting Vault secrets).",
+        lblQuickFillDeploy: "⚡ Presets:",
+        lblDepApp: "Application Slug",
+        lblDepRepo: "GitHub Repo or Path",
+        lblDepBranch: "Git Branch",
+        lblDepMem: "Memory Limit (Optional)",
+        lblDepCpu: "vCPU Limit (Optional)",
+        lblDepPg: "Provision PostgreSQL 16 (injects <code>DATABASE_URL</code>)",
+        lblDepRedis: "Provision Redis 7 (injects <code>REDIS_URL</code>)",
+        btnDeploy: "🚀 Build & Deploy",
+        exposeTitle: "🌐 Expose Application (Cloudflare Tunnel / Zero Trust / Tailscale)",
+        exposeDesc: "Configures Cloudflare Tunnel routing + proxied DNS CNAME + Zero Trust policy without opening router ports.",
+        lblQuickFillExpose: "⚡ Modes:",
+        chipModePublic: "🌍 Public (Open HTTPS)",
+        chipModeZT: "🛡️ Zero Trust (Email OTP)",
+        chipModeTS: "🔒 Tailscale (Private VPN)",
+        lblExpApp: "Application",
+        lblExpMode: "Security Mode",
+        optPublic: "Cloudflare Public (Open HTTPS)",
+        optZT: "Cloudflare Zero Trust (Email PIN Login)",
+        optTS: "Tailscale Serve (Private on Tailnet)",
+        lblExpSub: "Subdomain",
+        btnExpose: "🔗 Expose Address",
+        vaultTitle: "🔐 Encrypted Secret Vault (AES-256-GCM Vault)",
+        vaultDesc: "Each scope is encrypted on disk with random 96-bit IV and GCM auth tag. Values are never exposed in plaintext after save.",
+        lblVaultScopes: "⚡ Scopes:",
+        lblSecScope: "Scope (system or app slug)",
+        lblSecKey: "Key (A-Z, 0-9, _)",
+        lblSecVal: "Secret Value",
+        btnSaveSecret: "💾 Encrypt & Save",
+        btnLoadSecrets: "🔍 Reload Scope",
+        dbTitle: "🗄️ Provision Isolated Multi-Tenant Database",
+        dbDesc: "Creates database, exclusive role, and injects <code>DATABASE_URL</code> / <code>REDIS_URL</code> directly into app Vault.",
+        lblDbApp: "Application",
+        lblDbEngine: "Engine",
+        optDbPg: "PostgreSQL 16 (Isolated by DB + Role)",
+        optDbRedis: "Redis 7 (Isolated Logical DB)",
+        btnCreateDb: "+ Provision Database",
+        backupsTitle: "🛡️ Encrypted Snapshots & Restore (AES-256-GCM)",
+        backupsDesc: "Generates <code>pg_dump</code> or Redis snapshot, encrypts with Vault master key, and verifies SHA-256 integrity prior to restore.",
+        lblBakApp: "App for Backup",
+        lblBakEngine: "Engine",
+        optBakPg: "PostgreSQL 16 (pg_dump)",
+        optBakRedis: "Redis 7 (RDB)",
+        btnCreateBackup: "📸 Create Encrypted Snapshot",
+        fedTitle: "🌐 Multi-Server Handshake & Redundancy (HA Federation)",
+        fedDesc: "Pair a secondary server (VPS or homelab) via <code>HMAC-SHA256</code> signed token to run identical services in <strong>High Availability via Cloudflare Tunnel</strong> or <strong>Warm Standby</strong>.",
+        lblFedUrl: "This Server URL (Primary)",
+        lblFedMode: "Redundancy Mode",
+        optFedActive: "Active-Active (Cloudflare Tunnel Multi-Connector)",
+        optFedWarm: "Warm Standby (Encrypted Vault & App Sync)",
+        btnGenInvite: "🔑 Generate Join Token (15 min)",
+        btnExportSync: "📦 Export Encrypted Bundle",
+        lblJoinPeer: "Connect this server as Replica (Paste Join Token):",
+        btnJoinPeer: "🤝 Perform Handshake",
+        whTitle: "⚡ Auto-Deploy via GitHub Webhook & SSH Deploy Key",
+        whDesc: "Receive GitHub <code>git push</code> with constant-time <code>X-Hub-Signature-256</code> signature validation to auto-rebuild apps.",
+        lblWhUrl: "Webhook Payload URL (add in GitHub → Settings → Webhooks):",
+        lblWhSecret: "Webhook Secret (HMAC-SHA256):",
+        btnRevealWhSecret: "👁️ Reveal / Copy Secret",
+        lblSshKey: "Public SSH Deploy Key (Ed25519):",
+        btnCopySsh: "📋 Copy SSH Key",
+        doctorTitle: "🩺 PaaSMCP Doctor — Automated Container Diagnostics",
+        doctorDesc: "Checks for <code>OOMKilled</code> (low RAM), restart loops, exit codes, and health of all services.",
+        btnRunDoctor: "🔍 Run Diagnostics Now",
+        agentsTitle: "🤖 How to Connect your AI Agent (MCP Compatible Clients)",
+        agentsDesc: "PaaSMCP exposes <strong>15 native MCP tools</strong> via stdio JSON-RPC. Copy the config below so your AI agent can manage the entire server for you:",
+        archTitle: "🏛️ Architecture & Security Model (Inside PaaSMCP)",
+        archDesc: "Designed for maximum security and zero resource waste:",
+        logsTitle: "📜 Container Logs",
+        btnCloseLogs: "Close",
+        statHost: "Host Server",
+        statDisk: "Disk:",
+        statMem: "Free / Total Memory",
+        statIdle: "0 MB Idle Daemon",
+        statAppsDbs: "Isolated Apps & DBs",
+        statSnapshots: "Encrypted Snapshots",
+        statSecurityFed: "Security & Federation",
+        emptyApps: "No hosted applications yet. Use one of the presets below to get started!",
+        emptyDbs: "No databases provisioned yet.",
+        emptyBackups: "No encrypted snapshots created yet.",
+        emptyPeers: "No secondary servers paired yet.",
+        emptySecrets: "No variables stored in this scope.",
+        emptyDoctor: "No containers registered for diagnostics.",
+        actionExpose: "🌐 Expose",
+        actionEnv: "🔐 ENV",
+        actionLogs: "📜 Logs",
+        actionRestart: "🔄 Restart",
+        actionRollback: "⏪ Rollback",
+        actionDelete: "Delete",
+        btnRestartContainer: "🔄 Restart Container",
+        lastCheck: "Last checked:",
+        overallStatus: "Overall status:",
+        doctorChecking: "⏳ Checking Containers...",
+        doctorDoneToast: "🩺 Diagnostics completed",
+        confirmDelete: "Destroy container and files for ",
+        confirmRestore: "Restore encrypted backup ",
+        toastSecretSaved: "✅ Secret encrypted in Vault!",
+        toastDbCreated: "✅ Isolated database provisioned!",
+        toastBackupSaved: "📸 Encrypted backup saved: ",
+        toastDbRestored: "✅ Database restored successfully",
+        toastExposed: "🌐 Published at: ",
+        toastDeploying: "⏳ Building & Deploying...",
+        toastDeployDone: "🚀 Deploy completed: ",
+        toastBundleGen: "📦 Encrypted bundle generated",
+        toastHandshakeDone: "🤝 Handshake completed with primary node!",
+        copiedToast: "✅ Copied to clipboard!",
+        btnRestoreDump: "⏪ Restore Dump",
+        btnRemoveSecret: "Remove",
+        sizeLabel: "Size:",
+        stoppedStatus: "Stopped",
+        onDemandStatus: "On demand"
+      }
+    };
+
+    function t(key) {
+      const dict = I18N[currentLang] || I18N.pt;
+      return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
+    }
+
+    const I18N_KEYS = [
+      'sidebarSubtitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
+      'topHealthBadge', 'btnRefresh', 'btnLogout',
+      'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
+      'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
+      'exposeTitle', 'exposeDesc', 'lblQuickFillExpose', 'chipModePublic', 'chipModeZT', 'chipModeTS', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
+      'vaultTitle', 'vaultDesc', 'lblVaultScopes', 'lblSecScope', 'lblSecKey', 'lblSecVal', 'btnSaveSecret', 'btnLoadSecrets',
+      'dbTitle', 'dbDesc', 'lblDbApp', 'lblDbEngine', 'optDbPg', 'optDbRedis', 'btnCreateDb',
+      'backupsTitle', 'backupsDesc', 'lblBakApp', 'lblBakEngine', 'optBakPg', 'optBakRedis', 'btnCreateBackup',
+      'fedTitle', 'fedDesc', 'lblFedUrl', 'lblFedMode', 'optFedActive', 'optFedWarm', 'btnGenInvite', 'btnExportSync', 'lblJoinPeer', 'btnJoinPeer',
+      'whTitle', 'whDesc', 'lblWhUrl', 'lblWhSecret', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
+      'doctorTitle', 'doctorDesc', 'btnRunDoctor',
+      'agentsTitle', 'agentsDesc', 'archTitle', 'archDesc', 'logsTitle', 'btnCloseLogs'
+    ];
 
     function esc(str) {
       return String(str ?? '')
@@ -1370,6 +1659,19 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       document.getElementById('webhookUrlBox').textContent = window.location.origin + '/api/webhooks/github';
       const fedUrlEl = document.getElementById('fedUrl');
       if (fedUrlEl && !fedUrlEl.value) fedUrlEl.value = window.location.origin;
+
+      for (const k of I18N_KEYS) {
+        const el = document.getElementById(k);
+        if (el) {
+          const val = t(k);
+          if (val.indexOf('<') !== -1 && val.indexOf('>') !== -1) {
+            el.innerHTML = val;
+          } else {
+            el.textContent = val;
+          }
+        }
+      }
+
       if (lastStatus) renderStatusData(lastStatus);
       loadSecrets();
     }
@@ -1410,22 +1712,22 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 
       document.getElementById('statsGrid').innerHTML = \`
         <div class="stat-card">
-          <div class="stat-label">Servidor Host</div>
+          <div class="stat-label">\${esc(t('statHost'))}</div>
           <div class="stat-value">🖥️ \${esc(s.hostname)}</div>
-          <div class="stat-meta">\${esc(s.platform)} · Disco: \${esc(s.rootDisk)}</div>
+          <div class="stat-meta">\${esc(s.platform)} · \${esc(t('statDisk'))} \${esc(s.rootDisk)}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Memória Livre / Total</div>
+          <div class="stat-label">\${esc(t('statMem'))}</div>
           <div class="stat-value">⚡ \${esc(s.freeMemGb)} / \${esc(s.totalMemGb)} GB</div>
-          <div class="stat-meta">\${esc(s.cpus)} vCPUs · 0 MB Idle Daemon</div>
+          <div class="stat-meta">\${esc(s.cpus)} vCPUs · \${esc(t('statIdle'))}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Apps & Bancos Isolados</div>
+          <div class="stat-label">\${esc(t('statAppsDbs'))}</div>
           <div class="stat-value">📦 \${esc(s.appsCount)} Apps · \${esc(s.databasesCount)} DBs</div>
-          <div class="stat-meta">🛡️ \${esc(s.backupsCount || 0)} Snapshots Criptografados</div>
+          <div class="stat-meta">🛡️ \${esc(s.backupsCount || 0)} \${esc(t('statSnapshots'))}</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Segurança & Federação</div>
+          <div class="stat-label">\${esc(t('statSecurityFed'))}</div>
           <div class="stat-value">🔒 \${esc(role.toUpperCase())}</div>
           <div class="stat-meta">SSH: <code>\${esc((s.sshKeyFingerprint || '').slice(0, 22))}...</code></div>
         </div>
@@ -1443,18 +1745,18 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 
       const tbody = document.getElementById('appsTable');
       if (apps.length === 0) {
-        tbody.innerHTML = \`<tr><td colspan="6" style="color:var(--muted)">Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!</td></tr>\`;
+        tbody.innerHTML = \`<tr><td colspan="6" style="color:var(--muted)">\${esc(t('emptyApps'))}</td></tr>\`;
       } else {
         tbody.innerHTML = apps.map(a => {
           const m = metricsMap[a.containerName];
           const metricHtml = m
             ? \`<div><code>CPU: \${esc(m.cpuPercent)}</code></div><div style="margin-top:3px;"><code>RAM: \${esc(m.memUsage)}</code></div>\`
-            : \`<span style="color:var(--muted);font-size:11.5px;">\${a.status === 'stopped' ? 'Parado' : 'Sob demanda'}</span>\`;
+            : \`<span style="color:var(--muted);font-size:11.5px;">\${esc(a.status === 'stopped' ? t('stoppedStatus') : t('onDemandStatus'))}</span>\`;
           const limitsHtml = (a.memoryLimit || a.cpuLimit)
             ? \`<div style="margin-top:3px;font-size:11px;color:var(--muted);">Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU</div>\`
             : '';
           const rollbackBtn = a.previousImageTag
-            ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">⏪ Rollback</button>\`
+            ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${esc(t('actionRollback'))}</button>\`
             : '';
 
           return \`
@@ -1475,12 +1777,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               </td>
               <td>\${(a.domains || []).map(d => \`<div style="margin-bottom:3px;"><a href="\${esc(d.url)}" target="_blank" rel="noopener noreferrer">🔗 \${esc(d.url)}</a> <span class="badge" style="padding:1px 6px;font-size:10px;">\${esc(d.mode)}</span></div>\`).join('') || '<span style="color:var(--muted)">Local only</span>'}</td>
               <td class="actions">
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="selectAppForExpose('\${esc(a.name)}')">🌐 Expor</button>
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="setVaultScope('\${esc(a.name)}')">🔐 ENV</button>
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">📜 Logs</button>
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restart')">🔄 Restart</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="selectAppForExpose('\${esc(a.name)}')">\${esc(t('actionExpose'))}</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="setVaultScope('\${esc(a.name)}')">\${esc(t('actionEnv'))}</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
+                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restart')">\${esc(t('actionRestart'))}</button>
                 \${rollbackBtn}
-                <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="if(confirm('Destruir container e arquivos de ' + '\${esc(a.name)}' + '?')) appAction('\${esc(a.name)}','destroy')">Excluir</button>
+                <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="if(confirm(t('confirmDelete') + '\${esc(a.name)}' + '?')) appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>
               </td>
             </tr>
           \`;
@@ -1490,7 +1792,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       const dbs = Object.values(s.databases || {});
       document.getElementById('dbList').innerHTML = dbs.length
         ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">🗄️ <strong>\${esc(d.name)}</strong> (\${esc(d.engine)}) → DB: <code>\${esc(d.dbName)}</code> | User: <code>\${esc(d.dbUser)}</code></div>\`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">Nenhum banco provisionado ainda.</span>';
+        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>';
 
       const backups = s.backups || [];
       document.getElementById('backupsList').innerHTML = backups.length
@@ -1498,12 +1800,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12px;gap:8px;flex-wrap:wrap;">
             <div>
               🔒 <strong>\${esc(b.id)}</strong> (\${esc(b.engine)})<br/>
-              <span style="color:var(--muted);">Tamanho: \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code></span>
+              <span style="color:var(--muted);">\${esc(t('sizeLabel'))} \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code></span>
             </div>
-            <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="restoreBackup('\${esc(b.id)}')">⏪ Restaurar Dump</button>
+            <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="restoreBackup('\${esc(b.id)}')">\${esc(t('btnRestoreDump'))}</button>
           </div>
         \`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">Nenhum snapshot criptografado criado ainda.</span>';
+        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyBackups')) + '</span>';
 
       const peers = Object.values(s.federation?.peers || {});
       document.getElementById('fedPeersList').innerHTML = peers.length
@@ -1513,7 +1815,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
             <span style="color:var(--muted);font-size:11.5px;">Endpoint: \${esc(p.endpointUrl)} · Key: <code>\${esc(p.publicKeyFingerprint)}</code></span>
           </div>
         \`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">Nenhum servidor secundário pareado ainda.</span>';
+        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>';
     }
 
     async function loadAll() {
@@ -1530,8 +1832,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       const data = await res.json();
       const entries = Object.entries(data.secrets || {});
       document.getElementById('secretsList').innerHTML = entries.length
-        ? entries.map(([k, v]) => \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;"><span>🔑 <strong>\${esc(k)}</strong> = <code>\${esc(v)}</code></span><button class="danger" style="padding:3px 9px;font-size:11px" onclick="delSecret('\${esc(scope)}','\${esc(k)}')">Remover</button></div>\`).join('')
-        : '<div style="color:var(--muted);font-size:12.5px">Nenhuma variável salva neste escopo.</div>';
+        ? entries.map(([k, v]) => \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;"><span>🔑 <strong>\${esc(k)}</strong> = <code>\${esc(v)}</code></span><button class="danger" style="padding:3px 9px;font-size:11px" onclick="delSecret('\${esc(scope)}','\${esc(k)}')">\${esc(t('btnRemoveSecret'))}</button></div>\`).join('')
+        : '<div style="color:var(--muted);font-size:12.5px">' + esc(t('emptySecrets')) + '</div>';
     }
 
     async function saveSecret() {
@@ -1548,7 +1850,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       if (!res.ok) return alert(data.error);
       document.getElementById('secKey').value = '';
       document.getElementById('secVal').value = '';
-      showToast('✅ Segredo criptografado no Vault!');
+      showToast(t('toastSecretSaved'));
       loadSecrets();
     }
 
@@ -1572,7 +1874,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       });
       const data = await res.json();
       if (!res.ok) return alert(data.error);
-      showToast('✅ Banco isolado provisionado!');
+      showToast(t('toastDbCreated'));
       loadAll();
     }
 
@@ -1587,12 +1889,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       });
       const data = await res.json();
       if (!res.ok) return alert(data.error);
-      showToast('📸 Backup criptografado salvo: ' + data.id);
+      showToast(t('toastBackupSaved') + data.id);
       loadAll();
     }
 
     async function restoreBackup(backupId) {
-      if (!confirm('Restaurar o backup criptografado ' + backupId + '?')) return;
+      if (!confirm(t('confirmRestore') + backupId + '?')) return;
       const res = await fetch('/api/backups/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1627,7 +1929,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       const box = document.getElementById('fedTokenBox');
       box.style.display = 'block';
       box.textContent = JSON.stringify(data, null, 2);
-      showToast('📦 Bundle criptografado gerado (' + data.scopesCount + ' escopos Vault)!');
+      showToast(t('toastBundleGen') + ' (' + data.scopesCount + ' scopes)!');
     }
 
     async function joinFederation() {
@@ -1640,7 +1942,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       });
       const data = await res.json();
       if (!res.ok) return alert(data.error);
-      showToast('🤝 Handshake concluído com o nó primário!');
+      showToast(t('toastHandshakeDone'));
       loadAll();
     }
 
@@ -1652,23 +1954,43 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       copyText(data.webhookSecret);
     }
 
-    async function runDoctor() {
-      const res = await fetch('/api/doctor');
-      if (!res.ok) return;
-      const data = await res.json();
-      const items = data.diagnostics || [];
-      document.getElementById('doctorReportBox').innerHTML = items.length
-        ? items.map(d => \`
-          <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-              <strong>\${esc(d.target)}</strong>
-              <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(d.severity.toUpperCase())}</span>
+    async function runDoctor(showFeedback = false) {
+      const btn = document.getElementById('btnRunDoctor');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = t('doctorChecking');
+      }
+      try {
+        const res = await fetch('/api/doctor');
+        if (!res.ok) return;
+        const data = await res.json();
+        const items = data.diagnostics || [];
+        const checkedTime = data.checkedAt ? new Date(data.checkedAt).toLocaleTimeString() : '';
+        document.getElementById('doctorReportBox').innerHTML = items.length
+          ? \`<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px;">\${esc(t('lastCheck'))} <strong>\${esc(checkedTime)}</strong> · \${esc(t('overallStatus'))} <span class="badge \${data.overallHealth === 'healthy' ? 'success' : data.overallHealth === 'warning' ? 'warning' : 'danger'}">\${esc((data.overallHealth || 'healthy').toUpperCase())}</span></div>\` +
+            items.map(d => \`
+            <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+                <strong>\${esc(d.target)}</strong>
+                <div style="display:flex;gap:6px;align-items:center;">
+                  <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(d.severity.toUpperCase())}</span>
+                  \${d.severity !== 'healthy' ? \`<button class="secondary" style="padding:3px 9px;font-size:11px;" onclick="appAction('\${esc(d.target)}','restart')">\${esc(t('btnRestartContainer'))}</button>\` : ''}
+                </div>
+              </div>
+              <div style="font-size:13px;margin-top:6px;">\${esc(d.summary)}</div>
+              \${d.recommendation ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(d.recommendation)}</div>\` : ''}
             </div>
-            <div style="font-size:13px;margin-top:6px;">\${esc(d.summary)}</div>
-            \${d.recommendation ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(d.recommendation)}</div>\` : ''}
-          </div>
-        \`).join('')
-        : '<div style="color:var(--muted);font-size:13px;">Nenhum container registrado para diagnóstico.</div>';
+          \`).join('')
+          : '<div style="color:var(--muted);font-size:13px;">' + esc(t('emptyDoctor')) + '</div>';
+        if (showFeedback) {
+          showToast(t('doctorDoneToast') + ' (' + items.length + ' containers)!');
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = t('btnRunDoctor');
+        }
+      }
     }
 
     async function deployNewApp() {
@@ -1681,7 +2003,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       const withRedis = document.getElementById('depRedis').checked;
       if (!appName || !repoSource) return;
       const btn = document.getElementById('btnDeploy');
-      btn.textContent = '⏳ Fazendo Build & Deploy...';
+      btn.textContent = t('toastDeploying');
       btn.disabled = true;
       try {
         const res = await fetch('/api/deploy', {
@@ -1691,9 +2013,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         });
         const data = await res.json();
         if (!res.ok) alert('Error: ' + data.error);
-        else { showToast('🚀 Deploy concluído: ' + appName); loadAll(); }
+        else { showToast(t('toastDeployDone') + appName); loadAll(); }
       } finally {
-        btn.textContent = '🚀 Fazer Build & Deploy';
+        btn.textContent = t('btnDeploy');
         btn.disabled = false;
       }
     }
@@ -1710,7 +2032,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       });
       const data = await res.json();
       if (!res.ok) return alert('Error: ' + data.error);
-      showToast('🌐 Publicado em: ' + data.url);
+      showToast(t('toastExposed') + data.url);
       loadAll();
     }
 
@@ -1767,7 +2089,7 @@ export function ensureDashboardBackgroundService(port = 4099): {
     container_name: paasmcp-dashboard
     restart: unless-stopped
     working_dir: /app
-    command: ["node", "dist/cli.js", "dashboard", "serve", "--port", "${port}", "--host", "0.0.0.0"]
+    command: ["sh", "-c", "which docker >/dev/null 2>&1 || apk add --no-cache docker-cli docker-cli-compose git openssh-client; exec node dist/cli.js dashboard serve --port ${port} --host 0.0.0.0"]
     ports:
       - "127.0.0.1:${port}:${port}"
     volumes:
