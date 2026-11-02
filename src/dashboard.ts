@@ -713,7 +713,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       </div>
       <div class="step-box">
         <h3><span class="step-num">4</span> <span id="step4Title">Domínio HTTPS Seguro</span></h3>
-        <p id="step4Desc">Exponha na internet em <code>subdominio.guarapps.com</code> (Público ou protegido com login PIN por e-mail no Cloudflare Zero Trust).</p>
+        <p id="step4Desc">Exponha na internet em <code>subdominio.{domain}</code> (Público ou protegido com login PIN por e-mail no Cloudflare Zero Trust).</p>
       </div>
     </div>
   </div>
@@ -758,9 +758,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       </div>
       <div class="examples-bar">
         <span id="lblQuickFillDeploy">⚡ Preencher exemplo:</span>
-        <button class="chip" onclick="fillDeployExample('meu-saas', 'CodeVanzi/meu-saas', 'main', true, false)">SaaS Node/Next + Postgres</button>
-        <button class="chip" onclick="fillDeployExample('api-python', 'CodeVanzi/api-fastapi', 'main', true, true)">API Python + PG + Redis</button>
-        <button class="chip" onclick="fillDeployExample('landing-page', 'CodeVanzi/landing', 'main', false, false)">Site Estático / SPA</button>
+        <button class="chip" onclick="fillDeployExample('meu-saas', 'seu-usuario/meu-saas', 'main', true, false)">SaaS Node/Next + Postgres</button>
+        <button class="chip" onclick="fillDeployExample('api-python', 'seu-usuario/api-fastapi', 'main', true, true)">API Python + PG + Redis</button>
+        <button class="chip" onclick="fillDeployExample('landing-page', 'seu-usuario/landing', 'main', false, false)">Site Estático / SPA</button>
       </div>
       <div class="form-grid">
         <div>
@@ -769,7 +769,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         </div>
         <div>
           <label class="field-label" id="lblDepRepo">Repositório GitHub ou Caminho</label>
-          <input id="depRepo" placeholder="ex: CodeVanzi/meu-repo" />
+          <input id="depRepo" placeholder="ex: seu-usuario/meu-repo" />
         </div>
         <div>
           <label class="field-label" id="lblDepBranch">Branch Git</label>
@@ -816,7 +816,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         </div>
         <div>
           <label class="field-label" id="lblExpSub">Subdomínio desejado</label>
-          <input id="expSub" placeholder="ex: app (vira app.guarapps.com)" />
+          <input id="expSub" placeholder="ex: app (vira app.seudominio.com)" />
         </div>
       </div>
       <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
@@ -894,21 +894,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       <div class="prompt-card">
         <div>
           <span class="badge" style="margin-bottom:8px;">💬 Prompt — Deploy Completo</span>
-          <p id="prompt1Text">"Faça o deploy do meu repositório CodeVanzi/meu-app na branch main com um banco PostgreSQL e publique em meuapp.guarapps.com"</p>
+          <p id="prompt1Text">"Faça o deploy do meu repositório seu-usuario/meu-app na branch main com um banco PostgreSQL e publique em meuapp.{domain}"</p>
         </div>
         <button class="secondary" style="font-size:12px;padding:6px 10px;" onclick="copyText(document.getElementById('prompt1Text').textContent)">📋 Copiar Prompt</button>
       </div>
       <div class="prompt-card">
         <div>
           <span class="badge" style="margin-bottom:8px;">💬 Prompt — App Privado Zero Trust</span>
-          <p id="prompt2Text">"Suba o repositório CodeVanzi/painel-admin e exponha em admin.guarapps.com protegido com login por e-mail no Cloudflare Zero Trust"</p>
+          <p id="prompt2Text">"Suba o repositório seu-usuario/painel-admin e exponha em admin.{domain} protegido com login por e-mail no Cloudflare Zero Trust"</p>
         </div>
         <button class="secondary" style="font-size:12px;padding:6px 10px;" onclick="copyText(document.getElementById('prompt2Text').textContent)">📋 Copiar Prompt</button>
       </div>
       <div class="prompt-card">
         <div>
           <span class="badge" style="margin-bottom:8px;">💻 Equivalente no Terminal (CLI)</span>
-          <code style="display:block;padding:8px;margin-top:4px;white-space:pre-wrap;" id="cliExampleBox">paasmcp deploy meu-app CodeVanzi/meu-app --postgres
+          <code style="display:block;padding:8px;margin-top:4px;white-space:pre-wrap;" id="cliExampleBox">paasmcp deploy meu-app seu-usuario/meu-app --postgres
 paasmcp expose meu-app public meuapp</code>
         </div>
         <button class="secondary" style="font-size:12px;padding:6px 10px;" onclick="copyText(document.getElementById('cliExampleBox').textContent)">📋 Copiar Comandos</button>
@@ -942,11 +942,11 @@ paasmcp expose meu-app public meuapp</code>
         step1Title: "Variáveis & Segredos",
         step1Desc: "Salve chaves de API (OpenAI, Stripe, etc.) no Cofre AES-256-GCM usando o nome do seu app como escopo antes ou depois do deploy.",
         step2Title: "Build & Deploy do GitHub",
-        step2Desc: "Informe seu repositório owner/repo. Se não houver Dockerfile, o PaaSMCP gera um automaticamente (Node, Next, Python, Go, SPA).",
+        step2Desc: "Informe seu repositório <code>owner/repo</code>. Se não houver Dockerfile, o PaaSMCP gera um automaticamente (Node, Next, Python, Go, SPA).",
         step3Title: "Banco de Dados 1-Click",
-        step3Desc: "Marque PostgreSQL ou Redis no deploy (ou crie depois). A variável DATABASE_URL é injetada automaticamente no container.",
+        step3Desc: "Marque PostgreSQL ou Redis no deploy (ou crie depois). A variável <code>DATABASE_URL</code> é injetada automaticamente no container.",
         step4Title: "Domínio HTTPS Seguro",
-        step4Desc: "Exponha na internet em subdominio.guarapps.com (Público ou protegido com login PIN por e-mail no Cloudflare Zero Trust).",
+        step4Desc: "Exponha na internet em <code>subdominio.{domain}</code> (Público ou protegido com login PIN por e-mail no Cloudflare Zero Trust).",
         statServer: "Servidor Host",
         statMem: "Memória Livre / Total",
         statApps: "Aplicações & Bancos",
@@ -1003,8 +1003,8 @@ paasmcp expose meu-app public meuapp</code>
         btnCopySsh: "📋 Copiar Chave SSH",
         examplesTitle: "🤖 Exemplos de Uso com Agentes de IA (MCP) & Terminal",
         examplesDesc: "Como o PaaSMCP possui servidor MCP nativo, você pode pedir em linguagem natural no T3 Code / Claude / Cursor ou usar a CLI:",
-        prompt1Text: "\"Faça o deploy do meu repositório CodeVanzi/meu-app na branch main com um banco PostgreSQL e publique em meuapp.guarapps.com\"",
-        prompt2Text: "\"Suba o repositório CodeVanzi/painel-admin e exponha em admin.guarapps.com protegido com login por e-mail no Cloudflare Zero Trust\"",
+        prompt1Text: "\"Faça o deploy do meu repositório seu-usuario/meu-app na branch main com um banco PostgreSQL e publique em meuapp.{domain}\"",
+        prompt2Text: "\"Suba o repositório seu-usuario/painel-admin e exponha em admin.{domain} protegido com login por e-mail no Cloudflare Zero Trust\"",
         logsTitle: "📜 Logs do Container",
         btnCloseLogs: "Fechar",
         btnDestroy: "Excluir",
@@ -1024,11 +1024,11 @@ paasmcp expose meu-app public meuapp</code>
         step1Title: "Environment Secrets",
         step1Desc: "Store API keys (OpenAI, Stripe, etc.) in the AES-256-GCM Vault using your app name as the scope before or after deployment.",
         step2Title: "GitHub Build & Deploy",
-        step2Desc: "Enter your owner/repo. If no Dockerfile exists, PaaSMCP auto-generates one for Node.js, Next.js, Python, Go, or static SPAs.",
+        step2Desc: "Enter your <code>owner/repo</code>. If no Dockerfile exists, PaaSMCP auto-generates one for Node.js, Next.js, Python, Go, or static SPAs.",
         step3Title: "1-Click Databases",
-        step3Desc: "Check PostgreSQL or Redis when deploying (or provision later). DATABASE_URL is automatically injected into the container.",
+        step3Desc: "Check PostgreSQL or Redis when deploying (or provision later). <code>DATABASE_URL</code> is automatically injected into the container.",
         step4Title: "Secure HTTPS Domains",
-        step4Desc: "Expose to the internet on subdomain.guarapps.com (Public HTTPS or protected by Cloudflare Zero Trust Email OTP).",
+        step4Desc: "Expose to the internet on <code>subdomain.{domain}</code> (Public HTTPS or protected by Cloudflare Zero Trust Email OTP).",
         statServer: "Host Server",
         statMem: "Free / Total Memory",
         statApps: "Active Apps & Databases",
@@ -1085,8 +1085,8 @@ paasmcp expose meu-app public meuapp</code>
         btnCopySsh: "📋 Copy SSH Key",
         examplesTitle: "🤖 AI Agent (MCP) Prompts & CLI Examples",
         examplesDesc: "Since PaaSMCP includes a native MCP server, you can ask your AI agent in natural language or run CLI commands:",
-        prompt1Text: "\"Deploy my repository CodeVanzi/my-app on branch main with a PostgreSQL database and expose it on myapp.guarapps.com\"",
-        prompt2Text: "\"Deploy CodeVanzi/admin-panel and expose it on admin.guarapps.com protected by Cloudflare Zero Trust email login\"",
+        prompt1Text: "\"Deploy my repository seu-usuario/my-app on branch main with a PostgreSQL database and expose it on myapp.{domain}\"",
+        prompt2Text: "\"Deploy seu-usuario/admin-panel and expose it on admin.{domain} protected by Cloudflare Zero Trust email login\"",
         logsTitle: "📜 Container Logs",
         btnCloseLogs: "Close",
         btnDestroy: "Destroy",
@@ -1101,8 +1101,19 @@ paasmcp expose meu-app public meuapp</code>
     let currentTheme = localStorage.getItem('paasmcp_theme') || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     let lastStatus = null;
 
+    function getBaseDomain() {
+      const configured = lastStatus && lastStatus.cloudflare && lastStatus.cloudflare.baseDomain;
+      if (configured && configured !== "-" && configured !== "example.com") return configured;
+      const host = window.location.hostname;
+      const parts = host.split(".");
+      if (parts.length >= 2 && host !== "localhost" && !/^[0-9.]+$/.test(host)) {
+        return parts.slice(1).join(".");
+      }
+      return currentLang === "pt" ? "seudominio.com" : "yourdomain.com";
+    }
     function t(key) {
-      return (I18N[currentLang] && I18N[currentLang][key]) || I18N.pt[key] || key;
+      const raw = (I18N[currentLang] && I18N[currentLang][key]) || I18N.pt[key] || key;
+      return String(raw).replace(/\{domain\}/g, getBaseDomain());
     }
 
     function showToast(msg) {
@@ -1143,12 +1154,14 @@ paasmcp expose meu-app public meuapp</code>
       ];
       for (const id of ids) {
         const el = document.getElementById(id);
-        if (el) el.textContent = t(id);
+        if (el) { if (id.startsWith("step") && id.endsWith("Desc")) el.innerHTML = t(id); else el.textContent = t(id); }
       }
 
       const guideHidden = localStorage.getItem('paasmcp_hide_guide') === '1';
       document.getElementById('guideBanner').style.display = guideHidden ? 'none' : 'block';
 
+      const expSubEl = document.getElementById("expSub");
+      if (expSubEl) expSubEl.placeholder = currentLang === "pt" ? "ex: app (vira app." + getBaseDomain() + ")" : "e.g. app (becomes app." + getBaseDomain() + ")";
       if (lastStatus) renderStatusData(lastStatus);
       loadSecrets();
     }
@@ -1243,8 +1256,7 @@ paasmcp expose meu-app public meuapp</code>
       const res = await fetch('/api/status');
       if (!res.ok) return;
       lastStatus = await res.json();
-      renderStatusData(lastStatus);
-      loadSecrets();
+      applyPreferences();
     }
 
     async function loadSecrets() {
