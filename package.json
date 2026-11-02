@@ -1,0 +1,42 @@
+{
+  "name": "paasmcp",
+  "version": "1.0.0",
+  "description": "Agent-First Micro-PaaS & Model Context Protocol (MCP) Server for self-hosted servers and homelabs.",
+  "license": "MIT",
+  "author": "PaaSMCP Contributors",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "paas",
+    "self-hosted",
+    "homelab",
+    "docker",
+    "cloudflare-tunnel",
+    "tailscale",
+    "ai-agents",
+    "render-alternative"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "paasmcp": "./dist/cli.js",
+    "paasmcp-mcp": "./dist/mcp-server.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start:mcp": "node dist/mcp-server.js",
+    "cli": "node dist/cli.js",
+    "test": "node --test dist/test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
