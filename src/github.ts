@@ -1,18 +1,22 @@
 import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureDirectories, PAAS_SSH_DIR } from "./config.js";
+import YAML from "yaml";
+import { ensureDirectories, PAAS_SSH_DIR, validateBranchName } from "./config.js";
 import { getSecrets } from "./vault.js";
 
 export interface DeployKeyInfo {
   privateKeyPath: string;
   publicKeyPath: string;
   publicKey: string;
+  fingerprint: string;
 }
 
 export function getOrCreateSshDeployKey(keyName = "paasmcp_deploy_ed25519"): DeployKeyInfo {
+  const safeKeyName = keyName.replace(/[^a-zA-Z0-9_.-]/g, "");
   ensureDirectories();
-  const privateKeyPath = path.join(PAAS_SSH_DIR, keyName);
+  const privateKeyPath = path.join(PAAS_SSH_DIR, safeKeyName);
   const publicKeyPath = `${privateKeyPath}.pub`;
 
   if (!fs.existsSync(privateKeyPath)) {
@@ -34,7 +38,17 @@ export function getOrCreateSshDeployKey(keyName = "paasmcp_deploy_ed25519"): Dep
   }
 
   const publicKey = fs.readFileSync(publicKeyPath, "utf-8").trim();
-  return { privateKeyPath, publicKeyPath, publicKey };
+  const keyParts = publicKey.split(" ");
+  const rawKeyBody = keyParts[1] || publicKey;
+  const fingerprint =
+    "SHA256:" +
+    crypto
+      .createHash("sha256")
+      .update(Buffer.from(rawKeyBody, "base64"))
+      .digest("base64")
+      .replace(/=+$/, "");
+
+  return { privateKeyPath, publicKeyPath, publicKey, fingerprint };
 }
 
 export async function registerGitHubDeployKey(
@@ -58,6 +72,10 @@ export async function registerGitHubDeployKey(
     .replace(/^https?:\/\/github\.com\//, "")
     .replace(/^git@github\.com:/, "")
     .replace(/\.git$/, "");
+
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(cleanRepo)) {
+    throw new Error(`Invalid GitHub repository format: "${repoFullName}". Expected "owner/repo".`);
+  }
 
   const res = await fetch(`https://api.github.com/repos/${cleanRepo}/keys`, {
     method: "POST",
@@ -103,6 +121,8 @@ export function cloneOrUpdateRepo(
   targetDir: string,
   branch = "main"
 ): { commitHash: string; sourceType: "local" | "git" } {
+  const safeBranch = validateBranchName(branch);
+
   // Support local directory path directly as well as GitHub shorthand or URL
   if (fs.existsSync(repoSource) && fs.statSync(repoSource).isDirectory()) {
     fs.mkdirSync(targetDir, { recursive: true });
@@ -110,13 +130,17 @@ export function cloneOrUpdateRepo(
     return { commitHash: "local-source", sourceType: "local" };
   }
 
-  let gitUrl = repoSource;
-  if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(repoSource)) {
+  let gitUrl = repoSource.trim();
+  if (gitUrl.startsWith("-")) {
+    throw new Error("Invalid repository source URL.");
+  }
+
+  if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(gitUrl)) {
     const sysSecrets = getSecrets("system");
     if (sysSecrets.GITHUB_TOKEN) {
-      gitUrl = `https://x-access-token:${sysSecrets.GITHUB_TOKEN}@github.com/${repoSource}.git`;
+      gitUrl = `https://x-access-token:${sysSecrets.GITHUB_TOKEN}@github.com/${gitUrl}.git`;
     } else {
-      gitUrl = `git@github.com:${repoSource}.git`;
+      gitUrl = `git@github.com:${gitUrl}.git`;
     }
   }
 
@@ -128,8 +152,8 @@ export function cloneOrUpdateRepo(
 
   if (fs.existsSync(path.join(targetDir, ".git"))) {
     execFileSync("git", ["fetch", "--all"], { cwd: targetDir, env, stdio: "pipe" });
-    execFileSync("git", ["checkout", branch], { cwd: targetDir, env, stdio: "pipe" });
-    execFileSync("git", ["reset", "--hard", `origin/${branch}`], {
+    execFileSync("git", ["checkout", safeBranch], { cwd: targetDir, env, stdio: "pipe" });
+    execFileSync("git", ["reset", "--hard", `origin/${safeBranch}`], {
       cwd: targetDir,
       env,
       stdio: "pipe",
@@ -140,13 +164,17 @@ export function cloneOrUpdateRepo(
     }
     fs.mkdirSync(path.dirname(targetDir), { recursive: true });
     try {
-      execFileSync("git", ["clone", "--branch", branch, "--depth", "1", gitUrl, targetDir], {
-        env,
-        stdio: "pipe",
-      });
+      execFileSync(
+        "git",
+        ["clone", "--branch", safeBranch, "--depth", "1", "--", gitUrl, targetDir],
+        {
+          env,
+          stdio: "pipe",
+        }
+      );
     } catch {
       // Fallback if default branch is master or unspecified
-      execFileSync("git", ["clone", "--depth", "1", gitUrl, targetDir], {
+      execFileSync("git", ["clone", "--depth", "1", "--", gitUrl, targetDir], {
         env,
         stdio: "pipe",
       });
@@ -169,12 +197,62 @@ export interface DetectedBuildPlan {
   runtimeType: string;
   dockerfilePath: string;
   detectedPort: number;
+  composeFile?: string;
+  primaryServiceName?: string;
+  serviceNames?: string[];
 }
 
 export function detectOrGenerateDockerfile(
   repoDir: string,
   overridePort?: number
 ): DetectedBuildPlan {
+  // 1. Check for Multi-Service Docker Compose pass-through first
+  const composeCandidates = ["docker-compose.yml", "docker-compose.yaml", "compose.yaml", "compose.yml"];
+  for (const candidate of composeCandidates) {
+    const composePath = path.join(repoDir, candidate);
+    if (fs.existsSync(composePath)) {
+      const raw = fs.readFileSync(composePath, "utf-8");
+      const parsed = YAML.parse(raw) as {
+        services?: Record<
+          string,
+          {
+            ports?: Array<string | number>;
+            expose?: Array<string | number>;
+            privileged?: boolean;
+            network_mode?: string;
+            volumes?: string[];
+          }
+        >;
+      };
+      if (parsed && parsed.services && Object.keys(parsed.services).length > 0) {
+        const serviceNames = Object.keys(parsed.services);
+        const preferredNames = ["web", "app", "api", "frontend", "server"];
+        const primaryServiceName =
+          preferredNames.find((n) => serviceNames.includes(n)) || serviceNames[0];
+
+        let detectedPort = overridePort || 3000;
+        const primarySvc = parsed.services[primaryServiceName];
+        if (!overridePort && primarySvc?.ports && primarySvc.ports.length > 0) {
+          const firstPort = String(primarySvc.ports[0]);
+          const parts = firstPort.split(":");
+          const containerPortPart = parts[parts.length - 1].replace(/\/.*$/, "");
+          if (/^\d+$/.test(containerPortPart)) {
+            detectedPort = Number(containerPortPart);
+          }
+        }
+        return {
+          runtimeType: `multi-service-compose (${serviceNames.length} services)`,
+          dockerfilePath: candidate,
+          detectedPort,
+          composeFile: candidate,
+          primaryServiceName,
+          serviceNames,
+        };
+      }
+    }
+  }
+
+  // 2. Custom Dockerfile
   const existingDockerfile = path.join(repoDir, "Dockerfile");
   if (fs.existsSync(existingDockerfile)) {
     const content = fs.readFileSync(existingDockerfile, "utf-8");
@@ -187,6 +265,7 @@ export function detectOrGenerateDockerfile(
     };
   }
 
+  // 3. Node.js / Next.js / Static SPA
   const pkgJsonPath = path.join(repoDir, "package.json");
   if (fs.existsSync(pkgJsonPath)) {
     const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf-8"));
@@ -195,7 +274,6 @@ export function detectOrGenerateDockerfile(
     const hasBuild = Boolean(scripts.build);
     const hasStart = Boolean(scripts.start);
 
-    // Check if static Vite / SPA without server start script
     const isStaticSpa =
       (deps.vite || deps["react-scripts"] || deps.astro) && hasBuild && !hasStart && !deps.next;
 
@@ -223,11 +301,13 @@ CMD ["nginx", "-g", "daemon off;"]
 
     const port = overridePort || 3000;
     const buildStep = hasBuild ? "RUN npm run build" : "";
+    const safeMain =
+      pkg.main && /^[a-zA-Z0-9_./-]+$/.test(String(pkg.main))
+        ? String(pkg.main)
+        : "index.js";
     const startCmd = hasStart
       ? '["npm", "start"]'
-      : pkg.main
-        ? `["node", "${pkg.main}"]`
-        : '["node", "index.js"]';
+      : `["node", "${safeMain}"]`;
 
     const df = `FROM node:22-alpine
 WORKDIR /app
@@ -248,6 +328,7 @@ CMD ${startCmd}
     };
   }
 
+  // 4. Python (FastAPI / Flask / Django / Script)
   const reqTxt = path.join(repoDir, "requirements.txt");
   const pyproject = path.join(repoDir, "pyproject.toml");
   if (fs.existsSync(reqTxt) || fs.existsSync(pyproject)) {
@@ -277,6 +358,7 @@ CMD ${cmd}
     };
   }
 
+  // 5. Go
   if (fs.existsSync(path.join(repoDir, "go.mod"))) {
     const port = overridePort || 8080;
     const df = `FROM golang:1.23-alpine AS builder
@@ -301,6 +383,7 @@ CMD ["/app/server"]
     };
   }
 
+  // 6. Static HTML
   if (fs.existsSync(path.join(repoDir, "index.html"))) {
     const port = overridePort || 80;
     const df = `FROM nginx:alpine
@@ -317,6 +400,6 @@ CMD ["nginx", "-g", "daemon off;"]
   }
 
   throw new Error(
-    "Could not auto-detect stack in repository (no Dockerfile, package.json, requirements.txt, pyproject.toml, go.mod, or index.html found)."
+    "Could not auto-detect stack in repository (no docker-compose.yml, Dockerfile, package.json, requirements.txt, pyproject.toml, go.mod, or index.html found)."
   );
 }

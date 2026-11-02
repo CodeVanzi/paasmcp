@@ -4,25 +4,26 @@
 [![Node.js >= 20](https://img.shields.io/badge/Node.js-%3E%3D20.0.0-brightgreen)](https://nodejs.org)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-purple)](https://modelcontextprotocol.io)
 
-> **Turn any Linux server or Homelab into a Render / Railway experience operated directly by AI Agents via MCP (Model Context Protocol) or CLI — with zero idle RAM overhead.**  
+> **Turn any Linux server or Homelab into a modern automated Cloud PaaS operated directly by AI Agents via MCP (Model Context Protocol) or Humans via a sleek Web Control Plane — with zero idle RAM overhead.**  
 > 🇧🇷 **[Leia a Documentação Completa em Português aqui (docs/PT-BR.md)](./docs/PT-BR.md)**
 
 ---
 
 ## 💡 Why PaaSMCP?
 
-Self-hosted PaaS dashboards like Coolify, Dokploy, and CapRover are great for manual clicking, but they:
-1. Consume **300MB–1GB+ of RAM** continuously just to run their web control planes and internal databases.
+Traditional self-hosted PaaS dashboards are great for manual clicking, but they:
+1. Consume **300MB–1GB+ of RAM** continuously just to run their control plane daemons and internal queues.
 2. Require manual multi-step setup for SSH deploy keys, database bindings, and Cloudflare Tunnel / Zero Trust rules.
 3. Were **not designed from day one to be operated by AI Agents via MCP**.
 
-**PaaSMCP** takes a radically lightweight, **Agent-First** approach:
+**PaaSMCP** takes a radically lightweight, **Agent-First & Security-First** approach:
 - **0 MB Idle Daemon Overhead:** Runs on-demand via MCP stdio or CLI, orchestrating native Docker Compose stacks directly on your host.
-- **AES-256-GCM Encrypted Secrets Vault:** Secrets are encrypted at rest (`/opt/homelab/paasmcp/vault/<app>.enc.json`) with a `0600` master key. Values are masked in MCP outputs (`sk_l****def`) and can be ingested directly from files so sensitive keys never pass through LLM chat histories.
-- **Instant Multi-Tenant Databases:** Provision isolated PostgreSQL 16 databases (`db_<app>` + `user_<app>`) or Redis 7 logical instances in 1 second, automatically injecting `DATABASE_URL` and `REDIS_URL` into the app's encrypted vault.
-- **Zero-Config Buildpacks:** Automatically builds repositories with a custom `Dockerfile` or generates optimized multi-stage Dockerfiles for **Node.js, Next.js, Vite/React/Astro SPAs, Python (FastAPI/Flask/Django), Go, and Static HTML**.
-- **Built-in Web Control Plane (`paasmcp-dashboard`):** Optional ultra-lightweight dark-mode web dashboard (protected by `DASHBOARD_TOKEN` + Cloudflare Zero Trust Access) that can be hosted on its own subdomain (`paas.example.com`) to visually deploy apps, inspect logs, manage encrypted Vault secrets, and provision databases.
-- **1-Call Secure Internet Exposure:** Automatically updates **Cloudflare Tunnel (`cloudflared`)** ingress rules, creates proxied CNAME DNS records, attaches **Cloudflare Zero Trust Access (Email OTP)** policies, or exposes privately on your **Tailscale Tailnet (`Tailscale Serve`)**.
+- **AES-256-GCM Encrypted Secrets & Backups Vault:** Secrets (`/opt/homelab/paasmcp/vault/<app>.enc.json`) and database snapshots (`/opt/homelab/paasmcp/backups/<id>.enc.bak`) are encrypted at rest with a `0600` master key. Values are masked in MCP outputs (`sk_l****def`) and can be ingested directly from files so sensitive keys never pass through LLM chat histories.
+- **Instant Multi-Tenant Databases + Encrypted Snapshots:** Provision isolated PostgreSQL 16 databases (`db_<app>` + `user_<app>`) or Redis 7 logical instances in 1 second, automatically injecting `DATABASE_URL` and `REDIS_URL`, with 1-click encrypted `pg_dump` backup & zero-plaintext-disk restore.
+- **Zero-Config Buildpacks + Multi-Service Docker Compose Pass-Through:** Automatically builds repositories with a custom `Dockerfile`, sanitized multi-service `docker-compose.yml` (stripping unsafe `privileged`/`host` flags and injecting Vault secrets), or generates optimized multi-stage Dockerfiles for **Node.js, Next.js, Vite/React/Astro SPAs, Python (FastAPI/Flask/Django), Go, and Static HTML**.
+- **1-Second Image Rollback & `paas_doctor` Diagnostics:** Automatically tags the previous working image (`paasmcp/<app>:previous`) before every deploy for instant 1-second rollback, and inspects containers for `OOMKilled`, crash-loops, and live CPU/RAM metrics (`docker stats`).
+- **Multi-Server HA Handshake & Federation:** Pair a secondary server (e.g., a low-cost VPS or second homelab node) using a signed `paasmcp-join://` token (`HMAC-SHA256` + SSH fingerprint) for **Active-Active Cloudflare Tunnel failover** or **Encrypted Warm-Standby sync**.
+- **Built-in Workspace Web UI (`paasmcp-dashboard`):** Optional ultra-lightweight dark/light web workspace (protected by constant-time `DASHBOARD_TOKEN`, login rate-limiting, CSP headers, and Cloudflare Zero Trust Access) with built-in **GitHub Push Webhook (`X-Hub-Signature-256`)** auto-deploy receiver.
 
 ---
 
@@ -30,26 +31,29 @@ Self-hosted PaaS dashboards like Coolify, Dokploy, and CapRover are great for ma
 
 ```mermaid
 flowchart LR
-    Agent["AI Agent (T3 Code / Claude / Cursor)"] <-->|Stdio JSON-RPC| MCP["PaaSMCP MCP Server & CLI"]
+    Agent["AI Agent (MCP Client)"] <-->|Stdio JSON-RPC| MCP["PaaSMCP MCP Server & CLI"]
+    Human["Developer / Operator"] <-->|HTTPS + Zero Trust| Dash["PaaSMCP Workspace UI\n127.0.0.1:4099"]
+    GitHub["GitHub Repositories"] -->|Push Webhook HMAC-SHA256| Dash
     
-    subgraph Server ["Self-Hosted Linux Server / Homelab"]
-        MCP --> Vault["AES-256-GCM Vault (.enc.json)"]
-        MCP --> SSH["SSH Ed25519 Deploy Keys"]
-        MCP --> Builder["Zero-Config Buildpack Engine"]
+    subgraph Server1 ["Primary Linux Server / Homelab"]
+        MCP --> Vault["AES-256-GCM Vault & Backups"]
+        Dash --> MCP
         
         subgraph Docker ["Docker Engine (homelab-network)"]
             PG[("Shared PostgreSQL 16\n127.0.0.1:5432")]
             RD[("Shared Redis 7\n127.0.0.1:6379")]
             App1["App Container 1\n127.0.0.1:4000"]
-            App2["App Container 2\n127.0.0.1:4001"]
             CF["cloudflared-tunnel"]
         end
     end
 
-    SSH -->|Clone Private Repo| GitHub["GitHub Repositories"]
-    App1 --> PG
-    App1 --> RD
-    CF <-->|QUIC Outbound Tunnel| Cloudflare["Cloudflare Edge + Zero Trust Access"]
+    subgraph Server2 ["Optional Replica Server (VPS / Node 2)"]
+        Peer["PaaSMCP Replica Node"]
+    end
+
+    MCP <-->|Encrypted Sync Bundle\npaasmcp-join:// Handshake| Peer
+    CF <-->|Multi-Connector QUIC Tunnel| Cloudflare["Cloudflare Edge + Zero Trust Access"]
+    Peer <-->|Failover QUIC Tunnel| Cloudflare
 ```
 
 ---
@@ -70,9 +74,9 @@ cd paasmcp
 
 ---
 
-## 🔌 MCP Server Configuration
+## 🔌 MCP Server Configuration (15 Tools)
 
-Add `paasmcp` to your MCP client configuration (`claude_desktop_config.json`, Cursor, T3 Code, Windsurf, etc.):
+Add `paasmcp` to your MCP client configuration:
 
 ```json
 {
@@ -85,30 +89,33 @@ Add `paasmcp` to your MCP client configuration (`claude_desktop_config.json`, Cu
 }
 ```
 
-### Available MCP Tools (12 Tools)
+### Available MCP Tools
 
 | Tool | Description |
 | :--- | :--- |
-| `paas_system_status` | Returns server hardware stats (CPU/RAM/Disk), SSH public deploy key, masked system tokens, databases, and apps. |
+| `paas_system_status` | Returns server hardware stats (CPU/RAM/Disk), live per-container CPU/RAM (`docker stats`), SSH deploy key, masked tokens, DBs, backups, and federation state. |
 | `paas_bootstrap` | Initializes `/opt/homelab/paasmcp`, master encryption key, SSH deploy key, Docker network, and shared Postgres/Redis. |
-| `paas_dashboard` | Starts the built-in Web Control Plane Dashboard (`127.0.0.1:4099`) and optionally exposes it on a subdomain (`zero-trust`, `public`, or `tailscale`). |
+| `paas_dashboard` | Starts the Web Workspace UI (`127.0.0.1:4099`) + GitHub Webhook receiver and optionally exposes it (`zero-trust`, `public`, or `tailscale`). |
 | `paas_configure` | Configures Cloudflare `accountId`, `tunnelId`, `baseDomain`, `zeroTrustEmails`, and `tailscaleDomain`. |
-| `paas_github_key` | Retrieves the SSH Ed25519 public deploy key or auto-registers it on a GitHub repository via API. |
+| `paas_github_key` | Retrieves the SSH Ed25519 public deploy key + SHA256 fingerprint or auto-registers it on a GitHub repository via API. |
 | `paas_secret_set` | Encrypts and stores secrets in AES-256-GCM Vault (from key-values, `.env`, or secret file path). |
 | `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`). |
 | `paas_secret_delete` | Deletes a secret key from the encrypted vault. |
 | `paas_db_provision` | Creates an isolated PostgreSQL or Redis database and binds `DATABASE_URL` / `REDIS_URL` into the app's vault. |
-| `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds image, injects secrets + DB, starts container, and syncs Homepage. |
+| `paas_db_backup` | Creates, lists, or restores AES-256-GCM encrypted `pg_dump` / Redis snapshots with SHA-256 integrity verification. |
+| `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds Dockerfile or sanitized `docker-compose.yml`, sets CPU/RAM limits, tags `:previous` image, and starts containers. |
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
-| `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, or `destroy`. |
+| `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), or `destroy`. |
+| `paas_doctor` | Diagnoses `OOMKilled` events, crash-loops, non-zero exit codes, and recent error logs across all containers. |
+| `paas_node_federation` | Generates signed `paasmcp-join://` tokens, pairs secondary servers, and exports/imports encrypted Vault & State sync bundles. |
 
 ---
 
 ## 💻 CLI Reference
 
 ```bash
-# Initialize PaaSMCP and start shared Postgres & Redis clusters
-paasmcp init --postgres --redis
+# Initialize PaaSMCP and start shared Postgres, Redis & Web Workspace
+paasmcp init --postgres --redis --dashboard
 
 # Configure Cloudflare Tunnel & Domain settings
 paasmcp config --account-id <CF_ACCOUNT_ID> --tunnel-id <CF_TUNNEL_ID> --domain example.com --zero-trust-emails you@example.com
@@ -116,18 +123,21 @@ paasmcp config --account-id <CF_ACCOUNT_ID> --tunnel-id <CF_TUNNEL_ID> --domain 
 # Store platform tokens in the encrypted 'system' vault
 paasmcp secret set system CF_API_TOKEN=your_cf_token GITHUB_TOKEN=your_gh_token
 
-# Register SSH Deploy Key on a private GitHub repository
-paasmcp github-key owner/my-private-saas
+# Deploy an app from GitHub with PostgreSQL and 512MB RAM limit
+paasmcp deploy my-saas owner/my-private-saas --branch main --postgres --memory 512m --cpus 1.0
 
-# Deploy an app from GitHub with automatic PostgreSQL provisioning
-paasmcp deploy my-saas owner/my-private-saas --branch main --postgres
+# Create an encrypted database snapshot & restore if needed
+paasmcp db-backup create my-saas postgres
+paasmcp db-backup list
+paasmcp db-backup restore <backup-id>
 
-# Expose on https://my-saas.example.com (public or zero-trust)
-paasmcp expose my-saas public my-saas
+# Run health diagnostics or 1-second rollback
+paasmcp doctor
+paasmcp rollback my-saas
 
-# View logs or manage container lifecycle
-paasmcp logs my-saas
-paasmcp restart my-saas
+# Pair a secondary server for High Availability (HA)
+paasmcp node invite https://paas.example.com --mode active-active-tunnel
+paasmcp node join paasmcp-join://...
 ```
 
 ---
@@ -135,8 +145,9 @@ paasmcp restart my-saas
 ## 📚 Additional Documentation
 
 - 🇧🇷 **[Guia Completo em Português (`docs/PT-BR.md`)](./docs/PT-BR.md)**
-- 🏛️ **[Technical Architecture & Security Model (`docs/ARCHITECTURE.md`)](./docs/ARCHITECTURE.md)**
-- 🤝 **[Contributing & Roadmap (`CONTRIBUTING.md`)](./CONTRIBUTING.md)**
+- 🏛️ **[Technical Architecture, Security Model & Roadmap Specs (`docs/ARCHITECTURE.md`)](./docs/ARCHITECTURE.md)**
+- 🤝 **[Contributing & Detailed Roadmap for Developers / LLMs (`CONTRIBUTING.md`)](./CONTRIBUTING.md)**
+- 🤖 **[AI Agent Development Rules (`AGENTS.md`)](./AGENTS.md)**
 
 ---
 

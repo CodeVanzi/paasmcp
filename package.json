@@ -14,7 +14,7 @@
     "cloudflare-tunnel",
     "tailscale",
     "ai-agents",
-    "render-alternative"
+    "micro-paas"
   ],
   "type": "module",
   "engines": {

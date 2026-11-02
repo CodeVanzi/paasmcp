@@ -1,5 +1,14 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+
+export interface AppMetrics {
+  cpuPercent: string;
+  memUsage: string;
+  memPercent: string;
+  netIO: string;
+  pids: string;
+}
 
 export interface AppRecord {
   name: string;
@@ -19,6 +28,12 @@ export interface AppRecord {
   createdAt: string;
   updatedAt: string;
   status?: string;
+  lastCommit?: string;
+  previousImageTag?: string;
+  composePassThrough?: boolean;
+  memoryLimit?: string;
+  cpuLimit?: string;
+  lastWebhookAt?: string;
 }
 
 export interface DatabaseRecord {
@@ -32,6 +47,37 @@ export interface DatabaseRecord {
   port: number;
   localPort: number;
   createdAt: string;
+}
+
+export interface BackupRecord {
+  id: string;
+  appName: string;
+  databaseName: string;
+  engine: "postgres" | "redis";
+  filePath: string;
+  sizeBytes: number;
+  sha256: string;
+  encrypted: boolean;
+  createdAt: string;
+}
+
+export interface FederationPeerRecord {
+  nodeId: string;
+  name: string;
+  endpointUrl: string;
+  mode: "active-active-tunnel" | "warm-standby";
+  publicKeyFingerprint: string;
+  pairedAt: string;
+  lastSyncAt?: string;
+  status: "online" | "standby" | "unreachable";
+}
+
+export interface FederationConfig {
+  nodeId: string;
+  nodeName: string;
+  role: "standalone" | "primary" | "replica";
+  redundancyMode: "active-active-tunnel" | "warm-standby";
+  peers: Record<string, FederationPeerRecord>;
 }
 
 export interface CloudflareConfig {
@@ -49,6 +95,8 @@ export interface PaaSState {
   cloudflare: CloudflareConfig;
   apps: Record<string, AppRecord>;
   databases: Record<string, DatabaseRecord>;
+  backups?: Record<string, BackupRecord>;
+  federation?: FederationConfig;
 }
 
 export const HOMELAB_ROOT = process.env.PAASMCP_ROOT || "/opt/homelab";
@@ -56,6 +104,7 @@ export const PAAS_DATA_DIR = path.join(HOMELAB_ROOT, "paasmcp");
 export const PAAS_APPS_DIR = path.join(HOMELAB_ROOT, "apps");
 export const PAAS_VAULT_DIR = path.join(PAAS_DATA_DIR, "vault");
 export const PAAS_SSH_DIR = path.join(PAAS_DATA_DIR, "ssh");
+export const PAAS_BACKUPS_DIR = path.join(PAAS_DATA_DIR, "backups");
 export const PAAS_DB_DIR = path.join(HOMELAB_ROOT, "paasmcp-postgres");
 export const PAAS_REDIS_DIR = path.join(HOMELAB_ROOT, "paasmcp-redis");
 export const MASTER_KEY_PATH = path.join(PAAS_DATA_DIR, ".master.key");
@@ -73,7 +122,13 @@ export const DEFAULT_BASE_DOMAIN = process.env.PAASMCP_BASE_DOMAIN || "example.c
 export const DOCKER_NETWORK = process.env.PAASMCP_DOCKER_NETWORK || "homelab-network";
 
 export function ensureDirectories(): void {
-  for (const dir of [PAAS_DATA_DIR, PAAS_APPS_DIR, PAAS_VAULT_DIR, PAAS_SSH_DIR]) {
+  for (const dir of [
+    PAAS_DATA_DIR,
+    PAAS_APPS_DIR,
+    PAAS_VAULT_DIR,
+    PAAS_SSH_DIR,
+    PAAS_BACKUPS_DIR,
+  ]) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
@@ -84,7 +139,7 @@ export function loadState(): PaaSState {
   ensureDirectories();
   if (!fs.existsSync(STATE_FILE_PATH)) {
     const initial: PaaSState = {
-      version: 1,
+      version: 2,
       initializedAt: new Date().toISOString(),
       cloudflare: {
         accountId: DEFAULT_CF_ACCOUNT_ID,
@@ -95,12 +150,31 @@ export function loadState(): PaaSState {
       },
       apps: {},
       databases: {},
+      backups: {},
+      federation: {
+        nodeId: `node-${crypto.randomBytes(4).toString("hex")}`,
+        nodeName: "primary-node",
+        role: "standalone",
+        redundancyMode: "active-active-tunnel",
+        peers: {},
+      },
     };
     saveState(initial);
     return initial;
   }
   const raw = fs.readFileSync(STATE_FILE_PATH, "utf-8");
-  return JSON.parse(raw) as PaaSState;
+  const parsed = JSON.parse(raw) as PaaSState;
+  if (!parsed.backups) parsed.backups = {};
+  if (!parsed.federation) {
+    parsed.federation = {
+      nodeId: `node-${crypto.randomBytes(4).toString("hex")}`,
+      nodeName: "primary-node",
+      role: "standalone",
+      redundancyMode: "active-active-tunnel",
+      peers: {},
+    };
+  }
+  return parsed;
 }
 
 export function saveState(state: PaaSState): void {
@@ -116,14 +190,14 @@ export function updatePlatformConfig(opts: {
   tailscaleDomain?: string;
 }): PaaSState {
   const state = loadState();
-  if (opts.accountId !== undefined) state.cloudflare.accountId = opts.accountId;
-  if (opts.tunnelId !== undefined) state.cloudflare.tunnelId = opts.tunnelId;
-  if (opts.baseDomain !== undefined) state.cloudflare.baseDomain = opts.baseDomain;
+  if (opts.accountId !== undefined) state.cloudflare.accountId = opts.accountId.trim();
+  if (opts.tunnelId !== undefined) state.cloudflare.tunnelId = opts.tunnelId.trim();
+  if (opts.baseDomain !== undefined) state.cloudflare.baseDomain = opts.baseDomain.trim();
   if (opts.zeroTrustEmails !== undefined) {
-    state.cloudflare.zeroTrustEmails = opts.zeroTrustEmails;
+    state.cloudflare.zeroTrustEmails = opts.zeroTrustEmails.map((e) => e.trim()).filter(Boolean);
   }
   if (opts.tailscaleDomain !== undefined) {
-    state.tailscaleDomain = opts.tailscaleDomain;
+    state.tailscaleDomain = opts.tailscaleDomain.trim();
   }
   saveState(state);
   return state;
@@ -136,23 +210,62 @@ export function allocateAppPort(state: PaaSState, existingAppName?: string): num
   const usedPorts = new Set<number>(
     Object.values(state.apps).map((a) => a.localPort)
   );
-  // Start at 4000 to avoid any collision with standard administrative ports
-  for (let port = 4000; port <= 4999; port++) {
+  // Reserve 4099 for paasmcp-dashboard; allocate 4000-4998 for user apps
+  for (let port = 4000; port <= 4998; port++) {
     if (!usedPorts.has(port)) {
       return port;
     }
   }
-  throw new Error("No available ports in range 4000-4999");
+  throw new Error("No available ports in range 4000-4998");
 }
 
 export function sanitizeSlug(name: string): string {
-  const slug = name
+  const slug = String(name || "")
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
+    .replace(/^-|-$/g, "")
+    .slice(0, 63);
   if (!slug) {
     throw new Error(`Invalid application or database name: "${name}"`);
   }
   return slug;
+}
+
+export function validateEnvKey(key: string): string {
+  const clean = String(key || "").trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(clean)) {
+    throw new Error(
+      `Invalid environment variable key "${clean}". Keys must match ^[A-Za-z_][A-Za-z0-9_]*$.`
+    );
+  }
+  return clean;
+}
+
+export function validateBranchName(branch: string): string {
+  const clean = String(branch || "main").trim();
+  if (
+    !clean ||
+    clean.startsWith("-") ||
+    clean.includes("..") ||
+    !/^[A-Za-z0-9._/-]+$/.test(clean)
+  ) {
+    throw new Error(`Invalid Git branch or ref name: "${branch}"`);
+  }
+  return clean;
+}
+
+export function validateResourceLimit(limit?: string, type: "memory" | "cpu" = "memory"): string | undefined {
+  if (!limit) return undefined;
+  const clean = limit.trim().toLowerCase();
+  if (type === "memory") {
+    if (!/^\d+[kmg]b?$/.test(clean)) {
+      throw new Error(`Invalid memory limit "${limit}". Expected format like "256m", "512m", or "2g".`);
+    }
+    return clean;
+  }
+  if (!/^\d+(\.\d+)?$/.test(clean) || Number(clean) <= 0 || Number(clean) > 128) {
+    throw new Error(`Invalid CPU limit "${limit}". Expected positive number like "0.5", "1", or "2".`);
+  }
+  return clean;
 }
