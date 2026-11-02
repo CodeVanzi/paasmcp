@@ -995,9 +995,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               </div>
               <div class="examples-bar">
                 <span id="lblQuickFillDeploy">⚡ Presets:</span>
-                <button class="chip" onclick="fillDeployExample('meu-saas', 'seu-usuario/meu-saas', 'main', true, false, '512m', '1.0')">SaaS Next.js + PG (512MB)</button>
-                <button class="chip" onclick="fillDeployExample('api-worker', 'seu-usuario/api-compose', 'main', true, true, '1g', '2.0')">Multi-Service Compose + PG + Redis</button>
-                <button class="chip" onclick="fillDeployExample('landing', 'seu-usuario/landing', 'main', false, false, '256m', '0.5')">SPA / Site Estático</button>
+                <button class="chip" id="presetSaas" onclick="fillDeployExample('meu-saas', 'seu-usuario/meu-saas', 'main', true, false, '512m', '1.0')">SaaS Next.js + PG (512MB)</button>
+                <button class="chip" id="presetCompose" onclick="fillDeployExample('api-worker', 'seu-usuario/api-compose', 'main', true, true, '1g', '2.0')">Multi-Service Compose + PG + Redis</button>
+                <button class="chip" id="presetSpa" onclick="fillDeployExample('landing', 'seu-usuario/landing', 'main', false, false, '256m', '0.5')">SPA / Site Estático</button>
               </div>
               <div class="form-grid">
                 <div>
@@ -1080,7 +1080,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
             </div>
             <div class="examples-bar">
               <span id="lblVaultScopes">⚡ Escopos:</span>
-              <button class="chip" onclick="setVaultScope('system')">⚙️ system (Global Tokens)</button>
+              <button class="chip" id="chipSystemScope" onclick="setVaultScope('system')">⚙️ system (Global Tokens)</button>
               <span id="dynamicScopeChips"></span>
             </div>
             <div class="form-grid">
@@ -1244,16 +1244,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 }</pre>
             <div class="arch-grid" style="margin-top:16px;">
               <div class="arch-box">
-                <h3>💬 Deploy & Banco 1-Click</h3>
-                <p>"Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>"</p>
+                <h3 id="promptEx1Title">💬 Deploy & Banco 1-Click</h3>
+                <p id="promptEx1Desc">"Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>"</p>
               </div>
               <div class="arch-box">
-                <h3>💬 Backup & Rollback</h3>
-                <p>"Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro"</p>
+                <h3 id="promptEx2Title">💬 Backup & Rollback</h3>
+                <p id="promptEx2Desc">"Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro"</p>
               </div>
               <div class="arch-box">
-                <h3>💬 Diagnóstico & Multi-Node</h3>
-                <p>"Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA"</p>
+                <h3 id="promptEx3Title">💬 Diagnóstico & Multi-Node</h3>
+                <p id="promptEx3Desc">"Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA"</p>
               </div>
             </div>
           </div>
@@ -1265,20 +1265,20 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
             </div>
             <div class="arch-grid">
               <div class="arch-box">
-                <h3>1. Isolamento Loopback (127.0.0.1)</h3>
-                <p>Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.</p>
+                <h3 id="archPillar1Title">1. Isolamento Loopback (127.0.0.1)</h3>
+                <p id="archPillar1Desc">Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.</p>
               </div>
               <div class="arch-box">
-                <h3>2. Cofre & Backups AES-256-GCM</h3>
-                <p>Variáveis de ambiente e dumps de banco (<code>pg_dump</code>) são criptografados em repouso com chave mestra <code>0600</code> e mascarados nas respostas do MCP.</p>
+                <h3 id="archPillar2Title">2. Cofre & Backups AES-256-GCM</h3>
+                <p id="archPillar2Desc">Variáveis de ambiente e dumps de banco (<code>pg_dump</code>) são criptografados em repouso com chave mestra <code>0600</code> e mascarados nas respostas do MCP.</p>
               </div>
               <div class="arch-box">
-                <h3>3. Sanitização de Docker Compose</h3>
-                <p>Repositórios multi-serviço têm seus arquivos Compose auditados automaticamente, removendo <code>privileged: true</code>, <code>network_mode: host</code> e mounts inseguros.</p>
+                <h3 id="archPillar3Title">3. Sanitização de Docker Compose</h3>
+                <p id="archPillar3Desc">Repositórios multi-serviço têm seus arquivos Compose auditados automaticamente, removendo <code>privileged: true</code>, <code>network_mode: host</code> e mounts inseguros.</p>
               </div>
               <div class="arch-box">
-                <h3>4. Redundância Multi-Servidor</h3>
-                <p>Dois servidores podem parear via handshake HMAC-SHA256 e operar em <strong>Active-Active</strong> no mesmo Cloudflare Tunnel ou em <strong>Warm Standby</strong>.</p>
+                <h3 id="archPillar4Title">4. Redundância Multi-Servidor</h3>
+                <p id="archPillar4Desc">Dois servidores podem parear via handshake HMAC-SHA256 e operar em <strong>Active-Active</strong> no mesmo Cloudflare Tunnel ou em <strong>Warm Standby</strong>.</p>
               </div>
             </div>
           </div>
@@ -1404,6 +1404,24 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         statAppsDbs: "Apps & Bancos Isolados",
         statSnapshots: "Snapshots Criptografados",
         statSecurityFed: "Segurança & Federação",
+        presetSaas: "SaaS Next.js + PG (512MB)",
+        presetCompose: "Multi-Service Compose + PG + Redis",
+        presetSpa: "SPA / Site Estático",
+        chipSystemScope: "⚙️ system (Tokens Globais)",
+        promptEx1Title: "💬 Deploy & Banco 1-Click",
+        promptEx1Desc: "\"Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>\"",
+        promptEx2Title: "💬 Backup & Rollback",
+        promptEx2Desc: "\"Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro\"",
+        promptEx3Title: "💬 Diagnóstico & Multi-Node",
+        promptEx3Desc: "\"Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA\"",
+        archPillar1Title: "1. Isolamento Loopback (127.0.0.1)",
+        archPillar1Desc: "Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.",
+        archPillar2Title: "2. Cofre & Backups AES-256-GCM",
+        archPillar2Desc: "Variáveis de ambiente e dumps de banco (<code>pg_dump</code>) são criptografados em repouso com chave mestra <code>0600</code> e mascarados nas respostas do MCP.",
+        archPillar3Title: "3. Sanitização de Docker Compose",
+        archPillar3Desc: "Repositórios multi-serviço têm seus arquivos Compose auditados automaticamente, removendo <code>privileged: true</code>, <code>network_mode: host</code> e mounts inseguros.",
+        archPillar4Title: "4. Redundância Multi-Servidor",
+        archPillar4Desc: "Dois servidores podem parear via handshake HMAC-SHA256 e operar em <strong>Active-Active</strong> no mesmo Cloudflare Tunnel ou em <strong>Warm Standby</strong>.",
         emptyApps: "Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!",
         emptyDbs: "Nenhum banco provisionado ainda.",
         emptyBackups: "Nenhum snapshot criptografado criado ainda.",
@@ -1537,6 +1555,24 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         statAppsDbs: "Isolated Apps & DBs",
         statSnapshots: "Encrypted Snapshots",
         statSecurityFed: "Security & Federation",
+        presetSaas: "SaaS Next.js + PG (512MB)",
+        presetCompose: "Multi-Service Compose + PG + Redis",
+        presetSpa: "SPA / Static Site",
+        chipSystemScope: "⚙️ system (Global Tokens)",
+        promptEx1Title: "💬 1-Click Deploy & Database",
+        promptEx1Desc: "\"Deploy repository <code>user/my-saas</code> with PostgreSQL, 512m RAM limit, and publish on <code>saas.{domain}</code>\"",
+        promptEx2Title: "💬 Backup & Rollback",
+        promptEx2Desc: "\"Create an encrypted database backup for app <code>my-saas</code> before upgrading and rollback if it fails\"",
+        promptEx3Title: "💬 Diagnostics & Multi-Node",
+        promptEx3Desc: "\"Run <code>paas_doctor</code> to check if any container suffered an OOMKill and generate an HA pairing token\"",
+        archPillar1Title: "1. Loopback Isolation (127.0.0.1)",
+        archPillar1Desc: "No application or database ports are exposed on <code>0.0.0.0</code>. External traffic enters exclusively via outbound QUIC tunnels (Cloudflare Tunnel) or Tailscale.",
+        archPillar2Title: "2. AES-256-GCM Vault & Backups",
+        archPillar2Desc: "Environment variables and database dumps (<code>pg_dump</code>) are encrypted at rest with a <code>0600</code> master key and masked in MCP responses.",
+        archPillar3Title: "3. Docker Compose Sanitization",
+        archPillar3Desc: "Multi-service repositories have their Compose manifests audited automatically, stripping <code>privileged: true</code>, <code>network_mode: host</code>, and insecure mounts.",
+        archPillar4Title: "4. Multi-Server Redundancy",
+        archPillar4Desc: "Two servers can pair via HMAC-SHA256 handshake and operate in <strong>Active-Active</strong> on the same Cloudflare Tunnel or in <strong>Warm Standby</strong>.",
         emptyApps: "No hosted applications yet. Use one of the presets below to get started!",
         emptyDbs: "No databases provisioned yet.",
         emptyBackups: "No encrypted snapshots created yet.",
@@ -1591,6 +1627,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       'fedTitle', 'fedDesc', 'lblFedUrl', 'lblFedMode', 'optFedActive', 'optFedWarm', 'btnGenInvite', 'btnExportSync', 'lblJoinPeer', 'btnJoinPeer',
       'whTitle', 'whDesc', 'lblWhUrl', 'lblWhSecret', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
       'doctorTitle', 'doctorDesc', 'btnRunDoctor',
+      'presetSaas', 'presetCompose', 'presetSpa', 'chipSystemScope',
+      'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
+      'archPillar1Title', 'archPillar1Desc', 'archPillar2Title', 'archPillar2Desc', 'archPillar3Title', 'archPillar3Desc', 'archPillar4Title', 'archPillar4Desc',
       'agentsTitle', 'agentsDesc', 'archTitle', 'archDesc', 'logsTitle', 'btnCloseLogs'
     ];
 
@@ -1670,6 +1709,39 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
             el.textContent = val;
           }
         }
+      }
+
+
+      const placeholders = {
+        pt: {
+          depApp: "ex: meu-saas",
+          depRepo: "ex: seu-usuario/meu-repo",
+          depMem: "ex: 512m ou 1g",
+          depCpu: "ex: 0.5 ou 1.0",
+          expApp: "ex: meu-saas",
+          expSub: "ex: app",
+          secKey: "ex: STRIPE_SECRET_KEY",
+          dbApp: "ex: meu-saas",
+          bakApp: "ex: meu-saas",
+          fedUrl: "https://paas.seudominio.com"
+        },
+        en: {
+          depApp: "e.g.: my-saas",
+          depRepo: "e.g.: your-user/my-repo",
+          depMem: "e.g.: 512m or 1g",
+          depCpu: "e.g.: 0.5 or 1.0",
+          expApp: "e.g.: my-saas",
+          expSub: "e.g.: app",
+          secKey: "e.g.: STRIPE_SECRET_KEY",
+          dbApp: "e.g.: my-saas",
+          bakApp: "e.g.: my-saas",
+          fedUrl: "https://paas.yourdomain.com"
+        }
+      };
+      const phMap = placeholders[currentLang] || placeholders.pt;
+      for (const [id, val] of Object.entries(phMap)) {
+        const inputEl = document.getElementById(id);
+        if (inputEl) inputEl.placeholder = val;
       }
 
       if (lastStatus) renderStatusData(lastStatus);
