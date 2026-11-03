@@ -381,7 +381,6 @@ export async function deployApp(opts: DeployOptions): Promise<{
   hostAccessKept?: string[];
   hint?: string;
 }> {
-  ensureDockerNetwork();
   const slug = sanitizeSlug(opts.appName);
   const branch = validateBranchName(opts.branch || "main");
   const memoryLimit = validateResourceLimit(opts.memoryLimit, "memory");
@@ -398,6 +397,8 @@ export async function deployApp(opts: DeployOptions): Promise<{
   if (state.apps[slug]?.trashedAt) {
     throw new Error(`App '${slug}' is in the trash. Restore it (action 'restore') or purge it before deploying again.`);
   }
+  // Docker comes after the checks above, so a refused deploy touches nothing.
+  ensureDockerNetwork();
   const trusted = opts.trusted ?? state.apps[slug]?.trusted ?? false;
   const localPort = allocateAppPort(state, slug);
   const appDir = path.join(PAAS_APPS_DIR, slug);

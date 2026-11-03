@@ -62,6 +62,7 @@ Every PR or AI Agent modification **must** enforce these rules:
 7. ✅ Email: one relay (Brevo, SES…) configured once (`paasmcp email set`, password never on the command line), `paas_email_provision` injects SMTP_* / EMAIL_FROM / EMAIL_URL / BREVO_API_KEY per app, `email test` with a dependency-free SMTP client that refuses to authenticate without TLS. Open: per-app credentials (today every app holds the relay key; a local relay container would isolate them).
 8. ✅ Updater (`src/updater.ts`, `paas_update`, `paasmcp update`; tested on a real container: 16.15 → 16.10 with data kept, then a broken image rolled back in 61 s). Not covered: cloudflared (host package) and the dashboard base image. Original text: Updater: pinned versions for Postgres/Redis/Garage/cloudflared, `paas_update check|apply` with backup, health check and rollback (mirror replicas first).
 9. ✅ (`src/poller.ts`, `scripts/dockerfile-lab.sh`, fixtures in `test/fixtures`; static/node/go/go-cmd built and served for real, vite/cra/python need package downloads and run on a real server) Remaining promises: GitHub polling mode (0 MB idle auto-deploy) and per-language tests for generated Dockerfiles.
+10. ✅ Blue/green deploy (blueprint item 2; `deployApp` in `src/deployer.ts`, lab: `scripts/bluegreen-lab.sh`). Every deploy runs the new image as a candidate (`docker compose run`) on a free loopback port and needs `GET healthcheckPath` < 500 within 20 s (`healthcheckTimeoutSeconds`, max 300); a failure keeps the running version, puts `:latest` back on its image and returns the candidate's logs (`HealthcheckFailedError`). During the swap the candidate holds the container name as a network alias, so the Cloudflare Tunnel path keeps a healthy target. Changed from the plan: `exposure.ts` needed no change; the running image is held as `:pre-deploy` because the containerd image store drops untagged images. Open: the loopback port (`tailscale serve`) still has the ~0.5 s recreate gap; apps without HTTP use `skipHealthcheck`.
 
 ## 🗺️ Next Improvements Blueprint (For LLMs & Contributors)
 
@@ -73,15 +74,8 @@ Each item below is designed to preserve **0 MB Idle Daemon Overhead** while expa
   - **Files:** `src/deployer.ts`, `src/database.ts`, `src/exposure.ts`, `src/mcp-server.ts`.
   - **Logic:** Given `appName` and `prNumber` / `branch`, create a derived slug `${appName}-pr-${prNumber}`, clone the target branch, optionally clone the schema/data of `db_${appName}` into `db_${appName}_pr_${prNumber}` (`CREATE DATABASE ... TEMPLATE`), allocate an ephemeral port (`4500–4899`), and expose via `exposeApplication` with a `ttlHours` metadata field in `AppRecord`.
 
-### 2. Zero-Downtime Blue/Green Healthchecked Cutover (`deployApp` enhancement)
-- **Goal:** Eliminate the 1–2 second container recreation gap during `paas_app_deploy` and automatically abort if the new container fails its HTTP healthcheck.
-- **Implementation Spec:**
-  - **Files:** `src/deployer.ts`, `src/exposure.ts`.
-  - **Logic:**
-    1. Start the newly built image in a transient candidate container `paasmcp-${slug}-candidate` on an ephemeral loopback port.
-    2. Poll `http://127.0.0.1:${candidatePort}${healthcheckPath || "/"}` for up to 20 seconds.
-    3. If healthy (`status < 500`), swap the production container and promote `candidate` to `paasmcp-${slug}:latest`.
-    4. If unhealthy, capture the candidate's `stderr` logs, destroy the candidate container, leave the existing container untouched, and return the crash logs to the MCP agent.
+### 2. ✅ Zero-Downtime Blue/Green Healthchecked Cutover (`deployApp` enhancement)
+- **Done:** see item 10 in the roadmap above and "Blue/green cutover with healthcheck" in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
 
 ### 3. Serverless Scheduled Jobs / Cron Containers (`paas_job_schedule`)
 - **Goal:** Run periodic scripts (scrapers, billing jobs, cleanup workers) inside Docker with full access to Vault secrets and `paasmcp-postgres`, consuming **0 MB of RAM** when not executing.

@@ -1366,6 +1366,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <label class="field-label" id="lblDepCpu">Limite de vCPUs (Opcional)</label>
                   <input id="depCpu" placeholder="ex: 0.5 ou 1.0" />
                 </div>
+                <div>
+                  <label class="field-label" data-i18n="lblDepHealth"></label>
+                  <input id="depHealth" placeholder="/" />
+                </div>
               </div>
               <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; font-size:12.5px; flex-wrap:wrap;">
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
@@ -1387,6 +1391,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depEmail" style="width:auto;" />
                   <span data-i18n="lblDepEmail"></span>
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="depNoHealth" style="width:auto;" />
+                  <span data-i18n="lblDepNoHealth"></span>
                 </label>
               </div>
               <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
@@ -2519,6 +2527,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "lblDepPoll": "Atualizar sozinho quando eu mudar o código (confere a cada 2 min)",
           "lblDepStorage": "Criar espaço para arquivos",
           "lblDepEmail": "Deixar o app enviar e-mails",
+          "lblDepHealth": "Endereço de teste antes de trocar (Opcional)",
+          "lblDepNoHealth": "Não é um site (pular o teste antes de trocar)",
+          "deployHealthFailed": "A nova versão não passou no teste e NÃO foi colocada no ar. A versão anterior continua funcionando. Veja o erro do app abaixo:",
+          "guideAppsRollbackTitle": "🛡️ Troca segura + volta em 1s",
+          "guideAppsRollbackDesc": "Cada nova versão é testada antes de substituir a atual: se ela não responder, nada muda. E se aparecer um problema depois, dá para voltar à versão anterior em 1 segundo.",
           "emailTitle": "✉️ Envio de e-mails",
           "emailDesc": "E-mail enviado direto de casa cai no spam ou nem sai. Por isso o painel usa um serviço de envio, configurado uma vez para todos os apps.",
           "emailTip": "Sugestão: o Brevo tem plano gratuito de 300 e-mails por dia. Crie a conta, confirme seu domínio e copie os dados de SMTP. A senha fica cifrada e só é enviada por conexão segura.",
@@ -2704,6 +2717,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "lblDepPoll": "Update by itself when I change the code (checks every 2 min)",
           "lblDepStorage": "Create file space",
           "lblDepEmail": "Let the app send email",
+          "lblDepHealth": "Test address before switching (Optional)",
+          "lblDepNoHealth": "Not a website (skip the test before switching)",
+          "deployHealthFailed": "The new version failed its test and was NOT put live. The previous version is still running. The app's error is below:",
+          "guideAppsRollbackTitle": "🛡️ Safe switch + 1-second rollback",
+          "guideAppsRollbackDesc": "Every new version is tested before it replaces the current one: if it does not answer, nothing changes. If a problem shows up later, go back to the previous version in 1 second.",
           "emailTitle": "✉️ Email sending",
           "emailDesc": "Email sent straight from home lands in spam or never leaves. So the dashboard uses a sending service, set up once for all apps.",
           "emailTip": "Tip: Brevo has a free plan with 300 emails a day. Create the account, verify your domain and copy the SMTP details. The password is encrypted and only sent over a secure connection.",
@@ -3696,6 +3714,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       const cpuLimit = document.getElementById('depCpu').value.trim() || undefined;
       const withPostgres = document.getElementById('depPg').checked;
       const withRedis = document.getElementById('depRedis').checked;
+      const healthcheckPath = document.getElementById('depHealth').value.trim() || undefined;
+      // Only send the switch when ticked: an unticked box keeps what the app already has.
+      const skipHealthcheck = document.getElementById('depNoHealth').checked ? true : undefined;
       if (!appName || !repoSource) return;
       // Storage and e-mail go into the app's vault first, so this deploy already starts with them.
       if (document.getElementById('depStorage').checked && !(await postJson('/api/storage', { appName }))) return;
@@ -3707,10 +3728,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         const res = await fetch('/api/deploy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit })
+          body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit, healthcheckPath, skipHealthcheck })
         });
         const data = await res.json();
-        if (!res.ok) alert('Error: ' + data.error);
+        if (!res.ok) alert((/HealthcheckFailedError/.test(data.error) ? t('deployHealthFailed') + '\\n\\n' : 'Error: ') + data.error);
         else {
           if (document.getElementById('depPoll').checked) await postJson('/api/poll', { appName, on: true });
           showToast(t('toastDeployDone') + appName);
