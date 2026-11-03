@@ -39,6 +39,18 @@ Como a confirmação funciona com IA: a ferramenta MCP não executa e devolve um
 
 Na linha de comando, a pergunta aparece na tela; `--yes` serve para scripts nas confirmações comuns e `--confirm-name <nome>` nas fortes. Para a lixeira expirar sozinha, agende `paasmcp trash purge-expired` uma vez por dia (cron ou timer do systemd).
 
+### IA em outra máquina (MCP pela rede) e dois fatores no painel
+
+```bash
+paasmcp token create notebook --level deploy   # o token aparece uma vez; só o hash fica guardado
+paasmcp mcp serve --port 4098                  # escuta em 127.0.0.1 (ou --host tailscale)
+tailscale serve --bg --https=8443 http://127.0.0.1:4098
+```
+
+No cliente MCP (Claude Desktop/Code, Cursor, VS Code, Codex, clientes de modelos locais), use `https://<seu-servidor>.ts.net:8443/mcp` com o cabeçalho `Authorization: Bearer pmcp_...`. Níveis do token: `read` (só consultar), `deploy` (padrão: também implantar, criar banco, backup, expor por Tailscale/Zero Trust) e `destroy` (pode *pedir* ações arriscadas, que continuam precisando de uma pessoa). O MCP pela rede só escuta em `127.0.0.1` ou no endereço do Tailscale; ChatGPT e Claude.ai na web precisam de endereço público com login OAuth, que está planejado.
+
+`paasmcp dashboard 2fa enable` liga o código de 6 dígitos no painel (Aegis, Google Authenticator, 1Password…). Com ele ligado, o token sozinho não entra mais, e o painel pode ir para a internet aberta com confirmação forte. Sem 2FA, isso continua proibido.
+
 > Limite honesto: as confirmações protegem contra a IA agindo **pelo MCP**. Um agente que tem terminal no próprio servidor com acesso ao Docker (por exemplo um CLI de IA rodando lá) consegue contornar qualquer regra, porque o grupo `docker` equivale a root. Dê a esses agentes um usuário sem acesso ao Docker.
 
 ---

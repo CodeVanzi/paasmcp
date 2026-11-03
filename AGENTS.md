@@ -13,7 +13,10 @@
 - `src/federation.ts`: GitHub Push Webhook HMAC-SHA256 verification (`verifyGitHubWebhookSignature`, `handleGitHubPushWebhook`) and Multi-Server HA Handshake & Encrypted State/Vault Synchronization (`paasmcp-join://` tokens).
 - `src/exposure.ts`: Cloudflare Tunnel ingress API, Cloudflare DNS CNAME management, Cloudflare Zero Trust Access policy creation, and Tailscale Serve integration.
 - `src/dashboard.ts`: Modern Web Workspace Control Plane (`127.0.0.1:4099`) with CSP/security headers, login rate-limiting, XSS escaping, PT-BR/EN i18n, Dark/Light themes, and Webhook/Federation HTTP endpoints.
-- `src/mcp-server.ts`: Stdio MCP Server exposing all 15 `paas_*` tools.
+- `src/mcp-server.ts`: `createMcpServer(level)` with all 16 `paas_*` tools (stdio entry point runs with full level).
+- `src/mcp-http.ts`: Stateless Streamable HTTP endpoint `/mcp` (bearer token, loopback/Tailscale only).
+- `src/tokens.ts`: Personal MCP tokens (hashed, levels read/deploy/destroy).
+- `src/totp.ts`: RFC 6238 TOTP for the dashboard second factor.
 - `src/cli.ts`: Command-line interface (`paasmcp`).
 - `src/test.ts`: Node.js native security & unit test runner suite (`node --test`).
 

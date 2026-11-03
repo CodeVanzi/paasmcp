@@ -390,5 +390,105 @@ volumes:
     assert.equal(fs.existsSync(lockPath), false);
   });
 
+  const totp = await import("./totp.js");
+  const tokens = await import("./tokens.js");
+  const mcpServer = await import("./mcp-server.js");
+  const mcpHttp = await import("./mcp-http.js");
+  const dashboard = await import("./dashboard.js");
+
+  await t.test("12. TOTP matches the RFC 6238 test vectors", () => {
+    const secret = totp.base32Encode(Buffer.from("12345678901234567890"));
+    assert.equal(secret, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+    assert.equal(totp.totpCode(secret, 59_000), "287082");
+    assert.equal(totp.totpCode(secret, 1111111109_000), "081804");
+    assert.equal(totp.verifyTotp(secret, "081804", 1111111109_000 + 30_000), true); // one step of drift
+    assert.equal(totp.verifyTotp(secret, "081804", 1111111109_000 + 90_000), false);
+    assert.throws(() => totp.enableDashboardTwoFactor(secret, "000000"));
+  });
+
+  await t.test("13. Personal tokens: hashed, leveled, revocable", () => {
+    const { token, record } = tokens.createToken("laptop", "read");
+    assert.match(token, /^pmcp_[0-9a-f]{8}_/);
+    assert.equal(tokens.verifyToken(token)?.level, "read");
+    assert.equal(tokens.verifyToken(token + "x"), null);
+    assert.equal(JSON.stringify(tokens.listTokens()).includes(token.split("_")[2]), false);
+    assert.equal(tokens.levelAllows("deploy", "read"), true);
+    assert.equal(tokens.levelAllows("deploy", "destroy"), false);
+    assert.equal(tokens.revokeToken(record.id), true);
+    assert.equal(tokens.verifyToken(token), null);
+  });
+
+  await t.test("14. MCP enforces token levels before confirmations", async () => {
+    const text = (r: { content: { text: string }[] }) => r.content[0].text;
+    const readDeploy = await mcpServer.handleToolCall("paas_app_deploy", { appName: "x", repoSource: "/x" }, "read");
+    assert.match(text(readDeploy as never), /read-only tools/);
+    const deployDestroy = await mcpServer.handleToolCall("paas_app_lifecycle", { appName: "demo-saas", action: "destroy" }, "deploy");
+    assert.match(text(deployDestroy as never), /level 'destroy'/);
+    const destroyDestroy = await mcpServer.handleToolCall("paas_app_lifecycle", { appName: "demo-saas", action: "destroy" }, "destroy");
+    assert.equal(JSON.parse(text(destroyDestroy as never)).confirmationRequired, true);
+  });
+
+  await t.test("15. MCP over HTTP: loopback/Tailscale only, bearer token required, tools filtered by level", async () => {
+    assert.equal(mcpHttp.isAllowedMcpBindHost("127.0.0.1"), true);
+    assert.equal(mcpHttp.isAllowedMcpBindHost("100.101.102.103"), true);
+    assert.equal(mcpHttp.isAllowedMcpBindHost("0.0.0.0"), false);
+    assert.equal(mcpHttp.isAllowedMcpBindHost("8.8.8.8"), false);
+    assert.throws(() => mcpHttp.startMcpHttpServer(0, "0.0.0.0"), guard.ForbiddenActionError);
+
+    const srv = mcpHttp.startMcpHttpServer(0, "127.0.0.1");
+    await new Promise((r) => srv.once("listening", r));
+    const port = (srv.address() as { port: number }).port;
+    const call = (body: unknown, token?: string) =>
+      fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+    try {
+      assert.equal((await call({ jsonrpc: "2.0", id: 1, method: "tools/list" })).status, 401);
+      const { token } = tokens.createToken("reader", "read");
+      const res = await call({ jsonrpc: "2.0", id: 1, method: "tools/list" }, token);
+      assert.equal(res.status, 200);
+      const names = ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((x) => x.name);
+      assert.ok(names.includes("paas_system_status"));
+      assert.equal(names.includes("paas_app_deploy"), false);
+    } finally {
+      srv.close();
+    }
+  });
+
+  await t.test("16. Dashboard: public only with 2FA; with 2FA the token alone never logs in", async () => {
+    assert.throws(
+      () => guard.assessRisk("app.expose", { appName: "paasmcp-dashboard", mode: "public" }),
+      guard.ForbiddenActionError
+    );
+    const dashToken = dashboard.getOrCreateDashboardToken();
+    const secret = totp.newTotpSecret();
+    totp.enableDashboardTwoFactor(secret, totp.totpCode(secret));
+    assert.equal(guard.assessRisk("app.expose", { appName: "paasmcp-dashboard", mode: "public" })?.level, "strong");
+
+    const srv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => srv.once("listening", r));
+    const base = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const login = (body: unknown) =>
+      fetch(`${base}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    try {
+      assert.equal((await login({ token: dashToken })).status, 401);
+      assert.equal((await fetch(`${base}/api/approvals`, { headers: { Authorization: `Bearer ${dashToken}` } })).status, 401);
+      const ok = await login({ token: dashToken, code: totp.totpCode(secret) });
+      assert.equal(ok.status, 200);
+      const cookie = (ok.headers.get("set-cookie") || "").split(";")[0];
+      assert.match(cookie, /^paasmcp_session=/);
+      assert.equal((await fetch(`${base}/api/approvals`, { headers: { cookie } })).status, 200);
+      assert.equal((await fetch(`${base}/api/approvals`, { headers: { cookie: "paasmcp_session=99999999999999.bad" } })).status, 401);
+    } finally {
+      srv.close();
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

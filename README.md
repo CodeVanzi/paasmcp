@@ -81,8 +81,10 @@ cd paasmcp
 | :--- | :--- |
 | Free | status, logs, doctor, deploy, provision DBs, create backups, restart, rollback, expose via Tailscale or Zero Trust |
 | Confirm | destroy (to 30-day trash), restore a backup (a safety backup is taken first), delete a secret (old value archived), public exposure, exposing the dashboard, federation join/import |
-| Strong (type the name) | purge from trash, mark an app as trusted (keeps privileged / host network / host folders / docker.sock in its compose) |
-| Forbidden | plaintext secrets in outputs, dashboard on the open internet behind a token only, non-loopback ports, compose `extends` / `additional_contexts`, unsigned webhooks |
+| Strong (type the name) | purge from trash, mark an app as trusted (keeps privileged / host network / host folders / docker.sock in its compose), publish the dashboard on the open internet (only with 2FA on) |
+| Forbidden | plaintext secrets in outputs, dashboard on the open internet without 2FA, MCP over HTTP outside loopback/Tailscale, non-loopback ports, compose `extends` / `additional_contexts`, unsigned webhooks |
+
+MCP tokens have levels: `read` (status, logs, diagnostics), `deploy` (default: also deploy, provision, back up, expose privately) and `destroy` (can *request* risky actions, which still need a person). Local stdio runs with full level because it already runs on the server.
 
 MCP calls that need confirmation return `confirmationRequired` with an `approvalId`. A person approves it in the dashboard (Pending confirmations) or with `paasmcp approve <id>` on the server, then the agent repeats the call with `approvalId`. Requests expire in 10 minutes, are bound to the exact parameters and work once. Everything is logged to `audit.log`.
 
@@ -91,6 +93,40 @@ Limit: this protects against an agent acting **through MCP**. An agent with a sh
 ---
 
 ## 🔌 MCP Server Configuration (16 Tools)
+
+### Remote clients (MCP over HTTP)
+
+Any MCP client that supports Streamable HTTP with a bearer header (Claude Desktop/Code, Cursor, VS Code, Codex, local-model clients…) can connect from another machine on your Tailnet:
+
+```bash
+paasmcp token create laptop --level deploy        # shown once; only a hash is stored
+paasmcp mcp serve --port 4098                      # listens on 127.0.0.1 (or --host tailscale)
+tailscale serve --bg --https=8443 http://127.0.0.1:4098
+```
+
+```json
+{
+  "mcpServers": {
+    "paasmcp": {
+      "type": "http",
+      "url": "https://<your-server>.ts.net:8443/mcp",
+      "headers": { "Authorization": "Bearer pmcp_..." }
+    }
+  }
+}
+```
+
+Web-only assistants (ChatGPT / Claude.ai connectors) need a public URL with an OAuth login; that is planned, and a bearer token alone on the open internet is refused on purpose. Run `paasmcp mcp serve` as a systemd service to keep it up (this is the one always-on part of remote MCP).
+
+### Two-factor login for the dashboard
+
+```bash
+paasmcp dashboard 2fa enable     # scan the otpauth link, type the first code to activate
+```
+
+With 2FA on, login needs token + code, the token alone (header or cookie) stops working, and the dashboard may be published on the open internet after a strong confirmation.
+
+### Local client (stdio)
 
 Add `paasmcp` to your MCP client configuration:
 
@@ -155,6 +191,11 @@ paasmcp rollback my-saas
 # Approve what an AI agent asked for (people only)
 paasmcp approvals
 paasmcp approve c-7F3K2A
+
+# Remote MCP clients and dashboard 2FA
+paasmcp token create laptop --level deploy
+paasmcp mcp serve --host tailscale
+paasmcp dashboard 2fa enable
 
 # Trash: destroy is reversible for 30 days
 paasmcp destroy my-saas

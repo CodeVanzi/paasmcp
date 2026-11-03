@@ -54,7 +54,7 @@ Every PR or AI Agent modification **must** enforce these rules:
 ## 🧭 Plan Order
 
 1. Security base (done above).
-2. MCP over HTTP (Streamable HTTP) with personal tokens and levels (read / deploy / destroy); second factor for the dashboard so it can be public.
+2. ✅ MCP over HTTP (Streamable HTTP, stateless) with personal tokens and levels (read / deploy / destroy), loopback/Tailscale only; TOTP second factor and signed sessions for the dashboard. Follow-up: OAuth 2.1 + PKCE login so web assistants (ChatGPT / Claude.ai connectors) can use a public URL.
 3. Off-site encrypted backups (item 4 below) including app volumes, plus a restore test tool.
 4. S3 storage for apps (Garage): `paas_storage_provision` creates a bucket + key per app.
 5. Federation as a mirror, part 1: per-app modes `mirror` / `stateless` / `local`; each server streams its Postgres to the other over Tailscale (item 5 below, both directions), Garage in two zones, hourly restic of volumes, replication lag in status, manual failover with confirmation, epoch number and DNS switch.
