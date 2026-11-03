@@ -568,5 +568,70 @@ volumes:
     }
   });
 
+  await t.test("19. Storage: Garage bucket + key per app, layout once, idempotent", async () => {
+    const storage = await import("./storage.js");
+    const http = await import("node:http");
+    const calls: string[] = [];
+    const buckets = new Map<string, string>();
+    let layout = { version: 0, roles: [] as { id: string }[] };
+    let token = "";
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        if (req.headers.authorization !== `Bearer ${token}`) return res.writeHead(403).end();
+        const url = new URL(req.url!, "http://x");
+        const body = raw ? JSON.parse(raw) : undefined;
+        calls.push(`${req.method} ${url.pathname}`);
+        const json = (o: unknown, code = 200) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(o));
+        if (url.pathname === "/v1/status") return json({ node: "node1" });
+        if (url.pathname === "/v1/layout" && req.method === "GET") return json(layout);
+        if (url.pathname === "/v1/layout") return json({});
+        if (url.pathname === "/v1/layout/apply") {
+          assert.equal(body.version, layout.version + 1);
+          layout = { version: body.version, roles: [{ id: "node1" }] };
+          return json({});
+        }
+        if (url.pathname === "/v1/bucket" && req.method === "GET") {
+          const id = buckets.get(url.searchParams.get("globalAlias")!);
+          return id ? json({ id }) : json({ code: "NoSuchBucket" }, 404);
+        }
+        if (url.pathname === "/v1/bucket") {
+          buckets.set(body.globalAlias, "b-" + body.globalAlias);
+          return json({ id: "b-" + body.globalAlias });
+        }
+        if (url.pathname === "/v1/key") return json({ accessKeyId: "GK123", secretAccessKey: "sec" });
+        if (url.pathname === "/v1/bucket/allow") {
+          assert.deepEqual(body.permissions, { read: true, write: true, owner: false });
+          return json({});
+        }
+        json({}, 404);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GARAGE_ADMIN_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      vault.setSecretEntries("system", { GARAGE_ADMIN_TOKEN: "adm" });
+      token = "adm";
+      const first = await storage.provisionStorage("Fotos App");
+      assert.equal(first.reused, false);
+      assert.equal(first.record.bucket, "app-fotos-app");
+      const env = vault.getSecrets("fotos-app");
+      assert.equal(env.S3_ENDPOINT, "http://paasmcp-garage:3900");
+      assert.equal(env.AWS_SECRET_ACCESS_KEY, "sec");
+      assert.equal(layout.version, 1);
+
+      const second = await storage.provisionStorage("fotos-app");
+      assert.equal(second.reused, true);
+      assert.equal(calls.filter((c) => c === "POST /v1/key").length, 1, "no second key");
+      await storage.ensureGarage();
+      assert.equal(calls.filter((c) => c === "POST /v1/layout/apply").length, 1, "layout applied once");
+      assert.equal(storage.listStorage().length, 1);
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_GARAGE_ADMIN_URL;
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

@@ -69,6 +69,14 @@ export interface BackupRecord {
   localPrunedAt?: string;
 }
 
+export interface StorageRecord {
+  appName: string;
+  bucket: string;
+  bucketId: string;
+  accessKeyId: string;
+  createdAt: string;
+}
+
 export interface FederationPeerRecord {
   nodeId: string;
   name: string;
@@ -104,6 +112,7 @@ export interface PaaSState {
   apps: Record<string, AppRecord>;
   databases: Record<string, DatabaseRecord>;
   backups?: Record<string, BackupRecord>;
+  storage?: Record<string, StorageRecord>;
   federation?: FederationConfig;
 }
 

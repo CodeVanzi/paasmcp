@@ -155,6 +155,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`). |
 | `paas_secret_delete` | Deletes a secret key from the encrypted vault. |
 | `paas_db_provision` | Creates an isolated PostgreSQL or Redis database and binds `DATABASE_URL` / `REDIS_URL` into the app's vault. |
+| `paas_storage_provision` | Gives an app its own S3 bucket and key on this server (Garage, started on first use) and injects `S3_*` / `AWS_*` into its vault. |
 | `paas_db_backup` | Creates, lists, restores and **tests** AES-256-GCM encrypted `pg_dump` / Redis / Docker volume snapshots (SHA-256 checked); `sync` sends them off-site (S3/R2/B2/Garage), `fetch` brings one back. |
 | `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds Dockerfile or sanitized `docker-compose.yml`, sets CPU/RAM limits, tags `:previous` image, and starts containers. |
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
@@ -185,6 +186,9 @@ paasmcp db-backup list
 paasmcp db-backup restore <backup-id>
 paasmcp db-backup create my-saas volume      # every Docker volume of the app
 paasmcp backup test <backup-id>              # restores into a temporary DB; live data untouched
+
+# S3 bucket + key for an app on this server (Garage); redeploy to load S3_* / AWS_*
+paasmcp storage provision my-saas
 
 # Off-site copies (R2, B2, S3, Garage): set BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET,
 # BACKUP_S3_ACCESS_KEY_ID, BACKUP_S3_SECRET_ACCESS_KEY (+ optional BACKUP_S3_REGION, BACKUP_S3_PREFIX)
