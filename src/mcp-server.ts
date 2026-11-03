@@ -34,6 +34,7 @@ import {
   provisionDatabase,
   restoreDatabase,
 } from "./database.js";
+import { mirrorStatus, promoteMirror } from "./mirror.js";
 import { provisionStorage } from "./storage.js";
 import { backupAppVolumes, fetchOffsite, syncOffsite, testRestore } from "./backup.js";
 import { ensureDashboardBackgroundService, getOrCreateDashboardToken } from "./dashboard.js";
@@ -108,6 +109,7 @@ export function getSystemStatusSummary(includeMetrics = true) {
     databases: state.databases,
     backups: listDatabaseBackups(),
     storage: Object.values(state.storage || {}),
+    mirror: state.mirror,
   };
 }
 
@@ -122,6 +124,7 @@ const TOOLS_WITH_APPROVAL = new Set([
   "paas_dashboard",
   "paas_secret_delete",
   "paas_db_backup",
+  "paas_mirror",
   "paas_app_deploy",
   "paas_app_expose",
   "paas_app_lifecycle",
@@ -351,6 +354,19 @@ async function listTools() {
             },
           },
           required: ["appName"],
+        },
+      },
+      {
+        name: "paas_mirror",
+        description:
+          "Two-server mirror. 'status' shows, per peer, whether its Postgres copy is streaming, caught up and how many seconds behind, plus WAL kept for a peer that is away and the current epoch. 'promote' makes this server take over a peer's apps with its copy (manual failover): needs a person's strong confirmation, raises the epoch, redeploys the peer's apps here and points their DNS here. Pairing (offer/accept) is CLI-only because the token carries passwords.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["status", "promote"] },
+            peer: { type: "string", description: "Peer server name (required for promote)." },
+          },
+          required: ["action"],
         },
       },
       {
@@ -839,6 +855,15 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
+      }
+
+      case "paas_mirror": {
+        if (args.action === "promote") {
+          if (!args.peer) throw new Error("'peer' is required for promote.");
+          authorize("mirror.promote", { peer: String(args.peer) });
+          return { content: [{ type: "text", text: JSON.stringify(await promoteMirror(String(args.peer)), null, 2) }] };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(mirrorStatus(), null, 2) }] };
       }
 
       case "paas_storage_provision": {

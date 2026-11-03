@@ -62,6 +62,8 @@ admin_token = "${adminToken}"
 `,
       { mode: 0o600 }
     );
+    // S3 (not admin) is also published on the Tailscale IP once a mirror peer needs it.
+    const mirrorBind = loadState().mirror?.bindIp;
     const composeFile = path.join(PAAS_GARAGE_DIR, "compose.yaml");
     fs.writeFileSync(
       composeFile,
@@ -72,7 +74,7 @@ admin_token = "${adminToken}"
     restart: unless-stopped
     ports:
       - "127.0.0.1:3900:3900"
-      - "127.0.0.1:3903:3903"
+      - "127.0.0.1:3903:3903"${mirrorBind ? `\n      - "${mirrorBind}:3900:3900"` : ""}
     volumes:
       - ./garage.toml:/etc/garage.toml:ro
       - ./meta:/var/lib/garage/meta
@@ -107,6 +109,26 @@ networks:
   }
 }
 
+export async function createBucketWithKey(
+  bucket: string,
+  keyName: string
+): Promise<{ bucketId: string; accessKeyId: string; secretAccessKey: string }> {
+  await ensureGarage();
+  let bucketInfo: { id: string };
+  try {
+    bucketInfo = await admin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
+  } catch {
+    bucketInfo = await admin("POST", "/v1/bucket", { globalAlias: bucket });
+  }
+  const key = await admin<{ accessKeyId: string; secretAccessKey: string }>("POST", "/v1/key", { name: keyName });
+  await admin("POST", "/v1/bucket/allow", {
+    bucketId: bucketInfo.id,
+    accessKeyId: key.accessKeyId,
+    permissions: { read: true, write: true, owner: false },
+  });
+  return { bucketId: bucketInfo.id, accessKeyId: key.accessKeyId, secretAccessKey: key.secretAccessKey };
+}
+
 export async function provisionStorage(appName: string): Promise<{ record: StorageRecord; injectedKeys: string[]; reused: boolean }> {
   const slug = sanitizeSlug(appName);
   const existing = loadState().storage?.[slug];
@@ -115,20 +137,9 @@ export async function provisionStorage(appName: string): Promise<{ record: Stora
     return { record: existing, injectedKeys: keys, reused: true };
   }
 
-  await ensureGarage();
   const bucket = `app-${slug}`.slice(0, 63);
-  let bucketInfo: { id: string };
-  try {
-    bucketInfo = await admin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
-  } catch {
-    bucketInfo = await admin("POST", "/v1/bucket", { globalAlias: bucket });
-  }
-  const key = await admin<{ accessKeyId: string; secretAccessKey: string }>("POST", "/v1/key", { name: `paasmcp-${slug}` });
-  await admin("POST", "/v1/bucket/allow", {
-    bucketId: bucketInfo.id,
-    accessKeyId: key.accessKeyId,
-    permissions: { read: true, write: true, owner: false },
-  });
+  const { bucketId, ...key } = await createBucketWithKey(bucket, `paasmcp-${slug}`);
+  const bucketInfo = { id: bucketId };
 
   // S3_* for code that reads it explicitly; AWS_* so boto3 / AWS SDKs pick it up with no code.
   setSecretEntries(slug, {

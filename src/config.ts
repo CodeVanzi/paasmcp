@@ -37,6 +37,8 @@ export interface AppRecord {
   lastWebhookAt?: string;
   /** Set only after a strong confirmation: keeps privileged compose fields (see guard.ts). */
   trusted?: boolean;
+  /** Set on apps imported from a mirror peer: they run here only after that peer is promoted. */
+  originNodeId?: string;
   trashedAt?: string;
   trashDir?: string;
 }
@@ -77,6 +79,28 @@ export interface StorageRecord {
   createdAt: string;
 }
 
+export interface MirrorReplicaRecord {
+  peerName: string;
+  peerNodeId: string;
+  peerHost: string;
+  slot: string;
+  container: string;
+  localPort: number;
+  dataDir: string;
+  acceptedAt: string;
+  promotedAt?: string;
+  promotedEpoch?: number;
+}
+
+export interface MirrorConfig {
+  /** Raised on every promotion; the side with the higher epoch owns the data (split-brain fence). */
+  epoch: number;
+  /** Tailscale IP where Postgres / Garage S3 are also published for the peer. */
+  bindIp?: string;
+  offers: Record<string, { peerCidr: string; slot: string; offeredAt: string }>;
+  replicas: Record<string, MirrorReplicaRecord>;
+}
+
 export interface FederationPeerRecord {
   nodeId: string;
   name: string;
@@ -113,6 +137,7 @@ export interface PaaSState {
   databases: Record<string, DatabaseRecord>;
   backups?: Record<string, BackupRecord>;
   storage?: Record<string, StorageRecord>;
+  mirror?: MirrorConfig;
   federation?: FederationConfig;
 }
 

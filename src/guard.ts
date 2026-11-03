@@ -69,6 +69,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `Permanently deletes app '${subject}': containers, volumes, images and files. This cannot be undone.`,
         `Apaga de vez o app '${subject}': containers, volumes, imagens e arquivos. Não dá para desfazer.`,
         params);
+    case "mirror.promote":
+      return risk(action, subject, "strong",
+        `This server takes over the apps of '${subject}' using its copy of the database. If '${subject}' is still running, both sides would accept changes (split brain): make sure it is really down or cut off. Changes made on '${subject}' after the last replicated moment stay only there.`,
+        `Este servidor assume os apps de '${subject}' com a cópia do banco que tem aqui. Se '${subject}' ainda estiver ligado, os dois lados aceitariam alterações (cérebro dividido): confirme que ele caiu de verdade ou está isolado. O que foi gravado em '${subject}' depois do último momento copiado fica só lá.`,
+        params);
     case "app.trust":
       return risk(action, subject, "strong",
         `Marks app '${subject}' as trusted: its docker-compose.yml keeps privileged mode, host network, capabilities, devices and host folders (including /var/run/docker.sock). A trusted app can take full control of this server.`,

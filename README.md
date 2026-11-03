@@ -23,7 +23,7 @@ Traditional self-hosted PaaS dashboards are great for manual clicking, but they:
 - **Instant Multi-Tenant Databases + Encrypted Snapshots:** Provision isolated PostgreSQL 16 databases (`db_<app>` + `user_<app>`) or Redis 7 logical instances in 1 second, automatically injecting `DATABASE_URL` and `REDIS_URL`, with 1-click encrypted `pg_dump` backup & zero-plaintext-disk restore.
 - **Zero-Config Buildpacks + Multi-Service Docker Compose Pass-Through:** Automatically builds repositories with a custom `Dockerfile`, sanitized multi-service `docker-compose.yml` (stripping unsafe `privileged`/`host` flags and injecting Vault secrets), or generates optimized multi-stage Dockerfiles for **Node.js, Next.js, Vite/React/Astro SPAs, Python (FastAPI/Flask/Django), Go, and Static HTML**.
 - **1-Second Image Rollback & `paas_doctor` Diagnostics:** Automatically tags the previous working image (`paasmcp/<app>:previous`) before every deploy for instant 1-second rollback, and inspects containers for `OOMKilled`, crash-loops, and live CPU/RAM metrics (`docker stats`).
-- **Multi-Server Handshake & Federation (in progress):** Pair a secondary server using a signed `paasmcp-join://` token (`HMAC-SHA256` + SSH fingerprint) and sync configuration and vault. Data (databases, files) is **not replicated yet**, so active-active is only safe for stateless apps; the database/file mirror is on the [roadmap](./CONTRIBUTING.md).
+- **Two-Server Mirror:** Pair a second server (`paasmcp-join://`, `HMAC-SHA256` + SSH fingerprint), then `paasmcp mirror offer/accept`: each server keeps a live read-only copy of the other's Postgres (physical streaming over Tailscale, a replication slot keeps up to 10 GB of changes while the peer is away) and receives the other's backups in its Garage. `paas_mirror status` shows streaming / caught up / seconds behind; `promote` is a manual failover with a strong confirmation that raises an epoch number, redeploys the peer's apps and points their DNS here. Automatic failover (arbiter) and guided failback are the next step on the [roadmap](./CONTRIBUTING.md). Tested with `scripts/mirror-lab.sh` (two Postgres containers).
 - **Built-in Workspace Web UI (`paasmcp-dashboard`):** Optional ultra-lightweight dark/light web workspace (protected by constant-time `DASHBOARD_TOKEN`, login rate-limiting, CSP headers, and Cloudflare Zero Trust Access) with built-in **GitHub Push Webhook (`X-Hub-Signature-256`)** auto-deploy receiver.
 
 ---
@@ -81,7 +81,7 @@ cd paasmcp
 | :--- | :--- |
 | Free | status, logs, doctor, deploy, provision DBs, create backups, restart, rollback, expose via Tailscale or Zero Trust |
 | Confirm | destroy (to 30-day trash), restore a backup (a safety backup is taken first), delete a secret (old value archived), public exposure, exposing the dashboard, federation join/import |
-| Strong (type the name) | purge from trash, mark an app as trusted (keeps privileged / host network / host folders / docker.sock in its compose), publish the dashboard on the open internet (only with 2FA on) |
+| Strong (type the name) | promote a mirror copy (failover), purge from trash, mark an app as trusted (keeps privileged / host network / host folders / docker.sock in its compose), publish the dashboard on the open internet (only with 2FA on) |
 | Forbidden | plaintext secrets in outputs, dashboard on the open internet without 2FA, MCP over HTTP outside loopback/Tailscale, non-loopback ports, compose `extends` / `additional_contexts`, unsigned webhooks |
 
 MCP tokens have levels: `read` (status, logs, diagnostics), `deploy` (default: also deploy, provision, back up, expose privately) and `destroy` (can *request* risky actions, which still need a person). Local stdio runs with full level because it already runs on the server.
@@ -161,6 +161,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
 | `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), `destroy` (to the 30-day trash), `restore` (from the trash) or `purge`. |
 | `paas_doctor` | Diagnoses `OOMKilled` events, crash-loops, non-zero exit codes, and recent error logs across all containers. |
+| `paas_mirror` | Mirror status per peer (streaming, caught up, seconds behind, WAL kept, epoch) and manual `promote` (strong confirmation). Pairing is CLI-only. |
 | `paas_node_federation` | Generates signed `paasmcp-join://` tokens, pairs secondary servers, and exports/imports encrypted Vault & State sync bundles. |
 
 ---

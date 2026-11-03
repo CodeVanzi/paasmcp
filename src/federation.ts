@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import {
+  allocateAppPort,
   AppRecord,
   FederationPeerRecord,
   loadState,
@@ -324,6 +325,7 @@ export function applyEncryptedFederationSyncBundle(
 ): {
   importedApps: string[];
   importedScopes: string[];
+  skippedConflicts: string[];
   sourceNodeId: string;
 } {
   const clusterKey = getOrCreateFederationClusterKey();
@@ -341,9 +343,14 @@ export function applyEncryptedFederationSyncBundle(
   const bundle = JSON.parse(decryptedBuf.toString("utf-8")) as FederationSyncBundle;
 
   const state = loadState();
+  // An app that already lives here (ours, or from another peer) is never overwritten by a peer's copy.
+  const conflicts = Object.keys(bundle.apps || {})
+    .map((slug) => sanitizeSlug(slug))
+    .filter((slug) => state.apps[slug] && state.apps[slug].originNodeId !== bundle.sourceNodeId);
   const importedScopes: string[] = [];
   for (const [scope, secrets] of Object.entries(bundle.vaultScopes || {})) {
     const safeScope = sanitizeSlug(scope);
+    if (conflicts.includes(safeScope) || safeScope === "system") continue;
     saveSecrets(safeScope, secrets);
     importedScopes.push(safeScope);
   }
@@ -352,9 +359,14 @@ export function applyEncryptedFederationSyncBundle(
   for (const [slug, appRec] of Object.entries(bundle.apps || {})) {
     if (slug === "paasmcp-dashboard") continue;
     const safeSlug = sanitizeSlug(slug);
+    if (conflicts.includes(safeSlug)) continue;
+    const others = Object.values(state.apps).filter((a) => a.name !== safeSlug);
+    const portTaken = others.some((a) => a.localPort === appRec.localPort);
     state.apps[safeSlug] = {
       ...appRec,
       name: safeSlug,
+      originNodeId: bundle.sourceNodeId,
+      localPort: portTaken ? allocateAppPort({ ...state, apps: Object.fromEntries(others.map((a) => [a.name, a])) }) : appRec.localPort,
     };
     importedApps.push(safeSlug);
   }
@@ -369,6 +381,7 @@ export function applyEncryptedFederationSyncBundle(
   return {
     importedApps,
     importedScopes,
+    skippedConflicts: conflicts,
     sourceNodeId: bundle.sourceNodeId,
   };
 }

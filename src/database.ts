@@ -51,6 +51,8 @@ export function ensureSharedPostgresCluster(): { adminUser: string; adminPass: s
   const envFile = path.join(PAAS_DB_DIR, ".env");
   fs.writeFileSync(envFile, `POSTGRES_PASSWORD=${adminPass}\n`, { mode: 0o600 });
 
+  // Published on the Tailscale IP only when a mirror peer streams from this server (pg_hba still limits who).
+  const mirrorBind = loadState().mirror?.bindIp;
   const composeFile = path.join(PAAS_DB_DIR, "compose.yaml");
   const composeContent = `services:
   postgres:
@@ -63,7 +65,7 @@ export function ensureSharedPostgresCluster(): { adminUser: string; adminPass: s
       - POSTGRES_USER=paasmcp_admin
       - POSTGRES_DB=postgres
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5432:5432"${mirrorBind ? `\n      - "${mirrorBind}:5432:5432"` : ""}
     volumes:
       - ./data:/var/lib/postgresql/data
     networks:

@@ -274,7 +274,24 @@ volumes:
       bundle.encryptedBase64,
       bundle.hmacSignature
     );
-    assert.ok(applied.importedApps.includes("demo-saas"));
+    // Our own app is never overwritten by a peer's copy of it.
+    assert.ok(applied.skippedConflicts.includes("demo-saas"));
+    assert.ok(!applied.importedApps.includes("demo-saas"));
+
+    // On a server that does not have it, the app is imported and marked with its origin.
+    const st = config.loadState();
+    const original = st.apps["demo-saas"];
+    delete st.apps["demo-saas"];
+    st.apps["local-other"] = { ...original, name: "local-other" }; // takes the same port
+    config.saveState(st);
+    const again = federation.applyEncryptedFederationSyncBundle(bundle.encryptedBase64, bundle.hmacSignature);
+    assert.ok(again.importedApps.includes("demo-saas"));
+    const imported = config.loadState().apps["demo-saas"];
+    assert.ok(imported.originNodeId);
+    assert.notEqual(imported.localPort, original.localPort, "port clash with a local app is remapped");
+    const cleanup = config.loadState();
+    delete cleanup.apps["local-other"];
+    config.saveState(cleanup);
   });
 
   const guard = await import("./guard.js");
@@ -631,6 +648,41 @@ volumes:
       srv.close();
       delete process.env.PAASMCP_GARAGE_ADMIN_URL;
     }
+  });
+
+  await t.test("20. Mirror: encrypted one-hour token, copy recorded, promotion needs strong approval and raises the epoch", async () => {
+    const mirror = await import("./mirror.js");
+    const mcp = await import("./mcp-server.js");
+    const offer = await mirror.offerMirror({ peerName: "server-b", peerCidr: "100.64.0.2", advertiseHost: "100.64.0.1", withBackups: false });
+    assert.match(offer.token, /^pmirror_/);
+    assert.equal(config.loadState().mirror?.bindIp, "100.64.0.1");
+    assert.equal(config.loadState().mirror?.offers["server-b"].peerCidr, "100.64.0.2/32");
+    await assert.rejects(mirror.offerMirror({ peerName: "x", peerCidr: "1.2.3.4; rm -rf /", advertiseHost: "h" }), /Invalid --peer-ip/);
+
+    const accepted = mirror.acceptMirror(offer.token);
+    assert.equal(accepted.replica.container, `paasmcp-mirror-${accepted.replica.peerName}`);
+    assert.throws(() => mirror.acceptMirror(offer.token.slice(0, -4) + "AAAA"), /could not be decrypted/);
+
+    // An app imported from that peer gets its DATABASE_URL pointed at the local copy on promotion.
+    const st = config.loadState();
+    st.apps["peer-app"] = { ...Object.values(st.apps)[0], name: "peer-app", originNodeId: accepted.replica.peerNodeId, domains: [], repoUrl: "o/r" };
+    config.saveState(st);
+    vault.setSecretEntries("peer-app", { DATABASE_URL: "postgresql://u:p@paasmcp-postgres:5432/db_peer_app" });
+
+    const peer = accepted.replica.peerName;
+    const asked = JSON.parse((await mcp.handleToolCall("paas_mirror", { action: "promote", peer }, "destroy")).content[0].text);
+    assert.equal(asked.confirmationRequired, true);
+    assert.equal(asked.level, "strong");
+    assert.throws(() => guard.decideApproval(asked.approvalId, true, "test", "wrong-name"));
+    guard.decideApproval(asked.approvalId, true, "test", peer);
+    const done = JSON.parse(
+      (await mcp.handleToolCall("paas_mirror", { action: "promote", peer, approvalId: asked.approvalId }, "destroy")).content[0].text
+    );
+    assert.equal(done.epoch, 1);
+    // (in this single-process test every imported app shares one origin, so only check ours)
+    assert.deepEqual(done.apps.find((a: { app: string }) => a.app === "peer-app"), { app: "peer-app", ok: true, detail: "running here" });
+    assert.equal(vault.getSecrets("peer-app").DATABASE_URL, `postgresql://u:p@paasmcp-mirror-${peer}:5432/db_peer_app`);
+    await assert.rejects(mirror.promoteMirror(peer), /already promoted/);
   });
 
   fs.rmSync(tempRoot, { recursive: true, force: true });
