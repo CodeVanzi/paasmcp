@@ -1,4 +1,9 @@
-import { backupAppVolumes, testRestore } from "./backup.js";
+import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
+import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
+import { acceptMirror, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setAutoFailover } from "./mirror.js";
+import { setPolling } from "./poller.js";
+import { listStorage, provisionStorage } from "./storage.js";
+import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -498,6 +503,97 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           res.end(JSON.stringify({ output }));
           return true;
         }
+
+        const reply = (data: unknown) => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(data));
+          return true;
+        };
+
+        if (pathname === "/api/poll" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(setPolling(String(body.appName || ""), body.on === true));
+        }
+
+        if (pathname === "/api/backups/sync" && req.method === "POST") return reply(await syncOffsite());
+
+        if (pathname === "/api/storage" && req.method === "GET") return reply({ storage: listStorage() });
+        if (pathname === "/api/storage" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const { record, reused } = await provisionStorage(String(body.appName || ""));
+          return reply({ record, reused });
+        }
+
+        if (pathname === "/api/email" && req.method === "GET") {
+          const r = getEmailRelay();
+          return reply({ relay: r && { host: r.host, port: r.port, user: r.user, fromDomain: r.fromDomain, apiKey: Boolean(r.apiKey) } });
+        }
+        if (pathname === "/api/email" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const current = getEmailRelay();
+          // An empty password keeps the saved one, so the form never has to show it back.
+          const password = String(body.password || "") || current?.password || "";
+          if (!password) throw new Error("Password or API key is required.");
+          setEmailRelay({ host: String(body.host || ""), port: Number(body.port || 587), user: String(body.user || ""), password, fromDomain: String(body.fromDomain || "") });
+          return reply({ ok: true });
+        }
+        if (pathname === "/api/email/test" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await sendTestEmail(String(body.to || "")));
+        }
+        if (pathname === "/api/email/provision" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(provisionEmail(String(body.appName || ""), body.fromName ? String(body.fromName) : undefined));
+        }
+
+        if (pathname === "/api/updates" && req.method === "GET") return reply({ updates: await checkUpdates() });
+        if (pathname === "/api/updates/apply" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const component = String(body.component) as Component;
+          if (!PINNED[component]) throw new Error("'component' must be postgres, redis or garage.");
+          const image = body.image ? String(body.image) : (await checkUpdates()).find((u) => u.component === component)?.available;
+          if (!image) throw new Error(`${component} is already on the newest release of its major version.`);
+          confirmFromBody("update.apply", { component, image }, body);
+          return reply(applyUpdate(component, image));
+        }
+
+        if (pathname === "/api/mirror" && req.method === "GET") return reply(mirrorStatus());
+        if (pathname === "/api/mirror/offer" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(
+            await offerMirror({
+              peerName: String(body.peer || ""),
+              peerCidr: String(body.peerIp || ""),
+              fromCopyOf: body.fromCopyOf ? String(body.fromCopyOf) : undefined,
+            })
+          );
+        }
+        if (pathname === "/api/mirror/accept" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const rejoin = body.rejoin === true;
+          if (rejoin && !loadState().mirror?.fenced) confirmFromBody("mirror.rejoin", {}, body);
+          return reply(acceptMirror(String(body.token || ""), { rejoin }));
+        }
+        if (pathname === "/api/mirror/promote" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const peer = String(body.peer || "");
+          confirmFromBody("mirror.promote", { peer }, body);
+          return reply(await promoteMirror(peer));
+        }
+        if (pathname === "/api/mirror/handback" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const peer = String(body.peer || "");
+          confirmFromBody("mirror.handback", { peer }, body);
+          return reply(await handbackMirror(peer));
+        }
+        if (pathname === "/api/mirror/auto" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const peer = String(body.peer || "");
+          const on = body.on === true;
+          const arbiterUrl = body.arbiterUrl ? String(body.arbiterUrl) : undefined;
+          if (on) confirmFromBody("mirror.auto", { peer, arbiterUrl }, body);
+          return reply(setAutoFailover(peer, on, arbiterUrl));
+        }
         return false;
       };
 
@@ -838,8 +934,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       min-height: 100vh;
     }
     @media (max-width: 960px) {
-      .app-shell { grid-template-columns: 1fr; }
+      .app-shell { grid-template-columns: minmax(0, 1fr); }
+      .main-area, .sidebar { min-width: 0; }
       .sidebar { border-right: none; border-bottom: 1px solid var(--border); padding: 14px 16px; }
+      .sidebar .nav-list { flex-direction: row; overflow-x: auto; flex-wrap: nowrap; }
+      .sidebar .nav-list .nav-btn { flex: 0 0 auto; white-space: nowrap; }
+      .sidebar .sidebar-footer { display: none; }
     }
     .sidebar {
       background: var(--bg-elevated);
@@ -1073,12 +1173,17 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <div class="brand-sub" id="sidebarSubtitle">Agent-First Micro-PaaS</div>
         </div>
         <nav class="nav-list">
-          <button class="nav-btn active" onclick="switchTab('overview', this)" id="navOverview">📦 Aplicações & Deploy</button>
-          <button class="nav-btn" onclick="switchTab('vault', this)" id="navVault">🔐 Cofre AES-256-GCM</button>
-          <button class="nav-btn" onclick="switchTab('databases', this)" id="navDatabases">🗄️ Bancos & Backups</button>
-          <button class="nav-btn" onclick="switchTab('federation', this)" id="navFederation">🌐 Multi-Server HA & Webhook</button>
-          <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Doctor & Diagnóstico</button>
-          <button class="nav-btn" onclick="switchTab('agents', this)" id="navAgents">🤖 Studio IA (MCP) & Guia</button>
+          <button class="nav-btn active" onclick="switchTab('home', this)" id="navHome">🏠 Início</button>
+          <button class="nav-btn" onclick="switchTab('overview', this)" id="navOverview">📦 Apps</button>
+          <button class="nav-btn" onclick="switchTab('databases', this)" id="navDatabases">🗄️ Dados e cópias</button>
+          <button class="nav-btn" onclick="switchTab('vault', this)" id="navVault">🔐 Senhas e chaves</button>
+          <button class="nav-btn" onclick="switchTab('email', this)" id="navEmail">✉️ E-mail</button>
+          <button class="nav-btn" onclick="switchTab('mirror', this)" id="navMirror">🔁 Segundo servidor</button>
+          <button class="nav-btn" onclick="switchTab('updates', this)" id="navUpdates">⬆️ Atualizações</button>
+          <button class="nav-btn" onclick="switchTab('federation', this)" id="navFederation">🔗 Conexões e webhook</button>
+          <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Diagnóstico</button>
+          <button class="nav-btn" onclick="switchTab('agents', this)" id="navAgents">🤖 Conectar IA</button>
+          <button class="nav-btn" onclick="switchTab('help', this)" id="navHelp">❓ Ajuda</button>
         </nav>
       </div>
       <div class="sidebar-footer">
@@ -1109,13 +1214,27 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         <div class="grid-stats" id="statsGrid"></div>
 
         <!-- TAB 1: OVERVIEW, APPS, DEPLOY & EXPOSE -->
-        <div class="tab-pane active" id="tab-overview">
+        <div class="tab-pane active" id="tab-home">
+          <div class="card">
+            <div class="card-header">
+              <h2 id="homeTitle">🏠 Início</h2>
+              <p class="card-desc" data-i18n="homeDesc"></p>
+            </div>
+            <div class="grid-2" id="homeTiles"></div>
+          </div>
           <div class="card" id="approvalsCard" style="display:none;">
             <div class="card-header">
               <h2 id="approvalsTitle">✋ Confirmações pendentes</h2>
               <p class="card-desc" id="approvalsDesc">Ações arriscadas pedidas por um agente de IA esperam você aqui. O agente não consegue aprovar sozinho.</p>
             </div>
             <div id="approvalsList"></div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="stepsTitle"></h2>
+              <p class="card-desc" data-i18n="stepsDesc"></p>
+            </div>
+            <div id="homeSteps"></div>
           </div>
           <div class="card">
             <div class="card-header">
@@ -1144,7 +1263,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             </div>
             <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre a URL mostrada na aba Webhook no GitHub, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
           </div>
-          <div class="card">
+        </div>
+
+        <div class="tab-pane" id="tab-overview">
+                    <div class="card">
             <div class="card-header">
               <h2>
                 <span id="appsTitle">📦 Aplicações Hospedadas & Métricas em Tempo Real</span>
@@ -1238,6 +1360,18 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depRedis" style="width:auto;" />
                   <span id="lblDepRedis">Provisionar Redis 7 (injeta <code>REDIS_URL</code>)</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="depPoll" style="width:auto;" />
+                  <span data-i18n="lblDepPoll"></span>
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="depStorage" style="width:auto;" />
+                  <span data-i18n="lblDepStorage"></span>
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                  <input type="checkbox" id="depEmail" style="width:auto;" />
+                  <span data-i18n="lblDepEmail"></span>
                 </label>
               </div>
               <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
@@ -1356,6 +1490,26 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
 
         <!-- TAB 3: DATABASES & ENCRYPTED BACKUPS -->
         <div class="tab-pane" id="tab-databases">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="offsiteTitle"></h2>
+              <p class="card-desc" data-i18n="offsiteDesc"></p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button onclick="syncOffsiteNow()" id="btnSyncOffsite" data-i18n="btnSyncOffsite"></button>
+            </div>
+            <details style="margin-top:10px;font-size:12.5px;color:var(--muted);"><summary data-i18n="detailsTech"></summary><p data-i18n="offsiteTech"></p></details>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="storageTitle"></h2>
+              <p class="card-desc" data-i18n="storageDesc"></p>
+            </div>
+            <div id="storageList" style="margin-bottom:10px;"></div>
+            <label class="field-label" for="stoApp" data-i18n="lblAppName"></label>
+            <input id="stoApp" placeholder="ex: meu-saas" />
+            <div style="margin-top:10px;"><button onclick="provisionStorageUi()" data-i18n="btnStorage"></button></div>
+          </div>
           <div class="row">
             <div class="card">
               <div class="card-header">
@@ -1533,6 +1687,117 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="tab-email">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="emailTitle"></h2>
+              <p class="card-desc" data-i18n="emailDesc"></p>
+            </div>
+            <p class="card-desc" id="emailStatus" style="margin-bottom:10px;"></p>
+            <div class="grid-2">
+              <div><label class="field-label" for="emHost" data-i18n="lblEmHost"></label><input id="emHost" placeholder="smtp-relay.brevo.com" /></div>
+              <div><label class="field-label" for="emPort" data-i18n="lblEmPort"></label><input id="emPort" value="587" inputmode="numeric" /></div>
+              <div><label class="field-label" for="emUser" data-i18n="lblEmUser"></label><input id="emUser" autocomplete="off" /></div>
+              <div><label class="field-label" for="emPass" data-i18n="lblEmPass"></label><input id="emPass" type="password" autocomplete="new-password" /></div>
+              <div><label class="field-label" for="emDomain" data-i18n="lblEmDomain"></label><input id="emDomain" placeholder="seudominio.com" /></div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+              <button onclick="saveEmail()" data-i18n="btnSave"></button>
+            </div>
+            <p class="card-desc" data-i18n="emailTip" style="margin-top:10px;"></p>
+          </div>
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h2 data-i18n="emailTestTitle"></h2></div>
+              <label class="field-label" for="emTo" data-i18n="lblEmTo"></label>
+              <input id="emTo" type="email" />
+              <div style="margin-top:10px;"><button class="secondary" onclick="testEmail()" data-i18n="btnEmailTest"></button></div>
+            </div>
+            <div class="card">
+              <div class="card-header"><h2 data-i18n="emailAppTitle"></h2><p class="card-desc" data-i18n="emailAppDesc"></p></div>
+              <label class="field-label" for="emApp" data-i18n="lblAppName"></label>
+              <input id="emApp" placeholder="ex: meu-saas" />
+              <div style="margin-top:10px;"><button onclick="provisionEmailUi()" data-i18n="btnEmailApp"></button></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="tab-mirror">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="mirrorTitle"></h2>
+              <p class="card-desc" data-i18n="mirrorDesc"></p>
+            </div>
+            <div id="mirrorStatusBox"></div>
+          </div>
+          <div class="grid-2">
+            <div class="card">
+              <div class="card-header"><h2 data-i18n="mirrorOfferTitle"></h2><p class="card-desc" data-i18n="mirrorOfferDesc"></p></div>
+              <label class="field-label" for="mOfferPeer" data-i18n="lblPeerName"></label>
+              <input id="mOfferPeer" placeholder="ex: casa-mae" />
+              <label class="field-label" for="mOfferIp" data-i18n="lblPeerIp"></label>
+              <input id="mOfferIp" placeholder="100.64.0.2" />
+              <label class="field-label" for="mOfferFrom" data-i18n="lblFromCopyOf"></label>
+              <input id="mOfferFrom" />
+              <div style="margin-top:10px;"><button onclick="mirrorOffer()" data-i18n="btnMirrorOffer"></button></div>
+              <pre id="mOfferToken" style="display:none;white-space:pre-wrap;word-break:break-all;font-size:11.5px;margin-top:10px;"></pre>
+            </div>
+            <div class="card">
+              <div class="card-header"><h2 data-i18n="mirrorAcceptTitle"></h2><p class="card-desc" data-i18n="mirrorAcceptDesc"></p></div>
+              <label class="field-label" for="mAcceptToken" data-i18n="lblInvite"></label>
+              <textarea id="mAcceptToken" rows="4" style="width:100%;box-sizing:border-box;"></textarea>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:10px;font-size:12.5px;">
+                <input type="checkbox" id="mRejoin" style="width:auto;" />
+                <span data-i18n="lblRejoin"></span>
+              </label>
+              <div style="margin-top:10px;"><button onclick="mirrorAccept()" data-i18n="btnMirrorAccept"></button></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2 data-i18n="autoTitle"></h2><p class="card-desc" data-i18n="autoDesc"></p></div>
+            <div class="grid-2">
+              <div><label class="field-label" for="mAutoPeer" data-i18n="lblPeerName"></label><input id="mAutoPeer" /></div>
+              <div><label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label><input id="mArbiter" placeholder="http://100.64.0.9:4097" /></div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+              <button onclick="mirrorAuto(true)" data-i18n="btnAutoOn"></button>
+              <button class="secondary" onclick="mirrorAuto(false)" data-i18n="btnAutoOff"></button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2 data-i18n="failbackTitle"></h2></div>
+            <ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.7;">
+              <li data-i18n="failback1"></li>
+              <li data-i18n="failback2"></li>
+              <li data-i18n="failback3"></li>
+              <li data-i18n="failback4"></li>
+            </ol>
+            <details style="margin-top:10px;font-size:12.5px;color:var(--muted);"><summary data-i18n="detailsTech"></summary><p data-i18n="mirrorTech"></p></details>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="tab-updates">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="updatesTitle"></h2>
+              <p class="card-desc" data-i18n="updatesDesc"></p>
+            </div>
+            <div id="updatesList"></div>
+            <div style="margin-top:10px;"><button class="secondary" onclick="loadUpdates()" data-i18n="btnCheckUpdates"></button></div>
+            <details style="margin-top:10px;font-size:12.5px;color:var(--muted);"><summary data-i18n="updatesMajorQ"></summary><p data-i18n="updatesMajorA"></p></details>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="tab-help">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="helpTitle"></h2>
+              <p class="card-desc" data-i18n="helpDesc"></p>
+            </div>
+            <div id="helpGlossary"></div>
           </div>
         </div>
 
@@ -2115,6 +2380,378 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       }
     };
 
+    // Plain-language texts (override the older technical ones and add the new screens).
+    Object.assign(I18N.pt, {
+          "sidebarSubtitle": "Seu servidor de apps",
+          "navHome": "🏠 Início",
+          "navOverview": "📦 Apps",
+          "navDatabases": "🗄️ Dados e cópias",
+          "navVault": "🔐 Senhas e chaves",
+          "navEmail": "✉️ E-mail",
+          "navMirror": "🔁 Segundo servidor",
+          "navUpdates": "⬆️ Atualizações",
+          "navFederation": "🔗 Conexões e webhook",
+          "navDoctor": "🩺 Diagnóstico",
+          "navAgents": "🤖 Conectar IA",
+          "navHelp": "❓ Ajuda",
+          "homeTitle": "🏠 Início",
+          "setupTitle": "🧭 Integrações opcionais",
+          "appsTitle": "📦 Seus apps",
+          "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app.",
+          "deployTitle": "➕ Publicar um app",
+          "deployDesc": "Informe o repositório do GitHub (ou uma pasta do servidor). O painel descobre a linguagem e monta tudo sozinho. As senhas do app ficam em Senhas e chaves.",
+          "exposeTitle": "🌐 Deixar um app acessível",
+          "exposeDesc": "Escolha quem pode abrir: qualquer pessoa na internet, só e-mails autorizados ou só a sua rede privada (Tailscale). Nenhuma porta do roteador é aberta.",
+          "vaultTitle": "🔐 Senhas e chaves dos apps",
+          "vaultDesc": "Guarde aqui as senhas e chaves que seus apps usam (ex.: chave do Stripe). Tudo fica cifrado no disco e não aparece de novo por inteiro depois de salvo. Use o nome do app como escopo; <code>system</code> é só para as chaves do próprio painel.",
+          "dbTitle": "🗄️ Criar um banco de dados",
+          "dbDesc": "Cada app ganha o seu próprio banco, separado dos outros. O endereço de conexão (<code>DATABASE_URL</code> ou <code>REDIS_URL</code>) entra sozinho nas senhas do app.",
+          "backupsTitle": "🛡️ Cópias de segurança",
+          "backupsDesc": "Cópias cifradas dos bancos e dos arquivos dos apps. Use “Testar” para conferir que a cópia abre antes de precisar dela.",
+          "fedTitle": "🔗 Conectar outro servidor",
+          "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use a aba <strong>Segundo servidor</strong> para a cópia ao vivo dos dados.",
+          "optFedActive": "Os dois atendem juntos (apps sem dados próprios)",
+          "optFedWarm": "Reserva: copia apps e senhas para o outro servidor",
+          "btnGenInvite": "🔑 Gerar convite (vale 15 min)",
+          "btnExportSync": "📦 Enviar apps e senhas para o outro",
+          "lblJoinPeer": "Entrar como segundo servidor (cole o convite):",
+          "btnJoinPeer": "🤝 Conectar",
+          "whTitle": "⚡ Publicar sozinho a cada git push (webhook)",
+          "whDesc": "Opcional, e precisa que o painel seja acessível pela internet. Sem isso, marque “Atualizar sozinho” ao publicar o app: o servidor confere o GitHub a cada 2 minutos.",
+          "doctorTitle": "🩺 Diagnóstico",
+          "doctorDesc": "Procura apps sem memória, reiniciando sem parar ou parados com erro, e diz o que fazer.",
+          "agentsTitle": "🤖 Conectar sua IA",
+          "agentsDesc": "Qualquer IA compatível com MCP (Claude, ChatGPT, Gemini, modelos locais) pode cuidar do servidor por você. Ações arriscadas sempre esperam a sua aprovação no Início.",
+          "homeDesc": "Resumo do servidor, pedidos esperando você e os próximos passos.",
+          "stepsTitle": "🧭 Primeiros passos",
+          "stepsDesc": "Faça na ordem. Cada passo diz o que é e por que vale a pena.",
+          "step1Title": "Publicar o primeiro app",
+          "step1Desc": "Cole o endereço do código e o painel monta o resto.",
+          "step2Title": "Guardar cópias fora do servidor",
+          "step2Desc": "Se o servidor quebrar ou for roubado, seus dados continuam salvos em outro lugar.",
+          "step3Title": "Configurar o envio de e-mails",
+          "step3Desc": "Para os apps mandarem “esqueci a senha” e avisos. Leva 5 minutos com uma conta gratuita.",
+          "step4Title": "Ligar um segundo servidor",
+          "step4Desc": "Ele guarda uma cópia ao vivo de tudo e pode assumir se este cair.",
+          "step5Title": "Conectar sua IA",
+          "step5Desc": "Peça em português: “publica meu app”, “faz uma cópia agora”.",
+          "optional": "opcional",
+          "done": "Feito",
+          "openStep": "Fazer agora",
+          "never": "Nunca",
+          "notConfigured": "Não configurado",
+          "off": "Desligada",
+          "tileApps": "Apps",
+          "tileAppsNote": "rodando neste servidor",
+          "tileAppsNone": "Nenhum app ainda",
+          "tileBackup": "Última cópia",
+          "tileBackupOff": "Guardada também fora do servidor",
+          "tileBackupLocal": "Só neste servidor",
+          "tileBackupNone": "Nenhuma cópia ainda",
+          "tileMirror": "Segundo servidor",
+          "tileMirrorOn": "Ligado",
+          "tileMirrorOff": "Não usado",
+          "tileMirrorNote": "Cópia ao vivo dos dados",
+          "tileEmail": "E-mail",
+          "tileEmailNote": "Os apps ainda não enviam e-mail",
+          "detailsTech": "Detalhes técnicos",
+          "offsiteTitle": "☁️ Cópias fora do servidor",
+          "offsiteDesc": "Toda noite o servidor faz as cópias e manda para um serviço de armazenamento externo. As cópias locais só são apagadas depois de chegarem lá.",
+          "offsiteTech": "Qualquer serviço compatível com S3 (Backblaze B2, Cloudflare R2, Wasabi ou o segundo servidor). Configure BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID e BACKUP_S3_SECRET_ACCESS_KEY no escopo system de Senhas e chaves. Horário automático: paasmcp backup install-timer.",
+          "btnSyncOffsite": "☁️ Enviar cópias agora",
+          "offsiteDone": "Cópias enviadas:",
+          "offsiteFailed": "falharam:",
+          "storageTitle": "🗂️ Arquivos dos apps",
+          "storageDesc": "Espaço para fotos, PDFs e uploads. Cada app ganha o seu, com chave própria; as bibliotecas comuns (boto3, AWS SDK) funcionam sem mudar código.",
+          "storageNone": "Nenhum app com espaço de arquivos ainda.",
+          "btnStorage": "+ Criar espaço de arquivos",
+          "storageDone": "Espaço criado. Publique o app de novo para ele usar.",
+          "lblAppName": "Nome do app",
+          "lblDepPoll": "Atualizar sozinho quando eu mudar o código (confere a cada 2 min)",
+          "lblDepStorage": "Criar espaço para arquivos",
+          "lblDepEmail": "Deixar o app enviar e-mails",
+          "emailTitle": "✉️ Envio de e-mails",
+          "emailDesc": "E-mail enviado direto de casa cai no spam ou nem sai. Por isso o painel usa um serviço de envio, configurado uma vez para todos os apps.",
+          "emailTip": "Sugestão: o Brevo tem plano gratuito de 300 e-mails por dia. Crie a conta, confirme seu domínio e copie os dados de SMTP. A senha fica cifrada e só é enviada por conexão segura.",
+          "lblEmHost": "Servidor SMTP",
+          "lblEmPort": "Porta",
+          "lblEmUser": "Usuário",
+          "lblEmPass": "Senha ou chave",
+          "lblEmDomain": "Seu domínio de envio",
+          "btnSave": "💾 Salvar",
+          "saved": "Salvo.",
+          "keepSaved": "(deixe vazio para manter a salva)",
+          "emailOn": "Configurado:",
+          "emailTestTitle": "Mandar um e-mail de teste",
+          "lblEmTo": "Para",
+          "btnEmailTest": "📨 Mandar teste",
+          "emailSent": "E-mail de teste aceito pelo serviço.",
+          "emailAppTitle": "Liberar e-mail para um app",
+          "emailAppDesc": "Coloca os dados de envio nas senhas do app. Publique o app de novo para ele usar.",
+          "btnEmailApp": "Liberar",
+          "emailAppDone": "Pronto. Remetente:",
+          "mirrorTitle": "🔁 Segundo servidor",
+          "mirrorDesc": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro pode assumir os apps dele com os dados até o último segundo. Antes, conecte os dois em Conexões e webhook.",
+          "mirrorNone": "Nenhuma cópia configurada ainda. Use os dois quadros abaixo: um servidor oferece, o outro recebe.",
+          "mirrorAuto": "Troca automática",
+          "mirrorArbiter": "Juiz",
+          "mirrorSendingTo": "Mandando cópia para",
+          "connected": "Conectado",
+          "waitingPeer": "Esperando o outro servidor",
+          "mirrorLost": "O outro servidor ficou fora tempo demais e precisa de uma cópia nova: ofereça de novo.",
+          "mirrorCopyOf": "Cópia de",
+          "mirrorUpToDate": "Em dia",
+          "mirrorNotStreaming": "Parada",
+          "mirrorServingHere": "Apps rodando aqui",
+          "mirrorPromoteDesc": "Se esse servidor cair, você pode assumir os apps dele aqui.",
+          "mirrorPromotedDesc": "Os apps dele estão rodando aqui. Quando ele voltar, siga a devolução abaixo.",
+          "btnPromote": "Assumir os apps",
+          "btnHandback": "Devolver os apps",
+          "mirrorFenced": "Bloqueado",
+          "mirrorFencedDesc": "Outro servidor assumiu os dados deste enquanto ele estava fora. Os apps daqui ficam parados até a devolução, para não gravar dados diferentes.",
+          "mirrorOfferTitle": "Oferecer cópia ao outro servidor",
+          "mirrorOfferDesc": "Gera um convite. Cole-o no outro servidor, no quadro ao lado.",
+          "lblPeerName": "Nome do outro servidor",
+          "lblPeerIp": "Endereço do outro servidor no Tailscale",
+          "lblFromCopyOf": "Devolução: cópia de qual servidor? (deixe vazio no uso normal)",
+          "btnMirrorOffer": "🔑 Gerar convite",
+          "mirrorAcceptTitle": "Receber cópia do outro servidor",
+          "mirrorAcceptDesc": "Cole o convite gerado no outro servidor.",
+          "lblInvite": "Convite",
+          "lblRejoin": "Este servidor caiu e está voltando (recebe os dados novos do outro)",
+          "btnMirrorAccept": "🤝 Receber cópia",
+          "mirrorAccepted": "Cópia iniciada.",
+          "mirrorPromoted": "Apps assumidos.",
+          "mirrorHandedBack": "Apps devolvidos. Agora assuma-os no outro servidor.",
+          "autoTitle": "Troca automática",
+          "autoDesc": "Se o outro servidor sumir por mais de 1 minuto, este assume sozinho. Precisa de um juiz: um terceiro aparelho pequeno (Raspberry Pi ou VPS barata) com paasmcp arbiter serve. Sem juiz, se só a internet entre os dois cair, cada um acharia que o outro morreu.",
+          "lblArbiter": "Endereço do juiz",
+          "btnAutoOn": "Ligar",
+          "btnAutoOff": "Desligar",
+          "failbackTitle": "Devolver os apps quando o servidor que caiu voltar",
+          "failback1": "Aqui: em “Oferecer cópia”, preencha a devolução com o nome do servidor que caiu e gere o convite.",
+          "failback2": "No servidor que voltou: cole o convite e marque “Este servidor caiu e está voltando”.",
+          "failback3": "Aqui: clique em “Devolver os apps”.",
+          "failback4": "No servidor que voltou: clique em “Assumir os apps”.",
+          "mirrorTech": "Replicação física do PostgreSQL (streaming) com slot limitado a 10 GB. Cada troca aumenta a época; o servidor com época menor fica bloqueado (fencing). O juiz só autoriza a troca se também não ouvir o servidor caído.",
+          "updatesTitle": "⬆️ Atualizações",
+          "updatesDesc": "O painel só instala correções que não mudam o formato dos dados. Antes de atualizar ele faz uma cópia de segurança e, se algo der errado em 1 minuto, volta sozinho para a versão anterior.",
+          "btnCheckUpdates": "🔍 Procurar atualizações",
+          "checking": "Procurando…",
+          "upToDate": "Em dia",
+          "btnUpdate": "Atualizar",
+          "updateDone": "Atualizado para",
+          "updateRolledBack": "A atualização não funcionou e tudo voltou como estava:",
+          "compPostgres": "Banco de dados (PostgreSQL)",
+          "compRedis": "Cache (Redis)",
+          "compGarage": "Arquivos (Garage)",
+          "updatesMajorQ": "E as versões grandes (ex.: PostgreSQL 17)?",
+          "updatesMajorA": "Mudam o formato dos dados e precisam de migração própria. O painel não instala sozinho.",
+          "helpTitle": "❓ Ajuda",
+          "helpDesc": "As palavras que aparecem no painel, em uma frase cada. Detalhes técnicos estão em docs/ARCHITECTURE.md no repositório.",
+          "glApp": "App",
+          "glAppDesc": "Um site ou sistema seu rodando no servidor.",
+          "glBackup": "Cópia de segurança",
+          "glBackupDesc": "Foto dos seus dados para recuperar se algo quebrar.",
+          "glOffsite": "Fora do servidor",
+          "glOffsiteDesc": "Cópia guardada em outro lugar, para o caso de o servidor inteiro se perder.",
+          "glMirror": "Segundo servidor",
+          "glMirrorDesc": "Outra máquina que guarda uma cópia ao vivo e pode assumir os apps.",
+          "glArbiter": "Juiz",
+          "glArbiterDesc": "Terceiro aparelho que decide quem assume quando os dois servidores perdem contato.",
+          "glApproval": "Pedido de aprovação",
+          "glApprovalDesc": "Ação arriscada pedida pela IA que só acontece se você aprovar no Início.",
+          "glTrash": "Lixeira",
+          "glTrashDesc": "App apagado fica guardado por um tempo antes de sumir de vez.",
+          "glScope": "Escopo",
+          "glScopeDesc": "A gaveta de senhas de cada app. “system” guarda as chaves do próprio painel."
+    });
+    Object.assign(I18N.en, {
+          "sidebarSubtitle": "Your app server",
+          "navHome": "🏠 Home",
+          "navOverview": "📦 Apps",
+          "navDatabases": "🗄️ Data & backups",
+          "navVault": "🔐 Passwords & keys",
+          "navEmail": "✉️ Email",
+          "navMirror": "🔁 Second server",
+          "navUpdates": "⬆️ Updates",
+          "navFederation": "🔗 Connections & webhook",
+          "navDoctor": "🩺 Diagnostics",
+          "navAgents": "🤖 Connect AI",
+          "navHelp": "❓ Help",
+          "homeTitle": "🏠 Home",
+          "setupTitle": "🧭 Optional integrations",
+          "appsTitle": "📦 Your apps",
+          "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app.",
+          "deployTitle": "➕ Publish an app",
+          "deployDesc": "Enter the GitHub repository (or a folder on the server). The dashboard detects the language and builds everything. App passwords live in Passwords & keys.",
+          "exposeTitle": "🌐 Make an app reachable",
+          "exposeDesc": "Choose who can open it: anyone on the internet, only allowed emails, or only your private network (Tailscale). No router port is opened.",
+          "vaultTitle": "🔐 App passwords & keys",
+          "vaultDesc": "Store the passwords and keys your apps use (e.g. a Stripe key). Everything is encrypted on disk and never shown in full again after saving. Use the app name as scope; <code>system</code> is only for the dashboard's own keys.",
+          "dbTitle": "🗄️ Create a database",
+          "dbDesc": "Each app gets its own database, separate from the others. The connection address (<code>DATABASE_URL</code> or <code>REDIS_URL</code>) goes into the app's passwords automatically.",
+          "backupsTitle": "🛡️ Backups",
+          "backupsDesc": "Encrypted copies of app databases and files. Use “Test” to check a backup opens before you need it.",
+          "fedTitle": "🔗 Connect another server",
+          "fedDesc": "First step to a second server: both exchange a trust key. Then use the <strong>Second server</strong> tab for the live copy of the data.",
+          "optFedActive": "Both serve together (apps without their own data)",
+          "optFedWarm": "Standby: copy apps and passwords to the other server",
+          "btnGenInvite": "🔑 Create invite (valid 15 min)",
+          "btnExportSync": "📦 Send apps and passwords to the other",
+          "lblJoinPeer": "Join as second server (paste the invite):",
+          "btnJoinPeer": "🤝 Connect",
+          "whTitle": "⚡ Publish on every git push (webhook)",
+          "whDesc": "Optional, and the dashboard must be reachable from the internet. Without that, tick “Update by itself” when publishing: the server checks GitHub every 2 minutes.",
+          "doctorTitle": "🩺 Diagnostics",
+          "doctorDesc": "Looks for apps out of memory, restarting in a loop or stopped with an error, and says what to do.",
+          "agentsTitle": "🤖 Connect your AI",
+          "agentsDesc": "Any MCP-compatible AI (Claude, ChatGPT, Gemini, local models) can run the server for you. Risky actions always wait for your approval on Home.",
+          "homeDesc": "Server summary, requests waiting for you and next steps.",
+          "stepsTitle": "🧭 First steps",
+          "stepsDesc": "Do them in order. Each step says what it is and why it is worth it.",
+          "step1Title": "Publish your first app",
+          "step1Desc": "Paste the code address and the dashboard does the rest.",
+          "step2Title": "Keep backups off the server",
+          "step2Desc": "If the server breaks or is stolen, your data is still safe elsewhere.",
+          "step3Title": "Set up email sending",
+          "step3Desc": "So apps can send “forgot password” and notices. Takes 5 minutes with a free account.",
+          "step4Title": "Add a second server",
+          "step4Desc": "It keeps a live copy of everything and can take over if this one goes down.",
+          "step5Title": "Connect your AI",
+          "step5Desc": "Ask in plain words: “publish my app”, “back up now”.",
+          "optional": "optional",
+          "done": "Done",
+          "openStep": "Do it now",
+          "never": "Never",
+          "notConfigured": "Not set up",
+          "off": "Off",
+          "tileApps": "Apps",
+          "tileAppsNote": "running on this server",
+          "tileAppsNone": "No apps yet",
+          "tileBackup": "Last backup",
+          "tileBackupOff": "Also stored off the server",
+          "tileBackupLocal": "Only on this server",
+          "tileBackupNone": "No backups yet",
+          "tileMirror": "Second server",
+          "tileMirrorOn": "On",
+          "tileMirrorOff": "Not used",
+          "tileMirrorNote": "Live copy of the data",
+          "tileEmail": "Email",
+          "tileEmailNote": "Apps cannot send email yet",
+          "detailsTech": "Technical details",
+          "offsiteTitle": "☁️ Backups off the server",
+          "offsiteDesc": "Every night the server makes backups and sends them to external storage. Local copies are only deleted after they arrive there.",
+          "offsiteTech": "Any S3-compatible service (Backblaze B2, Cloudflare R2, Wasabi or the second server). Set BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID and BACKUP_S3_SECRET_ACCESS_KEY in the system scope of Passwords & keys. Nightly schedule: paasmcp backup install-timer.",
+          "btnSyncOffsite": "☁️ Send backups now",
+          "offsiteDone": "Backups sent:",
+          "offsiteFailed": "failed:",
+          "storageTitle": "🗂️ App files",
+          "storageDesc": "Space for photos, PDFs and uploads. Each app gets its own, with its own key; common libraries (boto3, AWS SDK) work without code changes.",
+          "storageNone": "No app has file space yet.",
+          "btnStorage": "+ Create file space",
+          "storageDone": "Space created. Publish the app again so it uses it.",
+          "lblAppName": "App name",
+          "lblDepPoll": "Update by itself when I change the code (checks every 2 min)",
+          "lblDepStorage": "Create file space",
+          "lblDepEmail": "Let the app send email",
+          "emailTitle": "✉️ Email sending",
+          "emailDesc": "Email sent straight from home lands in spam or never leaves. So the dashboard uses a sending service, set up once for all apps.",
+          "emailTip": "Tip: Brevo has a free plan with 300 emails a day. Create the account, verify your domain and copy the SMTP details. The password is encrypted and only sent over a secure connection.",
+          "lblEmHost": "SMTP server",
+          "lblEmPort": "Port",
+          "lblEmUser": "User",
+          "lblEmPass": "Password or key",
+          "lblEmDomain": "Your sending domain",
+          "btnSave": "💾 Save",
+          "saved": "Saved.",
+          "keepSaved": "(leave empty to keep the saved one)",
+          "emailOn": "Set up:",
+          "emailTestTitle": "Send a test email",
+          "lblEmTo": "To",
+          "btnEmailTest": "📨 Send test",
+          "emailSent": "Test email accepted by the service.",
+          "emailAppTitle": "Allow an app to send email",
+          "emailAppDesc": "Puts the sending details into the app's passwords. Publish the app again so it uses them.",
+          "btnEmailApp": "Allow",
+          "emailAppDone": "Done. Sender:",
+          "mirrorTitle": "🔁 Second server",
+          "mirrorDesc": "Both servers keep a live copy of each other. If one goes down, the other can take over its apps with data up to the last second. First connect both in Connections & webhook.",
+          "mirrorNone": "No copy set up yet. Use the two boxes below: one server offers, the other receives.",
+          "mirrorAuto": "Automatic takeover",
+          "mirrorArbiter": "Arbiter",
+          "mirrorSendingTo": "Sending copy to",
+          "connected": "Connected",
+          "waitingPeer": "Waiting for the other server",
+          "mirrorLost": "The other server was away too long and needs a fresh copy: offer again.",
+          "mirrorCopyOf": "Copy of",
+          "mirrorUpToDate": "Up to date",
+          "mirrorNotStreaming": "Stopped",
+          "mirrorServingHere": "Apps running here",
+          "mirrorPromoteDesc": "If that server goes down, you can take over its apps here.",
+          "mirrorPromotedDesc": "Its apps run here. When it comes back, follow the hand-back steps below.",
+          "btnPromote": "Take over the apps",
+          "btnHandback": "Hand the apps back",
+          "mirrorFenced": "Blocked",
+          "mirrorFencedDesc": "Another server took over this one's data while it was away. Apps here stay stopped until the hand-back, so no different data is written.",
+          "mirrorOfferTitle": "Offer a copy to the other server",
+          "mirrorOfferDesc": "Creates an invite. Paste it on the other server, in the box next to this one.",
+          "lblPeerName": "Other server's name",
+          "lblPeerIp": "Other server's Tailscale address",
+          "lblFromCopyOf": "Hand-back: copy of which server? (leave empty normally)",
+          "btnMirrorOffer": "🔑 Create invite",
+          "mirrorAcceptTitle": "Receive a copy from the other server",
+          "mirrorAcceptDesc": "Paste the invite created on the other server.",
+          "lblInvite": "Invite",
+          "lblRejoin": "This server went down and is coming back (receives the new data from the other)",
+          "btnMirrorAccept": "🤝 Receive copy",
+          "mirrorAccepted": "Copy started.",
+          "mirrorPromoted": "Apps taken over.",
+          "mirrorHandedBack": "Apps handed back. Now take them over on the other server.",
+          "autoTitle": "Automatic takeover",
+          "autoDesc": "If the other server disappears for more than 1 minute, this one takes over. Needs an arbiter: a small third device (Raspberry Pi or cheap VPS) running paasmcp arbiter serve. Without it, if only the link between the two breaks, each would think the other died.",
+          "lblArbiter": "Arbiter address",
+          "btnAutoOn": "Turn on",
+          "btnAutoOff": "Turn off",
+          "failbackTitle": "Hand the apps back when the failed server returns",
+          "failback1": "Here: in “Offer a copy”, fill the hand-back field with the failed server's name and create the invite.",
+          "failback2": "On the returning server: paste the invite and tick “This server went down and is coming back”.",
+          "failback3": "Here: click “Hand the apps back”.",
+          "failback4": "On the returning server: click “Take over the apps”.",
+          "mirrorTech": "PostgreSQL physical streaming replication with a slot capped at 10 GB. Each takeover raises the epoch; the server with the lower epoch is blocked (fencing). The arbiter only grants a takeover if it cannot hear the failed server either.",
+          "updatesTitle": "⬆️ Updates",
+          "updatesDesc": "The dashboard only installs fixes that keep the data format. Before updating it makes a backup and, if something fails within 1 minute, goes back to the previous version by itself.",
+          "btnCheckUpdates": "🔍 Check for updates",
+          "checking": "Checking…",
+          "upToDate": "Up to date",
+          "btnUpdate": "Update",
+          "updateDone": "Updated to",
+          "updateRolledBack": "The update did not work and everything is back as it was:",
+          "compPostgres": "Database (PostgreSQL)",
+          "compRedis": "Cache (Redis)",
+          "compGarage": "Files (Garage)",
+          "updatesMajorQ": "What about big versions (e.g. PostgreSQL 17)?",
+          "updatesMajorA": "They change the data format and need their own migration. The dashboard does not install them by itself.",
+          "helpTitle": "❓ Help",
+          "helpDesc": "The words you see in the dashboard, one sentence each. Technical details are in docs/ARCHITECTURE.md in the repository.",
+          "glApp": "App",
+          "glAppDesc": "A site or system of yours running on the server.",
+          "glBackup": "Backup",
+          "glBackupDesc": "A snapshot of your data to recover if something breaks.",
+          "glOffsite": "Off the server",
+          "glOffsiteDesc": "A copy kept somewhere else, in case the whole server is lost.",
+          "glMirror": "Second server",
+          "glMirrorDesc": "Another machine that keeps a live copy and can take over the apps.",
+          "glArbiter": "Arbiter",
+          "glArbiterDesc": "A third device that decides who takes over when the two servers lose contact.",
+          "glApproval": "Approval request",
+          "glApprovalDesc": "A risky action the AI asked for that only happens if you approve it on Home.",
+          "glTrash": "Trash",
+          "glTrashDesc": "A deleted app is kept for a while before it is gone for good.",
+          "glScope": "Scope",
+          "glScopeDesc": "Each app's password drawer. “system” holds the dashboard's own keys."
+    });
+
     function t(key) {
       const dict = I18N[currentLang] || I18N.pt;
       return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
@@ -2124,7 +2761,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
       'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
       'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
-      'sidebarSubtitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navUpdates', 'navHelp', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
       'topHealthBadge', 'btnRefresh', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -2193,6 +2830,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (pane) pane.classList.add('active');
       if (btnEl) btnEl.classList.add('active');
       if (tabName === 'doctor') runDoctor();
+      if (tabName === 'email') loadEmail();
+      if (tabName === 'mirror') loadMirror();
+      if (tabName === 'updates' && !updatesLoaded) loadUpdates();
+      if (tabName === 'databases') loadStorage();
     }
 
     function toggleTheme() {
@@ -2215,6 +2856,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       const fedUrlEl = document.getElementById('fedUrl');
       if (fedUrlEl && !fedUrlEl.value) fedUrlEl.value = window.location.origin;
 
+      document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
+      renderHome();
       for (const k of I18N_KEYS) {
         const el = document.getElementById(k);
         if (el) {
@@ -2467,8 +3110,185 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       loadApprovals();
     }
 
+    // ---- Home, e-mail, second server, updates, storage (plain-language screens) ----
+    let emailRelay = null;
+    let updatesLoaded = false;
+    const card = (inner) => '<div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;">' + inner + '</div>';
+    const badge = (cls, text) => '<span class="badge ' + cls + '">' + esc(text) + '</span>';
+    function goTab(name) { switchTab(name, document.getElementById('nav' + name.charAt(0).toUpperCase() + name.slice(1))); }
+    async function postJson(url, body) {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { if (!data.confirmationRequired) alert(data.error || ('HTTP ' + res.status)); return null; }
+      return data;
+    }
+
+    function renderHome() {
+      const tiles = document.getElementById('homeTiles');
+      if (!tiles) return;
+      const s = lastStatus || {};
+      const apps = Object.values(s.apps || {});
+      const backups = (s.backups || []).slice().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+      const last = backups[0];
+      const offsiteOn = Boolean((s.systemSecretsConfigured || {}).BACKUP_S3_ENDPOINT);
+      const m = s.mirror || {};
+      const hasMirror = Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0;
+      const tile = (title, value, note) => '<div class="arch-box"><h3>' + esc(title) + '</h3><p style="font-size:18px;font-weight:700;color:var(--text);margin:4px 0;">' + esc(value) + '</p><p>' + esc(note) + '</p></div>';
+      tiles.innerHTML =
+        tile(t('tileApps'), String(apps.length), apps.length ? t('tileAppsNote') : t('tileAppsNone')) +
+        tile(t('tileBackup'), last ? new Date(last.createdAt).toLocaleString() : t('never'), last ? (last.offsiteAt ? t('tileBackupOff') : t('tileBackupLocal')) : t('tileBackupNone')) +
+        tile(t('tileMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('tileMirrorOn') : t('tileMirrorOff'), t('tileMirrorNote')) +
+        tile(t('tileEmail'), emailRelay ? emailRelay.host : t('notConfigured'), emailRelay ? emailRelay.fromDomain : t('tileEmailNote'));
+      const steps = [
+        ['step1', apps.length > 0, 'overview', false],
+        ['step2', offsiteOn, 'databases', false],
+        ['step3', Boolean(emailRelay), 'email', false],
+        ['step4', hasMirror, 'mirror', true],
+        ['step5', false, 'agents', true],
+      ];
+      document.getElementById('homeSteps').innerHTML = steps.map((st, i) => card(
+        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
+        '<div><strong>' + (i + 1) + '. ' + esc(t(st[0] + 'Title')) + '</strong>' + (st[3] ? ' <span style="color:var(--muted)">(' + esc(t('optional')) + ')</span>' : '') +
+        '<div style="color:var(--muted);margin-top:4px;">' + esc(t(st[0] + 'Desc')) + '</div></div>' +
+        (st[1] ? badge('success', t('done')) : '<button class="secondary" onclick="goTab(&#39;' + st[2] + '&#39;)">' + esc(t('openStep')) + '</button>') +
+        '</div>')).join('');
+      const g = document.getElementById('helpGlossary');
+      if (g) g.innerHTML = ['App', 'Backup', 'Offsite', 'Mirror', 'Arbiter', 'Approval', 'Trash', 'Scope'].map(k => card('<strong>' + esc(t('gl' + k)) + '</strong><div style="color:var(--muted);margin-top:4px;">' + esc(t('gl' + k + 'Desc')) + '</div>')).join('');
+    }
+
+    async function loadEmail() {
+      const res = await fetch('/api/email');
+      if (!res.ok) return;
+      emailRelay = (await res.json()).relay;
+      const st = document.getElementById('emailStatus');
+      if (st) st.innerHTML = emailRelay ? badge('success', t('emailOn') + ' ' + emailRelay.host) : badge('warning', t('notConfigured'));
+      if (emailRelay) {
+        document.getElementById('emHost').value = emailRelay.host;
+        document.getElementById('emPort').value = emailRelay.port;
+        document.getElementById('emUser').value = emailRelay.user;
+        document.getElementById('emDomain').value = emailRelay.fromDomain;
+        document.getElementById('emPass').placeholder = t('keepSaved');
+      }
+      renderHome();
+    }
+    async function saveEmail() {
+      const ok = await postJson('/api/email', {
+        host: document.getElementById('emHost').value.trim(),
+        port: Number(document.getElementById('emPort').value || 587),
+        user: document.getElementById('emUser').value.trim(),
+        password: document.getElementById('emPass').value,
+        fromDomain: document.getElementById('emDomain').value.trim(),
+      });
+      if (ok) { document.getElementById('emPass').value = ''; showToast(t('saved')); loadEmail(); }
+    }
+    async function testEmail() {
+      const r = await postJson('/api/email/test', { to: document.getElementById('emTo').value.trim() });
+      if (r) showToast(t('emailSent'));
+    }
+    async function provisionEmailUi() {
+      const appName = document.getElementById('emApp').value.trim();
+      if (!appName) return;
+      const r = await postJson('/api/email/provision', { appName });
+      if (r) showToast(t('emailAppDone') + ' ' + r.from);
+    }
+
+    async function loadMirror() {
+      const res = await fetch('/api/mirror');
+      if (!res.ok) return;
+      const m = await res.json();
+      let html = '';
+      if (m.fenced) html += card(badge('danger', t('mirrorFenced')) + '<div style="margin-top:6px;">' + esc(t('mirrorFencedDesc')) + '</div>');
+      html += card('<strong>' + esc(t('mirrorAuto')) + ':</strong> ' + ((m.auto || []).length ? badge('success', (m.auto || []).join(', ')) : badge('', t('off'))) +
+        ' · <strong>' + esc(t('mirrorArbiter')) + ':</strong> ' + (m.arbiterUrl ? esc(m.arbiterUrl) : esc(t('notConfigured'))));
+      (m.sending || []).forEach(o => {
+        html += card('<strong>' + esc(t('mirrorSendingTo')) + ' ' + esc(o.peer) + '</strong> ' +
+          (o.error ? badge('danger', o.error) : o.connected ? badge('success', t('connected')) : badge('warning', t('waitingPeer'))) +
+          (o.walStatus === 'lost' ? '<div style="margin-top:6px;">' + esc(t('mirrorLost')) + '</div>' : ''));
+      });
+      (m.receiving || []).forEach(r => {
+        const state = r.error ? badge('danger', r.error)
+          : r.promotedAt ? badge('warning', t('mirrorServingHere'))
+          : r.streaming ? badge('success', t('mirrorUpToDate') + (r.secondsSinceLastChangeApplied != null ? ' (' + r.secondsSinceLastChangeApplied + ' s)' : ''))
+          : badge('warning', t('mirrorNotStreaming'));
+        const action = r.promotedAt
+          ? '<button class="secondary" onclick="mirrorHandback(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnHandback')) + '</button>'
+          : '<button class="danger" onclick="mirrorPromote(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnPromote')) + '</button>';
+        html += card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + '</strong> ' + state +
+          '<div style="color:var(--muted);margin-top:4px;">' + esc(r.promotedAt ? t('mirrorPromotedDesc') : t('mirrorPromoteDesc')) + '</div></div>' + action + '</div>');
+      });
+      if (!(m.sending || []).length && !(m.receiving || []).length) html += card(esc(t('mirrorNone')));
+      document.getElementById('mirrorStatusBox').innerHTML = html;
+    }
+    async function mirrorOffer() {
+      const r = await postJson('/api/mirror/offer', {
+        peer: document.getElementById('mOfferPeer').value.trim(),
+        peerIp: document.getElementById('mOfferIp').value.trim(),
+        fromCopyOf: document.getElementById('mOfferFrom').value.trim() || undefined,
+      });
+      if (!r) return;
+      const box = document.getElementById('mOfferToken');
+      box.style.display = 'block';
+      box.textContent = r.token;
+      copyText(r.token);
+      loadMirror();
+    }
+    async function mirrorAccept() {
+      const r = await postJson('/api/mirror/accept', { token: document.getElementById('mAcceptToken').value.trim(), rejoin: document.getElementById('mRejoin').checked });
+      if (r) { showToast(t('mirrorAccepted')); loadMirror(); }
+    }
+    async function mirrorPromote(peer) { if (await postJson('/api/mirror/promote', { peer })) { showToast(t('mirrorPromoted')); loadMirror(); loadAll(); } }
+    async function mirrorHandback(peer) { if (await postJson('/api/mirror/handback', { peer })) { showToast(t('mirrorHandedBack')); loadMirror(); loadAll(); } }
+    async function mirrorAuto(on) {
+      const r = await postJson('/api/mirror/auto', { peer: document.getElementById('mAutoPeer').value.trim(), on, arbiterUrl: document.getElementById('mArbiter').value.trim() || undefined });
+      if (r) { showToast(t('saved')); loadMirror(); }
+    }
+
+    async function loadUpdates() {
+      const box = document.getElementById('updatesList');
+      box.innerHTML = card(esc(t('checking')));
+      const res = await fetch('/api/updates');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { box.innerHTML = card(badge('danger', data.error || 'error')); return; }
+      updatesLoaded = true;
+      const names = { postgres: t('compPostgres'), redis: t('compRedis'), garage: t('compGarage') };
+      box.innerHTML = (data.updates || []).map(u => card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(names[u.component] || u.component) + '</strong><div style="color:var(--muted);margin-top:4px;">' + esc(u.running) +
+        (u.available ? ' → ' + esc(u.available) : '') + (u.note ? ' · ' + esc(u.note) : '') + '</div></div>' +
+        (u.available ? '<button onclick="applyUpdateUi(&#39;' + esc(u.component) + '&#39;, &#39;' + esc(u.available) + '&#39;)">' + esc(t('btnUpdate')) + '</button>' : badge('success', t('upToDate'))) + '</div>')).join('');
+    }
+    async function applyUpdateUi(component, image) {
+      const r = await postJson('/api/updates/apply', { component, image });
+      if (!r) return;
+      if (r.rolledBack) alert(t('updateRolledBack') + ' ' + r.rolledBack);
+      else showToast(t('updateDone') + ' ' + r.to);
+      loadUpdates();
+    }
+
+    async function loadStorage() {
+      const res = await fetch('/api/storage');
+      if (!res.ok) return;
+      const items = (await res.json()).storage || [];
+      document.getElementById('storageList').innerHTML = items.length
+        ? items.map(i => card('<strong>' + esc(i.appName) + '</strong> · <code>' + esc(i.bucket) + '</code>')).join('')
+        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('storageNone')) + '</span>';
+    }
+    async function provisionStorageUi() {
+      const appName = document.getElementById('stoApp').value.trim();
+      if (!appName) return;
+      const r = await postJson('/api/storage', { appName });
+      if (r) { showToast(t('storageDone')); loadStorage(); }
+    }
+    async function syncOffsiteNow() {
+      const btn = document.getElementById('btnSyncOffsite');
+      btn.disabled = true;
+      try {
+        const r = await postJson('/api/backups/sync', {});
+        if (r) showToast(t('offsiteDone') + ' ' + r.uploaded.length + (r.failed.length ? ' · ' + t('offsiteFailed') + ' ' + r.failed.length : ''));
+      } finally { btn.disabled = false; }
+    }
+
     async function loadAll() {
       loadApprovals();
+      loadEmail();
       const res = await fetch('/api/status');
       if (!res.ok) return;
       lastStatus = await res.json();
@@ -2662,6 +3482,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       const withPostgres = document.getElementById('depPg').checked;
       const withRedis = document.getElementById('depRedis').checked;
       if (!appName || !repoSource) return;
+      // Storage and e-mail go into the app's vault first, so this deploy already starts with them.
+      if (document.getElementById('depStorage').checked && !(await postJson('/api/storage', { appName }))) return;
+      if (document.getElementById('depEmail').checked && !(await postJson('/api/email/provision', { appName }))) return;
       const btn = document.getElementById('btnDeploy');
       btn.textContent = t('toastDeploying');
       btn.disabled = true;
@@ -2673,7 +3496,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         });
         const data = await res.json();
         if (!res.ok) alert('Error: ' + data.error);
-        else { showToast(t('toastDeployDone') + appName); loadAll(); }
+        else {
+          if (document.getElementById('depPoll').checked) await postJson('/api/poll', { appName, on: true });
+          showToast(t('toastDeployDone') + appName);
+          loadAll();
+        }
       } finally {
         btn.textContent = t('btnDeploy');
         btn.disabled = false;
