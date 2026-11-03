@@ -136,6 +136,8 @@ export async function offerMirror(opts: {
   peerName: string;
   peerCidr: string;
   advertiseHost?: string;
+  /** Port the peer connects to (default: 5432, or the copy's published port). Labs on one Docker host use 5432 + the container name. */
+  advertisePort?: number;
   withBackups?: boolean;
   /** Failback: offer the promoted copy of this peer (it is now where the data lives). */
   fromCopyOf?: string;
@@ -145,7 +147,7 @@ export async function offerMirror(opts: {
   const copy = opts.fromCopyOf ? mirrorState().replicas[sanitizeSlug(opts.fromCopyOf)] : undefined;
   if (opts.fromCopyOf && !copy?.promotedAt) throw new Error(`There is no promoted copy of '${opts.fromCopyOf}' here to offer.`);
   const source = copy ? copy.container : PRIMARY;
-  const sourcePort = copy ? copy.localPort : 5432;
+  const sourcePort = opts.advertisePort || (copy ? copy.localPort : 5432);
   if (!/^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(opts.peerCidr)) throw new Error(`Invalid --peer-ip '${opts.peerCidr}' (an IP or CIDR).`);
   const peerCidr = opts.peerCidr.includes("/") ? opts.peerCidr : `${opts.peerCidr}/${opts.peerCidr.includes(":") ? 128 : 32}`;
   const host = opts.advertiseHost || detectTailscaleIp();
