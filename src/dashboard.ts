@@ -962,6 +962,33 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         <div class="tab-pane active" id="tab-overview">
           <div class="card">
             <div class="card-header">
+              <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
+              <p class="card-desc" id="setupDesc">Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.</p>
+            </div>
+            <div class="grid-2">
+              <div class="arch-box">
+                <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
+                <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública na seção Webhook abaixo e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
+                <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" id="setupGithubLink">Criar fine-grained token ↗</a> · <a href="https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key" target="_blank" rel="noreferrer" id="setupGithubDocsLink">Permissões da API ↗</a></p>
+              </div>
+              <div class="arch-box">
+                <h3 id="setupCloudTitle">☁️ Cloudflare — opcional para publicar</h3>
+                <p id="setupCloudDesc">Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.</p>
+                <p><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" id="setupCloudLink">Criar API token ↗</a> · <a href="https://developers.cloudflare.com/fundamentals/api/get-started/create-token/" target="_blank" rel="noreferrer" id="setupCloudDocsLink">Guia de tokens ↗</a></p>
+              </div>
+              <div class="arch-box">
+                <h3 id="setupLocalTitle">🔐 Acesso e deploy local</h3>
+                <p id="setupLocalDesc">O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.</p>
+              </div>
+              <div class="arch-box">
+                <h3 id="setupAppTitle">🧩 Segredos e sugestões por aplicação</h3>
+                <p id="setupAppDesc">Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.</p>
+              </div>
+            </div>
+            <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre a URL mostrada na aba Webhook no GitHub, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
+          </div>
+          <div class="card">
+            <div class="card-header">
               <h2>
                 <span id="appsTitle">📦 Aplicações Hospedadas & Métricas em Tempo Real</span>
                 <span class="badge" id="appsBadgeCount">0 apps</span>
@@ -1307,6 +1334,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 
     const I18N = {
       pt: {
+        setupTitle: "🧭 Primeira configuração: o que você precisa?",
+        setupDesc: "Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.",
+        setupGithubTitle: "🐙 GitHub — opcional",
+        setupGithubDesc: "Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública na seção Webhook abaixo e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.",
+        setupGithubLink: "Criar fine-grained token ↗",
+        setupGithubDocsLink: "Permissões da API ↗",
+        setupCloudTitle: "☁️ Cloudflare — opcional para publicar",
+        setupCloudDesc: "Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.",
+        setupCloudLink: "Criar API token ↗",
+        setupCloudDocsLink: "Guia de tokens ↗",
+        setupLocalTitle: "🔐 Acesso e deploy local",
+        setupLocalDesc: "O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.",
+        setupAppTitle: "🧩 Segredos e sugestões por aplicação",
+        setupAppDesc: "Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.",
+        setupWebhookNote: "Auto-deploy por webhook é opcional: cadastre a URL mostrada na aba Webhook no GitHub, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navOverview: "📦 Aplicações & Deploy",
         navVault: "🔐 Cofre AES-256-GCM",
@@ -1409,11 +1451,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         presetSpa: "SPA / Site Estático",
         chipSystemScope: "⚙️ system (Tokens Globais)",
         promptEx1Title: "💬 Deploy & Banco 1-Click",
-        promptEx1Desc: "\"Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>\"",
+        promptEx1Desc: "'Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>'",
         promptEx2Title: "💬 Backup & Rollback",
-        promptEx2Desc: "\"Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro\"",
+        promptEx2Desc: "'Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro'",
         promptEx3Title: "💬 Diagnóstico & Multi-Node",
-        promptEx3Desc: "\"Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA\"",
+        promptEx3Desc: "'Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA'",
         archPillar1Title: "1. Isolamento Loopback (127.0.0.1)",
         archPillar1Desc: "Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.",
         archPillar2Title: "2. Cofre & Backups AES-256-GCM",
@@ -1435,8 +1477,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         actionRollback: "⏪ Rollback",
         actionDelete: "Excluir",
         btnRestartContainer: "🔄 Reiniciar Container",
-        lastCheck: "\${esc(t('lastCheck'))}",
-        overallStatus: "\${esc(t('overallStatus'))}",
+        lastCheck: "Última checagem:",
+        overallStatus: "Status geral:",
         doctorChecking: "⏳ Verificando Containers...",
         doctorDoneToast: "🩺 Diagnóstico concluído",
         confirmDelete: "Destruir container e arquivos de ",
@@ -1458,6 +1500,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         onDemandStatus: "Sob demanda"
       },
       en: {
+        setupTitle: "🧭 First-time setup: what do you need?",
+        setupDesc: "Configure only the integrations you plan to use. PaaSMCP works locally without third-party tokens; secret values are stored in the Vault.",
+        setupGithubTitle: "🐙 GitHub — optional",
+        setupGithubDesc: "For a private repository, use a read-only SSH Deploy Key. Copy the public key from the Webhook section below and add it under Settings → Deploy keys. To register it automatically or clone over HTTPS, save <code>GITHUB_TOKEN</code> in the <code>system</code> scope. A fine-grained token needs access only to the target repository and <em>Administration: read and write</em>; the created key remains read-only.",
+        setupGithubLink: "Create fine-grained token ↗",
+        setupGithubDocsLink: "API permissions ↗",
+        setupCloudTitle: "☁️ Cloudflare — optional for publishing",
+        setupCloudDesc: "For Tunnel + DNS: create a token with Account → Cloudflare Tunnel: Edit and Zone → DNS: Edit, scoped to the required account and zone. For Zero Trust protection, also add Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domain, and allowed emails with <code>paasmcp config</code> or <code>paas_configure</code>, and save <code>CF_API_TOKEN</code> in <code>system</code> scope.",
+        setupCloudLink: "Create API token ↗",
+        setupCloudDocsLink: "Token guide ↗",
+        setupLocalTitle: "🔐 Dashboard access and local deploy",
+        setupLocalDesc: "The dashboard token is generated automatically: retrieve it with <code>paasmcp dashboard token</code>. Public repositories, SSH access to private repositories, and local folders do not require a GitHub token if you add the public SSH key to the repository. Tailscale is a private alternative that does not require Cloudflare.",
+        setupAppTitle: "🧩 App secrets and recommendations",
+        setupAppDesc: "Save application keys in the scope named after its slug (for example <code>STRIPE_SECRET_KEY</code> or <code>API_KEY</code>), never in <code>system</code>. Select PostgreSQL/Redis during deployment if needed. Then check Logs and run Doctor; expose as Public only services with their own login. Use Zero Trust or Tailscale for admin tools.",
+        setupWebhookNote: "Webhook auto-deploy is optional: add the URL shown in the Webhook tab to GitHub, select Push events, and use the secret shown by the dashboard. Do not paste tokens into chat; enter them in the Vault.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navOverview: "📦 Applications & Deploy",
         navVault: "🔐 AES-256-GCM Vault",
@@ -1560,11 +1617,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         presetSpa: "SPA / Static Site",
         chipSystemScope: "⚙️ system (Global Tokens)",
         promptEx1Title: "💬 1-Click Deploy & Database",
-        promptEx1Desc: "\"Deploy repository <code>user/my-saas</code> with PostgreSQL, 512m RAM limit, and publish on <code>saas.{domain}</code>\"",
+        promptEx1Desc: "'Deploy repository <code>user/my-saas</code> with PostgreSQL, 512m RAM limit, and publish on <code>saas.{domain}</code>'",
         promptEx2Title: "💬 Backup & Rollback",
-        promptEx2Desc: "\"Create an encrypted database backup for app <code>my-saas</code> before upgrading and rollback if it fails\"",
+        promptEx2Desc: "'Create an encrypted database backup for app <code>my-saas</code> before upgrading and rollback if it fails'",
         promptEx3Title: "💬 Diagnostics & Multi-Node",
-        promptEx3Desc: "\"Run <code>paas_doctor</code> to check if any container suffered an OOMKill and generate an HA pairing token\"",
+        promptEx3Desc: "'Run <code>paas_doctor</code> to check if any container suffered an OOMKill and generate an HA pairing token'",
         archPillar1Title: "1. Loopback Isolation (127.0.0.1)",
         archPillar1Desc: "No application or database ports are exposed on <code>0.0.0.0</code>. External traffic enters exclusively via outbound QUIC tunnels (Cloudflare Tunnel) or Tailscale.",
         archPillar2Title: "2. AES-256-GCM Vault & Backups",
@@ -1616,6 +1673,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     }
 
     const I18N_KEYS = [
+      'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
+      'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
+      'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
       'sidebarSubtitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
       'topHealthBadge', 'btnRefresh', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',

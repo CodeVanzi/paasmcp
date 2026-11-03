@@ -46,3 +46,21 @@ A interface é dividida em 6 abas rápidas na barra lateral:
 - **🌐 Multi-Server HA & Webhook:** Gerador de Join Token `paasmcp-join://`, exportação de bundle criptografado e URL/Secret do Webhook do GitHub.
 - **🩺 Doctor & Diagnóstico:** Inspeção de saúde dos containers e alertas de `OOMKilled`.
 - **🤖 Studio IA (MCP) & Guia:** Configuração pronta para copiar em clientes MCP e explicação visual da arquitetura de segurança.
+
+### Primeira configuração e credenciais
+
+As integrações externas são opcionais. Bootstrap, deploy de pastas locais, repositórios públicos, bancos locais e uso do painel não precisam de token Cloudflare ou GitHub. Guarde credenciais em **Cofre → escopo `system`**; segredos usados pelo código de uma aplicação ficam no escopo do slug dela. O painel mostra valores mascarados depois de salvar.
+
+| Item | Quando é necessário | Como obter/configurar |
+| --- | --- | --- |
+| `DASHBOARD_TOKEN` | Entrar no painel | Gerado automaticamente. Consulte no host com `paasmcp dashboard token`; não é necessário criar token externo. |
+| Chave SSH Ed25519 | Clonar repositórios privados por SSH ou usar chave de deploy | A chave é criada no bootstrap. Na aba Webhook, copie a chave pública e adicione em GitHub → repositório → Settings → Deploy keys. Mantenha acesso somente leitura. |
+| `GITHUB_TOKEN` | Opcional: registrar a Deploy Key via API ou clonar repositório privado por HTTPS | Crie um fine-grained personal access token, restrito ao repositório necessário, com `Administration: read and write` para a API de Deploy Keys. Essa permissão é exigida pelo endpoint do GitHub mesmo quando a chave registrada é somente leitura. Se não quiser concedê-la, adicione a chave SSH manualmente e deixe o token vazio. [Criar token](https://github.com/settings/personal-access-tokens/new) · [Permissões do endpoint](https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key). |
+| `CF_API_TOKEN` | Opcional: publicar via Cloudflare Tunnel/DNS; também cria política Access no modo Zero Trust | Crie token restrito à conta e zona usadas. Necessário: Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit. Para Zero Trust, inclua Account → Access: Apps and Policies: Edit. [Criar token](https://dash.cloudflare.com/profile/api-tokens) · [Guia oficial de tokens](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/). Salve-o no Cofre `system`. |
+| Account ID, Tunnel ID e domínio base | Exposição via Cloudflare | Obtenha Account ID na área Overview da conta, Tunnel ID na lista de Tunnels e use um domínio cuja zona DNS esteja na Cloudflare. Configure por `paasmcp config --account-id ... --tunnel-id ... --domain ... --zero-trust-emails ...` ou MCP `paas_configure`. Para Zero Trust, informe os emails autorizados. |
+| `WEBHOOK_SECRET` | Opcional: rebuild automático ao receber Push do GitHub | Gerado automaticamente pelo PaaSMCP. Na aba Webhook, copie a URL e revele/copiei o secret; no GitHub → Settings → Webhooks, crie webhook com Content type `application/json`, secret correspondente e evento `Push`. O endpoint precisa estar acessível pelo GitHub. |
+| `CF_API_TOKEN` não necessário com Tailscale | Publicação privada via Tailnet | Instale e autentique Tailscale no host; use o modo Tailscale. Não requer DNS Cloudflare nem credencial adicional no PaaSMCP. |
+
+**Fluxo recomendado:** (1) inicialize com `paasmcp init`; (2) recupere o token do painel; (3) para código privado, escolha Deploy Key SSH manual ou token GitHub restrito; (4) configure Cloudflare somente se for publicar por Tunnel; (5) faça deploy e adicione segredos próprios da aplicação no escopo do app; (6) confira Logs/Doctor e publique serviços com autenticação própria como públicos, reservando Zero Trust/Tailscale para interfaces administrativas.
+
+Para o primeiro teste, use uma pasta local ou repositório público e um preset SPA; não configure tokens externos até que uma funcionalidade precise deles. PostgreSQL/Redis podem ser provisionados durante o deploy e as URLs são injetadas no escopo da aplicação.
