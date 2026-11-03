@@ -148,6 +148,8 @@ export interface PaaSState {
   backups?: Record<string, BackupRecord>;
   storage?: Record<string, StorageRecord>;
   mirror?: MirrorConfig;
+  /** Images moved by 'paasmcp update apply' (see updater.ts PINNED). */
+  versions?: Partial<Record<"postgres" | "redis" | "garage", string>>;
   federation?: FederationConfig;
 }
 

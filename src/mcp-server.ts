@@ -35,6 +35,7 @@ import {
   restoreDatabase,
 } from "./database.js";
 import { provisionEmail } from "./email.js";
+import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { mirrorStatus, promoteMirror } from "./mirror.js";
 import { provisionStorage } from "./storage.js";
 import { backupAppVolumes, fetchOffsite, syncOffsite, testRestore } from "./backup.js";
@@ -126,6 +127,7 @@ const TOOLS_WITH_APPROVAL = new Set([
   "paas_secret_delete",
   "paas_db_backup",
   "paas_mirror",
+  "paas_update",
   "paas_app_deploy",
   "paas_app_expose",
   "paas_app_lifecycle",
@@ -381,6 +383,20 @@ async function listTools() {
             fromName: { type: "string", description: "Optional display name for the sender, e.g. 'Guarapps'." },
           },
           required: ["appName"],
+        },
+      },
+      {
+        name: "paas_update",
+        description:
+          "Keeps the shared services (postgres, redis, garage) on pinned images. 'check' lists newer releases within the same major; 'apply' (needs a person's confirmation) backs up the databases, switches the image (mirror copies first), health-checks for 60 s and rolls back on failure. Major upgrades are refused.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["check", "apply"] },
+            component: { type: "string", enum: ["postgres", "redis", "garage"] },
+            image: { type: "string", description: "Target image for apply (default: the newest found by check)." },
+          },
+          required: ["action"],
         },
       },
       {
@@ -883,6 +899,18 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
       case "paas_email_provision": {
         const result = provisionEmail(String(args.appName), args.fromName ? String(args.fromName) : undefined);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "paas_update": {
+        if (args.action === "apply") {
+          const component = String(args.component) as Component;
+          if (!PINNED[component]) throw new Error("'component' must be postgres, redis or garage.");
+          const image = args.image ? String(args.image) : (await checkUpdates()).find((u) => u.component === component)?.available;
+          if (!image) throw new Error(`${component} is already on the newest release of its major version.`);
+          authorize("update.apply", { component, image });
+          return { content: [{ type: "text", text: JSON.stringify(applyUpdate(component, image), null, 2) }] };
+        }
+        return { content: [{ type: "text", text: JSON.stringify(await checkUpdates(), null, 2) }] };
       }
 
       case "paas_storage_provision": {

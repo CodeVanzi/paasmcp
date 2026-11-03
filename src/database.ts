@@ -20,6 +20,7 @@ import {
   setSecretEntries,
 } from "./vault.js";
 import { readVerifiedBackup, restoreVolume } from "./backup.js";
+import { imageFor } from "./updater.js";
 
 function assertSafeSqlIdentifier(id: string): string {
   if (!/^[a-z0-9_]{1,63}$/.test(id)) {
@@ -56,7 +57,7 @@ export function ensureSharedPostgresCluster(): { adminUser: string; adminPass: s
   const composeFile = path.join(PAAS_DB_DIR, "compose.yaml");
   const composeContent = `services:
   postgres:
-    image: postgres:16-alpine
+    image: ${imageFor("postgres")}
     container_name: paasmcp-postgres
     restart: unless-stopped
     env_file:
@@ -119,7 +120,7 @@ export function ensureSharedRedisCluster(): { redisPass: string } {
   const composeFile = path.join(PAAS_REDIS_DIR, "compose.yaml");
   const composeContent = `services:
   redis:
-    image: redis:7-alpine
+    image: ${imageFor("redis")}
     container_name: paasmcp-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${redisPass}"]

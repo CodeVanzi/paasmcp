@@ -155,6 +155,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`). |
 | `paas_secret_delete` | Deletes a secret key from the encrypted vault. |
 | `paas_db_provision` | Creates an isolated PostgreSQL or Redis database and binds `DATABASE_URL` / `REDIS_URL` into the app's vault. |
+| `paas_update` | `check` newer Postgres/Redis/Garage releases within the same major; `apply` (confirmation) backs up, switches (mirror copies first), health-checks and rolls back on failure. |
 | `paas_email_provision` | Lets an app send email through the server's relay (Brevo, SES...): injects `SMTP_*`, `EMAIL_FROM`, `EMAIL_URL` (and `BREVO_API_KEY`), sender `<app>@<domain>`. |
 | `paas_storage_provision` | Gives an app its own S3 bucket and key on this server (Garage, started on first use) and injects `S3_*` / `AWS_*` into its vault. |
 | `paas_db_backup` | Creates, lists, restores and **tests** AES-256-GCM encrypted `pg_dump` / Redis / Docker volume snapshots (SHA-256 checked); `sync` sends them off-site (S3/R2/B2/Garage), `fetch` brings one back. |
@@ -188,6 +189,10 @@ paasmcp db-backup list
 paasmcp db-backup restore <backup-id>
 paasmcp db-backup create my-saas volume      # every Docker volume of the app
 paasmcp backup test <backup-id>              # restores into a temporary DB; live data untouched
+
+# Keep shared services current (same major only; backup, health check, automatic rollback)
+paasmcp update check
+paasmcp update apply postgres
 
 # Email through one relay (home IPs cannot deliver mail directly)
 paasmcp email set --host smtp-relay.brevo.com --port 587 --user you@example.com --from-domain example.com
