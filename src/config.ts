@@ -39,6 +39,8 @@ export interface AppRecord {
   trusted?: boolean;
   /** Set on apps imported from a mirror peer: they run here only after that peer is promoted. */
   originNodeId?: string;
+  /** "poll": `paasmcp poll` (systemd timer) redeploys when the branch moves. */
+  autoDeploy?: "poll";
   trashedAt?: string;
   trashDir?: string;
 }

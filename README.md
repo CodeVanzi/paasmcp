@@ -190,6 +190,10 @@ paasmcp db-backup restore <backup-id>
 paasmcp db-backup create my-saas volume      # every Docker volume of the app
 paasmcp backup test <backup-id>              # restores into a temporary DB; live data untouched
 
+# Auto-deploy without a public webhook: a timer checks git every 2 min and exits (0 MB idle)
+paasmcp poll enable my-saas
+sudo paasmcp poll install-timer
+
 # Keep shared services current (same major only; backup, health check, automatic rollback)
 paasmcp update check
 paasmcp update apply postgres
