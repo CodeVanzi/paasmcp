@@ -3731,7 +3731,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit, healthcheckPath, skipHealthcheck })
         });
         const data = await res.json();
-        if (!res.ok) alert((/HealthcheckFailedError/.test(data.error) ? t('deployHealthFailed') + '\n\n' : 'Error: ') + data.error);
+        if (!res.ok) alert((/HealthcheckFailedError/.test(data.error) ? t('deployHealthFailed') + '\\n\\n' : 'Error: ') + data.error);
         else {
           if (document.getElementById('depPoll').checked) await postJson('/api/poll', { appName, on: true });
           showToast(t('toastDeployDone') + appName);
