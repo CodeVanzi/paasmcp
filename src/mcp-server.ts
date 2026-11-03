@@ -13,9 +13,17 @@ import {
   PAAS_APPS_DIR,
   PAAS_BACKUPS_DIR,
   PAAS_DATA_DIR,
+  sanitizeSlug,
   saveState,
   updatePlatformConfig,
+  withStateLock,
 } from "./config.js";
+import {
+  authorizeAgent,
+  ConfirmationRequiredError,
+  ForbiddenActionError,
+  listApprovals,
+} from "./guard.js";
 import {
   backupDatabase,
   ensureDockerNetwork,
@@ -27,6 +35,7 @@ import {
 } from "./database.js";
 import { ensureDashboardBackgroundService, getOrCreateDashboardToken } from "./dashboard.js";
 import {
+  AppLifecycleAction,
   deployApp,
   getContainerMetrics,
   manageAppLifecycle,
@@ -109,9 +118,55 @@ const server = new Server(
   }
 );
 
+// Tools that can trigger a confirmation accept the id of a request a person approved.
+const APPROVAL_ID_PROPERTY = {
+  type: "string",
+  description:
+    "Id of a confirmation request a person already approved (dashboard Approvals or `paasmcp approve <id>`). Only needed after a call answered 'Confirmation required'.",
+};
+const TOOLS_WITH_APPROVAL = new Set([
+  "paas_dashboard",
+  "paas_secret_delete",
+  "paas_db_backup",
+  "paas_app_deploy",
+  "paas_app_expose",
+  "paas_app_lifecycle",
+  "paas_node_federation",
+]);
+// Read-only tools skip the state lock so they answer while a long deploy runs.
+const READ_ONLY_TOOLS = new Set(["paas_system_status", "paas_secret_list", "paas_doctor", "paas_approvals"]);
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const listed = await listTools();
+  return {
+    tools: listed.tools.map((tool) =>
+      TOOLS_WITH_APPROVAL.has(tool.name)
+        ? {
+            ...tool,
+            inputSchema: {
+              ...tool.inputSchema,
+              properties: { ...tool.inputSchema.properties, approvalId: APPROVAL_ID_PROPERTY },
+            },
+          }
+        : tool
+    ),
+  };
+});
+
+async function listTools() {
   return {
     tools: [
+      {
+        name: "paas_approvals",
+        description:
+          "Lists confirmation requests (pending, approved, used, rejected). Risky actions (destroy, purge, public exposure, restore, deleting secrets, trusted apps, federation) need a person to approve them in the dashboard or with `paasmcp approve <id>` on the server; agents cannot approve.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            onlyPending: { type: "boolean", description: "Only pending requests (default: true)." },
+          },
+        },
+      },
       {
         name: "paas_system_status",
         description:
@@ -364,6 +419,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description:
                 "Optional environment variables to save in the app's Vault before starting.",
             },
+            trusted: {
+              type: "boolean",
+              description:
+                "true keeps host-access compose fields (privileged, host network, host folders, docker.sock): needs a strong confirmation by a person. false revokes it. Omit to keep the current setting.",
+            },
           },
           required: ["appName", "repoSource"],
         },
@@ -406,7 +466,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             action: {
               type: "string",
-              enum: ["logs", "restart", "stop", "start", "rollback", "destroy"],
+              enum: ["logs", "restart", "stop", "start", "rollback", "destroy", "restore", "purge"],
+              description:
+                "'destroy' stops the app and moves it to the trash for 30 days (needs confirmation); 'restore' brings it back; 'purge' deletes it for good (strong confirmation).",
             },
             tailLines: {
               type: "number",
@@ -475,12 +537,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     ],
   };
-});
+}
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   try {
+    return READ_ONLY_TOOLS.has(name)
+      ? await callTool(name, args)
+      : await withStateLock(() => callTool(name, args));
+  } catch (err) {
+    if (err instanceof ConfirmationRequiredError) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                confirmationRequired: true,
+                approvalId: err.approvalId,
+                level: err.risk.level,
+                warning: err.risk.warning,
+                nextStep: err.message,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `${err instanceof ForbiddenActionError ? "Forbidden" : "Error executing"} ${name}: ${message}`,
+        },
+      ],
+    };
+  }
+});
+
+async function callTool(name: string, args: Record<string, unknown>) {
+  const approvalId = args.approvalId ? String(args.approvalId) : undefined;
+  {
     switch (name) {
+      case "paas_approvals": {
+        const approvals = listApprovals(args.onlyPending !== false);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ approvals }, null, 2) }],
+        };
+      }
+
       case "paas_system_status": {
         const includeMetrics = args.includeMetrics !== false;
         const status = getSystemStatusSummary(includeMetrics);
@@ -554,6 +663,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "paas_dashboard": {
         const port = args.port ? Number(args.port) : 4099;
+        if (args.exposeMode) {
+          authorizeAgent("app.expose", { appName: "paasmcp-dashboard", mode: String(args.exposeMode) }, approvalId);
+        }
         const info = ensureDashboardBackgroundService(port);
         let exposure: unknown = undefined;
         if (args.exposeMode) {
@@ -673,6 +785,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "paas_secret_delete": {
         const scope = String(args.scope);
         const keyName = String(args.keyName);
+        authorizeAgent("secret.delete", { scope, keyName }, approvalId);
         const deleted = deleteSecretKey(scope, keyName);
         return {
           content: [
@@ -717,6 +830,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (!args.backupId) {
             throw new Error("'backupId' is required when action='restore'.");
           }
+          authorizeAgent("db.restore", { backupId: String(args.backupId) }, approvalId);
           const result = restoreDatabase(String(args.backupId));
           return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -726,7 +840,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "paas_app_deploy": {
+        const trusted = typeof args.trusted === "boolean" ? args.trusted : undefined;
+        if (trusted && !loadState().apps[sanitizeSlug(String(args.appName))]?.trusted) {
+          authorizeAgent("app.trust", { appName: sanitizeSlug(String(args.appName)) }, approvalId);
+        }
         const result = deployApp({
+          trusted,
           appName: String(args.appName),
           repoSource: String(args.repoSource),
           branch: args.branch ? String(args.branch) : "main",
@@ -743,6 +862,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "paas_app_expose": {
+        authorizeAgent("app.expose", { appName: String(args.appName), mode: String(args.mode) }, approvalId);
         const result = await exposeApplication({
           appName: String(args.appName),
           subdomain: args.subdomain ? String(args.subdomain) : undefined,
@@ -754,9 +874,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "paas_app_lifecycle": {
+        const action = args.action as AppLifecycleAction;
+        if (action === "destroy" || action === "purge") {
+          authorizeAgent(`app.${action}`, { appName: String(args.appName) }, approvalId);
+        }
         const output = manageAppLifecycle(
           String(args.appName),
-          args.action as "logs" | "restart" | "stop" | "start" | "rollback" | "destroy",
+          action,
           args.tailLines ? Number(args.tailLines) : 80
         );
         return {
@@ -804,6 +928,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             throw new Error("'joinToken' is required when action='join-cluster'.");
           }
           const verified = parseAndVerifyFederationJoinToken(String(args.joinToken));
+          authorizeAgent("federation.join", { peer: verified.primaryName, joinToken: String(args.joinToken) }, approvalId);
           setSecretEntries("system", {
             FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
           });
@@ -850,6 +975,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "'encryptedBase64' and 'hmacSignature' are required when action='import-sync-bundle'."
             );
           }
+          authorizeAgent("federation.import", { peer: "sync-bundle", hmacSignature: String(args.hmacSignature) }, approvalId);
           const imported = applyEncryptedFederationSyncBundle(
             String(args.encryptedBase64),
             String(args.hmacSignature)
@@ -864,14 +990,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      isError: true,
-      content: [{ type: "text", text: `Error executing ${name}: ${message}` }],
-    };
   }
-});
+}
 
 async function main() {
   const transport = new StdioServerTransport();

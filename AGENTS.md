@@ -4,7 +4,8 @@
 **PaaSMCP** is an Agent-First & Security-First Micro-PaaS & Model Context Protocol (MCP) Server written in TypeScript (Node.js ESM).
 
 ## Codebase Structure
-- `src/config.ts`: State management (`/opt/homelab/paasmcp/state.json`), port allocator (`4000-4998`, `4099` for dashboard), slug sanitization, and strict security validators (`validateEnvKey`, `validateBranchName`, `validateResourceLimit`).
+- `src/guard.ts`: Risk policy (free / confirm / strong / forbidden), approval requests for agents, audit log.
+- `src/config.ts`: State management (atomic writes + `withStateLock` across MCP, CLI and dashboard) (`/opt/homelab/paasmcp/state.json`), port allocator (`4000-4998`, `4099` for dashboard), slug sanitization, and strict security validators (`validateEnvKey`, `validateBranchName`, `validateResourceLimit`).
 - `src/vault.ts`: AES-256-GCM encryption/decryption for per-app and `system` JSON secrets, binary AES-256-GCM (`PMCP` wire format) for database backups & sync bundles, and constant-time `timingSafeCompare`.
 - `src/database.ts`: Shared PostgreSQL 16 and Redis 7 cluster provisioning, isolated SQL user/database creation, Vault secret injection, and encrypted `pg_dump` / Redis backup & zero-plaintext-disk restore (`paas_db_backup`).
 - `src/github.ts`: SSH Ed25519 deploy key generation + SHA256 fingerprint, GitHub API deploy key registration, git clone/pull, Zero-Config Dockerfile generator, and multi-service `docker-compose.yml` detector.
@@ -23,4 +24,6 @@
    - Always use `timingSafeCompare` when comparing tokens or HMAC signatures.
    - Never bind application or database ports to `0.0.0.0` on the host (`127.0.0.1` only).
    - Never return plaintext secret values from MCP tools or API endpoints.
+   - Every risky action goes through `src/guard.ts`: classify it in `assessRisk`, call `authorizeAgent` from MCP tools and `authorizeHuman` from the dashboard/CLI. Agents must never be able to approve their own requests.
+   - Prefer "allow with warning + confirmation" over removing a feature; forbid only what has no safe use.
 3. **Always run `npm run build && npm test`** after modifying any TypeScript file in `src/`.

@@ -10,6 +10,7 @@ import {
   HOMEPAGE_SERVICES_YAML,
   loadState,
   PAAS_APPS_DIR,
+  PAAS_TRASH_DIR,
   sanitizeSlug,
   saveState,
   validateBranchName,
@@ -21,6 +22,8 @@ import { setSecretEntries, writeRuntimeEnvFile } from "./vault.js";
 
 export interface DeployOptions {
   appName: string;
+  /** true = keep host-escape compose fields (caller must have a strong confirmation, guard.ts "app.trust"); false = revoke. */
+  trusted?: boolean;
   repoSource: string;
   branch?: string;
   internalPort?: number;
@@ -71,6 +74,41 @@ export function syncHomepageDashboard(): void {
   }
 }
 
+// Fields that let a container escape to the host. Removed unless the app is trusted (guard.ts "app.trust").
+const HOST_ESCAPE_FIELDS = [
+  "privileged",
+  "network_mode",
+  "pid",
+  "ipc",
+  "uts",
+  "userns_mode",
+  "cap_add",
+  "devices",
+  "device_cgroup_rules",
+  "security_opt",
+  "cgroup",
+  "cgroup_parent",
+  "volumes_from",
+];
+
+/** A volume source that reaches the host filesystem (absolute, home, parent, or env-interpolated path). */
+function isHostPath(source: string): boolean {
+  return /^(\/|~|\$)/.test(source) || source.split(/[\\/]/).includes("..");
+}
+
+function hostVolumeSource(v: unknown): string | undefined {
+  if (typeof v === "string") {
+    const source = v.split(":")[0] || "";
+    return isHostPath(source) ? source : undefined;
+  }
+  if (v && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    const source = String(obj.source ?? "");
+    if (obj.type === "bind" || isHostPath(source)) return source || "(bind)";
+  }
+  return undefined;
+}
+
 export function generateSanitizedComposeFromRepo(opts: {
   repoComposePath: string;
   slug: string;
@@ -80,7 +118,8 @@ export function generateSanitizedComposeFromRepo(opts: {
   primaryServiceName: string;
   memoryLimit?: string;
   cpuLimit?: string;
-}): string {
+  trusted?: boolean;
+}): { yaml: string; findings: string[] } {
   const raw = fs.readFileSync(opts.repoComposePath, "utf-8");
   const parsed = YAML.parse(raw) as {
     services?: Record<string, Record<string, unknown>>;
@@ -91,21 +130,24 @@ export function generateSanitizedComposeFromRepo(opts: {
     throw new Error("Invalid docker-compose file: missing 'services' root object.");
   }
 
+  // Host-escape findings: removed for untrusted apps, kept (and reported) for trusted ones.
+  const findings: string[] = [];
   const safeServices: Record<string, Record<string, unknown>> = {};
   for (const [svcName, svcDef] of Object.entries(parsed.services)) {
     const cleanSvc: Record<string, unknown> = { ...svcDef };
 
-    // Security hardening: strip privileged/host-escape directives from untrusted compose files
-    delete cleanSvc.privileged;
-    delete cleanSvc.network_mode;
-    delete cleanSvc.pid;
-    delete cleanSvc.ipc;
-    delete cleanSvc.userns_mode;
-    delete cleanSvc.cap_add;
-    delete cleanSvc.devices;
-    delete cleanSvc.security_opt;
+    for (const field of HOST_ESCAPE_FIELDS) {
+      if (cleanSvc[field] === undefined) continue;
+      findings.push(`${svcName}.${field}`);
+      if (!opts.trusted) delete cleanSvc[field];
+    }
+    // `extends` can pull service definitions from arbitrary files; never trusted.
+    if (cleanSvc.extends !== undefined) {
+      findings.push(`${svcName}.extends (always removed)`);
+      delete cleanSvc.extends;
+    }
 
-    // Rewrite build context to point inside ./repo
+    // Rewrite build context to point inside ./repo (always enforced)
     if (typeof cleanSvc.build === "string") {
       const rel = cleanSvc.build.replace(/^\.\//, "");
       if (rel.includes("..") || path.isAbsolute(rel)) {
@@ -119,25 +161,27 @@ export function generateSanitizedComposeFromRepo(opts: {
         throw new Error(`Unsafe build context in service '${svcName}': ${ctx}`);
       }
       bObj.context = ctx && ctx !== "." ? `./repo/${ctx}` : "./repo";
+      if (bObj.additional_contexts !== undefined) {
+        findings.push(`${svcName}.build.additional_contexts (always removed)`);
+        delete bObj.additional_contexts;
+      }
       cleanSvc.build = bObj;
     }
 
-    // Sanitize volumes: block host bind mounts (starting with / or ..)
+    // Host bind mounts (short or long syntax, absolute, ~, $VAR or ..)
     if (Array.isArray(cleanSvc.volumes)) {
       cleanSvc.volumes = cleanSvc.volumes.filter((v) => {
-        const volStr = typeof v === "string" ? v : "";
-        const source = volStr.split(":")[0] || "";
-        if (source.startsWith("/") || source.includes("..")) {
-          return false;
-        }
-        return true;
+        const hostSource = hostVolumeSource(v);
+        if (!hostSource) return true;
+        findings.push(`${svcName}.volumes: ${hostSource}`);
+        return Boolean(opts.trusted);
       });
     }
 
     // Inject encrypted Vault runtime environment and homelab-network into every service
     cleanSvc.env_file = [".env.runtime"];
     cleanSvc.restart = "unless-stopped";
-    cleanSvc.networks = [DOCKER_NETWORK];
+    if (cleanSvc.network_mode === undefined) cleanSvc.networks = [DOCKER_NETWORK];
 
     if (opts.memoryLimit) cleanSvc.mem_limit = opts.memoryLimit;
     if (opts.cpuLimit) cleanSvc.cpus = Number(opts.cpuLimit);
@@ -164,10 +208,22 @@ export function generateSanitizedComposeFromRepo(opts: {
   };
 
   if (parsed.volumes && typeof parsed.volumes === "object") {
-    outputCompose.volumes = parsed.volumes;
+    // A named volume with driver_opts (type: none, o: bind, device: /etc) is a host bind mount in disguise.
+    const volumes: Record<string, unknown> = {};
+    for (const [volName, volDef] of Object.entries(parsed.volumes)) {
+      const driverOpts = (volDef as Record<string, unknown> | null)?.driver_opts;
+      if (driverOpts && !opts.trusted) {
+        findings.push(`volumes.${volName}.driver_opts`);
+        volumes[volName] = {};
+      } else {
+        if (driverOpts) findings.push(`volumes.${volName}.driver_opts`);
+        volumes[volName] = volDef;
+      }
+    }
+    outputCompose.volumes = volumes;
   }
 
-  return YAML.stringify(outputCompose);
+  return { yaml: YAML.stringify(outputCompose), findings };
 }
 
 export function deployApp(opts: DeployOptions): {
@@ -175,6 +231,9 @@ export function deployApp(opts: DeployOptions): {
   commitHash: string;
   provisionedDatabases: string[];
   previousImageSaved: boolean;
+  removedForSafety?: string[];
+  hostAccessKept?: string[];
+  hint?: string;
 } {
   ensureDockerNetwork();
   const slug = sanitizeSlug(opts.appName);
@@ -182,6 +241,10 @@ export function deployApp(opts: DeployOptions): {
   const memoryLimit = validateResourceLimit(opts.memoryLimit, "memory");
   const cpuLimit = validateResourceLimit(opts.cpuLimit, "cpu");
   const state = loadState();
+  if (state.apps[slug]?.trashedAt) {
+    throw new Error(`App '${slug}' is in the trash. Restore it (action 'restore') or purge it before deploying again.`);
+  }
+  const trusted = opts.trusted ?? state.apps[slug]?.trusted ?? false;
   const localPort = allocateAppPort(state, slug);
   const appDir = path.join(PAAS_APPS_DIR, slug);
   const repoDir = path.join(appDir, "repo");
@@ -227,10 +290,11 @@ export function deployApp(opts: DeployOptions): {
 
   const composePath = path.join(appDir, "compose.yaml");
   const isComposePassThrough = Boolean(buildPlan.composeFile);
+  let composeFindings: string[] = [];
 
   if (isComposePassThrough && buildPlan.composeFile && buildPlan.primaryServiceName) {
     const repoComposePath = path.join(repoDir, buildPlan.composeFile);
-    const composeContent = generateSanitizedComposeFromRepo({
+    const sanitized = generateSanitizedComposeFromRepo({
       repoComposePath,
       slug,
       containerName,
@@ -239,8 +303,10 @@ export function deployApp(opts: DeployOptions): {
       primaryServiceName: buildPlan.primaryServiceName,
       memoryLimit,
       cpuLimit,
+      trusted,
     });
-    fs.writeFileSync(composePath, composeContent, { mode: 0o600 });
+    composeFindings = sanitized.findings;
+    fs.writeFileSync(composePath, sanitized.yaml, { mode: 0o600 });
   } else {
     const memLine = memoryLimit ? `    mem_limit: ${memoryLimit}\n` : "";
     const cpuLine = cpuLimit ? `    cpus: ${cpuLimit}\n` : "";
@@ -302,18 +368,53 @@ networks:
     composePassThrough: isComposePassThrough,
     memoryLimit: memoryLimit || existing?.memoryLimit,
     cpuLimit: cpuLimit || existing?.cpuLimit,
+    trusted,
   };
 
   latestState.apps[slug] = record;
   saveState(latestState);
   syncHomepageDashboard();
 
-  return { app: record, commitHash, provisionedDatabases, previousImageSaved };
+  return {
+    app: record,
+    commitHash,
+    provisionedDatabases,
+    previousImageSaved,
+    ...(composeFindings.length
+      ? trusted
+        ? { hostAccessKept: composeFindings }
+        : {
+            removedForSafety: composeFindings,
+            hint: "These compose fields reach the host and were removed. To keep them, redeploy with trusted=true (needs a strong confirmation).",
+          }
+      : {}),
+  };
+}
+
+export const TRASH_RETENTION_DAYS = 30;
+
+export type AppLifecycleAction =
+  | "logs"
+  | "restart"
+  | "stop"
+  | "start"
+  | "rollback"
+  | "destroy"
+  | "restore"
+  | "purge";
+
+/** Deletes apps that stayed in the trash longer than TRASH_RETENTION_DAYS (run daily from cron/timer). */
+export function purgeExpiredTrash(now = Date.now()): string[] {
+  const cutoff = now - TRASH_RETENTION_DAYS * 24 * 3600 * 1000;
+  const expired = Object.values(loadState().apps).filter(
+    (a) => a.trashedAt && Date.parse(a.trashedAt) < cutoff
+  );
+  return expired.map((a) => manageAppLifecycle(a.name, "purge"));
 }
 
 export function manageAppLifecycle(
   appName: string,
-  action: "logs" | "restart" | "stop" | "start" | "destroy" | "rollback",
+  action: AppLifecycleAction,
   tailLines = 80
 ): string {
   const slug = sanitizeSlug(appName);
@@ -321,6 +422,48 @@ export function manageAppLifecycle(
   const app = state.apps[slug];
   if (!app) {
     throw new Error(`App '${slug}' is not registered in PaaSMCP.`);
+  }
+
+  if (app.trashedAt && app.trashDir) {
+    const trashCompose = path.join(app.trashDir, "compose.yaml");
+    if (action === "restore") {
+      if (fs.existsSync(app.appDir)) {
+        throw new Error(`Cannot restore '${slug}': ${app.appDir} already exists.`);
+      }
+      fs.renameSync(app.trashDir, app.appDir);
+      delete app.trashedAt;
+      delete app.trashDir;
+      app.status = "running";
+      saveState(state);
+      execFileSync("docker", ["compose", "-f", path.join(app.appDir, "compose.yaml"), "up", "-d"], {
+        cwd: app.appDir,
+        stdio: "pipe",
+      });
+      syncHomepageDashboard();
+      return `App '${slug}' restored from the trash and started.`;
+    }
+    if (action === "purge") {
+      try {
+        execFileSync("docker", ["compose", "-f", trashCompose, "down", "-v", "--rmi", "local"], {
+          cwd: app.trashDir,
+          stdio: "pipe",
+        });
+      } catch {
+        // containers may already be gone
+      }
+      const resolvedTrash = path.resolve(app.trashDir);
+      if (resolvedTrash.startsWith(path.resolve(PAAS_TRASH_DIR) + path.sep)) {
+        fs.rmSync(resolvedTrash, { recursive: true, force: true });
+      }
+      delete state.apps[slug];
+      saveState(state);
+      syncHomepageDashboard();
+      return `App '${slug}' was permanently deleted (containers, volumes, images and files).`;
+    }
+    throw new Error(`App '${slug}' is in the trash since ${app.trashedAt}. Use 'restore' or 'purge'.`);
+  }
+  if (action === "restore" || action === "purge") {
+    throw new Error(`App '${slug}' is not in the trash. Use 'destroy' first.`);
   }
   const composePath = path.join(app.appDir, "compose.yaml");
 
@@ -383,23 +526,26 @@ export function manageAppLifecycle(
   }
 
   if (action === "destroy") {
+    // Reversible: stop containers, keep volumes/images/files in the trash for TRASH_RETENTION_DAYS.
     try {
-      execFileSync("docker", ["compose", "-f", composePath, "down", "-v", "--rmi", "local"], {
-        cwd: app.appDir,
-        stdio: "pipe",
-      });
+      execFileSync("docker", ["compose", "-f", composePath, "down"], { cwd: app.appDir, stdio: "pipe" });
     } catch {
       // ignore if already stopped
     }
     const resolvedDir = path.resolve(app.appDir);
-    const allowedAppsRoot = path.resolve(PAAS_APPS_DIR);
-    if (resolvedDir.startsWith(allowedAppsRoot + path.sep)) {
-      fs.rmSync(resolvedDir, { recursive: true, force: true });
+    if (!resolvedDir.startsWith(path.resolve(PAAS_APPS_DIR) + path.sep)) {
+      throw new Error(`Refusing to move ${app.appDir}: outside ${PAAS_APPS_DIR}.`);
     }
-    delete state.apps[slug];
+    const now = new Date();
+    const trashDir = path.join(PAAS_TRASH_DIR, `${slug}-${now.toISOString().replace(/[:.]/g, "-")}`);
+    if (fs.existsSync(resolvedDir)) fs.renameSync(resolvedDir, trashDir);
+    else fs.mkdirSync(trashDir, { recursive: true, mode: 0o700 });
+    app.trashedAt = now.toISOString();
+    app.trashDir = trashDir;
+    app.status = "trashed";
     saveState(state);
     syncHomepageDashboard();
-    return `App '${slug}' and its containers/files in ${app.appDir} were destroyed.`;
+    return `App '${slug}' stopped and moved to the trash (kept for ${TRASH_RETENTION_DAYS} days; use 'restore' to bring it back or 'purge' to delete it now).`;
   }
 
   throw new Error(`Unsupported action: ${action}`);

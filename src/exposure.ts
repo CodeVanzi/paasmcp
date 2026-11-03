@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { loadState, sanitizeSlug, saveState } from "./config.js";
 import { syncHomepageDashboard } from "./deployer.js";
+import { assessRisk } from "./guard.js";
 import { getSecrets } from "./vault.js";
 
 export interface ExposeOptions {
@@ -33,6 +34,7 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
   details: string;
 }> {
   const slug = sanitizeSlug(opts.appName);
+  assessRisk("app.expose", { appName: slug, mode: opts.mode }); // throws for forbidden exposures, whatever the caller
   const state = loadState();
   const app = state.apps[slug];
   if (!app) {

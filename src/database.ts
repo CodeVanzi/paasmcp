@@ -386,6 +386,7 @@ export function restoreDatabase(backupId: string): {
   restored: boolean;
   backup: BackupRecord;
   restoredBytes: number;
+  safetyBackupId?: string;
 } {
   ensureDirectories();
   const cleanId = backupId.replace(/[^a-zA-Z0-9._-]/g, "");
@@ -414,8 +415,11 @@ export function restoreDatabase(backupId: string): {
   // Decrypt and verify AES-256-GCM authentication tag in memory
   const decryptedDump = decryptBinaryPayload(encryptedBuf);
 
+  let safetyBackupId: string | undefined;
   if (process.env.PAASMCP_OFFLINE_TEST !== "1") {
     if (backup.engine === "postgres") {
+      // Never skippable: snapshot the current state so a wrong restore can be undone.
+      safetyBackupId = backupDatabase(backup.appName, "postgres").id;
       const safeDbName = assertSafeSqlIdentifier(backup.databaseName);
       execFileSync(
         "docker",
@@ -437,5 +441,6 @@ export function restoreDatabase(backupId: string): {
     restored: true,
     backup,
     restoredBytes: decryptedDump.length,
+    safetyBackupId,
   };
 }

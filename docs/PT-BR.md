@@ -2,7 +2,7 @@
 
 O **PaaSMCP** é um Micro-PaaS open-source *"Agent-First & Security-First"* (feito sob medida para ser operado tanto por **Agentes de IA via MCP** quanto por **Humanos via Workspace Web e CLI**).
 
-Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pessoal automatizada, com **0 MB de consumo ocioso de RAM**.
+Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pessoal automatizada, com **0 MB de consumo ocioso de RAM** quando usado só pelo MCP e pela linha de comando. O painel web e o webhook do GitHub, se ligados, são um serviço sempre ativo (pequeno, mas não zero).
 
 ---
 
@@ -21,9 +21,25 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
    - O `paas_doctor` inspeciona containers parados, mortes por falta de memória (`OOMKilled`), contadores de crash e métricas em tempo real (`docker stats`).
 6. **Auto-Deploy via GitHub Webhook (`HMAC-SHA256`):**
    - Endpoint integrado `/api/webhooks/github` que valida a assinatura `X-Hub-Signature-256` em tempo constante (`timingSafeEqual`) e reconstrói automaticamente o app quando você dá `git push` na branch configurada.
-7. **Handshake Multi-Servidor & Redundância (`node` / `paas_node_federation`):**
-   - Pareie um segundo servidor (ex: uma VPS barata + seu Homelab) usando um token assinado `paasmcp-join://` com expiração de 15 minutos.
-   - Opera em **Active-Active via Cloudflare Tunnel** (dois servidores rodando o mesmo túnel com failover automático na borda da Cloudflare se cair a energia/internet de um deles) ou **Warm Standby** (sincronização criptografada de Cofre e estado).
+7. **Handshake Multi-Servidor & Redundância (`node` / `paas_node_federation`) — em construção:**
+   - Já funciona: pareamento com token assinado `paasmcp-join://` (expira em 15 minutos) e sincronização criptografada de **configuração e Cofre**.
+   - Ainda não replica **dados** (banco, arquivos). Por isso o modo Active-Active só é seguro para apps **sem estado**: com banco, cada servidor gravaria no próprio Postgres e os dados se separariam. O espelho de dados entre servidores (Postgres + arquivos, troca manual com confirmação, troca automática só com árbitro) está no roadmap do `CONTRIBUTING.md`.
+8. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
+
+---
+
+## 🛡️ O que a IA faz sozinha, o que pede confirmação e o que é proibido
+
+- **Livre:** status, logs, diagnóstico, deploy, criar banco e backup, reiniciar, voltar versão, expor app pelo Tailscale ou Zero Trust.
+- **Pede confirmação de uma pessoa:** excluir app (vai para a **lixeira por 30 dias**, com banco e volumes), restaurar backup (sempre faz um backup do estado atual antes), apagar segredo (o valor antigo fica no arquivo de apagados do Cofre), expor app na internet aberta, expor o painel por Tailscale/Zero Trust, parear servidores e importar pacote de sincronização.
+- **Confirmação forte (digitar o nome):** apagar de vez da lixeira (`purge`) e marcar um app como **confiável** (`--trusted`), o que mantém no `docker-compose.yml` modo privilegiado, rede do servidor, capabilities, dispositivos e pastas do servidor, inclusive `/var/run/docker.sock`.
+- **Proibido:** devolver segredo em texto aberto; publicar o painel na internet aberta protegido só por token (use Zero Trust ou Tailscale); portas de app ou banco fora de `127.0.0.1`; `extends` e `additional_contexts` no compose; webhook sem assinatura.
+
+Como a confirmação funciona com IA: a ferramenta MCP não executa e devolve um pedido (`approvalId`, ex. `c-7F3K2A`), que vale 10 minutos e só para aqueles parâmetros. Uma pessoa aprova no painel (cartão "Confirmações pendentes") ou no servidor com `paasmcp approve c-7F3K2A`; depois a IA repete a chamada com `approvalId`. Tudo fica registrado em `/opt/homelab/paasmcp/audit.log`.
+
+Na linha de comando, a pergunta aparece na tela; `--yes` serve para scripts nas confirmações comuns e `--confirm-name <nome>` nas fortes. Para a lixeira expirar sozinha, agende `paasmcp trash purge-expired` uma vez por dia (cron ou timer do systemd).
+
+> Limite honesto: as confirmações protegem contra a IA agindo **pelo MCP**. Um agente que tem terminal no próprio servidor com acesso ao Docker (por exemplo um CLI de IA rodando lá) consegue contornar qualquer regra, porque o grupo `docker` equivale a root. Dê a esses agentes um usuário sem acesso ao Docker.
 
 ---
 

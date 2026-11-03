@@ -102,7 +102,7 @@ volumes:
     assert.equal(composePlan.primaryServiceName, "web");
     assert.equal(composePlan.detectedPort, 8080);
 
-    const sanitizedYaml = deployer.generateSanitizedComposeFromRepo({
+    const { yaml: sanitizedYaml, findings } = deployer.generateSanitizedComposeFromRepo({
       repoComposePath: composePath,
       slug: "my-stack",
       containerName: "paasmcp-my-stack",
@@ -123,6 +123,69 @@ volumes:
     assert.equal(parsed.services.worker.ports, undefined);
     assert.deepEqual(parsed.services.web.env_file, [".env.runtime"]);
     assert.deepEqual(parsed.services.worker.env_file, [".env.runtime"]);
+    assert.ok(findings.includes("web.privileged"));
+    assert.ok(findings.includes("web.volumes: /etc/shadow"));
+  });
+
+  await t.test("3b. Blocks disguised host access in compose; keeps it only for trusted apps", () => {
+    const dir = path.join(tempRoot, "sneaky-compose");
+    fs.mkdirSync(dir, { recursive: true });
+    const composePath = path.join(dir, "docker-compose.yml");
+    fs.writeFileSync(
+      composePath,
+      `services:
+  web:
+    build:
+      context: .
+      additional_contexts:
+        host: /
+    uts: host
+    volumes_from:
+      - paasmcp-dashboard
+    extends:
+      file: /etc/other.yml
+      service: x
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - ~/.ssh:/root/.ssh
+      - \${HOME}:/home
+      - ./data:/data
+      - cache:/cache
+volumes:
+  cache: {}
+  sneaky:
+    driver: local
+    driver_opts: { type: none, o: bind, device: /etc }
+`
+    );
+    const base = {
+      repoComposePath: composePath,
+      slug: "sneaky",
+      containerName: "paasmcp-sneaky",
+      localPort: 4010,
+      internalPort: 80,
+      primaryServiceName: "web",
+    };
+
+    const untrusted = deployer.generateSanitizedComposeFromRepo(base);
+    const web = YAML.parse(untrusted.yaml).services.web;
+    assert.deepEqual(web.volumes, ["./data:/data", "cache:/cache"]);
+    assert.equal(web.uts, undefined);
+    assert.equal(web.volumes_from, undefined);
+    assert.equal(web.extends, undefined);
+    assert.equal(web.build.additional_contexts, undefined);
+    assert.deepEqual(YAML.parse(untrusted.yaml).volumes.sneaky, {});
+
+    const trusted = deployer.generateSanitizedComposeFromRepo({ ...base, trusted: true });
+    const tweb = YAML.parse(trusted.yaml).services.web;
+    assert.equal(tweb.volumes.length, 5);
+    assert.equal(tweb.uts, "host");
+    // Never relaxed, even for trusted apps: extends, extra build contexts, loopback-only ports.
+    assert.equal(tweb.extends, undefined);
+    assert.equal(tweb.build.additional_contexts, undefined);
+    assert.deepEqual(tweb.ports, ["127.0.0.1:4010:80"]);
   });
 
   await t.test("4. Creates & restores AES-256-GCM encrypted database backups with SHA-256 check", () => {
@@ -212,6 +275,119 @@ volumes:
       bundle.hmacSignature
     );
     assert.ok(applied.importedApps.includes("demo-saas"));
+  });
+
+  const guard = await import("./guard.js");
+
+  await t.test("7. Classifies risky actions and forbids the unsafe ones", () => {
+    assert.equal(guard.assessRisk("app.expose", { appName: "blog", mode: "tailscale" }), null);
+    assert.equal(guard.assessRisk("app.expose", { appName: "blog", mode: "public" })?.level, "confirm");
+    assert.equal(guard.assessRisk("app.purge", { appName: "blog" })?.level, "strong");
+    assert.equal(guard.assessRisk("app.trust", { appName: "blog" })?.level, "strong");
+    assert.throws(
+      () => guard.assessRisk("app.expose", { appName: "paasmcp-dashboard", mode: "public" }),
+      guard.ForbiddenActionError
+    );
+    assert.equal(
+      guard.assessRisk("app.expose", { appName: "paasmcp-dashboard", mode: "zero-trust" })?.level,
+      "confirm"
+    );
+  });
+
+  await t.test("8. Agents need a person's approval, bound to the exact parameters and usable once", () => {
+    const params = { appName: "blog" };
+    let approvalId = "";
+    try {
+      guard.authorizeAgent("app.destroy", params);
+      assert.fail("should require confirmation");
+    } catch (err) {
+      assert.ok(err instanceof guard.ConfirmationRequiredError);
+      approvalId = (err as InstanceType<typeof guard.ConfirmationRequiredError>).approvalId!;
+    }
+    // Same request again reuses the pending id instead of piling up requests.
+    assert.throws(() => guard.authorizeAgent("app.destroy", params), (e: unknown) =>
+      (e as { approvalId?: string }).approvalId === approvalId
+    );
+    // Not approved yet: still blocked.
+    assert.throws(() => guard.authorizeAgent("app.destroy", params, approvalId));
+
+    guard.decideApproval(approvalId, true, "test-person");
+    // Approval does not carry over to other parameters...
+    assert.throws(() => guard.authorizeAgent("app.destroy", { appName: "other" }, approvalId));
+    // ...works once for the exact call...
+    guard.authorizeAgent("app.destroy", params, approvalId);
+    // ...and cannot be replayed.
+    assert.throws(() => guard.authorizeAgent("app.destroy", params, approvalId));
+
+    // Strong confirmations need the name typed by the person.
+    let strongId = "";
+    try {
+      guard.authorizeAgent("app.purge", params);
+    } catch (err) {
+      strongId = (err as { approvalId: string }).approvalId;
+    }
+    assert.throws(() => guard.decideApproval(strongId, true, "test-person"));
+    assert.throws(() => guard.decideApproval(strongId, true, "test-person", "wrong"));
+    guard.decideApproval(strongId, true, "test-person", "blog");
+    guard.authorizeAgent("app.purge", params, strongId);
+
+    // People confirm directly.
+    assert.throws(() => guard.authorizeHuman("app.purge", params, { confirmed: true, by: "t" }));
+    guard.authorizeHuman("app.purge", params, { confirmed: true, confirmName: "blog", by: "t" });
+    guard.authorizeHuman("app.expose", { appName: "blog", mode: "tailscale" }, { by: "t" });
+  });
+
+  await t.test("9. Destroy moves the app to the trash; purge deletes it", () => {
+    const appDir = path.join(tempRoot, "apps", "trash-me");
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(path.join(appDir, "compose.yaml"), "services: {}\n");
+    const state = config.loadState();
+    state.apps["trash-me"] = {
+      ...state.apps["demo-saas"],
+      name: "trash-me",
+      containerName: "paasmcp-trash-me",
+      appDir,
+    };
+    config.saveState(state);
+
+    deployer.manageAppLifecycle("trash-me", "destroy");
+    const trashed = config.loadState().apps["trash-me"];
+    assert.ok(trashed.trashedAt && trashed.trashDir);
+    assert.equal(fs.existsSync(appDir), false);
+    assert.ok(fs.existsSync(path.join(trashed.trashDir!, "compose.yaml")));
+    assert.throws(() => deployer.manageAppLifecycle("trash-me", "restart"), /trash/);
+
+    // Not expired yet: kept. 31 days later: purged.
+    assert.deepEqual(deployer.purgeExpiredTrash(), []);
+    assert.equal(deployer.purgeExpiredTrash(Date.now() + 31 * 24 * 3600 * 1000).length, 1);
+    assert.equal(config.loadState().apps["trash-me"], undefined);
+    assert.equal(fs.existsSync(trashed.trashDir!), false);
+  });
+
+  await t.test("10. Deleting a secret keeps the old value in the deleted archive", () => {
+    vault.setSecretEntries("demo-app", { TO_DROP: "old-value" });
+    assert.equal(vault.deleteSecretKey("demo-app", "TO_DROP"), true);
+    assert.equal(vault.getSecrets("demo-app").TO_DROP, undefined);
+    const archived = Object.entries(vault.getSecrets("demo-app", ".deleted"));
+    assert.ok(archived.some(([k, v]) => k.startsWith("TO_DROP@") && v === "old-value"));
+  });
+
+  await t.test("11. State lock serializes operations and recovers from a dead holder", async () => {
+    let counter = 0;
+    const bump = () =>
+      config.withStateLock(async () => {
+        const before = counter;
+        await new Promise((r) => setTimeout(r, 5));
+        counter = before + 1;
+      });
+    await Promise.all([bump(), bump(), bump(), bump()]);
+    assert.equal(counter, 4);
+
+    // A lock left by a process that no longer exists is taken over.
+    const lockPath = path.join(tempRoot, "paasmcp", ".lock");
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: 2 ** 22 + 12345, host: os.hostname(), at: Date.now() }));
+    assert.equal(await config.withStateLock(() => "ok", 2000), "ok");
+    assert.equal(fs.existsSync(lockPath), false);
   });
 
   fs.rmSync(tempRoot, { recursive: true, force: true });

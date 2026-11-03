@@ -3,7 +3,14 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, saveState } from "./config.js";
+import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock } from "./config.js";
+import {
+  authorizeHuman,
+  ConfirmationRequiredError,
+  decideApproval,
+  ForbiddenActionError,
+  listApprovals,
+} from "./guard.js";
 import {
   backupDatabase,
   ensureDockerNetwork,
@@ -12,6 +19,7 @@ import {
   restoreDatabase,
 } from "./database.js";
 import {
+  AppLifecycleAction,
   deployApp,
   manageAppLifecycle,
   runPaaSDoctor,
@@ -138,7 +146,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         const payload = JSON.parse(rawBody || "{}") as Record<string, unknown>;
-        const result = handleGitHubPushWebhook(payload);
+        const result = await withStateLock(() => handleGitHubPushWebhook(payload));
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, ...result }));
       } catch (err) {
@@ -154,7 +162,9 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         const body = await readJsonBody(req);
         const encryptedBase64 = String(body.encryptedBase64 || "");
         const hmacSignature = String(body.hmacSignature || "");
-        const result = applyEncryptedFederationSyncBundle(encryptedBase64, hmacSignature);
+        const result = await withStateLock(() =>
+          applyEncryptedFederationSyncBundle(encryptedBase64, hmacSignature)
+        );
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, ...result }));
       } catch (err) {
@@ -228,12 +238,39 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         return;
       }
 
-      try {
+      const actor = (req.headers["cf-access-authenticated-user-email"] as string | undefined) || "dashboard";
+      // Risky actions answer 409 with the warning until the person confirms (body.confirmed / body.confirmName).
+      const confirmFromBody = (action: string, params: Record<string, unknown>, body: Record<string, unknown>) =>
+        authorizeHuman(action, params, {
+          confirmed: body.confirmed === true,
+          confirmName: typeof body.confirmName === "string" ? body.confirmName : undefined,
+          by: actor,
+        });
+      const handleApi = async (): Promise<boolean> => {
+        if (pathname === "/api/approvals" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ approvals: listApprovals(url.searchParams.get("all") !== "1") }));
+          return true;
+        }
+
+        if (pathname === "/api/approvals/decide" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const rec = decideApproval(
+            String(body.id || ""),
+            body.approve === true,
+            actor,
+            typeof body.confirmName === "string" ? body.confirmName : undefined
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(rec));
+          return true;
+        }
+
         if (pathname === "/api/status" && req.method === "GET") {
           const status = getSystemStatusSummary(true);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
-          return;
+          return true;
         }
 
         if (pathname === "/api/doctor" && req.method === "GET") {
@@ -241,13 +278,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const report = runPaaSDoctor(appName);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(report));
-          return;
+          return true;
         }
 
         if (pathname === "/api/webhook-secret" && req.method === "GET") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ webhookSecret: getOrCreateWebhookSecret() }));
-          return;
+          return true;
         }
 
         if (pathname === "/api/secrets" && req.method === "GET") {
@@ -259,7 +296,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
               secrets: listMaskedSecrets(scope),
             })
           );
-          return;
+          return true;
         }
 
         if (pathname === "/api/secrets" && req.method === "POST") {
@@ -276,13 +313,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
               secrets: listMaskedSecrets(scope),
             })
           );
-          return;
+          return true;
         }
 
         if (pathname === "/api/secrets" && req.method === "DELETE") {
           const body = await readJsonBody(req);
           const scope = String(body.scope || "system");
           const key = String(body.key || "");
+          confirmFromBody("secret.delete", { scope, keyName: key }, body);
           deleteSecretKey(scope, key);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
@@ -291,7 +329,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
               secrets: listMaskedSecrets(scope),
             })
           );
-          return;
+          return true;
         }
 
         if (pathname === "/api/db" && req.method === "POST") {
@@ -301,14 +339,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const result = provisionDatabase(appName, engine);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
-          return;
+          return true;
         }
 
         if (pathname === "/api/backups" && req.method === "GET") {
           const appName = url.searchParams.get("app") || undefined;
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ backups: listDatabaseBackups(appName) }));
-          return;
+          return true;
         }
 
         if (pathname === "/api/backups" && req.method === "POST") {
@@ -318,16 +356,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const backup = backupDatabase(appName, engine);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(backup));
-          return;
+          return true;
         }
 
         if (pathname === "/api/backups/restore" && req.method === "POST") {
           const body = await readJsonBody(req);
           const backupId = String(body.backupId || "");
+          confirmFromBody("db.restore", { backupId }, body);
           const result = restoreDatabase(backupId);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
-          return;
+          return true;
         }
 
         if (pathname === "/api/federation/invite" && req.method === "POST") {
@@ -339,13 +378,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const invite = generateFederationJoinToken({ endpointUrl, mode });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(invite));
-          return;
+          return true;
         }
 
         if (pathname === "/api/federation/join" && req.method === "POST") {
           const body = await readJsonBody(req);
           const joinToken = String(body.joinToken || "");
           const verified = parseAndVerifyFederationJoinToken(joinToken);
+          confirmFromBody("federation.join", { peer: verified.primaryName, joinToken }, body);
           setSecretEntries("system", {
             FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
           });
@@ -364,19 +404,24 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ joined: true, primaryPeer: peer }));
-          return;
+          return true;
         }
 
         if (pathname === "/api/federation/export" && req.method === "POST") {
           const bundle = buildEncryptedFederationSyncBundle();
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(bundle));
-          return;
+          return true;
         }
 
         if (pathname === "/api/deploy" && req.method === "POST") {
           const body = await readJsonBody(req);
+          const trusted = typeof body.trusted === "boolean" ? body.trusted : undefined;
+          if (trusted && !loadState().apps[sanitizeSlug(String(body.appName))]?.trusted) {
+            confirmFromBody("app.trust", { appName: sanitizeSlug(String(body.appName)) }, body);
+          }
           const result = deployApp({
+            trusted,
             appName: String(body.appName),
             repoSource: String(body.repoSource),
             branch: body.branch ? String(body.branch) : "main",
@@ -388,11 +433,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
-          return;
+          return true;
         }
 
         if (pathname === "/api/expose" && req.method === "POST") {
           const body = await readJsonBody(req);
+          confirmFromBody("app.expose", { appName: String(body.appName), mode: String(body.mode) }, body);
           const result = await exposeApplication({
             appName: String(body.appName),
             mode: body.mode as "public" | "zero-trust" | "tailscale",
@@ -400,22 +446,44 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
-          return;
+          return true;
         }
 
         if (pathname === "/api/lifecycle" && req.method === "POST") {
           const body = await readJsonBody(req);
+          const action = body.action as AppLifecycleAction;
+          if (action === "destroy" || action === "purge") {
+            confirmFromBody(`app.${action}`, { appName: String(body.appName) }, body);
+          }
           const output = manageAppLifecycle(
             String(body.appName),
-            body.action as "logs" | "restart" | "stop" | "start" | "rollback" | "destroy",
+            action,
             body.tailLines ? Number(body.tailLines) : 120
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ output }));
+          return true;
+        }
+        return false;
+      };
+
+      try {
+        const handled = req.method === "GET" ? await handleApi() : await withStateLock(handleApi);
+        if (handled) return;
+      } catch (err) {
+        if (err instanceof ConfirmationRequiredError) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              confirmationRequired: true,
+              level: err.risk.level,
+              subject: err.risk.subject,
+              warning: err.risk.warning,
+            })
+          );
           return;
         }
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
+        res.writeHead(err instanceof ForbiddenActionError ? 403 : 500, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
@@ -1004,6 +1072,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 
         <!-- TAB 1: OVERVIEW, APPS, DEPLOY & EXPOSE -->
         <div class="tab-pane active" id="tab-overview">
+          <div class="card" id="approvalsCard" style="display:none;">
+            <div class="card-header">
+              <h2 id="approvalsTitle">✋ Confirmações pendentes</h2>
+              <p class="card-desc" id="approvalsDesc">Ações arriscadas pedidas por um agente de IA esperam você aqui. O agente não consegue aprovar sozinho.</p>
+            </div>
+            <div id="approvalsList"></div>
+          </div>
           <div class="card">
             <div class="card-header">
               <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
@@ -1681,8 +1756,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         overallStatus: "Status geral:",
         doctorChecking: "⏳ Verificando Containers...",
         doctorDoneToast: "🩺 Diagnóstico concluído",
-        confirmDelete: "Destruir container e arquivos de ",
-        confirmRestore: "Restaurar o backup criptografado ",
+        approvalsTitle: "✋ Confirmações pendentes",
+        approvalsDesc: "Ações arriscadas pedidas por um agente de IA esperam você aqui. O agente não consegue aprovar sozinho.",
+        approvalsEmpty: "Nenhuma confirmação pendente.",
+        btnApprove: "Aprovar",
+        btnReject: "Recusar",
+        typeNameToConfirm: "Confirmação forte. Digite o nome para confirmar: ",
+        actionRestore: "Restaurar",
+        actionPurge: "Apagar de vez",
+        trashedStatus: "Na lixeira desde ",
         toastSecretSaved: "✅ Segredo criptografado no Vault!",
         toastDbCreated: "✅ Banco isolado provisionado!",
         toastBackupSaved: "📸 Backup criptografado salvo: ",
@@ -1905,8 +1987,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         overallStatus: "Overall status:",
         doctorChecking: "⏳ Checking Containers...",
         doctorDoneToast: "🩺 Diagnostics completed",
-        confirmDelete: "Destroy container and files for ",
-        confirmRestore: "Restore encrypted backup ",
+        approvalsTitle: "✋ Pending confirmations",
+        approvalsDesc: "Risky actions requested by an AI agent wait for you here. The agent cannot approve them by itself.",
+        approvalsEmpty: "No pending confirmations.",
+        btnApprove: "Approve",
+        btnReject: "Reject",
+        typeNameToConfirm: "Strong confirmation. Type the name to confirm: ",
+        actionRestore: "Restore",
+        actionPurge: "Delete for good",
+        trashedStatus: "In the trash since ",
         toastSecretSaved: "✅ Secret encrypted in Vault!",
         toastDbCreated: "✅ Isolated database provisioned!",
         toastBackupSaved: "📸 Encrypted backup saved: ",
@@ -2238,7 +2327,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restart')">\${esc(t('actionRestart'))}</button>
                 \${rollbackBtn}
-                <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="if(confirm(t('confirmDelete') + '\${esc(a.name)}' + '?')) appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>
+                \${a.trashedAt
+                  ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10))}</span>
+                     <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
+                     <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','purge')">\${esc(t('actionPurge'))}</button>\`
+                  : \`<button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>\`}
               </td>
             </tr>
           \`;
@@ -2274,7 +2367,62 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>';
     }
 
+    // Server answers 409 for risky actions: show its warning, ask the person, and resend with the confirmation.
+    const rawFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const res = await rawFetch(input, init);
+      if (res.status !== 409 || !init || typeof init.body !== 'string') return res;
+      const info = await res.clone().json().catch(() => ({}));
+      if (!info.confirmationRequired) return res;
+      const warning = (info.warning && (info.warning[currentLang] || info.warning.en)) || '';
+      const body = JSON.parse(init.body);
+      if (info.level === 'strong') {
+        const typed = prompt(warning + '\\n\\n' + t('typeNameToConfirm') + info.subject);
+        if (typed === null) return res;
+        body.confirmName = typed.trim();
+      } else if (!confirm(warning)) {
+        return res;
+      }
+      body.confirmed = true;
+      return rawFetch(input, { ...init, body: JSON.stringify(body) });
+    };
+
+    async function loadApprovals() {
+      const res = await fetch('/api/approvals');
+      if (!res.ok) return;
+      const data = await res.json();
+      const items = data.approvals || [];
+      document.getElementById('approvalsCard').style.display = items.length ? 'block' : 'none';
+      document.getElementById('approvalsList').innerHTML = items.map(a => \`
+        <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <strong>\${esc(a.id)} · \${esc(a.action)} · \${esc(a.subject)}</strong>
+            <span class="badge \${a.level === 'strong' ? 'danger' : 'warning'}">\${esc(a.level)}</span>
+          </div>
+          <div style="font-size:13px;margin:6px 0;">\${esc(a.warning[currentLang] || a.warning.en)}</div>
+          <button onclick="decideApproval('\${esc(a.id)}', true, '\${esc(a.level)}', '\${esc(a.subject)}')">\${esc(t('btnApprove'))}</button>
+          <button class="secondary" onclick="decideApproval('\${esc(a.id)}', false)">\${esc(t('btnReject'))}</button>
+        </div>\`).join('');
+    }
+
+    async function decideApproval(id, approve, level, subject) {
+      let confirmName;
+      if (approve && level === 'strong') {
+        confirmName = prompt(t('typeNameToConfirm') + subject);
+        if (confirmName === null) return;
+      }
+      const res = await fetch('/api/approvals/decide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, approve, confirmName: confirmName && confirmName.trim() })
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      loadApprovals();
+    }
+
     async function loadAll() {
+      loadApprovals();
       const res = await fetch('/api/status');
       if (!res.ok) return;
       lastStatus = await res.json();
@@ -2350,7 +2498,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     }
 
     async function restoreBackup(backupId) {
-      if (!confirm(t('confirmRestore') + backupId + '?')) return;
       const res = await fetch('/api/backups/restore', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2523,6 +2670,22 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
 </html>`;
 }
 
+// Pinned base image; tools are installed once at build time, never on every start.
+const DASHBOARD_DOCKERFILE = `FROM node:22.11.0-alpine3.20
+RUN apk add --no-cache docker-cli docker-cli-compose git openssh-client
+`;
+
+/** Builds the dashboard image once per Dockerfile version (tag = content hash). */
+function ensureDashboardImage(): string {
+  const tag = `paasmcp/dashboard:${crypto.createHash("sha256").update(DASHBOARD_DOCKERFILE).digest("hex").slice(0, 12)}`;
+  try {
+    execFileSync("docker", ["image", "inspect", tag], { stdio: "ignore" });
+  } catch {
+    execFileSync("docker", ["build", "-t", tag, "-"], { input: DASHBOARD_DOCKERFILE, stdio: ["pipe", "pipe", "pipe"] });
+  }
+  return tag;
+}
+
 export function ensureDashboardBackgroundService(port = 4099): {
   url: string;
   localPort: number;
@@ -2538,14 +2701,15 @@ export function ensureDashboardBackgroundService(port = 4099): {
     ".."
   );
 
+  const image = ensureDashboardImage();
   const composePath = path.join(dashDir, "compose.yaml");
   const composeContent = `services:
   dashboard:
-    image: node:22-alpine
+    image: ${image}
     container_name: paasmcp-dashboard
     restart: unless-stopped
     working_dir: /app
-    command: ["sh", "-c", "which docker >/dev/null 2>&1 || apk add --no-cache docker-cli docker-cli-compose git openssh-client; exec node dist/cli.js dashboard serve --port ${port} --host 0.0.0.0"]
+    command: ["node", "dist/cli.js", "dashboard", "serve", "--port", "${port}", "--host", "0.0.0.0"]
     ports:
       - "127.0.0.1:${port}:${port}"
     volumes:
