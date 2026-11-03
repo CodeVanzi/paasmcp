@@ -7,6 +7,7 @@ import {
   PAAS_VAULT_DIR,
   sanitizeSlug,
   validateEnvKey,
+  writeFileAtomic,
 } from "./config.js";
 
 interface EncryptedPayload {
@@ -28,9 +29,10 @@ export function getOrCreateMasterKey(): Buffer {
   return Buffer.from(hex, "hex");
 }
 
-function getVaultFilePath(scope: string): string {
+// kind ".deleted" holds removed values; sanitizeSlug never produces a dot, so it cannot collide with a scope.
+function getVaultFilePath(scope: string, kind: "" | ".deleted" = ""): string {
   const safeScope = sanitizeSlug(scope);
-  return path.join(PAAS_VAULT_DIR, `${safeScope}.enc.json`);
+  return path.join(PAAS_VAULT_DIR, `${safeScope}${kind}.enc.json`);
 }
 
 export function timingSafeCompare(a: string, b: string): boolean {
@@ -71,9 +73,9 @@ export function decryptBinaryPayload(packedBuffer: Buffer, customKey?: Buffer): 
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-export function getSecrets(scope: string): Record<string, string> {
+export function getSecrets(scope: string, kind: "" | ".deleted" = ""): Record<string, string> {
   ensureDirectories();
-  const filePath = getVaultFilePath(scope);
+  const filePath = getVaultFilePath(scope, kind);
   if (!fs.existsSync(filePath)) {
     return {};
   }
@@ -92,7 +94,11 @@ export function getSecrets(scope: string): Record<string, string> {
   return JSON.parse(decrypted.toString("utf-8")) as Record<string, string>;
 }
 
-export function saveSecrets(scope: string, secrets: Record<string, string>): void {
+export function saveSecrets(
+  scope: string,
+  secrets: Record<string, string>,
+  kind: "" | ".deleted" = ""
+): void {
   ensureDirectories();
   const masterKey = getOrCreateMasterKey();
   const iv = crypto.randomBytes(12);
@@ -109,8 +115,7 @@ export function saveSecrets(scope: string, secrets: Record<string, string>): voi
     updatedAt: new Date().toISOString(),
   };
 
-  const filePath = getVaultFilePath(scope);
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  writeFileAtomic(getVaultFilePath(scope, kind), JSON.stringify(payload, null, 2));
 }
 
 export function setSecretEntries(
@@ -172,6 +177,9 @@ export function deleteSecretKey(scope: string, keyName: string): boolean {
   if (!(keyName in current)) {
     return false;
   }
+  const archive = getSecrets(scope, ".deleted");
+  archive[`${keyName}@${new Date().toISOString()}`] = current[keyName];
+  saveSecrets(scope, archive, ".deleted");
   delete current[keyName];
   saveSecrets(scope, current);
   return true;

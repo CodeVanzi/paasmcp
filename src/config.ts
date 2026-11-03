@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export interface AppMetrics {
@@ -34,6 +35,10 @@ export interface AppRecord {
   memoryLimit?: string;
   cpuLimit?: string;
   lastWebhookAt?: string;
+  /** Set only after a strong confirmation: keeps privileged compose fields (see guard.ts). */
+  trusted?: boolean;
+  trashedAt?: string;
+  trashDir?: string;
 }
 
 export interface DatabaseRecord {
@@ -107,6 +112,7 @@ export const PAAS_SSH_DIR = path.join(PAAS_DATA_DIR, "ssh");
 export const PAAS_BACKUPS_DIR = path.join(PAAS_DATA_DIR, "backups");
 export const PAAS_DB_DIR = path.join(HOMELAB_ROOT, "paasmcp-postgres");
 export const PAAS_REDIS_DIR = path.join(HOMELAB_ROOT, "paasmcp-redis");
+export const PAAS_TRASH_DIR = path.join(PAAS_DATA_DIR, "trash");
 export const MASTER_KEY_PATH = path.join(PAAS_DATA_DIR, ".master.key");
 export const STATE_FILE_PATH = path.join(PAAS_DATA_DIR, "state.json");
 export const HOMEPAGE_SERVICES_YAML = path.join(
@@ -128,6 +134,7 @@ export function ensureDirectories(): void {
     PAAS_VAULT_DIR,
     PAAS_SSH_DIR,
     PAAS_BACKUPS_DIR,
+    PAAS_TRASH_DIR,
   ]) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -179,7 +186,72 @@ export function loadState(): PaaSState {
 
 export function saveState(state: PaaSState): void {
   ensureDirectories();
-  fs.writeFileSync(STATE_FILE_PATH, JSON.stringify(state, null, 2), { mode: 0o600 });
+  writeFileAtomic(STATE_FILE_PATH, JSON.stringify(state, null, 2));
+}
+
+/** Writes via a temp file + rename so a crash never leaves a half-written file. */
+export function writeFileAtomic(filePath: string, content: string): void {
+  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, content, { mode: 0o600 });
+  fs.renameSync(tmp, filePath);
+}
+
+const LOCK_PATH = path.join(PAAS_DATA_DIR, ".lock");
+const LOCK_STALE_MS = 30 * 60 * 1000;
+let inProcessQueue: Promise<unknown> = Promise.resolve();
+
+function lockIsStale(): boolean {
+  try {
+    const info = JSON.parse(fs.readFileSync(LOCK_PATH, "utf-8")) as { pid: number; host: string; at: number };
+    if (Date.now() - info.at > LOCK_STALE_MS) return true;
+    if (info.host !== os.hostname()) return false; // other machine/container: only age tells
+    try {
+      process.kill(info.pid, 0);
+      return false;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  } catch {
+    return true; // unreadable or vanished lock
+  }
+}
+
+/**
+ * Serializes state-changing operations across the MCP server, the CLI and the dashboard
+ * (which may run in a container sharing PAASMCP_ROOT). Do not nest calls: it would wait forever.
+ */
+export function withStateLock<T>(fn: () => T | Promise<T>, timeoutMs = 20 * 60 * 1000): Promise<T> {
+  const run = async (): Promise<T> => {
+    ensureDirectories();
+    const started = Date.now();
+    for (;;) {
+      try {
+        fs.writeFileSync(LOCK_PATH, JSON.stringify({ pid: process.pid, host: os.hostname(), at: Date.now() }), {
+          flag: "wx",
+          mode: 0o600,
+        });
+        break;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        if (lockIsStale()) {
+          fs.rmSync(LOCK_PATH, { force: true });
+          continue;
+        }
+        if (Date.now() - started > timeoutMs) {
+          throw new Error("Another PaaSMCP operation is still running (lock held). Try again later.");
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    try {
+      return await fn();
+    } finally {
+      fs.rmSync(LOCK_PATH, { force: true });
+    }
+  };
+  const result = inProcessQueue.then(run, run);
+  inProcessQueue = result.catch(() => undefined);
+  return result;
 }
 
 export function updatePlatformConfig(opts: {

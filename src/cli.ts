@@ -1,5 +1,14 @@
 #!/usr/bin/env node
-import { ensureDirectories, loadState, saveState, updatePlatformConfig } from "./config.js";
+import readline from "node:readline/promises";
+import {
+  ensureDirectories,
+  loadState,
+  sanitizeSlug,
+  saveState,
+  updatePlatformConfig,
+  withStateLock,
+} from "./config.js";
+import { assessRisk, authorizeHuman, decideApproval, listApprovals } from "./guard.js";
 import {
   ensureDashboardBackgroundService,
   getOrCreateDashboardToken,
@@ -14,7 +23,13 @@ import {
   provisionDatabase,
   restoreDatabase,
 } from "./database.js";
-import { deployApp, manageAppLifecycle, runPaaSDoctor } from "./deployer.js";
+import {
+  AppLifecycleAction,
+  deployApp,
+  manageAppLifecycle,
+  purgeExpiredTrash,
+  runPaaSDoctor,
+} from "./deployer.js";
 import { exposeApplication } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
@@ -36,6 +51,35 @@ import {
 function getFlagValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
   return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : undefined;
+}
+
+async function ask(question: string): Promise<string | undefined> {
+  if (!process.stdin.isTTY) return undefined;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return (await rl.question(question)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Asks the person at the terminal before risky actions (guard.ts). `--yes` skips normal
+ * confirmations; strong ones need the name typed or `--confirm-name <name>`.
+ */
+async function confirmInCli(action: string, params: Record<string, unknown>, args: string[]): Promise<void> {
+  const r = assessRisk(action, params);
+  if (!r) return;
+  console.error(`⚠️  ${r.warning.en}`);
+  let confirmName = getFlagValue(args, "--confirm-name");
+  let confirmed = args.includes("--yes") || Boolean(confirmName);
+  if (r.level === "strong" && confirmName === undefined) {
+    confirmName = await ask(`Type "${r.subject}" to confirm: `);
+    confirmed = Boolean(confirmName);
+  } else if (!confirmed) {
+    confirmed = (await ask("Continue? [y/N] "))?.toLowerCase() === "y";
+  }
+  authorizeHuman(action, params, { confirmed, confirmName, by: `cli:${process.env.USER || "unknown"}` });
 }
 
 async function runCli() {
@@ -96,12 +140,13 @@ async function runCli() {
         startDashboardServer(port, host);
         console.log(`PaaSMCP Dashboard listening on http://${host}:${port}`);
       } else {
-        const info = ensureDashboardBackgroundService(port);
         const mode = getFlagValue(rest, "--expose") as
           | "public"
           | "zero-trust"
           | "tailscale"
           | undefined;
+        if (mode) await confirmInCli("app.expose", { appName: "paasmcp-dashboard", mode }, rest);
+        const info = ensureDashboardBackgroundService(port);
         const subdomain = getFlagValue(rest, "--subdomain") || "paas";
         let exposure: unknown = undefined;
         if (mode) {
@@ -182,6 +227,7 @@ async function runCli() {
         console.log(JSON.stringify(listMaskedSecrets(scope), null, 2));
       } else if (sub === "delete") {
         const [keyName] = kvArgs;
+        await confirmInCli("secret.delete", { scope, keyName }, kvArgs);
         deleteSecretKey(scope, keyName);
         console.log(JSON.stringify(listMaskedSecrets(scope), null, 2));
       } else {
@@ -207,7 +253,8 @@ async function runCli() {
         const engine = (arg2 as "postgres" | "redis") || "postgres";
         console.log(JSON.stringify(backupDatabase(arg1, engine), null, 2));
       } else if (sub === "restore") {
-        if (!arg1) throw new Error("Usage: paasmcp db-backup restore <backupId>");
+        if (!arg1) throw new Error("Usage: paasmcp db-backup restore <backupId> [--yes]");
+        await confirmInCli("db.restore", { backupId: arg1 }, rest);
         console.log(JSON.stringify(restoreDatabase(arg1), null, 2));
       } else {
         // Shorthand: paasmcp db-backup <appName>
@@ -233,6 +280,7 @@ async function runCli() {
       } else if (sub === "join") {
         if (!arg1) throw new Error("Usage: paasmcp node join <paasmcp-join://...>");
         const verified = parseAndVerifyFederationJoinToken(arg1);
+        await confirmInCli("federation.join", { peer: verified.primaryName, joinToken: arg1 }, rest);
         setSecretEntries("system", {
           FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
         });
@@ -257,6 +305,7 @@ async function runCli() {
         if (!arg1 || !sig) {
           throw new Error("Usage: paasmcp node import-sync <encryptedBase64> --sig <hmac>");
         }
+        await confirmInCli("federation.import", { peer: "sync-bundle", hmacSignature: sig }, rest);
         console.log(
           JSON.stringify(applyEncryptedFederationSyncBundle(arg1, sig), null, 2)
         );
@@ -280,8 +329,13 @@ async function runCli() {
       const cpuLimit = getFlagValue(rest, "--cpus");
       const withPostgres = rest.includes("--postgres");
       const withRedis = rest.includes("--redis");
+      const trusted = rest.includes("--trusted") ? true : rest.includes("--untrusted") ? false : undefined;
+      if (trusted && !loadState().apps[sanitizeSlug(appName)]?.trusted) {
+        await confirmInCli("app.trust", { appName: sanitizeSlug(appName) }, rest);
+      }
 
       const res = deployApp({
+        trusted,
         appName,
         repoSource,
         branch,
@@ -302,10 +356,11 @@ async function runCli() {
           "Usage: paasmcp expose <appName> <public|zero-trust|tailscale> [subdomain]"
         );
       }
+      await confirmInCli("app.expose", { appName, mode: modeArg }, rest);
       const res = await exposeApplication({
         appName,
         mode: modeArg as "public" | "zero-trust" | "tailscale",
-        subdomain,
+        subdomain: subdomain?.startsWith("--") ? undefined : subdomain,
       });
       console.log(JSON.stringify(res, null, 2));
       break;
@@ -316,15 +371,41 @@ async function runCli() {
     case "stop":
     case "start":
     case "rollback":
-    case "destroy": {
+    case "destroy":
+    case "restore":
+    case "purge": {
       const [appName] = rest;
       if (!appName) throw new Error(`Usage: paasmcp ${cmd} <appName>`);
-      console.log(
-        manageAppLifecycle(
-          appName,
-          cmd as "logs" | "restart" | "stop" | "start" | "rollback" | "destroy"
-        )
-      );
+      if (cmd === "destroy" || cmd === "purge") await confirmInCli(`app.${cmd}`, { appName }, rest);
+      console.log(manageAppLifecycle(appName, cmd as AppLifecycleAction));
+      break;
+    }
+
+    case "trash": {
+      // For a daily cron/systemd timer: deletes apps trashed more than 30 days ago.
+      if (rest[0] !== "purge-expired") throw new Error("Usage: paasmcp trash purge-expired");
+      console.log(JSON.stringify({ purged: purgeExpiredTrash() }, null, 2));
+      break;
+    }
+
+    case "approvals": {
+      console.log(JSON.stringify(listApprovals(!rest.includes("--all")), null, 2));
+      break;
+    }
+
+    case "approve":
+    case "reject": {
+      const [id] = rest;
+      if (!id) throw new Error(`Usage: paasmcp ${cmd} <requestId> [--confirm-name <name>]`);
+      const pending = listApprovals(false).find((a) => a.id === id);
+      if (!pending) throw new Error(`Approval request '${id}' not found.`);
+      console.error(`⚠️  ${pending.warning.en}`);
+      let confirmName = getFlagValue(rest, "--confirm-name");
+      if (cmd === "approve" && pending.level === "strong" && confirmName === undefined) {
+        confirmName = await ask(`Type "${pending.subject}" to confirm: `);
+      }
+      const rec = decideApproval(id, cmd === "approve", `cli:${process.env.USER || "unknown"}`, confirmName);
+      console.log(JSON.stringify(rec, null, 2));
       break;
     }
 
@@ -345,14 +426,23 @@ Commands:
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database snapshots & restore
   paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo (or multi-service compose.yaml)
   paasmcp expose <app> <public|zero-trust|tailscale> [subdomain]
-  paasmcp <logs|restart|stop|start|rollback|destroy> <app>
+  paasmcp <logs|restart|stop|start|rollback> <app>
+  paasmcp destroy <app> [--yes]                      Stop app and move it to the trash (30 days)
+  paasmcp restore <app>                              Bring an app back from the trash
+  paasmcp purge <app> [--confirm-name <app>]         Delete a trashed app for good (strong confirmation)
+  paasmcp trash purge-expired                        Delete apps trashed more than 30 days ago (cron)
+  paasmcp approvals [--all]                          List confirmation requests made by AI agents
+  paasmcp approve|reject <id> [--confirm-name <x>]   Decide a confirmation request (people only)
   paasmcp node <status|invite|join|export-sync>      Multi-Server HA Handshake & Federation`);
       break;
     }
   }
 }
 
-runCli().catch((err) => {
+// Read-only commands and the long-running dashboard server skip the state lock.
+const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", undefined]);
+const command = process.argv[2];
+(LOCK_FREE_COMMANDS.has(command) ? runCli() : withStateLock(runCli)).catch((err) => {
   console.error("Error:", err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

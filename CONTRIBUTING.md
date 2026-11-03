@@ -44,6 +44,25 @@ Every PR or AI Agent modification **must** enforce these rules:
 
 ---
 
+## ✅ Security Base (v1.2)
+
+- [x] Risk policy in `src/guard.ts` (free / confirm / strong / forbidden) with agent approval requests, audit log and dashboard/CLI confirmations.
+- [x] 30-day app trash (`destroy` → `restore` / `purge`), safety backup before every restore, archive of deleted secrets.
+- [x] Trusted apps: host-access compose fields kept only after a strong confirmation; disguised host mounts (long syntax, `~`, `$VAR`, `driver_opts`, `volumes_from`, `extends`, `additional_contexts`) are caught.
+- [x] Atomic state/vault writes and a cross-process state lock; dashboard runs from a pinned prebuilt image.
+
+## 🧭 Plan Order
+
+1. Security base (done above).
+2. MCP over HTTP (Streamable HTTP) with personal tokens and levels (read / deploy / destroy); second factor for the dashboard so it can be public.
+3. Off-site encrypted backups (item 4 below) including app volumes, plus a restore test tool.
+4. S3 storage for apps (Garage): `paas_storage_provision` creates a bucket + key per app.
+5. Federation as a mirror, part 1: per-app modes `mirror` / `stateless` / `local`; each server streams its Postgres to the other over Tailscale (item 5 below, both directions), Garage in two zones, hourly restic of volumes, replication lag in status, manual failover with confirmation, epoch number and DNS switch.
+6. Mirror, part 2: optional arbiter (tiny VPS, Raspberry or Cloudflare Worker) for automatic failover; guided failback. Automatic failover without an arbiter stays forbidden.
+7. Email: one relay (Brevo, SES…) configured once, per-app variables.
+8. Updater: pinned versions for Postgres/Redis/Garage/cloudflared, `paas_update check|apply` with backup, health check and rollback (mirror replicas first).
+9. Remaining promises: GitHub polling mode (0 MB idle auto-deploy) and per-language tests for generated Dockerfiles.
+
 ## 🗺️ Next Improvements Blueprint (For LLMs & Contributors)
 
 Each item below is designed to preserve **0 MB Idle Daemon Overhead** while expanding PaaSMCP's capabilities:
