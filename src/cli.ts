@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import readline from "node:readline/promises";
 import {
   ensureDirectories,
@@ -9,6 +10,7 @@ import {
   withStateLock,
 } from "./config.js";
 import { deriveArbiterKey, startArbiterServer } from "./arbiter.js";
+import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import {
   acceptMirror,
   handbackMirror,
@@ -382,6 +384,40 @@ async function runCli() {
       break;
     }
 
+    case "email": {
+      const [sub, arg1] = rest;
+      if (sub === "set") {
+        const host = getFlagValue(rest, "--host");
+        const fromDomain = getFlagValue(rest, "--from-domain");
+        if (!host || !fromDomain) {
+          throw new Error("Usage: paasmcp email set --host <smtp host> [--port 587] --user <login> --from-domain <domain> [--password-file f] [--api-key-file f]");
+        }
+        const pwFile = getFlagValue(rest, "--password-file");
+        const password = pwFile ? fs.readFileSync(pwFile, "utf-8").trim() : await ask("SMTP password (or key): ");
+        if (!password) throw new Error("No password given (use --password-file when not in a terminal).");
+        const apiFile = getFlagValue(rest, "--api-key-file");
+        setEmailRelay({
+          host,
+          port: Number(getFlagValue(rest, "--port") || 587),
+          user: getFlagValue(rest, "--user") || "",
+          password,
+          fromDomain,
+          apiKey: apiFile ? fs.readFileSync(apiFile, "utf-8").trim() : undefined,
+        });
+        console.log(JSON.stringify({ configured: true, host, fromDomain }, null, 2));
+      } else if (sub === "provision" && arg1) {
+        console.log(JSON.stringify(provisionEmail(arg1, getFlagValue(rest, "--from-name")), null, 2));
+      } else if (sub === "test" && arg1) {
+        console.log(JSON.stringify(await sendTestEmail(arg1), null, 2));
+      } else if (!sub || sub === "status") {
+        const r = getEmailRelay();
+        console.log(JSON.stringify(r ? { host: r.host, port: r.port, user: r.user, fromDomain: r.fromDomain, httpApi: !!r.apiKey } : { configured: false }, null, 2));
+      } else {
+        throw new Error("Usage: paasmcp email <set|status|provision <app> [--from-name N]|test <to>>");
+      }
+      break;
+    }
+
     case "storage": {
       const [sub, arg1] = rest;
       if (sub === "provision" && arg1) {
@@ -615,6 +651,7 @@ Commands:
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp arbiter <key|serve>                       Third vote for automatic failover (run on a small third device)
+  paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
                                                     Restore test, off-site sync (S3/R2/B2), daily timer, master key export

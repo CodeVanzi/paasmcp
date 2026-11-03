@@ -728,5 +728,64 @@ volumes:
     }
   });
 
+  await t.test("22. Email relay: per-app variables, SMTP client never sends the password in clear", async () => {
+    const email = await import("./email.js");
+    const net = await import("node:net");
+    assert.throws(() => email.provisionEmail("mail-app"), /No email relay/);
+    assert.throws(() => email.setEmailRelay({ host: "smtp.x.com;rm", port: 587, user: "u", password: "p", fromDomain: "x.com" }));
+    email.setEmailRelay({ host: "127.0.0.1", port: 2525, user: "login@x.com", password: "p@ss:w/rd", fromDomain: "example.com", apiKey: "xkeysib-1" });
+    const out = email.provisionEmail("Mail App", 'Guarapps "Bot"');
+    assert.equal(out.from, "Guarapps Bot <mail-app@example.com>");
+    const env = vault.getSecrets("mail-app");
+    assert.equal(env.SMTP_SECURE, "starttls");
+    assert.equal(env.EMAIL_URL, "submission://login%40x.com:p%40ss%3Aw%2Frd@127.0.0.1:2525");
+    assert.equal(env.BREVO_API_KEY, "xkeysib-1");
+
+    const seen: string[] = [];
+    const srv = net.createServer((c) => {
+      let inData = false;
+      let buf = "";
+      c.write("220 fake ESMTP\r\n");
+      c.on("data", (d) => {
+        buf += d.toString();
+        let i;
+        while ((i = buf.indexOf("\r\n")) >= 0) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          seen.push(line);
+          if (inData) {
+            if (line === ".") {
+              inData = false;
+              c.write("250 2.0.0 queued as ABC\r\n");
+            }
+            continue;
+          }
+          if (line.startsWith("EHLO")) c.write("250-fake\r\n250 AUTH PLAIN\r\n");
+          else if (line.startsWith("AUTH PLAIN")) c.write("235 ok\r\n");
+          else if (line.startsWith("MAIL") || line.startsWith("RCPT")) c.write("250 ok\r\n");
+          else if (line === "DATA") {
+            inData = true;
+            c.write("354 go\r\n");
+          } else if (line === "QUIT") c.end("221 bye\r\n");
+        }
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const relay = { ...email.getEmailRelay()!, port: (srv.address() as { port: number }).port };
+    try {
+      await assert.rejects(email.sendTestEmail("me@example.org", { relay }), /refusing to send the password in clear/);
+      assert.ok(!seen.some((l) => l.startsWith("AUTH")), "no AUTH without TLS");
+      const sent = await email.sendTestEmail("me@example.org", { relay, allowPlaintextForLocalTest: true });
+      assert.match(sent.accepted, /queued as ABC/);
+      const auth = seen.find((l) => l.startsWith("AUTH PLAIN "))!.slice(11);
+      assert.equal(Buffer.from(auth, "base64").toString(), "\0login@x.com\0p@ss:w/rd");
+      assert.ok(seen.includes("RCPT TO:<me@example.org>"));
+      assert.ok(!sent.log.join(" ").includes(auth), "password not in the log");
+      await assert.rejects(email.sendTestEmail("bad address", { relay }), /Invalid recipient/);
+    } finally {
+      srv.close();
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
