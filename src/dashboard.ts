@@ -1477,8 +1477,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         actionRollback: "⏪ Rollback",
         actionDelete: "Excluir",
         btnRestartContainer: "🔄 Reiniciar Container",
-        lastCheck: "\${esc(t('lastCheck'))}",
-        overallStatus: "\${esc(t('overallStatus'))}",
+        lastCheck: "Última checagem:",
+        overallStatus: "Status geral:",
         doctorChecking: "⏳ Verificando Containers...",
         doctorDoneToast: "🩺 Diagnóstico concluído",
         confirmDelete: "Destruir container e arquivos de ",
@@ -1673,6 +1673,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     }
 
     const I18N_KEYS = [
+      'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
+      'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
+      'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
       'sidebarSubtitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
       'topHealthBadge', 'btnRefresh', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
