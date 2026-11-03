@@ -685,5 +685,48 @@ volumes:
     await assert.rejects(mirror.promoteMirror(peer), /already promoted/);
   });
 
+  await t.test("21. Arbiter: third vote, epochs only go up, fencing stops a server whose data moved", async () => {
+    const arbiter = await import("./arbiter.js");
+    const mirror = await import("./mirror.js");
+    const st: import("./arbiter.js").ArbiterState = { nodes: {}, owners: {} };
+    const t0 = 1_000_000;
+    arbiter.arbiterDecide(st, { op: "heartbeat", node: "A", epoch: 0 }, t0);
+    assert.equal(arbiter.arbiterDecide(st, { op: "claim", node: "B", epoch: 1, dataOf: "A" }, t0 + 10_000).granted, false, "A is alive for the arbiter");
+    assert.equal(arbiter.arbiterDecide(st, { op: "claim", node: "B", epoch: 0, dataOf: "A" }, t0 + 120_000).granted, false, "epoch must go up");
+    assert.equal(arbiter.arbiterDecide(st, { op: "claim", node: "B", epoch: 1, dataOf: "A" }, t0 + 120_000).granted, true);
+    assert.equal(arbiter.arbiterDecide(st, { op: "handover", node: "A", epoch: 2, dataOf: "A", to: "A" }, t0 + 130_000).granted, false, "only the owner hands back");
+    assert.equal(arbiter.arbiterDecide(st, { op: "handover", node: "B", epoch: 2, dataOf: "A", to: "A" }, t0 + 130_000).granted, true);
+    assert.deepEqual(st.owners.A, { owner: "A", epoch: 2 });
+
+    // Guard: automatic failover is forbidden without an arbiter, strong with one.
+    assert.throws(() => guard.assessRisk("mirror.auto", { peer: "x" }), guard.ForbiddenActionError);
+    assert.equal(guard.assessRisk("mirror.auto", { peer: "x", arbiterUrl: "http://100.64.0.9:4097" })?.level, "strong");
+
+    // Over HTTP: bad signatures are refused; another server claiming this one fences it.
+    const key = arbiter.deriveArbiterKey();
+    const srv = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", key, stateFile: path.join(tempRoot, "arb.json") });
+    await new Promise((r) => srv.once("listening", r));
+    const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      assert.equal((await fetch(`${url}/arbiter`, { method: "POST", body: "{}", headers: { "X-Paasmcp-Signature": "00" } })).status, 401);
+      const me = config.loadState().federation?.nodeId || "primary";
+      const claim = await arbiter.askArbiter(url, { op: "claim", node: "other-server", epoch: 5, dataOf: me });
+      assert.equal(claim.granted, true, "this server never heartbeated, so it counts as gone");
+      const st2 = config.loadState();
+      st2.mirror = { ...st2.mirror!, arbiterUrl: url };
+      config.saveState(st2);
+      const tick = await mirror.watchTick();
+      assert.deepEqual((tick.fenced as { by: string }).by, "other-server");
+      assert.equal(config.loadState().mirror?.fenced?.epoch, 5);
+      assert.throws(() => deployer.deployApp({ appName: "fresh-app", repoSource: "/tmp" }), /fenced/);
+    } finally {
+      srv.close();
+      const st3 = config.loadState();
+      delete st3.mirror!.fenced;
+      delete st3.mirror!.arbiterUrl;
+      config.saveState(st3);
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

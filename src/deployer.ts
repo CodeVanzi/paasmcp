@@ -241,6 +241,9 @@ export function deployApp(opts: DeployOptions): {
   const memoryLimit = validateResourceLimit(opts.memoryLimit, "memory");
   const cpuLimit = validateResourceLimit(opts.cpuLimit, "cpu");
   const state = loadState();
+  if (state.mirror?.fenced && !state.apps[slug]?.originNodeId) {
+    throw new Error(`This server is fenced: since epoch ${state.mirror.fenced.epoch} another server serves its data. Follow the failback steps ('paasmcp mirror status').`);
+  }
   if (state.apps[slug]?.trashedAt) {
     throw new Error(`App '${slug}' is in the trash. Restore it (action 'restore') or purge it before deploying again.`);
   }

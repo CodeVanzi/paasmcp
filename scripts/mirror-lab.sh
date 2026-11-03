@@ -3,14 +3,16 @@
 # Needs Docker and a build (npm run build). Uses /tmp/labA, /tmp/labB and port 5432/5433 on this machine; removes them at the end.
 set -e
 cd /home/user/paasmcp
-rm -rf /tmp/labA /tmp/labB; docker rm -f paasmcp-postgres paasmcp-mirror-primary-node >/dev/null 2>&1 || true
+rm -rf /tmp/labA /tmp/labB; docker rm -f paasmcp-postgres paasmcp-mirror-server-a >/dev/null 2>&1 || true
 step() { echo; echo "=== $*"; }
 runA() { PAASMCP_ROOT=/tmp/labA node --input-type=module -e "$1"; }
 runB() { PAASMCP_ROOT=/tmp/labB node --input-type=module -e "$1"; }
 pa() { docker exec -i paasmcp-postgres psql -U paasmcp_admin -d postgres -tA -c "$1"; }
-pb() { docker exec -i paasmcp-mirror-primary-node psql -U paasmcp_admin -d postgres -tA -c "$1"; }
+pb() { docker exec -i paasmcp-mirror-server-a psql -U paasmcp_admin -d postgres -tA -c "$1"; }
 
 step "A: start Postgres, cluster key, data"
+name() { node --input-type=module -e "const c=await import('./dist/config.js');const s=c.loadState();s.federation={...(s.federation||{nodeId:'node-'+'$1',role:'standalone',redundancyMode:'warm-standby',peers:{}}),nodeId:'node-$1',nodeName:'$1'};c.saveState(s);"; }
+PAASMCP_ROOT=/tmp/labA name server-a; PAASMCP_ROOT=/tmp/labB name server-b
 runA 'const d=await import("./dist/database.js");d.ensureSharedPostgresCluster();const f=await import("./dist/federation.js");f.getOrCreateFederationClusterKey();'
 pa "CREATE TABLE notas(id serial primary key, txt text); INSERT INTO notas(txt) SELECT 'n'||g FROM generate_series(1,100) g;"
 KEY=$(runA 'const v=await import("./dist/vault.js");console.log(v.getSecrets("system").FEDERATION_CLUSTER_KEY)')
@@ -34,21 +36,41 @@ runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirr
 runA 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus().sending))'
 
 step "B goes away; A keeps WAL for it; B comes back and catches up"
-docker stop paasmcp-mirror-primary-node >/dev/null
+docker stop paasmcp-mirror-server-a >/dev/null
 pa "INSERT INTO notas(txt) SELECT repeat('w',500) FROM generate_series(1,20000) g;"
 runA 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus().sending))'
-docker start paasmcp-mirror-primary-node >/dev/null; sleep 5
+docker start paasmcp-mirror-server-a >/dev/null; sleep 5
 echo "rows on B copy: $(pb 'SELECT count(*) FROM notas')  (A: $(pa 'SELECT count(*) FROM notas'))"
 runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus().receiving))'
 
 step "A dies; B is promoted"
 docker stop paasmcp-postgres >/dev/null
-runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(await m.promoteMirror("primary-node")))'
+runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(await m.promoteMirror("server-a")))'
 sleep 2
 echo "B accepts writes now: $(pb "INSERT INTO notas(txt) VALUES ('after-failover') RETURNING id")"
 echo "rows on B: $(pb 'SELECT count(*) FROM notas')"
 runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus()))'
 
+step "Failback: A comes back, rejoins as a copy of B, gets the data back"
+docker start paasmcp-postgres >/dev/null; sleep 3
+GW=$(docker network inspect homelab-network -f '{{(index .IPAM.Config 0).Gateway}}')
+TOKEN2=$(runB "const m=await import('./dist/mirror.js');const r=await m.offerMirror({peerName:'server-a',peerCidr:'172.16.0.0/12',advertiseHost:'$GW',fromCopyOf:'server-a'});console.log(r.token)")
+runA "const m=await import('./dist/mirror.js');const r=m.acceptMirror('$TOKEN2',{rejoin:true});console.log('A old data kept at', r.movedAside)"
+sleep 3
+pb "INSERT INTO notas(txt) SELECT 'b'||g FROM generate_series(1,5) g;" >/dev/null; sleep 2
+echo "A (now a copy) rows: $(pa 'SELECT count(*) FROM notas')  B rows: $(pb 'SELECT count(*) FROM notas')"
+runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(await m.handbackMirror("server-a")))'
+runA 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(await m.promoteMirror("server-b")))'
+sleep 2
+echo "A accepts writes again: $(pa "INSERT INTO notas(txt) VALUES ('back-home') RETURNING id" | head -1)"
+
+step "B rebuilds its stale copy from A"
+TOKEN3=$(runA 'const m=await import("./dist/mirror.js");const r=await m.offerMirror({peerName:"server-b",peerCidr:"172.16.0.0/12",advertiseHost:"paasmcp-postgres",withBackups:false});console.log(r.token)')
+runB "const m=await import('./dist/mirror.js');const r=m.acceptMirror('$TOKEN3');console.log('B stale copy kept at', r.movedAside)"
+sleep 4
+echo "rows A: $(pa 'SELECT count(*) FROM notas')  B copy: $(pb 'SELECT count(*) FROM notas')"
+runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus().receiving))'
+
 step "cleanup"
-docker rm -f paasmcp-postgres paasmcp-mirror-primary-node >/dev/null
+docker rm -f paasmcp-postgres paasmcp-mirror-server-a >/dev/null
 rm -rf /tmp/labA /tmp/labB
