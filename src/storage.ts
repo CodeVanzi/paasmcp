@@ -4,10 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, saveState, StorageRecord } from "./config.js";
 import { ensureDockerNetwork } from "./database.js";
+import { imageFor } from "./updater.js";
 import { getSecrets, setSecretEntries } from "./vault.js";
 
-// Pinned on purpose: the updater (plan item 8) moves it, never a floating tag.
-export const GARAGE_IMAGE = "dxflrs/garage:v1.1.0";
 export const PAAS_GARAGE_DIR = path.join(HOMELAB_ROOT, "paasmcp-garage");
 export const GARAGE_INTERNAL_ENDPOINT = "http://paasmcp-garage:3900";
 export const GARAGE_REGION = "garage";
@@ -69,7 +68,7 @@ admin_token = "${adminToken}"
       composeFile,
       `services:
   garage:
-    image: ${GARAGE_IMAGE}
+    image: ${imageFor("garage")}
     container_name: paasmcp-garage
     restart: unless-stopped
     ports:

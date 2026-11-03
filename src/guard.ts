@@ -94,6 +94,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `The apps of '${subject}' stop here and the data goes back to '${subject}' once its copy has every change. Then run 'paasmcp mirror promote' there.`,
         `Os apps de '${subject}' param aqui e os dados voltam para '${subject}' assim que a cópia dele tiver tudo. Depois rode 'paasmcp mirror promote' lá.`,
         params);
+    case "update.apply":
+      return risk(action, String(params.component), "confirm",
+        `${String(params.component)} restarts on ${String(params.image)} (a few seconds of downtime for every app that uses it). Databases are backed up first; if it does not come back healthy in 60 s, the previous version is restored.`,
+        `${String(params.component)} reinicia em ${String(params.image)} (alguns segundos fora do ar para os apps que usam). Os bancos têm backup antes; se não voltar saudável em 60 s, a versão anterior é restaurada.`,
+        params);
     case "app.trust":
       return risk(action, subject, "strong",
         `Marks app '${subject}' as trusted: its docker-compose.yml keeps privileged mode, host network, capabilities, devices and host folders (including /var/run/docker.sock). A trusted app can take full control of this server.`,

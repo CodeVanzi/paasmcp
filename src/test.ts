@@ -787,5 +787,38 @@ volumes:
     }
   });
 
+  await t.test("23. Updater: same-major only, newest pick, existing installs keep their image until updated", async () => {
+    const up = await import("./updater.js");
+    const mcp = await import("./mcp-server.js");
+    assert.equal(up.majorOf("postgres", "postgres:16.15-alpine"), "16");
+    assert.equal(up.majorOf("postgres", "postgres:16-alpine"), "16");
+    assert.equal(up.majorOf("redis", "redis:7.4.12-alpine"), "7.4");
+    assert.equal(up.majorOf("garage", "dxflrs/garage:v1.1.0"), "v1");
+    assert.equal(up.pickLatest("postgres", "postgres:16.9-alpine", ["16.10-alpine", "16.2-alpine", "17.1-alpine", "16.11-bookworm", "16.11-alpine"]), "postgres:16.11-alpine");
+    assert.equal(up.pickLatest("garage", "dxflrs/garage:v1.1.0", ["v1.3.1", "v1.99.3-internal", "v2.5.0", "v1.0.0"]), "dxflrs/garage:v1.3.1");
+    assert.equal(up.pickLatest("redis", "redis:7.4.12-alpine", ["7.4.3-alpine", "7.2.9-alpine"]), null);
+
+    // An older install keeps the image its compose file already runs.
+    const pgDir = path.join(tempRoot, "paasmcp-postgres");
+    fs.mkdirSync(pgDir, { recursive: true });
+    fs.writeFileSync(path.join(pgDir, "compose.yaml"), "services:\n  postgres:\n    image: postgres:16-alpine\n");
+    assert.equal(up.imageFor("postgres"), "postgres:16-alpine");
+
+    const found = await up.checkUpdates(async (repo) => (repo === "library/postgres" ? ["16.15-alpine", "17.2-alpine"] : []));
+    assert.equal(found.find((f) => f.component === "postgres")?.available, "postgres:16.15-alpine");
+
+    assert.throws(() => up.applyUpdate("postgres", "postgres:17.2-alpine"), /major upgrade/);
+    assert.throws(() => up.applyUpdate("postgres", "evil/postgres:16.15-alpine"), /not an image of/);
+
+    const asked = JSON.parse((await mcp.handleToolCall("paas_update", { action: "apply", component: "postgres", image: "postgres:16.15-alpine" }, "destroy")).content[0].text);
+    assert.equal(asked.confirmationRequired, true);
+    guard.decideApproval(asked.approvalId, true, "test");
+    const done = JSON.parse(
+      (await mcp.handleToolCall("paas_update", { action: "apply", component: "postgres", image: "postgres:16.15-alpine", approvalId: asked.approvalId }, "destroy")).content[0].text
+    );
+    assert.equal(done.to, "postgres:16.15-alpine");
+    assert.equal(up.imageFor("postgres"), "postgres:16.15-alpine");
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

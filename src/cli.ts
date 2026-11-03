@@ -10,6 +10,7 @@ import {
   withStateLock,
 } from "./config.js";
 import { deriveArbiterKey, startArbiterServer } from "./arbiter.js";
+import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import {
   acceptMirror,
@@ -384,6 +385,21 @@ async function runCli() {
       break;
     }
 
+    case "update": {
+      const [sub, comp, image] = rest;
+      if (!sub || sub === "check") {
+        console.log(JSON.stringify(await checkUpdates(), null, 2));
+      } else if (sub === "apply" && comp && PINNED[comp as Component]) {
+        const target = image && !image.startsWith("--") ? image : (await checkUpdates()).find((u) => u.component === comp)?.available;
+        if (!target) throw new Error(`${comp} is already on the newest release of its major version.`);
+        await confirmInCli("update.apply", { component: comp, image: target }, rest);
+        console.log(JSON.stringify(applyUpdate(comp as Component, target), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp update <check|apply <postgres|redis|garage> [image]>");
+      }
+      break;
+    }
+
     case "email": {
       const [sub, arg1] = rest;
       if (sub === "set") {
@@ -651,6 +667,7 @@ Commands:
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp arbiter <key|serve>                       Third vote for automatic failover (run on a small third device)
+  paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
   paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>

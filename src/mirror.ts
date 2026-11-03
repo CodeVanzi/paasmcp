@@ -19,12 +19,14 @@ import { askArbiter } from "./arbiter.js";
 import { audit } from "./guard.js";
 import { exposeApplication } from "./exposure.js";
 import { createBucketWithKey } from "./storage.js";
+import { imageFor } from "./updater.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, setSecretEntries } from "./vault.js";
 
 // Mirror = each server keeps a live, read-only copy of the other's Postgres (physical streaming
 // over Tailscale) and receives the other's backups in its Garage. Promotion is manual (part 1).
 
-export const PG_IMAGE = "postgres:16-alpine";
+// Copies run the same pinned Postgres image as the primary (see updater.ts).
+const PG_IMAGE_NOW = () => imageFor("postgres");
 const PRIMARY = "paasmcp-postgres";
 const REPLICATOR = "paasmcp_replicator";
 const OFFLINE = () => process.env.PAASMCP_OFFLINE_TEST === "1";
@@ -89,7 +91,7 @@ function writeCopyCompose(rec: { container: string; localPort: number; dataDir: 
     path.join(dir, "compose.yaml"),
     `services:
   mirror:
-    image: ${PG_IMAGE}
+    image: ${PG_IMAGE_NOW()}
     container_name: ${rec.container}
     restart: unless-stopped
     ports:
@@ -114,7 +116,7 @@ function basebackup(offer: MirrorOffer, dataDir: string): void {
     "docker",
     [
       "run", "--rm", "--network", DOCKER_NETWORK, "-e", `PGPASSWORD=${offer.password}`,
-      "-v", `${dataDir}:/var/lib/postgresql/data`, PG_IMAGE, "sh", "-c",
+      "-v", `${dataDir}:/var/lib/postgresql/data`, PG_IMAGE_NOW(), "sh", "-c",
       'pg_basebackup -h "$1" -p "$2" -U "$3" -D /var/lib/postgresql/data -R -X stream -S "$4" && chown -R postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data',
       "sh", offer.host, String(offer.port), REPLICATOR, offer.slot,
     ],
