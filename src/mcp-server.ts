@@ -34,6 +34,7 @@ import {
   provisionDatabase,
   restoreDatabase,
 } from "./database.js";
+import { provisionEmail } from "./email.js";
 import { mirrorStatus, promoteMirror } from "./mirror.js";
 import { provisionStorage } from "./storage.js";
 import { backupAppVolumes, fetchOffsite, syncOffsite, testRestore } from "./backup.js";
@@ -367,6 +368,19 @@ async function listTools() {
             peer: { type: "string", description: "Peer server name (required for promote)." },
           },
           required: ["action"],
+        },
+      },
+      {
+        name: "paas_email_provision",
+        description:
+          "Lets an app send email through the server's relay (Brevo, SES... set once by a person with 'paasmcp email set'). Injects SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_SECURE, EMAIL_FROM, DEFAULT_FROM_EMAIL, EMAIL_URL (and BREVO_API_KEY when an HTTP API key is set) into the app's vault; sender is <app>@<domain>. Redeploy the app to load them.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            appName: { type: "string", description: "Application slug." },
+            fromName: { type: "string", description: "Optional display name for the sender, e.g. 'Guarapps'." },
+          },
+          required: ["appName"],
         },
       },
       {
@@ -864,6 +878,11 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           return { content: [{ type: "text", text: JSON.stringify(await promoteMirror(String(args.peer)), null, 2) }] };
         }
         return { content: [{ type: "text", text: JSON.stringify(mirrorStatus(), null, 2) }] };
+      }
+
+      case "paas_email_provision": {
+        const result = provisionEmail(String(args.appName), args.fromName ? String(args.fromName) : undefined);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
 
       case "paas_storage_provision": {
