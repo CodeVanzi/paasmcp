@@ -1,9 +1,22 @@
 #!/bin/bash
 # Two "servers" on one Docker daemon: A = paasmcp-postgres (root /tmp/labA), B = replica (root /tmp/labB).
-# Needs Docker and a build (npm run build). Uses /tmp/labA, /tmp/labB and port 5432/5433 on this machine; removes them at the end.
+# Needs Docker and a build (npm run build). Uses its own Docker network (paasmcp-lab-net), /tmp/labA, /tmp/labB
+# and ports 127.0.0.1:5432/5433. Refuses to run where PaaSMCP already runs (same container names); removes only what it created.
 set -e
-cd /home/user/paasmcp
-rm -rf /tmp/labA /tmp/labB; docker rm -f paasmcp-postgres paasmcp-mirror-server-a >/dev/null 2>&1 || true
+cd "$(dirname "$0")/.."
+docker info >/dev/null 2>&1 || { echo "Docker is not reachable." >&2; exit 1; }
+for c in paasmcp-postgres paasmcp-mirror-server-a; do
+  if docker inspect "$c" >/dev/null 2>&1; then
+    echo "Container '$c' already exists (a real PaaSMCP?). This lab never touches it: run it in a VM or a machine without PaaSMCP." >&2
+    exit 1
+  fi
+done
+for p in 5432 5433; do
+  if (ss -ltn 2>/dev/null || true) | grep -q "127.0.0.1:$p "; then echo "Port 127.0.0.1:$p is in use; free it or run elsewhere." >&2; exit 1; fi
+done
+export PAASMCP_DOCKER_NETWORK=paasmcp-lab-net
+docker network inspect "$PAASMCP_DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$PAASMCP_DOCKER_NETWORK" >/dev/null
+rm -rf /tmp/labA /tmp/labB
 step() { echo; echo "=== $*"; }
 runA() { PAASMCP_ROOT=/tmp/labA node --input-type=module -e "$1"; }
 runB() { PAASMCP_ROOT=/tmp/labB node --input-type=module -e "$1"; }
@@ -53,7 +66,7 @@ runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirr
 
 step "Failback: A comes back, rejoins as a copy of B, gets the data back"
 docker start paasmcp-postgres >/dev/null; sleep 3
-GW=$(docker network inspect homelab-network -f '{{(index .IPAM.Config 0).Gateway}}')
+GW=$(docker network inspect "$PAASMCP_DOCKER_NETWORK" -f '{{(index .IPAM.Config 0).Gateway}}')
 TOKEN2=$(runB "const m=await import('./dist/mirror.js');const r=await m.offerMirror({peerName:'server-a',peerCidr:'172.16.0.0/12',advertiseHost:'$GW',fromCopyOf:'server-a'});console.log(r.token)")
 runA "const m=await import('./dist/mirror.js');const r=m.acceptMirror('$TOKEN2',{rejoin:true});console.log('A old data kept at', r.movedAside)"
 sleep 3
@@ -73,4 +86,6 @@ runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirr
 
 step "cleanup"
 docker rm -f paasmcp-postgres paasmcp-mirror-server-a >/dev/null
-rm -rf /tmp/labA /tmp/labB
+docker network rm "$PAASMCP_DOCKER_NETWORK" >/dev/null
+# Postgres files belong to the container user; remove them from a throwaway container.
+docker run --rm -v /tmp:/t alpine:3.20 rm -rf /t/labA /t/labB
