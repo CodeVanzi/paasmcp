@@ -8,6 +8,7 @@ import {
   updatePlatformConfig,
   withStateLock,
 } from "./config.js";
+import { acceptMirror, mirrorStatus, offerMirror, promoteMirror } from "./mirror.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import {
   backupAppVolumes,
@@ -300,6 +301,28 @@ async function runCli() {
       break;
     }
 
+    case "mirror": {
+      const [sub, arg1] = rest;
+      if (sub === "offer" && arg1) {
+        const peerCidr = getFlagValue(rest, "--peer-ip");
+        if (!peerCidr) throw new Error("Usage: paasmcp mirror offer <peerName> --peer-ip <peer Tailscale IP> [--advertise <this server's IP>] [--no-backups]");
+        const r = await offerMirror({ peerName: arg1, peerCidr, advertiseHost: getFlagValue(rest, "--advertise"), withBackups: !rest.includes("--no-backups") });
+        console.error(`Run on '${arg1}' within one hour (the token carries passwords; do not paste it into chats):`);
+        console.log(`paasmcp mirror accept ${r.token}`);
+        console.error(JSON.stringify({ ...r, token: undefined }, null, 2));
+      } else if (sub === "accept" && arg1) {
+        console.log(JSON.stringify(acceptMirror(arg1), null, 2));
+      } else if (sub === "promote" && arg1) {
+        await confirmInCli("mirror.promote", { peer: arg1 }, rest);
+        console.log(JSON.stringify(await promoteMirror(arg1), null, 2));
+      } else if (!sub || sub === "status") {
+        console.log(JSON.stringify(mirrorStatus(), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp mirror <offer <peer> --peer-ip <ip>|accept <token>|status|promote <peer>>");
+      }
+      break;
+    }
+
     case "storage": {
       const [sub, arg1] = rest;
       if (sub === "provision" && arg1) {
@@ -530,6 +553,7 @@ Commands:
   paasmcp secret list <scope>                        List masked secrets in scope
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
+  paasmcp mirror <offer|accept|status|promote>      Live Postgres copy between two servers + manual failover
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
                                                     Restore test, off-site sync (S3/R2/B2), daily timer, master key export

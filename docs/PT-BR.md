@@ -25,9 +25,12 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
    - O `paas_doctor` inspeciona containers parados, mortes por falta de memória (`OOMKilled`), contadores de crash e métricas em tempo real (`docker stats`).
 6. **Auto-Deploy via GitHub Webhook (`HMAC-SHA256`):**
    - Endpoint integrado `/api/webhooks/github` que valida a assinatura `X-Hub-Signature-256` em tempo constante (`timingSafeEqual`) e reconstrói automaticamente o app quando você dá `git push` na branch configurada.
-7. **Handshake Multi-Servidor & Redundância (`node` / `paas_node_federation`) — em construção:**
-   - Já funciona: pareamento com token assinado `paasmcp-join://` (expira em 15 minutos) e sincronização criptografada de **configuração e Cofre**.
-   - Ainda não replica **dados** (banco, arquivos). Por isso o modo Active-Active só é seguro para apps **sem estado**: com banco, cada servidor gravaria no próprio Postgres e os dados se separariam. O espelho de dados entre servidores (Postgres + arquivos, troca manual com confirmação, troca automática só com árbitro) está no roadmap do `CONTRIBUTING.md`.
+7. **Dois servidores em espelho (`node`, `mirror` / `paas_mirror`):**
+   - Parear: `paasmcp node invite` num servidor e `paasmcp node join` no outro (token assinado, expira em 15 minutos). A sincronização de configuração e Cofre nunca sobrescreve um app que já existe no servidor de destino, e troca a porta se houver conflito.
+   - Espelhar: no servidor A, `paasmcp mirror offer B --peer-ip <IP do Tailscale de B>`; ele mostra um comando `paasmcp mirror accept ...` para rodar em B em até 1 hora. B passa a ter uma cópia viva, só de leitura, do Postgres de A, e os backups de B passam a ir para o Garage de A. Repita no sentido contrário para um ser o espelho do outro.
+   - Se B ficar fora do ar, A guarda até 10 GB de alterações e B se atualiza sozinho quando volta. `paasmcp mirror status` mostra se está transmitindo, se está em dia e quantos segundos atrás.
+   - Troca manual: se A cair, `paasmcp mirror promote A` em B (pede para digitar o nome). B assume os apps de A com a cópia, sobe o número de época, aponta o DNS para si. **Confirme que A caiu mesmo**: se os dois ficarem ligados, cada um aceitaria alterações. Troca automática (com árbitro) e volta guiada vêm na parte 2.
+   - Testado com dois containers Postgres (`scripts/mirror-lab.sh`); falta repetir em duas máquinas.
 8. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---
