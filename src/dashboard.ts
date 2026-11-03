@@ -460,8 +460,11 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           if (trusted && !loadState().apps[sanitizeSlug(String(body.appName))]?.trusted) {
             confirmFromBody("app.trust", { appName: sanitizeSlug(String(body.appName)) }, body);
           }
-          const result = deployApp({
+          const result = await deployApp({
             trusted,
+            healthcheckPath: body.healthcheckPath ? String(body.healthcheckPath) : undefined,
+            healthcheckTimeoutSeconds: body.healthcheckTimeoutSeconds ? Number(body.healthcheckTimeoutSeconds) : undefined,
+            skipHealthcheck: typeof body.skipHealthcheck === "boolean" ? body.skipHealthcheck : undefined,
             appName: String(body.appName),
             repoSource: String(body.repoSource),
             branch: body.branch ? String(body.branch) : "main",

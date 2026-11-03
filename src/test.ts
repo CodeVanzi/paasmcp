@@ -213,7 +213,7 @@ volumes:
     assert.ok(restoreRes.restoredBytes > 10);
   });
 
-  await t.test("5. Verifies GitHub Webhook HMAC-SHA256 signatures and triggers matched branch rebuilds", () => {
+  await t.test("5. Verifies GitHub Webhook HMAC-SHA256 signatures and triggers matched branch rebuilds", async () => {
     const secret = federation.getOrCreateWebhookSecret();
     const body = JSON.stringify({
       ref: "refs/heads/main",
@@ -245,7 +245,7 @@ volumes:
     };
     config.saveState(state);
 
-    const whResult = federation.handleGitHubPushWebhook(JSON.parse(body));
+    const whResult = await federation.handleGitHubPushWebhook(JSON.parse(body));
     assert.deepEqual(whResult.matchedApps, ["demo-saas"]);
     assert.deepEqual(whResult.rebuiltApps, ["demo-saas"]);
   });
@@ -718,7 +718,7 @@ volumes:
       const tick = await mirror.watchTick();
       assert.deepEqual((tick.fenced as { by: string }).by, "other-server");
       assert.equal(config.loadState().mirror?.fenced?.epoch, 5);
-      assert.throws(() => deployer.deployApp({ appName: "fresh-app", repoSource: "/tmp" }), /fenced/);
+      await assert.rejects(() => deployer.deployApp({ appName: "fresh-app", repoSource: "/tmp" }), /fenced/);
     } finally {
       srv.close();
       const st3 = config.loadState();
@@ -851,15 +851,87 @@ volumes:
     config.saveState(st);
     assert.throws(() => poller.setPolling("local-app", true), /not deployed from a git repository/);
     poller.setPolling("poll-app", true);
-    const same = poller.pollRepos(() => "abc1234" + "0".repeat(33));
+    const same = await poller.pollRepos(() => "abc1234" + "0".repeat(33));
     assert.deepEqual(same.checked, ["poll-app"]);
     assert.deepEqual(same.deployed, []);
     assert.deepEqual(same.errors, []);
     // A new commit triggers a deploy (it fails here because o/r cannot be cloned, which proves it tried).
-    const moved = poller.pollRepos(() => "f".repeat(40));
+    const moved = await poller.pollRepos(() => "f".repeat(40));
     assert.equal(moved.errors[0]?.app, "poll-app");
     poller.setPolling("poll-app", false);
-    assert.deepEqual(poller.pollRepos(() => "f".repeat(40)).checked, []);
+    assert.deepEqual((await poller.pollRepos(() => "f".repeat(40))).checked, []);
+  });
+
+  await t.test("26. Blue/green deploy: healthcheck probe, path validation, pinned primary image", async () => {
+    const http = await import("node:http");
+    // The probe passes on the first status below 500 (5xx means "keep waiting"; redirects are not followed).
+    let hits = 0;
+    const srv = http.createServer((req, res) => {
+      hits++;
+      if (req.url === "/redirect") {
+        res.writeHead(302, { Location: "http://203.0.113.1/" });
+        return res.end();
+      }
+      res.writeHead(hits < 3 ? 503 : 200);
+      res.end("ok");
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const base = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const ok = await deployer.waitForHealthy({ url: `${base}/healthz`, timeoutMs: 5000, intervalMs: 20 });
+      assert.equal(ok.healthy, true);
+      assert.equal(ok.status, 200);
+      assert.equal(hits, 3);
+      const redirect = await deployer.waitForHealthy({ url: `${base}/redirect`, timeoutMs: 2000, intervalMs: 20 });
+      assert.equal(redirect.healthy, true);
+      assert.equal(redirect.status, 302);
+      const dead = await deployer.waitForHealthy({ url: `${base}/`, timeoutMs: 2000, intervalMs: 20, isAlive: () => false });
+      assert.equal(dead.healthy, false);
+      assert.match(dead.reason || "", /exited/);
+    } finally {
+      srv.close();
+    }
+    // Nothing listening: gives up after the timeout and says why.
+    const freePort = await deployer.findFreeLoopbackPort();
+    const none = await deployer.waitForHealthy({ url: `http://127.0.0.1:${freePort}/`, timeoutMs: 600, intervalMs: 50 });
+    assert.equal(none.healthy, false);
+    assert.match(none.reason || "", /within 1s \(last: ECONNREFUSED\)/);
+
+    const err = new deployer.HealthcheckFailedError("demo", { healthy: false, elapsedMs: 20000, reason: "boom", path: "/" }, "Error: DATABASE_URL missing");
+    assert.match(err.message, /running is untouched/);
+    assert.match(err.message, /DATABASE_URL missing/);
+
+    assert.equal(deployer.validateHealthcheckPath(undefined), undefined);
+    assert.equal(deployer.validateHealthcheckPath("/api/health?full=1"), "/api/health?full=1");
+    for (const bad of ["healthz", "/a b", "/x\nHost: evil", "@evil.com/", "/\u00e9"]) {
+      assert.throws(() => deployer.validateHealthcheckPath(bad), /Invalid healthcheckPath/);
+    }
+    assert.throws(() => deployer.validateHealthcheckTimeout(0), /between 1 and 300/);
+    assert.throws(() => deployer.validateHealthcheckTimeout(301), /between 1 and 300/);
+    assert.equal(deployer.validateHealthcheckTimeout(45), 45);
+
+    // Compose pass-through: a built primary service gets the fixed paasmcp/<slug>:latest tag (restore + rollback).
+    const composeDir = fs.mkdtempSync(path.join(tempRoot, "bg-"));
+    const composeFile = path.join(composeDir, "docker-compose.yml");
+    fs.writeFileSync(composeFile, YAML.stringify({ services: { web: { build: "." }, db: { image: "postgres:16" } } }));
+    const built = deployer.generateSanitizedComposeFromRepo({
+      repoComposePath: composeFile, slug: "bg-app", containerName: "paasmcp-bg-app",
+      localPort: 4020, internalPort: 3000, primaryServiceName: "web",
+    });
+    assert.equal(built.primaryImage, "paasmcp/bg-app:latest");
+    assert.equal(YAML.parse(built.yaml).services.web.image, "paasmcp/bg-app:latest");
+    assert.equal(YAML.parse(built.yaml).services.db.image, "postgres:16");
+    fs.writeFileSync(composeFile, YAML.stringify({ services: { web: { image: "ghcr.io/acme/web:1" } } }));
+    const pulled = deployer.generateSanitizedComposeFromRepo({
+      repoComposePath: composeFile, slug: "bg-app", containerName: "paasmcp-bg-app",
+      localPort: 4020, internalPort: 3000, primaryServiceName: "web",
+    });
+    assert.equal(pulled.primaryImage, "ghcr.io/acme/web:1");
+
+    await assert.rejects(
+      () => deployer.deployApp({ appName: "bg-bad", repoSource: "/tmp", healthcheckPath: "nope" }),
+      /Invalid healthcheckPath/
+    );
   });
 
   fs.rmSync(tempRoot, { recursive: true, force: true });

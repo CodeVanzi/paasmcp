@@ -23,12 +23,14 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
 4. **Buildpacks Zero-Config + Multi-Service Docker Compose:**
    - Detecta automaticamente **Node.js, Next.js, Vite/React/Astro, Python (FastAPI/Flask/Django), Go, HTML Estático** ou `Dockerfile` próprio.
    - Suporta repositórios complexos com `docker-compose.yml`: o PaaSMCP audita e sanitiza o arquivo (removendo `privileged: true`, `network_mode: host` e volumes inseguros do host), injeta o `.env.runtime` do Cofre em todos os serviços e expõe apenas o container web em `127.0.0.1:<porta>`.
-5. **Rollback em 1 Segundo & Diagnóstico `paas_doctor`:**
+5. **Deploy Blue/Green sem Queda:**
+   - A nova versão sobe primeiro como container candidato numa porta loopback livre e precisa responder a um healthcheck HTTP (`healthcheckPath`, padrão `/`, status < 500, até 20 s) antes de substituir a que está no ar. Se ela cair ou continuar falhando, a versão atual segue intacta e o deploy devolve os logs do candidato ao agente. Durante a troca o candidato também responde pelo nome do container, então o tráfego do Cloudflare Tunnel continua chegando numa cópia saudável enquanto a produção é recriada (`scripts/bluegreen-lab.sh`). Apps que não falam HTTP usam `skipHealthcheck: true` (`--no-healthcheck` na CLI).
+6. **Rollback em 1 Segundo & Diagnóstico `paas_doctor`:**
    - Antes de cada deploy, a imagem funcional anterior é salva como `paasmcp/<app>:previous`. Se o novo deploy apresentar problema, `paasmcp rollback <app>` reverte em 1 segundo sem precisar recompilar.
    - O `paas_doctor` inspeciona containers parados, mortes por falta de memória (`OOMKilled`), contadores de crash e métricas em tempo real (`docker stats`).
-6. **Auto-Deploy via GitHub Webhook (`HMAC-SHA256`):**
+7. **Auto-Deploy via GitHub Webhook (`HMAC-SHA256`):**
    - Endpoint integrado `/api/webhooks/github` que valida a assinatura `X-Hub-Signature-256` em tempo constante (`timingSafeEqual`) e reconstrói automaticamente o app quando você dá `git push` na branch configurada.
-7. **Dois servidores em espelho (`node`, `mirror` / `paas_mirror`):**
+8. **Dois servidores em espelho (`node`, `mirror` / `paas_mirror`):**
    - Parear: `paasmcp node invite` num servidor e `paasmcp node join` no outro (token assinado, expira em 15 minutos). A sincronização de configuração e Cofre nunca sobrescreve um app que já existe no servidor de destino, e troca a porta se houver conflito.
    - Espelhar: no servidor A, `paasmcp mirror offer B --peer-ip <IP do Tailscale de B>`; ele mostra um comando `paasmcp mirror accept ...` para rodar em B em até 1 hora. B passa a ter uma cópia viva, só de leitura, do Postgres de A, e os backups de B passam a ir para o Garage de A. Repita no sentido contrário para um ser o espelho do outro.
    - Se B ficar fora do ar, A guarda até 10 GB de alterações e B se atualiza sozinho quando volta. `paasmcp mirror status` mostra se está transmitindo, se está em dia e quantos segundos atrás.
@@ -41,7 +43,7 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
      4. Em A: `paasmcp mirror promote B`.
      5. Para B voltar a ser espelho: `mirror offer B ...` em A e `mirror accept` em B (a cópia velha é movida para o lado).
    - Testado com containers Postgres reais (`scripts/mirror-lab.sh`: cópia, queda do espelho, troca, volta completa); falta repetir em duas máquinas.
-8. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
+9. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---
 

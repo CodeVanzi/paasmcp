@@ -368,7 +368,7 @@ export async function promoteMirror(peerName: string, opts: { epoch?: number } =
         if (!OFFLINE()) manageAppLifecycle(app.name, "start");
       } else {
         if (!app.repoUrl) throw new Error("no repository recorded; deploy it by hand");
-        if (!OFFLINE()) deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted });
+        if (!OFFLINE()) await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted });
       }
       // DNS switch: re-exposing points the hostname at this server's tunnel.
       const base = state.cloudflare.baseDomain;

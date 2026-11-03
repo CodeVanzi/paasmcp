@@ -32,7 +32,7 @@ export function remoteHead(repoUrl: string, branch: string): string {
   return sha;
 }
 
-export function pollRepos(head = remoteHead): { checked: string[]; deployed: { app: string; commit: string }[]; errors: { app: string; error: string }[] } {
+export async function pollRepos(head = remoteHead): Promise<{ checked: string[]; deployed: { app: string; commit: string }[]; errors: { app: string; error: string }[] }> {
   const checked: string[] = [];
   const deployed: { app: string; commit: string }[] = [];
   const errors: { app: string; error: string }[] = [];
@@ -42,7 +42,7 @@ export function pollRepos(head = remoteHead): { checked: string[]; deployed: { a
     try {
       const sha = head(app.repoUrl!, app.branch);
       if (app.lastCommit && sha.startsWith(app.lastCommit)) continue;
-      const result = deployApp({ appName: app.name, repoSource: app.repoUrl!, branch: app.branch, trusted: app.trusted });
+      const result = await deployApp({ appName: app.name, repoSource: app.repoUrl!, branch: app.branch, trusted: app.trusted });
       deployed.push({ app: app.name, commit: result.commitHash });
       audit({ event: "poll.deploy", app: app.name, commit: result.commitHash });
     } catch (err) {

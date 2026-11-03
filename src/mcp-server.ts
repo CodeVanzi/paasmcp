@@ -444,7 +444,7 @@ async function listTools() {
       {
         name: "paas_app_deploy",
         description:
-          "Deploys an application from a GitHub repository ('owner/repo' or git URL) or local directory path. Supports single-container buildpacks (Node, Next.js, Python, Go, Static) and multi-service docker-compose.yml pass-through with automatic Vault injection, loopback security hardening, resource limits, and rollback image tagging.",
+          "Deploys an application from a GitHub repository ('owner/repo' or git URL) or local directory path. Supports single-container buildpacks (Node, Next.js, Python, Go, Static) and multi-service docker-compose.yml pass-through with automatic Vault injection, loopback security hardening, resource limits, and rollback image tagging. Zero-downtime blue/green: the new image first runs as a candidate container and must answer an HTTP healthcheck (status < 500) before it replaces the running one; if it fails, the running version is untouched and the error contains the candidate's logs.",
         inputSchema: {
           type: "object",
           properties: {
@@ -488,6 +488,20 @@ async function listTools() {
             cpuLimit: {
               type: "string",
               description: "Optional container CPU limit (e.g., '0.5', '1.0', '2').",
+            },
+            healthcheckPath: {
+              type: "string",
+              description:
+                "Blue/green cutover: path probed on the new version before it replaces the running one (default '/'; any status below 500 passes). Remembered for later deploys.",
+            },
+            healthcheckTimeoutSeconds: {
+              type: "number",
+              description: "Seconds the new version has to answer the healthcheck (default 20, max 300). Remembered for later deploys.",
+            },
+            skipHealthcheck: {
+              type: "boolean",
+              description:
+                "true = replace the container directly without a candidate/healthcheck (for apps that do not serve HTTP). Remembered; pass false to turn the healthcheck back on.",
             },
             env: {
               type: "object",
@@ -971,8 +985,11 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
         if (trusted && !loadState().apps[sanitizeSlug(String(args.appName))]?.trusted) {
           authorize("app.trust", { appName: sanitizeSlug(String(args.appName)) });
         }
-        const result = deployApp({
+        const result = await deployApp({
           trusted,
+          healthcheckPath: args.healthcheckPath ? String(args.healthcheckPath) : undefined,
+          healthcheckTimeoutSeconds: args.healthcheckTimeoutSeconds ? Number(args.healthcheckTimeoutSeconds) : undefined,
+          skipHealthcheck: typeof args.skipHealthcheck === "boolean" ? args.skipHealthcheck : undefined,
           appName: String(args.appName),
           repoSource: String(args.repoSource),
           branch: args.branch ? String(args.branch) : "main",
