@@ -44,14 +44,14 @@ export function verifyGitHubWebhookSignature(
   return timingSafeCompare(expectedSig, signatureHeader.trim());
 }
 
-export function handleGitHubPushWebhook(payload: {
+export async function handleGitHubPushWebhook(payload: {
   ref?: string;
   repository?: { full_name?: string; clone_url?: string; ssh_url?: string };
-}): {
+}): Promise<{
   matchedApps: string[];
   rebuiltApps: string[];
   errors: Record<string, string>;
-} {
+}> {
   const state = loadState();
   const ref = String(payload.ref || "");
   const pushedBranch = ref.startsWith("refs/heads/")
@@ -82,7 +82,7 @@ export function handleGitHubPushWebhook(payload: {
         rebuiltApps.push(app.name);
       } else {
         try {
-          deployApp({
+          await deployApp({
             appName: app.name,
             repoSource: app.repoUrl,
             branch: app.branch,

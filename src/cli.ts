@@ -389,7 +389,7 @@ async function runCli() {
     case "poll": {
       const [sub, arg1] = rest;
       if (!sub || sub === "run") {
-        console.log(JSON.stringify(pollRepos(), null, 2));
+        console.log(JSON.stringify(await pollRepos(), null, 2));
       } else if ((sub === "enable" || sub === "disable") && arg1) {
         console.log(JSON.stringify(setPolling(arg1, sub === "enable"), null, 2));
       } else if (sub === "install-timer") {
@@ -545,7 +545,7 @@ async function runCli() {
       const [appName, repoSource] = rest;
       if (!appName || !repoSource) {
         throw new Error(
-          "Usage: paasmcp deploy <appName> <repoSource> [--branch main] [--port 3000] [--postgres] [--redis] [--memory 512m] [--cpus 1.0]"
+          "Usage: paasmcp deploy <appName> <repoSource> [--branch main] [--port 3000] [--postgres] [--redis] [--memory 512m] [--cpus 1.0] [--healthcheck-path /healthz] [--healthcheck-timeout 20] [--no-healthcheck]"
         );
       }
       const branch = getFlagValue(rest, "--branch") || "main";
@@ -560,8 +560,12 @@ async function runCli() {
         await confirmInCli("app.trust", { appName: sanitizeSlug(appName) }, rest);
       }
 
-      const res = deployApp({
+      const hcTimeout = getFlagValue(rest, "--healthcheck-timeout");
+      const res = await deployApp({
         trusted,
+        healthcheckPath: getFlagValue(rest, "--healthcheck-path"),
+        healthcheckTimeoutSeconds: hcTimeout ? Number(hcTimeout) : undefined,
+        skipHealthcheck: rest.includes("--no-healthcheck") ? true : rest.includes("--healthcheck") ? false : undefined,
         appName,
         repoSource,
         branch,

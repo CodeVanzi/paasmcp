@@ -43,6 +43,12 @@ export interface AppRecord {
   autoDeploy?: "poll";
   trashedAt?: string;
   trashDir?: string;
+  /** Blue/green deploy: path probed on the candidate container (default "/"). */
+  healthcheckPath?: string;
+  /** Blue/green deploy: seconds to wait for a healthy answer (default 20). */
+  healthcheckTimeoutSeconds?: number;
+  /** true = deploy without candidate/healthcheck (apps that do not speak HTTP). */
+  healthcheckDisabled?: boolean;
 }
 
 export interface DatabaseRecord {

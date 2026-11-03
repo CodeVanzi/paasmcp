@@ -1,5 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import YAML from "yaml";
 import {
@@ -32,6 +33,12 @@ export interface DeployOptions {
   env?: Record<string, string>;
   memoryLimit?: string;
   cpuLimit?: string;
+  /** Path probed on the candidate before the cutover (default "/", kept for later deploys). */
+  healthcheckPath?: string;
+  /** Seconds to wait for a healthy answer (default 20, max 300, kept for later deploys). */
+  healthcheckTimeoutSeconds?: number;
+  /** true = old behaviour (no candidate, no probe) for apps that do not speak HTTP; kept for later deploys. */
+  skipHealthcheck?: boolean;
 }
 
 export function syncHomepageDashboard(): void {
@@ -119,7 +126,7 @@ export function generateSanitizedComposeFromRepo(opts: {
   memoryLimit?: string;
   cpuLimit?: string;
   trusted?: boolean;
-}): { yaml: string; findings: string[] } {
+}): { yaml: string; findings: string[]; primaryImage?: string } {
   const raw = fs.readFileSync(opts.repoComposePath, "utf-8");
   const parsed = YAML.parse(raw) as {
     services?: Record<string, Record<string, unknown>>;
@@ -189,6 +196,8 @@ export function generateSanitizedComposeFromRepo(opts: {
     // Loopback-only port enforcement: only primary service gets 127.0.0.1:<localPort>:<internalPort>
     if (svcName === opts.primaryServiceName) {
       cleanSvc.container_name = opts.containerName;
+      // A fixed tag lets the blue/green cutover restore the old image and keeps rollback working.
+      if (cleanSvc.build !== undefined && cleanSvc.image === undefined) cleanSvc.image = `paasmcp/${opts.slug}:latest`;
       cleanSvc.ports = [`127.0.0.1:${opts.localPort}:${opts.internalPort}`];
     } else {
       cleanSvc.container_name = `${opts.containerName}-${ sanitizeSlug(svcName) }`;
@@ -223,24 +232,166 @@ export function generateSanitizedComposeFromRepo(opts: {
     outputCompose.volumes = volumes;
   }
 
-  return { yaml: YAML.stringify(outputCompose), findings };
+  const primaryImage = safeServices[opts.primaryServiceName]?.image;
+  return {
+    yaml: YAML.stringify(outputCompose),
+    findings,
+    ...(typeof primaryImage === "string" ? { primaryImage } : {}),
+  };
 }
 
-export function deployApp(opts: DeployOptions): {
+export const DEFAULT_HEALTHCHECK_TIMEOUT_SECONDS = 20;
+const MAX_HEALTHCHECK_TIMEOUT_SECONDS = 300;
+const CANDIDATE_LOG_LINES = 80;
+
+/** Only a plain absolute URL path: it is appended to http://127.0.0.1:<port>. */
+export function validateHealthcheckPath(value?: string): string | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value.length > 512 || !/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*$/.test(value)) {
+    throw new Error(`Invalid healthcheckPath '${value}': use a URL path such as '/' or '/healthz'.`);
+  }
+  return value;
+}
+
+export function validateHealthcheckTimeout(value?: number): number | undefined {
+  if (value === undefined) return undefined;
+  if (!Number.isFinite(value) || value < 1 || value > MAX_HEALTHCHECK_TIMEOUT_SECONDS) {
+    throw new Error(`healthcheckTimeoutSeconds must be between 1 and ${MAX_HEALTHCHECK_TIMEOUT_SECONDS}.`);
+  }
+  return Math.round(value);
+}
+
+export interface HealthcheckResult {
+  healthy: boolean;
+  status?: number;
+  elapsedMs: number;
+  reason?: string;
+}
+
+/**
+ * Polls `url` until it answers with a status below 500 (redirects and 4xx count as "the app is up").
+ * Stops early when `isAlive` says the container already exited.
+ */
+export async function waitForHealthy(opts: {
+  url: string;
+  timeoutMs: number;
+  intervalMs?: number;
+  isAlive?: () => boolean;
+}): Promise<HealthcheckResult> {
+  const started = Date.now();
+  const interval = opts.intervalMs ?? 500;
+  let lastStatus: number | undefined;
+  let lastProblem = "no answer";
+  for (;;) {
+    const elapsed = Date.now() - started;
+    const remaining = opts.timeoutMs - elapsed;
+    if (remaining <= 0) break;
+    if (opts.isAlive && !opts.isAlive()) {
+      return { healthy: false, status: lastStatus, elapsedMs: elapsed, reason: "the container exited before answering" };
+    }
+    try {
+      const res = await fetch(opts.url, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(Math.max(250, Math.min(3000, remaining))),
+      });
+      lastStatus = res.status;
+      await res.body?.cancel().catch(() => undefined);
+      if (res.status < 500) return { healthy: true, status: res.status, elapsedMs: Date.now() - started };
+      lastProblem = `HTTP ${res.status}`;
+    } catch (err) {
+      const cause = (err as { cause?: { code?: string } }).cause?.code;
+      lastProblem = cause || (err instanceof Error ? err.name : String(err));
+    }
+    await new Promise((r) => setTimeout(r, Math.max(0, Math.min(interval, opts.timeoutMs - (Date.now() - started)))));
+  }
+  return {
+    healthy: false,
+    status: lastStatus,
+    elapsedMs: Date.now() - started,
+    reason: `no healthy answer within ${Math.round(opts.timeoutMs / 1000)}s (last: ${lastProblem})`,
+  };
+}
+
+/** Thrown when the new version fails its healthcheck; the running version was left untouched. */
+export class HealthcheckFailedError extends Error {
+  constructor(
+    readonly app: string,
+    readonly healthcheck: HealthcheckResult & { path: string },
+    readonly candidateLogs: string
+  ) {
+    super(
+      `Deploy of '${app}' aborted: the new version failed its healthcheck (GET ${healthcheck.path}: ${healthcheck.reason}). ` +
+        `The version that was running is untouched and still serving traffic. Fix the error below and deploy again.\n` +
+        `--- candidate logs (last ${CANDIDATE_LOG_LINES} lines) ---\n${candidateLogs || "(no output)"}`
+    );
+    this.name = "HealthcheckFailedError";
+  }
+}
+
+/** A free loopback port picked by the kernel (closed again right away; docker binds it next). */
+export function findFreeLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/** `docker tag`, false when the source image does not exist. */
+function tagImage(source: string, target: string): boolean {
+  return spawnSync("docker", ["tag", source, target], { stdio: "ignore" }).status === 0;
+}
+
+function containerRunning(name: string): boolean {
+  try {
+    return (
+      execFileSync("docker", ["inspect", "--format", "{{.State.Running}}", name], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim() === "true"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function removeContainer(name: string): void {
+  spawnSync("docker", ["rm", "-f", name], { stdio: "ignore" });
+}
+
+function containerLogs(name: string, lines = CANDIDATE_LOG_LINES): string {
+  const res = spawnSync("docker", ["logs", "--tail", String(lines), name], { encoding: "utf-8" });
+  const out = `${res.stdout || ""}${res.stderr || ""}`.trim();
+  return out.length > 6000 ? out.slice(-6000) : out;
+}
+
+export async function deployApp(opts: DeployOptions): Promise<{
   app: AppRecord;
   commitHash: string;
   provisionedDatabases: string[];
   previousImageSaved: boolean;
+  cutover: "blue-green" | "direct";
+  healthcheck?: HealthcheckResult & { path: string; candidatePort: number };
+  warning?: string;
   removedForSafety?: string[];
   hostAccessKept?: string[];
   hint?: string;
-} {
+}> {
   ensureDockerNetwork();
   const slug = sanitizeSlug(opts.appName);
   const branch = validateBranchName(opts.branch || "main");
   const memoryLimit = validateResourceLimit(opts.memoryLimit, "memory");
   const cpuLimit = validateResourceLimit(opts.cpuLimit, "cpu");
   const state = loadState();
+  const prior = state.apps[slug];
+  const healthcheckPath = validateHealthcheckPath(opts.healthcheckPath) ?? prior?.healthcheckPath;
+  const healthcheckTimeoutSeconds =
+    validateHealthcheckTimeout(opts.healthcheckTimeoutSeconds) ?? prior?.healthcheckTimeoutSeconds;
+  const healthcheckDisabled = opts.skipHealthcheck ?? prior?.healthcheckDisabled ?? false;
   if (state.mirror?.fenced && !state.apps[slug]?.originNodeId) {
     throw new Error(`This server is fenced: since epoch ${state.mirror.fenced.epoch} another server serves its data. Follow the failback steps ('paasmcp mirror status').`);
   }
@@ -279,21 +430,14 @@ export function deployApp(opts: DeployOptions): {
     NODE_ENV: "production",
   });
 
-  // Preserve current image as :previous for 1-second rollback if it exists
-  let previousImageSaved = false;
   const currentImg = `paasmcp/${slug}:latest`;
   const prevImg = `paasmcp/${slug}:previous`;
-  try {
-    execFileSync("docker", ["image", "inspect", currentImg], { stdio: "ignore" });
-    execFileSync("docker", ["tag", currentImg, prevImg], { stdio: "ignore" });
-    previousImageSaved = true;
-  } catch {
-    // First deploy or image not present yet
-  }
 
   const composePath = path.join(appDir, "compose.yaml");
   const isComposePassThrough = Boolean(buildPlan.composeFile);
   let composeFindings: string[] = [];
+  let primaryService = "app";
+  let primaryImage: string | undefined = currentImg;
 
   if (isComposePassThrough && buildPlan.composeFile && buildPlan.primaryServiceName) {
     const repoComposePath = path.join(repoDir, buildPlan.composeFile);
@@ -309,6 +453,8 @@ export function deployApp(opts: DeployOptions): {
       trusted,
     });
     composeFindings = sanitized.findings;
+    primaryService = buildPlan.primaryServiceName;
+    primaryImage = sanitized.primaryImage;
     fs.writeFileSync(composePath, sanitized.yaml, { mode: 0o600 });
   } else {
     const memLine = memoryLimit ? `    mem_limit: ${memoryLimit}\n` : "";
@@ -335,14 +481,87 @@ networks:
     fs.writeFileSync(composePath, composeContent, { mode: 0o600 });
   }
 
-  execFileSync(
-    "docker",
-    ["compose", "-f", composePath, "up", "-d", "--build", "--remove-orphans"],
-    {
-      cwd: appDir,
-      stdio: "pipe",
+  const compose = (...args: string[]) =>
+    execFileSync("docker", ["compose", "-f", composePath, ...args], { cwd: appDir, stdio: "pipe" });
+
+  // Hold the running version's image under its own tag (an untagged image can vanish with the
+  // containerd image store), then build the new image while the running version keeps serving.
+  const holdImg = `paasmcp/${slug}:pre-deploy`;
+  const hadOldImage = primaryImage ? tagImage(primaryImage, holdImg) : false;
+  const releaseHold = () => {
+    if (hadOldImage) spawnSync("docker", ["image", "rm", holdImg], { stdio: "ignore" });
+  };
+  // Until the swap starts, any failure puts the tag back on the running version's image.
+  const abort = () => {
+    if (primaryImage && hadOldImage) tagImage(holdImg, primaryImage);
+    releaseHold();
+  };
+
+  let healthcheck: (HealthcheckResult & { path: string; candidatePort: number }) | undefined;
+  let warning: string | undefined;
+  const probePath = healthcheckPath || "/";
+  const timeoutMs = (healthcheckTimeoutSeconds || DEFAULT_HEALTHCHECK_TIMEOUT_SECONDS) * 1000;
+  const candidateName = `${containerName}-candidate`;
+  try {
+    compose("build");
+    if (!healthcheckDisabled) {
+      // Blue/green: run the new image as a one-off candidate on a free loopback port and probe it.
+      const candidatePort = await findFreeLoopbackPort();
+      removeContainer(candidateName); // leftover from an interrupted deploy
+      compose(
+        "run", "-d",
+        "--name", candidateName,
+        "--label", `paasmcp.candidate=${slug}`,
+        "--publish", `127.0.0.1:${candidatePort}:${internalPort}`,
+        primaryService
+      );
+      const result = await waitForHealthy({
+        url: `http://127.0.0.1:${candidatePort}${probePath}`,
+        timeoutMs,
+        isAlive: () => containerRunning(candidateName),
+      });
+      healthcheck = { ...result, path: probePath, candidatePort };
+      if (!result.healthy) {
+        throw new HealthcheckFailedError(slug, healthcheck, containerLogs(candidateName));
+      }
+
+      // Healthy: let the candidate answer for the container name (Cloudflare Tunnel routes by it on
+      // the Docker network) while the production container is recreated, so tunnel traffic sees no gap.
+      try {
+        execFileSync("docker", ["network", "disconnect", DOCKER_NETWORK, candidateName], { stdio: "ignore" });
+        execFileSync("docker", ["network", "connect", "--alias", containerName, DOCKER_NETWORK, candidateName], {
+          stdio: "ignore",
+        });
+      } catch {
+        // Best effort: without the alias the cutover still works, with the usual 1-2 s recreate gap.
+      }
     }
-  );
+  } catch (err) {
+    removeContainer(candidateName);
+    abort();
+    throw err;
+  }
+
+  // Swap: recreate the production container(s) from the new image.
+  try {
+    compose("up", "-d", "--no-build", "--remove-orphans");
+    if (healthcheck) {
+      const settled = await waitForHealthy({
+        url: `http://127.0.0.1:${localPort}${probePath}`,
+        timeoutMs,
+        isAlive: () => containerRunning(containerName),
+      });
+      if (!settled.healthy) {
+        warning = `The candidate passed, but ${containerName} did not answer GET ${probePath} on 127.0.0.1:${localPort} after the swap (${settled.reason}). Check paas_app_lifecycle(action='logs') or roll back.`;
+      }
+    }
+  } finally {
+    removeContainer(candidateName);
+  }
+
+  // Keep the replaced image as :previous for the 1-second rollback.
+  const previousImageSaved = hadOldImage && primaryImage === currentImg && tagImage(holdImg, prevImg);
+  releaseHold();
 
   const latestState = loadState();
   const existing = latestState.apps[slug];
@@ -374,6 +593,9 @@ networks:
     memoryLimit: memoryLimit || existing?.memoryLimit,
     cpuLimit: cpuLimit || existing?.cpuLimit,
     trusted,
+    healthcheckPath,
+    healthcheckTimeoutSeconds,
+    healthcheckDisabled: healthcheckDisabled || undefined,
   };
 
   latestState.apps[slug] = record;
@@ -385,6 +607,9 @@ networks:
     commitHash,
     provisionedDatabases,
     previousImageSaved,
+    cutover: healthcheckDisabled ? "direct" : "blue-green",
+    ...(healthcheck ? { healthcheck } : {}),
+    ...(warning ? { warning } : {}),
     ...(composeFindings.length
       ? trusted
         ? { hostAccessKept: composeFindings }

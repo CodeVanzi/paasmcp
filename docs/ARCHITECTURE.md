@@ -55,6 +55,19 @@ By default, PaaSMCP stores all runtime state under `PAASMCP_ROOT` (`/opt/homelab
   2. Host bind-mounts (volumes starting with `/` or containing `..`) are stripped; only named Docker volumes are permitted.
   3. `.env.runtime` (from the encrypted Vault) and `homelab-network` are injected into all services.
   4. Only the primary web service binds to `127.0.0.1:<allocatedPort>:<internalPort>`; background workers (`worker`, `cron`, `queue`) have external `ports` removed so they run completely isolated inside the bridge network.
+  5. A primary service that is built (has `build` and no `image`) is tagged `paasmcp/<app>:latest`, so the blue/green cutover can restore it and `rollback` works for compose apps too.
+
+### Blue/green cutover with healthcheck (`deployApp`)
+
+Every deploy builds the new image while the running version keeps serving, then checks it before anything is replaced:
+
+1. The running version's image is held as `paasmcp/<app>:pre-deploy` (with the containerd image store an untagged image can disappear), then `docker compose build`.
+2. The new image runs as a one-off candidate (`docker compose run -d --name paasmcp-<app>-candidate`) published on a free loopback port (`127.0.0.1:<random>`). It gets the same env file, network, volumes and limits as production; `depends_on` services are started if missing.
+3. `GET http://127.0.0.1:<candidatePort><healthcheckPath>` is polled every 0.5 s for up to 20 s (`healthcheckTimeoutSeconds`, max 300). Any status below 500 passes (redirects are not followed). If the candidate exits, the check stops at once.
+4. **Unhealthy:** the candidate's last 80 log lines are captured, the candidate is removed, the `:latest` tag goes back to the running version's image and the deploy fails with `HealthcheckFailedError` (the logs are in the message, so the MCP agent sees them). Nothing that was running is touched and the app record is not changed.
+5. **Healthy:** the candidate gets the network alias `paasmcp-<app>` on `homelab-network`, so Cloudflare Tunnel (which routes by container name) keeps reaching a healthy copy while `docker compose up -d --no-build` recreates production. Once production answers on `127.0.0.1:<localPort>`, the candidate is removed and the replaced image becomes `:previous`.
+
+Traffic that reaches the app through the Docker network never finds the name unanswered; a request that is in flight on the old container when it stops can still fail unless the app shuts down gracefully (the lab sees 0–1 failed requests out of ~1,150 during a swap). Traffic to the loopback port itself (`tailscale serve`, `curl 127.0.0.1:<port>`) still has the short recreate gap, because only one container can own that port. Apps that do not serve HTTP deploy with `skipHealthcheck: true` (CLI `--no-healthcheck`), which restores the direct replace. `healthcheckPath`, `healthcheckTimeoutSeconds` and `skipHealthcheck` are stored on the app, so webhook and polling redeploys use them. Nothing stays running between deploys: the candidate exists only during `deployApp`.
 
 ---
 
@@ -143,6 +156,8 @@ memory and nothing needs to be reachable from the internet.
 ## 12. Test labs
 
 - `npm test`: unit tests, no Docker.
+- `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
+  versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,
   Django, Go, Go `cmd/`, static).
 - `scripts/mirror-lab.sh`: two simulated servers on one Docker host (own network, ports 5432/5433):
