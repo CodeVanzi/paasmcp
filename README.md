@@ -155,7 +155,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`). |
 | `paas_secret_delete` | Deletes a secret key from the encrypted vault. |
 | `paas_db_provision` | Creates an isolated PostgreSQL or Redis database and binds `DATABASE_URL` / `REDIS_URL` into the app's vault. |
-| `paas_db_backup` | Creates, lists, or restores AES-256-GCM encrypted `pg_dump` / Redis snapshots with SHA-256 integrity verification. |
+| `paas_db_backup` | Creates, lists, restores and **tests** AES-256-GCM encrypted `pg_dump` / Redis / Docker volume snapshots (SHA-256 checked); `sync` sends them off-site (S3/R2/B2/Garage), `fetch` brings one back. |
 | `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds Dockerfile or sanitized `docker-compose.yml`, sets CPU/RAM limits, tags `:previous` image, and starts containers. |
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
 | `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), `destroy` (to the 30-day trash), `restore` (from the trash) or `purge`. |
@@ -183,6 +183,15 @@ paasmcp deploy my-saas owner/my-private-saas --branch main --postgres --memory 5
 paasmcp db-backup create my-saas postgres
 paasmcp db-backup list
 paasmcp db-backup restore <backup-id>
+paasmcp db-backup create my-saas volume      # every Docker volume of the app
+paasmcp backup test <backup-id>              # restores into a temporary DB; live data untouched
+
+# Off-site copies (R2, B2, S3, Garage): set BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET,
+# BACKUP_S3_ACCESS_KEY_ID, BACKUP_S3_SECRET_ACCESS_KEY (+ optional BACKUP_S3_REGION, BACKUP_S3_PREFIX)
+# in the "system" vault scope, then:
+sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
+paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
+paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it
 
 # Run health diagnostics or 1-second rollback
 paasmcp doctor

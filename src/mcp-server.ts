@@ -34,6 +34,7 @@ import {
   provisionDatabase,
   restoreDatabase,
 } from "./database.js";
+import { backupAppVolumes, fetchOffsite, syncOffsite, testRestore } from "./backup.js";
 import { ensureDashboardBackgroundService, getOrCreateDashboardToken } from "./dashboard.js";
 import {
   AppLifecycleAction,
@@ -353,14 +354,14 @@ async function listTools() {
       {
         name: "paas_db_backup",
         description:
-          "Creates, lists, or restores AES-256-GCM encrypted database snapshots (pg_dump / Redis RDB) stored in /opt/homelab/paasmcp/backups.",
+          "Encrypted (AES-256-GCM) backups of databases (pg_dump / Redis RDB) and app Docker volumes. 'create' a snapshot, 'list' them, 'restore' one (needs human confirmation; a safety backup is taken first), 'test' that a backup really restores (into a temporary database, live data untouched), 'sync' new backups off-site (S3/R2/B2, BACKUP_S3_* in the system vault) or 'fetch' one back from off-site.",
         inputSchema: {
           type: "object",
           properties: {
             action: {
               type: "string",
-              enum: ["create", "list", "restore"],
-              description: "'create' a new encrypted snapshot, 'list' existing backups, or 'restore' from backupId.",
+              enum: ["create", "list", "restore", "test", "sync", "fetch"],
+              description: "create | list | restore | test | sync | fetch (see tool description).",
             },
             appName: {
               type: "string",
@@ -368,12 +369,12 @@ async function listTools() {
             },
             engine: {
               type: "string",
-              enum: ["postgres", "redis"],
-              description: "Database engine for 'create' (default: postgres).",
+              enum: ["postgres", "redis", "volume"],
+              description: "What to back up on 'create' (default: postgres; 'volume' backs up every Docker volume of the app).",
             },
             backupId: {
               type: "string",
-              description: "Backup ID to restore (required when action='restore').",
+              description: "Backup ID (required for restore, test and fetch).",
             },
           },
           required: ["action"],
@@ -840,8 +841,9 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           if (!args.appName) {
             throw new Error("'appName' is required when action='create'.");
           }
-          const engine = (args.engine as "postgres" | "redis") || "postgres";
-          const record = backupDatabase(String(args.appName), engine);
+          const engine = (args.engine as "postgres" | "redis" | "volume") || "postgres";
+          const record =
+            engine === "volume" ? backupAppVolumes(String(args.appName)) : backupDatabase(String(args.appName), engine);
           return {
             content: [{ type: "text", text: JSON.stringify(record, null, 2) }],
           };
@@ -855,6 +857,14 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
           };
+        }
+        if (action === "sync") {
+          return { content: [{ type: "text", text: JSON.stringify(await syncOffsite(), null, 2) }] };
+        }
+        if (action === "test" || action === "fetch") {
+          if (!args.backupId) throw new Error(`'backupId' is required when action='${action}'.`);
+          const result = action === "test" ? testRestore(String(args.backupId)) : await fetchOffsite(String(args.backupId));
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         }
         throw new Error(`Unsupported paas_db_backup action: ${action}`);
       }
