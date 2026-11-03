@@ -8,6 +8,15 @@ import {
   updatePlatformConfig,
   withStateLock,
 } from "./config.js";
+import {
+  backupAppVolumes,
+  fetchOffsite,
+  installBackupTimer,
+  pruneLocalBackups,
+  runNightlyBackup,
+  syncOffsite,
+  testRestore,
+} from "./backup.js";
 import { assessRisk, authorizeHuman, decideApproval, listApprovals } from "./guard.js";
 import {
   ensureDashboardBackgroundService,
@@ -50,6 +59,7 @@ import {
 } from "./totp.js";
 import {
   deleteSecretKey,
+  getOrCreateMasterKey,
   importDotEnvFile,
   listMaskedSecrets,
   setSecretEntries,
@@ -274,9 +284,9 @@ async function runCli() {
       if (!sub || sub === "list") {
         console.log(JSON.stringify(listDatabaseBackups(arg1), null, 2));
       } else if (sub === "create") {
-        if (!arg1) throw new Error("Usage: paasmcp db-backup create <appName> [postgres|redis]");
-        const engine = (arg2 as "postgres" | "redis") || "postgres";
-        console.log(JSON.stringify(backupDatabase(arg1, engine), null, 2));
+        if (!arg1) throw new Error("Usage: paasmcp db-backup create <appName> [postgres|redis|volume]");
+        const engine = (arg2 as "postgres" | "redis" | "volume") || "postgres";
+        console.log(JSON.stringify(engine === "volume" ? backupAppVolumes(arg1) : backupDatabase(arg1, engine), null, 2));
       } else if (sub === "restore") {
         if (!arg1) throw new Error("Usage: paasmcp db-backup restore <backupId> [--yes]");
         await confirmInCli("db.restore", { backupId: arg1 }, rest);
@@ -285,6 +295,35 @@ async function runCli() {
         // Shorthand: paasmcp db-backup <appName>
         const engine = (arg1 as "postgres" | "redis") || "postgres";
         console.log(JSON.stringify(backupDatabase(sub, engine), null, 2));
+      }
+      break;
+    }
+
+    case "backup": {
+      const [sub, arg1] = rest;
+      const days = Number(getFlagValue(rest, "--days") || 7);
+      if (sub === "test") {
+        if (!arg1) throw new Error("Usage: paasmcp backup test <backupId>");
+        console.log(JSON.stringify(testRestore(arg1), null, 2));
+      } else if (sub === "sync") {
+        console.log(JSON.stringify(await syncOffsite(), null, 2));
+      } else if (sub === "fetch") {
+        if (!arg1) throw new Error("Usage: paasmcp backup fetch <backupId>");
+        console.log(JSON.stringify(await fetchOffsite(arg1), null, 2));
+      } else if (sub === "prune") {
+        console.log(JSON.stringify(pruneLocalBackups(days), null, 2));
+      } else if (sub === "nightly") {
+        console.log(JSON.stringify(await runNightlyBackup(days), null, 2));
+      } else if (sub === "install-timer") {
+        console.log(JSON.stringify(installBackupTimer(Number(getFlagValue(rest, "--hour") || 3)), null, 2));
+      } else if (sub === "export-key") {
+        console.error(
+          "This is the master key that decrypts the vault and every backup. Off-site backups are useless without it.\n" +
+            "Keep it outside this server (password manager or paper). Anyone with it and the backups can read your data."
+        );
+        console.log(getOrCreateMasterKey().toString("hex"));
+      } else {
+        throw new Error("Usage: paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key> [--days N] [--hour H]");
       }
       break;
     }
@@ -477,7 +516,9 @@ Commands:
   paasmcp secret import-env <scope> <.env>           Import .env file into encrypted Vault
   paasmcp secret list <scope>                        List masked secrets in scope
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
-  paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database snapshots & restore
+  paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
+  paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
+                                                    Restore test, off-site sync (S3/R2/B2), daily timer, master key export
   paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo (or multi-service compose.yaml)
   paasmcp expose <app> <public|zero-trust|tailscale> [subdomain]
   paasmcp <logs|restart|stop|start|rollback> <app>

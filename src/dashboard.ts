@@ -1,3 +1,4 @@
+import { backupAppVolumes, testRestore } from "./backup.js";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -377,10 +378,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/backups" && req.method === "POST") {
           const body = await readJsonBody(req);
           const appName = String(body.appName || "");
-          const engine = (body.engine as "postgres" | "redis") || "postgres";
-          const backup = backupDatabase(appName, engine);
+          const engine = (body.engine as "postgres" | "redis" | "volume") || "postgres";
+          const backup = engine === "volume" ? backupAppVolumes(appName) : backupDatabase(appName, engine);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(backup));
+          return true;
+        }
+
+        if (pathname === "/api/backups/test" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(testRestore(String(body.backupId || ""))));
           return true;
         }
 
@@ -1401,6 +1409,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <select id="bakEngine">
                     <option value="postgres" id="optBakPg">PostgreSQL 16 (pg_dump)</option>
                     <option value="redis" id="optBakRedis">Redis 7 (RDB)</option>
+                    <option value="volume">Docker volumes</option>
                   </select>
                 </div>
               </div>
@@ -1806,6 +1815,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         toastHandshakeDone: "🤝 Handshake concluído com o nó primário!",
         copiedToast: "✅ Copiado para a área de transferência!",
         btnRestoreDump: "⏪ Restaurar Dump",
+        btnTestRestore: "🧪 Testar",
+        offsiteLabel: "fora do servidor",
         btnRemoveSecret: "Remover",
         sizeLabel: "Tamanho:",
         stoppedStatus: "Parado",
@@ -2037,6 +2048,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         toastHandshakeDone: "🤝 Handshake completed with primary node!",
         copiedToast: "✅ Copied to clipboard!",
         btnRestoreDump: "⏪ Restore Dump",
+        btnTestRestore: "🧪 Test",
+        offsiteLabel: "off-site",
         btnRemoveSecret: "Remove",
         sizeLabel: "Size:",
         stoppedStatus: "Stopped",
@@ -2379,9 +2392,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12px;gap:8px;flex-wrap:wrap;">
             <div>
               🔒 <strong>\${esc(b.id)}</strong> (\${esc(b.engine)})<br/>
-              <span style="color:var(--muted);">\${esc(t('sizeLabel'))} \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code></span>
+              <span style="color:var(--muted);">\${esc(t('sizeLabel'))} \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code>\${b.offsiteKey ? ' · ☁️ ' + esc(t('offsiteLabel')) : ''}</span>
             </div>
-            <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="restoreBackup('\${esc(b.id)}')">\${esc(t('btnRestoreDump'))}</button>
+            <span>
+              <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="testBackup('\${esc(b.id)}')">\${esc(t('btnTestRestore'))}</button>
+              <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="restoreBackup('\${esc(b.id)}')">\${esc(t('btnRestoreDump'))}</button>
+            </span>
           </div>
         \`).join('')
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyBackups')) + '</span>';
@@ -2525,6 +2541,17 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (!res.ok) return alert(data.error);
       showToast(t('toastBackupSaved') + data.id);
       loadAll();
+    }
+
+    async function testBackup(backupId) {
+      const res = await fetch('/api/backups/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ backupId })
+      });
+      const data = await res.json();
+      if (!res.ok) return alert(data.error);
+      showToast((data.ok ? '✅ ' : '⚠️ ') + data.detail);
     }
 
     async function restoreBackup(backupId) {

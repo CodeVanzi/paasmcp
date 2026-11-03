@@ -103,8 +103,8 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
     }
     case "db.restore":
       return risk(action, subject, "confirm",
-        `The current database will be replaced by backup '${subject}'. A backup of the current state is taken first.`,
-        `O banco atual será substituído pelo backup '${subject}'. Antes, é feito um backup do estado atual.`,
+        `The current data (database or volume) will be replaced by backup '${subject}'. A backup of the current state is taken first.`,
+        `Os dados atuais (banco ou volume) serão substituídos pelo backup '${subject}'. Antes, é feito um backup do estado atual.`,
         params);
     case "secret.delete":
       return risk(action, subject, "confirm",

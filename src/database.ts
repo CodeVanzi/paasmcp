@@ -15,11 +15,11 @@ import {
   saveState,
 } from "./config.js";
 import {
-  decryptBinaryPayload,
   encryptBinaryPayload,
   getSecrets,
   setSecretEntries,
 } from "./vault.js";
+import { readVerifiedBackup, restoreVolume } from "./backup.js";
 
 function assertSafeSqlIdentifier(id: string): string {
   if (!/^[a-z0-9_]{1,63}$/.test(id)) {
@@ -389,31 +389,10 @@ export function restoreDatabase(backupId: string): {
   safetyBackupId?: string;
 } {
   ensureDirectories();
-  const cleanId = backupId.replace(/[^a-zA-Z0-9._-]/g, "");
-  const state = loadState();
-  const backup = state.backups?.[cleanId];
-  if (!backup) {
-    throw new Error(`Backup '${cleanId}' not found in PaaSMCP state.`);
+  const { backup, plain: decryptedDump } = readVerifiedBackup(backupId);
+  if (backup.engine === "volume") {
+    return { restored: true, backup, restoredBytes: decryptedDump.length, ...restoreVolume(backup, decryptedDump) };
   }
-
-  const resolvedPath = path.resolve(backup.filePath);
-  const allowedDir = path.resolve(PAAS_BACKUPS_DIR);
-  if (!resolvedPath.startsWith(allowedDir + path.sep)) {
-    throw new Error("Security violation: backup file path is outside PAAS_BACKUPS_DIR.");
-  }
-
-  if (!fs.existsSync(resolvedPath)) {
-    throw new Error(`Encrypted backup file missing on disk: ${resolvedPath}`);
-  }
-
-  const encryptedBuf = fs.readFileSync(resolvedPath);
-  const currentHash = crypto.createHash("sha256").update(encryptedBuf).digest("hex");
-  if (currentHash !== backup.sha256) {
-    throw new Error("Backup SHA-256 integrity check failed! File may have been tampered with.");
-  }
-
-  // Decrypt and verify AES-256-GCM authentication tag in memory
-  const decryptedDump = decryptBinaryPayload(encryptedBuf);
 
   let safetyBackupId: string | undefined;
   if (process.env.PAASMCP_OFFLINE_TEST !== "1") {

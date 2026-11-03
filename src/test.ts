@@ -490,5 +490,83 @@ volumes:
     }
   });
 
+  await t.test("17. S3 Signature V4 matches the AWS documented example", async () => {
+    const backup = await import("./backup.js");
+    const headers = {
+      host: "examplebucket.s3.amazonaws.com",
+      range: "bytes=0-9",
+      "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "x-amz-date": "20130524T000000Z",
+    };
+    const auth = backup.signV4({
+      method: "GET",
+      url: new URL("https://examplebucket.s3.amazonaws.com/test.txt"),
+      headers,
+      payloadHash: headers["x-amz-content-sha256"],
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      region: "us-east-1",
+      amzDate: "20130524T000000Z",
+    });
+    assert.match(auth, /Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41$/);
+    assert.match(auth, /SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,/);
+  });
+
+  await t.test("18. Volume backups, restore test, off-site sync, safe pruning and fetch", async () => {
+    const backup = await import("./backup.js");
+    const http = await import("node:http");
+    const store = new Map<string, Buffer>();
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const body = Buffer.concat(chunks);
+        const signed = /^AWS4-HMAC-SHA256 Credential=AK\//.test(String(req.headers.authorization));
+        const hashOk = req.headers["x-amz-content-sha256"] === crypto.createHash("sha256").update(body).digest("hex");
+        if (!signed || !hashOk) return res.writeHead(403).end("bad signature");
+        if (req.method === "PUT") store.set(req.url!, body);
+        const found = store.get(req.url!);
+        if (req.method === "GET" && !found) return res.writeHead(404).end();
+        res.writeHead(200).end(req.method === "GET" ? found : undefined);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    try {
+      const vols = backup.backupAppVolumes("vol-app");
+      assert.equal(vols.length, 1);
+      assert.equal(vols[0].engine, "volume");
+      assert.equal(backup.testRestore(vols[0].id).ok, true);
+      assert.equal(database.restoreDatabase(vols[0].id).restored, true);
+
+      // Without off-site config, pruning keeps everything.
+      assert.deepEqual(backup.pruneLocalBackups(0).pruned, []);
+      await assert.rejects(backup.syncOffsite(), /not configured/);
+
+      vault.setSecretEntries("system", {
+        BACKUP_S3_ENDPOINT: `http://127.0.0.1:${(srv.address() as { port: number }).port}`,
+        BACKUP_S3_BUCKET: "bk",
+        BACKUP_S3_ACCESS_KEY_ID: "AK",
+        BACKUP_S3_SECRET_ACCESS_KEY: "SK",
+        BACKUP_S3_PREFIX: "srv1",
+      });
+      const sync = await backup.syncOffsite();
+      assert.deepEqual(sync.failed, []);
+      assert.ok(sync.uploaded.includes(vols[0].id));
+      assert.ok(store.has(`/bk/srv1/${vols[0].id}.enc.bak.json`));
+      assert.equal((await backup.syncOffsite()).uploaded.length, 0, "second sync uploads nothing new");
+
+      const pruned = backup.pruneLocalBackups(0, Date.now() + 1000);
+      assert.ok(pruned.pruned.includes(vols[0].id));
+      assert.equal(fs.existsSync(vols[0].filePath), false);
+      assert.throws(() => backup.testRestore(vols[0].id), /backup fetch/);
+
+      const fetched = await backup.fetchOffsite(vols[0].id);
+      assert.equal(fetched.sha256, vols[0].sha256);
+      assert.equal(backup.testRestore(vols[0].id).ok, true);
+    } finally {
+      srv.close();
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

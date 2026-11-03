@@ -58,12 +58,15 @@ export interface BackupRecord {
   id: string;
   appName: string;
   databaseName: string;
-  engine: "postgres" | "redis";
+  engine: "postgres" | "redis" | "volume";
   filePath: string;
   sizeBytes: number;
   sha256: string;
   encrypted: boolean;
   createdAt: string;
+  offsiteKey?: string;
+  offsiteAt?: string;
+  localPrunedAt?: string;
 }
 
 export interface FederationPeerRecord {
