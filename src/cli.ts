@@ -64,7 +64,7 @@ import {
   registerFederationPeer,
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
-import { startMcpHttpServer } from "./mcp-http.js";
+import { installMcpService, startMcpHttpServer } from "./mcp-http.js";
 import { getSystemStatusSummary } from "./mcp-server.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import {
@@ -608,7 +608,11 @@ async function runCli() {
     }
 
     case "mcp": {
-      if (rest[0] !== "serve") throw new Error("Usage: paasmcp mcp serve [--port 4098] [--host 127.0.0.1|tailscale]");
+      if (rest[0] === "install-service") {
+        console.log(JSON.stringify(installMcpService(getFlagValue(rest, "--host") || "tailscale", Number(getFlagValue(rest, "--port") || 4098)), null, 2));
+        break;
+      }
+      if (rest[0] !== "serve") throw new Error("Usage: paasmcp mcp <serve [--port 4098] [--host 127.0.0.1|tailscale]|install-service [--host tailscale] [--port 4098]>");
       const port = Number(getFlagValue(rest, "--port") || 4098);
       const host = getFlagValue(rest, "--host") || "127.0.0.1";
       startMcpHttpServer(port, host);

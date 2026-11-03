@@ -101,6 +101,7 @@ Any MCP client that supports Streamable HTTP with a bearer header (Claude Deskto
 ```bash
 paasmcp token create laptop --level deploy        # shown once; only a hash is stored
 paasmcp mcp serve --port 4098                      # listens on 127.0.0.1 (or --host tailscale)
+paasmcp mcp install-service                       # same, as a systemd service on the Tailscale address (survives reboots)
 tailscale serve --bg --https=8443 http://127.0.0.1:4098
 ```
 
@@ -116,7 +117,7 @@ tailscale serve --bg --https=8443 http://127.0.0.1:4098
 }
 ```
 
-Web-only assistants (ChatGPT / Claude.ai connectors) need a public URL with an OAuth login; that is planned, and a bearer token alone on the open internet is refused on purpose. Run `paasmcp mcp serve` as a systemd service to keep it up (this is the one always-on part of remote MCP).
+Web-only assistants (ChatGPT / Claude.ai connectors) need a public URL with an OAuth login; that is planned, and a bearer token alone on the open internet is refused on purpose. `sudo paasmcp mcp install-service` keeps it up as a systemd service (this is the one always-on part of remote MCP). The dashboard tab **Connect AI** creates tokens and shows the exact command or config for Claude Code, Codex, Cursor, VS Code and Gemini CLI.
 
 ### Two-factor login for the dashboard
 

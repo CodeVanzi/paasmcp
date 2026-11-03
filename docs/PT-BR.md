@@ -61,6 +61,7 @@ Na linha de comando, a pergunta aparece na tela; `--yes` serve para scripts nas 
 ```bash
 paasmcp token create notebook --level deploy   # o token aparece uma vez; só o hash fica guardado
 paasmcp mcp serve --port 4098                  # escuta em 127.0.0.1 (ou --host tailscale)
+paasmcp mcp install-service                   # o mesmo, como serviço do systemd no endereço Tailscale (volta depois de reiniciar)
 tailscale serve --bg --https=8443 http://127.0.0.1:4098
 ```
 
