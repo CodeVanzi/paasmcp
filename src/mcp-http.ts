@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import net from "node:net";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ForbiddenActionError } from "./guard.js";
@@ -110,4 +112,17 @@ export function startMcpHttpServer(port = 4098, requestedHost = "127.0.0.1"): ht
 
   server.listen(port, host);
   return server;
+}
+
+/** Keeps `paasmcp mcp serve` running across reboots (systemd), so remote AIs can always connect. */
+export function installMcpService(host = "tailscale", port = 4098): { service: string } {
+  if (host !== "tailscale" && !isAllowedMcpBindHost(host)) throw new ForbiddenActionError(`MCP over HTTP only listens on loopback or on the Tailscale address (got '${host}').`);
+  const service = "/etc/systemd/system/paasmcp-mcp.service";
+  fs.writeFileSync(
+    service,
+    `[Unit]\nDescription=PaaSMCP MCP over HTTP (for AI clients on your Tailscale network)\nAfter=network-online.target tailscaled.service\nWants=network-online.target\n\n[Service]\nEnvironment=PAASMCP_ROOT=${process.env.PAASMCP_ROOT || "/opt/homelab"}\nExecStart=${process.execPath} ${path.resolve(process.argv[1])} mcp serve --host ${host} --port ${port}\n# The Tailscale address may not exist yet right after boot.\nRestart=on-failure\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n`
+  );
+  execFileSync("systemctl", ["daemon-reload"]);
+  execFileSync("systemctl", ["enable", "--now", "paasmcp-mcp.service"]);
+  return { service };
 }

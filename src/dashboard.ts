@@ -2,6 +2,7 @@ import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { acceptMirror, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
+import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
@@ -509,6 +510,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           res.end(JSON.stringify(data));
           return true;
         };
+
+        if (pathname === "/api/tokens" && req.method === "GET") return reply({ tokens: listTokens() });
+        if (pathname === "/api/tokens" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const { token, record } = createToken(String(body.name || "ai"), String(body.level || "deploy") as TokenLevel);
+          return reply({ token, id: record.id, name: record.name, level: record.level });
+        }
+        if (pathname === "/api/tokens" && req.method === "DELETE") {
+          const body = await readJsonBody(req);
+          return reply({ revoked: revokeToken(String(body.id || "")) });
+        }
 
         if (pathname === "/api/poll" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -1841,13 +1853,47 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <h2 id="agentsTitle">🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)</h2>
               <p class="card-desc" id="agentsDesc">O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:</p>
             </div>
-            <pre id="mcpConfigBox" style="user-select:all;">{
-  "mcpServers": {
-    "paasmcp": {
-      "command": "paasmcp-mcp"
-    }
-  }
-}</pre>
+            <p class="card-desc" data-i18n="aiIntro" style="margin:-6px 0 12px;"></p>
+            <div class="grid-2" style="margin-bottom:14px;">
+              <label class="arch-box" style="cursor:pointer;"><input type="radio" name="aiWhere" value="remote" checked onchange="renderAi()" style="width:auto;" /> <strong data-i18n="aiRemoteTitle"></strong><p data-i18n="aiRemoteDesc"></p></label>
+              <label class="arch-box" style="cursor:pointer;"><input type="radio" name="aiWhere" value="local" onchange="renderAi()" style="width:auto;" /> <strong data-i18n="aiLocalTitle"></strong><p data-i18n="aiLocalDesc"></p></label>
+            </div>
+            <div class="ai-remote">
+              <h3 data-i18n="aiStep1"></h3>
+              <p class="card-desc" data-i18n="aiStep1Desc"></p>
+              <label class="field-label" for="aiTokName" data-i18n="aiTokName"></label>
+              <input id="aiTokName" placeholder="ex: notebook" />
+              <div style="display:flex;flex-direction:column;gap:6px;margin:10px 0;font-size:12.5px;">
+                <label style="display:flex;gap:6px;align-items:flex-start;cursor:pointer;"><input type="radio" name="aiLevel" value="read" style="width:auto;" /> <span data-i18n="aiLvlRead"></span></label>
+                <label style="display:flex;gap:6px;align-items:flex-start;cursor:pointer;"><input type="radio" name="aiLevel" value="deploy" checked style="width:auto;" /> <span data-i18n="aiLvlDeploy"></span></label>
+                <label style="display:flex;gap:6px;align-items:flex-start;cursor:pointer;"><input type="radio" name="aiLevel" value="destroy" style="width:auto;" /> <span data-i18n="aiLvlDestroy"></span></label>
+              </div>
+              <button onclick="createAiToken()" data-i18n="aiBtnCreate"></button>
+              <div id="aiNewToken" style="display:none;margin-top:10px;"></div>
+              <div id="aiTokens" style="margin-top:10px;"></div>
+              <h3 data-i18n="aiStep2" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="aiStep2Desc"></p>
+              <pre style="user-select:all;">sudo paasmcp mcp install-service</pre>
+            </div>
+            <h3 data-i18n="aiStep3" style="margin-top:18px;"></h3>
+            <div class="grid-2">
+              <div><label class="field-label" for="aiClient" data-i18n="aiClient"></label>
+                <select id="aiClient" onchange="renderAi()">
+                  <option value="claude">Claude Code</option>
+                  <option value="codex">Codex CLI</option>
+                  <option value="cursor">Cursor</option>
+                  <option value="vscode">VS Code (Copilot)</option>
+                  <option value="gemini">Gemini CLI</option>
+                  <option value="other" data-i18n="aiOther"></option>
+                </select></div>
+              <div class="ai-remote"><label class="field-label" for="aiHost" data-i18n="aiHost"></label><input id="aiHost" oninput="renderAi()" /></div>
+            </div>
+            <p class="card-desc" id="aiWhereFile" style="margin-top:10px;"></p>
+            <pre id="aiSnippet" style="user-select:all;white-space:pre-wrap;word-break:break-all;"></pre>
+            <button class="secondary" onclick="copyText(document.getElementById('aiSnippet').textContent)" data-i18n="aiCopy"></button>
+            <h3 data-i18n="aiStep4" style="margin-top:18px;"></h3>
+            <p class="card-desc" data-i18n="aiStep4Desc"></p>
+            <p class="card-desc" data-i18n="aiWebNote" style="margin-top:10px;"></p>
             <div class="arch-grid" style="margin-top:16px;">
               <div class="arch-box">
                 <h3 id="promptEx1Title">💬 Deploy & Banco 1-Click</h3>
@@ -2421,7 +2467,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "doctorTitle": "🩺 Diagnóstico",
           "doctorDesc": "Procura apps sem memória, reiniciando sem parar ou parados com erro, e diz o que fazer.",
           "agentsTitle": "🤖 Conectar sua IA",
-          "agentsDesc": "Qualquer IA compatível com MCP (Claude, ChatGPT, Gemini, modelos locais) pode cuidar do servidor por você. Ações arriscadas sempre esperam a sua aprovação no Início.",
+          "agentsDesc": "Qualquer IA compatível com MCP (Claude Code, Codex, Gemini CLI, Cursor, VS Code, modelos locais) pode cuidar do servidor por você: publicar apps, fazer cópias, ver o que deu errado. Ações arriscadas sempre esperam a sua aprovação no Início.",
           "homeDesc": "Resumo do servidor, pedidos esperando você e os próximos passos.",
           "stepsTitle": "🧭 Primeiros passos",
           "stepsDesc": "Faça na ordem. Cada passo diz o que é e por que vale a pena.",
@@ -2606,7 +2652,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "doctorTitle": "🩺 Diagnostics",
           "doctorDesc": "Looks for apps out of memory, restarting in a loop or stopped with an error, and says what to do.",
           "agentsTitle": "🤖 Connect your AI",
-          "agentsDesc": "Any MCP-compatible AI (Claude, ChatGPT, Gemini, local models) can run the server for you. Risky actions always wait for your approval on Home.",
+          "agentsDesc": "Any MCP-compatible AI (Claude Code, Codex, Gemini CLI, Cursor, VS Code, local models) can run the server for you: publish apps, make backups, find what went wrong. Risky actions always wait for your approval on Home.",
           "homeDesc": "Server summary, requests waiting for you and next steps.",
           "stepsTitle": "🧭 First steps",
           "stepsDesc": "Do them in order. Each step says what it is and why it is worth it.",
@@ -2752,6 +2798,101 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "glScopeDesc": "Each app's password drawer. “system” holds the dashboard's own keys."
     });
 
+    Object.assign(I18N.pt, {
+          "aiIntro": "Primeiro diga onde a IA está.",
+      "archPillar4Title": "4. Segundo servidor",
+      "archPillar4Desc": "Dois servidores guardam uma cópia ao vivo um do outro (replicação do PostgreSQL). Assumir é manual com confirmação, ou automático só com um juiz; a época impede que os dois gravem ao mesmo tempo.",
+          "aiRemoteTitle": "Em outro computador",
+          "aiRemoteDesc": "Seu notebook ou desktop, na mesma rede Tailscale do servidor. Precisa de um acesso (token).",
+          "aiLocalTitle": "Neste servidor",
+          "aiLocalDesc": "A IA roda no próprio servidor (ex.: Claude Code ou Codex pelo SSH). Não precisa de token.",
+          "aiStep1": "1. Criar um acesso",
+          "aiStep1Desc": "Cada computador ou IA ganha o seu, e você pode revogar quando quiser.",
+          "aiTokName": "Nome do acesso",
+          "aiLvlRead": "<strong>Só olhar</strong>: ver status, logs e listas. Não muda nada.",
+          "aiLvlDeploy": "<strong>Publicar e cuidar</strong>: publicar apps, criar bancos, fazer cópias. Ações arriscadas pedem sua aprovação no Início.",
+          "aiLvlDestroy": "<strong>Também pedir para apagar</strong>: pode pedir exclusões, e cada uma espera você aprovar.",
+          "aiLvlReadShort": "Só olhar",
+          "aiLvlDeployShort": "Publicar e cuidar",
+          "aiLvlDestroyShort": "Também apagar",
+          "aiBtnCreate": "🔑 Criar acesso",
+          "aiTokenOnce": "Copie agora: este token aparece só uma vez (já foi copiado).",
+          "aiTokensTitle": "Acessos criados",
+          "aiLastUsed": "Último uso:",
+          "aiRevoke": "Revogar",
+          "aiRevokeConfirm": "Revogar este acesso? A IA que o usa deixa de conectar.",
+          "aiStep2": "2. Ligar o acesso pela rede (uma vez)",
+          "aiStep2Desc": "No terminal do servidor, rode o comando abaixo. Ele deixa o PaaSMCP atendendo IAs no endereço Tailscale do servidor, porta 4098, e volta sozinho depois de reiniciar. Nunca fica aberto na internet.",
+          "aiStep3": "3. Adicionar na sua IA",
+          "aiClient": "Sua IA",
+          "aiOther": "Outra (LM Studio, Claude Desktop com ponte, etc.)",
+          "aiHost": "Endereço Tailscale do servidor",
+          "aiHostPh": "IP-TAILSCALE-DO-SERVIDOR",
+          "aiTokenPh": "SEU_TOKEN",
+          "aiCopy": "📋 Copiar",
+          "aiFileTerminal": "Cole no terminal do computador onde a IA está:",
+          "aiFileCursor": "Cole em ~/.cursor/mcp.json (Cursor › Settings › MCP › Add):",
+          "aiFileVscode": "Cole em .vscode/mcp.json do projeto (ou MCP: Add Server na paleta de comandos):",
+          "aiFileGemini": "Cole em ~/.gemini/settings.json:",
+          "aiFileOther": "A maioria dos apps aceita este formato no arquivo de configuração de MCP. Se o app só aceitar comando, use a ponte: npx mcp-remote <endereço> --header \\"Authorization: Bearer <token>\\".",
+          "aiStep4": "4. Testar",
+          "aiStep4Desc": "Abra a IA e peça: “mostra o status do servidor PaaSMCP”. Se ela responder com o nome do servidor e os apps, está conectada.",
+          "aiWebNote": "Os conectores dos sites claude.ai e chatgpt.com ainda não funcionam: eles exigem endereço público com login OAuth, que está nos próximos passos do projeto.",
+          "promptEx1Title": "💬 Publicar",
+          "promptEx1Desc": "“Publica o repositório <code>voce/meu-app</code> com banco de dados e deixa só na minha rede.”",
+          "promptEx2Title": "💬 Cópias",
+          "promptEx2Desc": "“Faz uma cópia de segurança do app <code>meu-app</code> agora e testa se ela abre.”",
+          "promptEx3Title": "💬 Problemas",
+          "promptEx3Desc": "“Por que o app <code>blog</code> parou? Roda o diagnóstico e me diz o que fazer.”"
+    });
+    Object.assign(I18N.en, {
+          "aiIntro": "First tell where the AI is.",
+      "archPillar4Title": "4. Second server",
+      "archPillar4Desc": "Two servers keep a live copy of each other (PostgreSQL replication). Taking over is manual with confirmation, or automatic only with an arbiter; the epoch stops both from writing at once.",
+          "aiRemoteTitle": "On another computer",
+          "aiRemoteDesc": "Your laptop or desktop, on the same Tailscale network as the server. Needs an access token.",
+          "aiLocalTitle": "On this server",
+          "aiLocalDesc": "The AI runs on the server itself (e.g. Claude Code or Codex over SSH). No token needed.",
+          "aiStep1": "1. Create an access",
+          "aiStep1Desc": "Each computer or AI gets its own, and you can revoke it any time.",
+          "aiTokName": "Access name",
+          "aiLvlRead": "<strong>Look only</strong>: see status, logs and lists. Changes nothing.",
+          "aiLvlDeploy": "<strong>Publish and maintain</strong>: publish apps, create databases, make backups. Risky actions wait for your approval on Home.",
+          "aiLvlDestroy": "<strong>Also ask to delete</strong>: may request deletions, each one waits for your approval.",
+          "aiLvlReadShort": "Look only",
+          "aiLvlDeployShort": "Publish and maintain",
+          "aiLvlDestroyShort": "Also delete",
+          "aiBtnCreate": "🔑 Create access",
+          "aiTokenOnce": "Copy it now: this token is shown only once (already copied).",
+          "aiTokensTitle": "Accesses",
+          "aiLastUsed": "Last used:",
+          "aiRevoke": "Revoke",
+          "aiRevokeConfirm": "Revoke this access? The AI using it can no longer connect.",
+          "aiStep2": "2. Turn on network access (once)",
+          "aiStep2Desc": "In the server's terminal, run the command below. It makes PaaSMCP answer AIs on the server's Tailscale address, port 4098, and comes back by itself after a reboot. It is never open to the internet.",
+          "aiStep3": "3. Add it to your AI",
+          "aiClient": "Your AI",
+          "aiOther": "Other (LM Studio, Claude Desktop via bridge, etc.)",
+          "aiHost": "Server's Tailscale address",
+          "aiHostPh": "SERVER-TAILSCALE-IP",
+          "aiTokenPh": "YOUR_TOKEN",
+          "aiCopy": "📋 Copy",
+          "aiFileTerminal": "Paste into the terminal of the computer where the AI runs:",
+          "aiFileCursor": "Paste into ~/.cursor/mcp.json (Cursor › Settings › MCP › Add):",
+          "aiFileVscode": "Paste into the project's .vscode/mcp.json (or MCP: Add Server in the command palette):",
+          "aiFileGemini": "Paste into ~/.gemini/settings.json:",
+          "aiFileOther": "Most apps accept this format in their MCP config file. If the app only takes a command, use the bridge: npx mcp-remote <address> --header \\"Authorization: Bearer <token>\\".",
+          "aiStep4": "4. Test",
+          "aiStep4Desc": "Open the AI and ask: “show the PaaSMCP server status”. If it answers with the server name and apps, it is connected.",
+          "aiWebNote": "The claude.ai and chatgpt.com website connectors do not work yet: they need a public address with OAuth login, which is on the project's next steps.",
+          "promptEx1Title": "💬 Publish",
+          "promptEx1Desc": "“Publish the repository <code>you/my-app</code> with a database and keep it on my network only.”",
+          "promptEx2Title": "💬 Backups",
+          "promptEx2Desc": "“Back up the app <code>my-app</code> now and test that the backup opens.”",
+          "promptEx3Title": "💬 Problems",
+          "promptEx3Desc": "“Why did the app <code>blog</code> stop? Run diagnostics and tell me what to do.”"
+    });
+
     function t(key) {
       const dict = I18N[currentLang] || I18N.pt;
       return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
@@ -2831,6 +2972,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (btnEl) btnEl.classList.add('active');
       if (tabName === 'doctor') runDoctor();
       if (tabName === 'email') loadEmail();
+      if (tabName === 'agents') { renderAi(); loadAiTokens(); }
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') loadStorage();
@@ -2858,6 +3000,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
 
       document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
       renderHome();
+      renderAi();
       for (const k of I18N_KEYS) {
         const el = document.getElementById(k);
         if (el) {
@@ -3284,6 +3427,75 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         const r = await postJson('/api/backups/sync', {});
         if (r) showToast(t('offsiteDone') + ' ' + r.uploaded.length + (r.failed.length ? ' · ' + t('offsiteFailed') + ' ' + r.failed.length : ''));
       } finally { btn.disabled = false; }
+    }
+
+    // ---- Connect AI ----
+    let aiLastToken = '';
+    const NL = String.fromCharCode(10);
+    function renderAi() {
+      const where = (document.querySelector('input[name="aiWhere"]:checked') || {}).value || 'remote';
+      document.querySelectorAll('.ai-remote').forEach(el => { el.style.display = where === 'remote' ? '' : 'none'; });
+      const hostEl = document.getElementById('aiHost');
+      if (!hostEl) return;
+      if (!hostEl.value) {
+        const h = window.location.hostname;
+        if (/^100[.]/.test(h) || /[.]ts[.]net$/.test(h)) hostEl.value = h;
+      }
+      const host = hostEl.value.trim() || t('aiHostPh');
+      const url = 'http://' + host + ':4098/mcp';
+      const token = aiLastToken || t('aiTokenPh');
+      const auth = { Authorization: 'Bearer ' + token };
+      const remote = where === 'remote';
+      const client = document.getElementById('aiClient').value;
+      const json = (o) => JSON.stringify(o, null, 2);
+      let text = '';
+      let file = '';
+      if (client === 'claude') {
+        text = remote ? 'claude mcp add --transport http paasmcp ' + url + ' --header "Authorization: Bearer ' + token + '"' : 'claude mcp add paasmcp -- paasmcp-mcp';
+        file = t('aiFileTerminal');
+      } else if (client === 'codex') {
+        text = remote ? ['export PAASMCP_TOKEN=' + token, 'codex mcp add paasmcp --url ' + url + ' --bearer-token-env-var PAASMCP_TOKEN'].join(NL) : 'codex mcp add paasmcp -- paasmcp-mcp';
+        file = t('aiFileTerminal');
+      } else if (client === 'vscode') {
+        text = json({ servers: { paasmcp: remote ? { type: 'http', url, headers: auth } : { type: 'stdio', command: 'paasmcp-mcp' } } });
+        file = t('aiFileVscode');
+      } else if (client === 'gemini') {
+        text = json({ mcpServers: { paasmcp: remote ? { httpUrl: url, headers: auth } : { command: 'paasmcp-mcp' } } });
+        file = t('aiFileGemini');
+      } else {
+        text = json({ mcpServers: { paasmcp: remote ? { url, headers: auth } : { command: 'paasmcp-mcp' } } });
+        file = client === 'cursor' ? t('aiFileCursor') : t('aiFileOther');
+      }
+      document.getElementById('aiSnippet').textContent = text;
+      document.getElementById('aiWhereFile').textContent = file;
+    }
+    async function loadAiTokens() {
+      const res = await fetch('/api/tokens');
+      if (!res.ok) return;
+      const items = (await res.json()).tokens || [];
+      const names = { read: t('aiLvlReadShort'), deploy: t('aiLvlDeployShort'), destroy: t('aiLvlDestroyShort') };
+      document.getElementById('aiTokens').innerHTML = items.length
+        ? '<div class="field-label">' + esc(t('aiTokensTitle')) + '</div>' + items.map(k => card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(k.name) + '</strong> ' + badge('', names[k.level] || k.level) +
+          '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aiLastUsed')) + ' ' + esc(k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : t('never')) + '</div></div>' +
+          '<button class="danger" onclick="revokeAiToken(&#39;' + esc(k.id) + '&#39;)">' + esc(t('aiRevoke')) + '</button></div>')).join('')
+        : '';
+    }
+    async function createAiToken() {
+      const level = (document.querySelector('input[name="aiLevel"]:checked') || {}).value || 'deploy';
+      const r = await postJson('/api/tokens', { name: document.getElementById('aiTokName').value.trim() || 'ai', level });
+      if (!r) return;
+      aiLastToken = r.token;
+      const box = document.getElementById('aiNewToken');
+      box.style.display = 'block';
+      box.innerHTML = card('<strong>' + esc(t('aiTokenOnce')) + '</strong><pre style="user-select:all;white-space:pre-wrap;word-break:break-all;margin:8px 0;">' + esc(r.token) + '</pre>');
+      copyText(r.token);
+      renderAi();
+      loadAiTokens();
+    }
+    async function revokeAiToken(id) {
+      if (!confirm(t('aiRevokeConfirm'))) return;
+      const res = await fetch('/api/tokens', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+      if (res.ok) loadAiTokens();
     }
 
     async function loadAll() {
