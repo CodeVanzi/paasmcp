@@ -290,7 +290,7 @@ export function acceptMirror(
 
 export function mirrorStatus(): Record<string, unknown> {
   const m = mirrorState();
-  const out: Record<string, unknown> = { epoch: m.epoch, bindIp: m.bindIp };
+  const out: Record<string, unknown> = { epoch: m.epoch, bindIp: m.bindIp, arbiterUrl: m.arbiterUrl, auto: m.auto || [], fenced: m.fenced };
   const safe = <T>(fn: () => T): T | { error: string } => {
     try {
       return fn();
