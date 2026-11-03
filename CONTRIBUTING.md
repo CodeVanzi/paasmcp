@@ -56,7 +56,7 @@ Every PR or AI Agent modification **must** enforce these rules:
 1. Security base (done above).
 2. ✅ MCP over HTTP (Streamable HTTP, stateless) with personal tokens and levels (read / deploy / destroy), loopback/Tailscale only; TOTP second factor and signed sessions for the dashboard. Follow-up: OAuth 2.1 + PKCE login so web assistants (ChatGPT / Claude.ai connectors) can use a public URL.
 3. ✅ Off-site encrypted backups (item 4 below, native SigV4 to R2/B2/S3/Garage) including app volumes, a restore test tool, a daily systemd timer and safe local pruning (only what is already off-site). Big volumes still go through memory; restic replaces that in item 5.
-4. S3 storage for apps (Garage): `paas_storage_provision` creates a bucket + key per app.
+4. ✅ S3 storage for apps (Garage, pinned image, admin API on loopback): `paas_storage_provision` creates a bucket + key per app and injects `S3_*` + `AWS_*`. Open: a public S3 endpoint for presigned browser URLs, and removing the bucket on purge (today it is kept).
 5. Federation as a mirror, part 1: per-app modes `mirror` / `stateless` / `local`; each server streams its Postgres to the other over Tailscale (item 5 below, both directions), Garage in two zones, hourly restic of volumes, replication lag in status, manual failover with confirmation, epoch number and DNS switch.
 6. Mirror, part 2: optional arbiter (tiny VPS, Raspberry or Cloudflare Worker) for automatic failover; guided failback. Automatic failover without an arbiter stays forbidden.
 7. Email: one relay (Brevo, SES…) configured once, per-app variables.

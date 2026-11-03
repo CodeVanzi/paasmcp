@@ -8,6 +8,7 @@ import {
   updatePlatformConfig,
   withStateLock,
 } from "./config.js";
+import { listStorage, provisionStorage } from "./storage.js";
 import {
   backupAppVolumes,
   fetchOffsite,
@@ -299,6 +300,18 @@ async function runCli() {
       break;
     }
 
+    case "storage": {
+      const [sub, arg1] = rest;
+      if (sub === "provision" && arg1) {
+        console.log(JSON.stringify(await provisionStorage(arg1), null, 2));
+      } else if (!sub || sub === "list") {
+        console.log(JSON.stringify(listStorage(), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp storage <provision <appName>|list>");
+      }
+      break;
+    }
+
     case "backup": {
       const [sub, arg1] = rest;
       const days = Number(getFlagValue(rest, "--days") || 7);
@@ -517,6 +530,7 @@ Commands:
   paasmcp secret list <scope>                        List masked secrets in scope
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
+  paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
                                                     Restore test, off-site sync (S3/R2/B2), daily timer, master key export
   paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo (or multi-service compose.yaml)
