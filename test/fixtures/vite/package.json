@@ -1,0 +1,9 @@
+{
+  "name": "v",
+  "scripts": {
+    "build": "mkdir -p dist && cp index.html dist/"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}

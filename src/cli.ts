@@ -10,6 +10,7 @@ import {
   withStateLock,
 } from "./config.js";
 import { deriveArbiterKey, startArbiterServer } from "./arbiter.js";
+import { installPollTimer, pollRepos, setPolling } from "./poller.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import {
@@ -385,6 +386,20 @@ async function runCli() {
       break;
     }
 
+    case "poll": {
+      const [sub, arg1] = rest;
+      if (!sub || sub === "run") {
+        console.log(JSON.stringify(pollRepos(), null, 2));
+      } else if ((sub === "enable" || sub === "disable") && arg1) {
+        console.log(JSON.stringify(setPolling(arg1, sub === "enable"), null, 2));
+      } else if (sub === "install-timer") {
+        console.log(JSON.stringify(installPollTimer(Number(getFlagValue(rest, "--minutes") || 2)), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp poll [run]|enable <app>|disable <app>|install-timer [--minutes 2]");
+      }
+      break;
+    }
+
     case "update": {
       const [sub, comp, image] = rest;
       if (!sub || sub === "check") {
@@ -667,6 +682,7 @@ Commands:
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp arbiter <key|serve>                       Third vote for automatic failover (run on a small third device)
+  paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
   paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)

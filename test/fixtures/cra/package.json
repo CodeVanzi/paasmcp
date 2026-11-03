@@ -1,0 +1,9 @@
+{
+  "name": "c",
+  "scripts": {
+    "build": "mkdir -p build && cp index.html build/"
+  },
+  "dependencies": {
+    "react-scripts": "5.0.1"
+  }
+}

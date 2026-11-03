@@ -116,6 +116,30 @@ export async function registerGitHubDeployKey(
   };
 }
 
+export function resolveGitUrl(repoSource: string): string {
+  let gitUrl = repoSource.trim();
+  if (gitUrl.startsWith("-")) {
+    throw new Error("Invalid repository source URL.");
+  }
+  if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(gitUrl)) {
+    const sysSecrets = getSecrets("system");
+    if (sysSecrets.GITHUB_TOKEN) {
+      gitUrl = `https://x-access-token:${sysSecrets.GITHUB_TOKEN}@github.com/${gitUrl}.git`;
+    } else {
+      gitUrl = `git@github.com:${gitUrl}.git`;
+    }
+  }
+  return gitUrl;
+}
+
+export function gitEnv(): NodeJS.ProcessEnv {
+  const keyInfo = getOrCreateSshDeployKey();
+  return {
+    ...process.env,
+    GIT_SSH_COMMAND: `ssh -i ${keyInfo.privateKeyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`,
+  };
+}
+
 export function cloneOrUpdateRepo(
   repoSource: string,
   targetDir: string,
@@ -130,25 +154,8 @@ export function cloneOrUpdateRepo(
     return { commitHash: "local-source", sourceType: "local" };
   }
 
-  let gitUrl = repoSource.trim();
-  if (gitUrl.startsWith("-")) {
-    throw new Error("Invalid repository source URL.");
-  }
-
-  if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(gitUrl)) {
-    const sysSecrets = getSecrets("system");
-    if (sysSecrets.GITHUB_TOKEN) {
-      gitUrl = `https://x-access-token:${sysSecrets.GITHUB_TOKEN}@github.com/${gitUrl}.git`;
-    } else {
-      gitUrl = `git@github.com:${gitUrl}.git`;
-    }
-  }
-
-  const keyInfo = getOrCreateSshDeployKey();
-  const env = {
-    ...process.env,
-    GIT_SSH_COMMAND: `ssh -i ${keyInfo.privateKeyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`,
-  };
+  const gitUrl = resolveGitUrl(repoSource);
+  const env = gitEnv();
 
   if (fs.existsSync(path.join(targetDir, ".git"))) {
     execFileSync("git", ["fetch", "--all"], { cwd: targetDir, env, stdio: "pipe" });
@@ -278,7 +285,8 @@ export function detectOrGenerateDockerfile(
       (deps.vite || deps["react-scripts"] || deps.astro) && hasBuild && !hasStart && !deps.next;
 
     if (isStaticSpa) {
-      const port = overridePort || 80;
+      const port = 80; // nginx listens on 80 whatever the override
+      const outDir = deps["react-scripts"] ? "build" : "dist";
       const df = `FROM node:22-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
@@ -287,7 +295,7 @@ COPY . .
 RUN npm run build
 
 FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
+COPY --from=builder /app/${outDir} /usr/share/nginx/html
 EXPOSE ${port}
 CMD ["nginx", "-g", "daemon off;"]
 `;
@@ -334,10 +342,17 @@ CMD ${startCmd}
   if (fs.existsSync(reqTxt) || fs.existsSync(pyproject)) {
     const port = overridePort || 8000;
     let cmd = `["python", "main.py"]`;
+    let extraInstall = "";
     const reqContent = fs.existsSync(reqTxt) ? fs.readFileSync(reqTxt, "utf-8") : "";
     if (reqContent.includes("uvicorn") || reqContent.includes("fastapi")) {
       const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
       cmd = `["uvicorn", "${entry}", "--host", "0.0.0.0", "--port", "${port}"]`;
+    } else if (fs.existsSync(path.join(repoDir, "manage.py"))) {
+      // Django: serve the project's WSGI app with gunicorn (never the dev server).
+      const wsgiDir = fs.readdirSync(repoDir).find((d) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(d) && fs.existsSync(path.join(repoDir, d, "wsgi.py")));
+      if (!wsgiDir) throw new Error("Django project found (manage.py) but no <project>/wsgi.py; add a Dockerfile.");
+      cmd = `["gunicorn", "-b", "0.0.0.0:${port}", "${wsgiDir}.wsgi"]`;
+      if (!/gunicorn/i.test(reqContent)) extraInstall = "RUN pip install --no-cache-dir gunicorn\n";
     } else if (reqContent.includes("gunicorn")) {
       const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
       cmd = `["gunicorn", "-b", "0.0.0.0:${port}", "${entry}"]`;
@@ -346,7 +361,7 @@ CMD ${startCmd}
 WORKDIR /app
 COPY . .
 RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; elif [ -f pyproject.toml ]; then pip install --no-cache-dir .; fi
-ENV PORT=${port}
+${extraInstall}ENV PORT=${port}
 EXPOSE ${port}
 CMD ${cmd}
 `;
@@ -361,12 +376,17 @@ CMD ${cmd}
   // 5. Go
   if (fs.existsSync(path.join(repoDir, "go.mod"))) {
     const port = overridePort || 8080;
+    // Many Go repos keep main in cmd/<name>/; build that when the root has no Go files.
+    const rootHasGo = fs.readdirSync(repoDir).some((f) => f.endsWith(".go"));
+    const cmdDir = path.join(repoDir, "cmd");
+    const sub = !rootHasGo && fs.existsSync(cmdDir) ? fs.readdirSync(cmdDir).filter((d) => /^[a-zA-Z0-9_-]+$/.test(d)).sort()[0] : undefined;
+    const pkgPath = sub ? `./cmd/${sub}` : ".";
     const df = `FROM golang:1.23-alpine AS builder
 WORKDIR /app
 COPY go.* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/server ${pkgPath}
 
 FROM alpine:3.20
 WORKDIR /app
@@ -385,7 +405,7 @@ CMD ["/app/server"]
 
   // 6. Static HTML
   if (fs.existsSync(path.join(repoDir, "index.html"))) {
-    const port = overridePort || 80;
+    const port = 80; // nginx listens on 80 whatever the override
     const df = `FROM nginx:alpine
 COPY . /usr/share/nginx/html
 EXPOSE ${port}

@@ -35,6 +35,7 @@ import {
   restoreDatabase,
 } from "./database.js";
 import { provisionEmail } from "./email.js";
+import { setPolling } from "./poller.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { mirrorStatus, promoteMirror } from "./mirror.js";
 import { provisionStorage } from "./storage.js";
@@ -478,6 +479,11 @@ async function listTools() {
             memoryLimit: {
               type: "string",
               description: "Optional container memory limit (e.g., '512m', '1g').",
+            },
+            autoDeploy: {
+              type: "string",
+              enum: ["poll"],
+              description: "'poll': redeploy automatically when the branch gets new commits (checked every 2 min by 'paasmcp poll install-timer'; no public webhook needed).",
             },
             cpuLimit: {
               type: "string",
@@ -977,6 +983,7 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           cpuLimit: args.cpuLimit ? String(args.cpuLimit) : undefined,
           env: (args.env as Record<string, string>) || undefined,
         });
+        if (args.autoDeploy === "poll") setPolling(String(args.appName), true);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };

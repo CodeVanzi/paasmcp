@@ -820,5 +820,47 @@ volumes:
     assert.equal(up.imageFor("postgres"), "postgres:16.15-alpine");
   });
 
+  await t.test("24. Generated Dockerfiles per language (fixtures in test/fixtures)", () => {
+    const fixtures = path.resolve("test/fixtures");
+    const cases: [string, string, number, RegExp[]][] = [
+      ["node", "nodejs", 3000, [/CMD \["node", "server.js"\]/, /ENV PORT=3000/]],
+      ["vite", "nodejs-static-spa", 80, [/COPY --from=builder \/app\/dist /]],
+      ["cra", "nodejs-static-spa", 80, [/COPY --from=builder \/app\/build /]],
+      ["fastapi", "python", 8000, [/"uvicorn", "main:app"/]],
+      ["django", "python", 8000, [/"gunicorn", "-b", "0.0.0.0:8000", "site1.wsgi"/, /pip install --no-cache-dir gunicorn/]],
+      ["go", "go", 8080, [/go build -o \/app\/server \.$/m]],
+      ["go-cmd", "go", 8080, [/go build -o \/app\/server \.\/cmd\/server/]],
+      ["static", "static-html", 80, [/FROM nginx:alpine/]],
+    ];
+    for (const [dir, runtime, port, patterns] of cases) {
+      const work = fs.mkdtempSync(path.join(tempRoot, `fx-${dir}-`));
+      fs.cpSync(path.join(fixtures, dir), work, { recursive: true });
+      const plan = github.detectOrGenerateDockerfile(work, dir === "vite" || dir === "static" ? 9999 : undefined);
+      assert.equal(plan.runtimeType, runtime, dir);
+      assert.equal(plan.detectedPort, port, `${dir} port (nginx always 80)`);
+      const df = fs.readFileSync(path.join(work, plan.dockerfilePath), "utf-8");
+      for (const re of patterns) assert.match(df, re, `${dir}: ${re}`);
+    }
+  });
+
+  await t.test("25. Git polling: redeploys only when the branch moved; opt-in per git app", async () => {
+    const poller = await import("./poller.js");
+    const st = config.loadState();
+    st.apps["poll-app"] = { ...Object.values(st.apps)[0], name: "poll-app", repoUrl: "o/r", branch: "main", lastCommit: "abc1234", domains: [], originNodeId: undefined };
+    st.apps["local-app"] = { ...st.apps["poll-app"], name: "local-app", repoUrl: tempRoot };
+    config.saveState(st);
+    assert.throws(() => poller.setPolling("local-app", true), /not deployed from a git repository/);
+    poller.setPolling("poll-app", true);
+    const same = poller.pollRepos(() => "abc1234" + "0".repeat(33));
+    assert.deepEqual(same.checked, ["poll-app"]);
+    assert.deepEqual(same.deployed, []);
+    assert.deepEqual(same.errors, []);
+    // A new commit triggers a deploy (it fails here because o/r cannot be cloned, which proves it tried).
+    const moved = poller.pollRepos(() => "f".repeat(40));
+    assert.equal(moved.errors[0]?.app, "poll-app");
+    poller.setPolling("poll-app", false);
+    assert.deepEqual(poller.pollRepos(() => "f".repeat(40)).checked, []);
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

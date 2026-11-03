@@ -353,6 +353,8 @@ networks:
   );
 
   const record: AppRecord = {
+    // Keep fields other features own (originNodeId for the mirror, autoDeploy for polling, ...).
+    ...existing,
     name: slug,
     repoUrl: opts.repoSource,
     branch,
