@@ -906,6 +906,50 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     }
     .arch-box h3 { margin: 0 0 6px; font-size: 13.5px; }
     .arch-box p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .guide-box {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-top: 14px;
+    }
+    .guide-box-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 0 0 10px 0;
+    }
+    .guide-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+    }
+    .guide-item {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .guide-item strong {
+      display: block;
+      color: var(--accent-text);
+      margin-bottom: 3px;
+      font-size: 12px;
+    }
+    .guide-item span {
+      color: var(--muted);
+    }
     .tab-pane { display: none; }
     .tab-pane.active { display: block; }
   </style>
@@ -1012,6 +1056,29 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
                 </tbody>
               </table>
             </div>
+            <div class="guide-box">
+              <div class="guide-box-title">
+                <span id="guideAppsTitle">💡 Funções de Gestão & Ciclo de Vida</span>
+              </div>
+              <div class="guide-grid">
+                <div class="guide-item">
+                  <strong id="guideAppsRollbackTitle">⏪ Rollback em 1s</strong>
+                  <span id="guideAppsRollbackDesc">Restaura o container para a imagem anterior instantaneamente caso o novo deploy falhe ou contenha bugs.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideAppsLimitsTitle">⚡ Limites de Memória & CPU</strong>
+                  <span id="guideAppsLimitsDesc">Isolamento cgroups do kernel Linux que impede que um app consuma toda a RAM do host ou trave outros containers.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideAppsActionsTitle">🛠️ Ações Rápidas (ENV, Logs, Restart)</strong>
+                  <span id="guideAppsActionsDesc">Edite segredos no cofre sem re-build, consulte logs em tempo real e reinicie containers sem downtime desnecessário.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideAppsLoopbackTitle">🔒 Isolamento Loopback</strong>
+                  <span id="guideAppsLoopbackDesc">Containers escutam exclusivamente em 127.0.0.1:4000-4998, sem portas expostas no firewall ou roteador.</span>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="row">
@@ -1094,6 +1161,25 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
                 </div>
               </div>
               <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
+              <div class="guide-box">
+                <div class="guide-box-title">
+                  <span id="guideExposeTitle">🛡️ Como funcionam os Modos de Publicação</span>
+                </div>
+                <div class="guide-grid">
+                  <div class="guide-item">
+                    <strong id="guideExposePublicTitle">🌐 Público (Cloudflare Tunnel)</strong>
+                    <span id="guideExposePublicDesc">Túnel QUIC criptografado com DNS CNAME proxied e certificado SSL automático sem abrir portas.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideExposeZTTitle">🛡️ Zero Trust (PIN por E-mail)</strong>
+                    <span id="guideExposeZTDesc">Protege o app exigindo código OTP no e-mail antes do acesso. Recomendado para painéis e bancos.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideExposeTailscaleTitle">🔒 Tailscale (VPN Privada)</strong>
+                    <span id="guideExposeTailscaleDesc">Expõe o serviço de forma privada diretamente na sua Tailnet WireGuard, sem acesso público.</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1129,6 +1215,29 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               <button class="secondary" onclick="loadSecrets()" id="btnLoadSecrets">🔍 Recarregar Escopo</button>
             </div>
             <div id="secretsList"></div>
+            <div class="guide-box">
+              <div class="guide-box-title">
+                <span id="guideVaultTitle">🔐 Arquitetura de Segurança do Cofre (AES-256-GCM)</span>
+              </div>
+              <div class="guide-grid">
+                <div class="guide-item">
+                  <strong id="guideVaultScopesTitle">📁 Escopos Isolados</strong>
+                  <span id="guideVaultScopesDesc">O escopo <code>system</code> guarda tokens de nuvem. Cada aplicação possui seu próprio escopo isolado.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideVaultGcmTitle">🛡️ Criptografia AES-256-GCM</strong>
+                  <span id="guideVaultGcmDesc">Dados cifrados em repouso com IV aleatório de 96 bits e autenticação GCM contra adulterações.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideVaultInjectionTitle">⚡ Injeção Segura</strong>
+                  <span id="guideVaultInjectionDesc">Variáveis são descriptografadas em memória na partida do container, sem nunca vazarem no código ou git.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideVaultMasterKeyTitle">🔑 Chave Mestra 0600</strong>
+                  <span id="guideVaultMasterKeyDesc">Guardada em arquivo local com permissões restritas (0600), acessível apenas pelo daemon do PaaS.</span>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1155,6 +1264,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               </div>
               <button onclick="createDb()" id="btnCreateDb" style="margin-bottom:16px;">+ Provisionar Banco</button>
               <div id="dbList"></div>
+              <div class="guide-box">
+                <div class="guide-box-title">
+                  <span id="guideDbTitle">🗄️ Como funciona o Banco Multi-Tenant</span>
+                </div>
+                <div class="guide-grid">
+                  <div class="guide-item">
+                    <strong id="guideDbIsolationTitle">🐘 PostgreSQL 16 & Redis 7</strong>
+                    <span id="guideDbIsolationDesc">Cada app recebe um banco lógico e usuário exclusivo com senha forte, isolado dos demais.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideDbInjectionTitle">🔗 DATABASE_URL Automática</strong>
+                    <span id="guideDbInjectionDesc">A URL de conexão é salva no Cofre do app e injetada no container sem configuração manual.</span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div class="card">
@@ -1177,6 +1301,29 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               </div>
               <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Criar Snapshot Criptografado</button>
               <div id="backupsList"></div>
+              <div class="guide-box">
+                <div class="guide-box-title">
+                  <span id="guideBackupTitle">🛡️ Como funcionam os Snapshots & Restore</span>
+                </div>
+                <div class="guide-grid">
+                  <div class="guide-item">
+                    <strong id="guideBackupDumpTitle">📸 Dumps Consistentes</strong>
+                    <span id="guideBackupDumpDesc">Executa <code>pg_dump</code> transacional ou RDB em tempo de execução sem interromper os serviços.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideBackupCryptoTitle">🔐 Criptografia em Repouso</strong>
+                    <span id="guideBackupCryptoDesc">O dump é criptografado com chave AES-256-GCM antes de ser gravado no diretório de backups.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideBackupIntegrityTitle">🛡️ Checksum SHA-256</strong>
+                    <span id="guideBackupIntegrityDesc">Todo snapshot calcula um hash SHA-256 que é estritamente verificado antes de qualquer restauração.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideBackupRestoreTitle">⏪ Restore 1-Click</strong>
+                    <span id="guideBackupRestoreDesc">Restaura o banco instantaneamente para recuperação de desastres ou testes de migração.</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1214,6 +1361,25 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
                 <button class="secondary" onclick="joinFederation()" id="btnJoinPeer">🤝 Fazer Handshake</button>
               </div>
               <div id="fedPeersList"></div>
+              <div class="guide-box">
+                <div class="guide-box-title">
+                  <span id="guideFedTitle">🌐 Redundância e Alta Disponibilidade</span>
+                </div>
+                <div class="guide-grid">
+                  <div class="guide-item">
+                    <strong id="guideFedTokenTitle">🤝 Handshake HMAC-SHA256</strong>
+                    <span id="guideFedTokenDesc">Pareia nós com token assinado e expiração de 15 minutos, impedindo conexões não autorizadas.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideFedActiveTitle">⚡ Active-Active (Cloudflare)</strong>
+                    <span id="guideFedActiveDesc">Múltiplos servidores atendem no mesmo túnel com balanceamento de carga e failover automático.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideFedWarmTitle">📦 Warm Standby & Sync</strong>
+                    <span id="guideFedWarmDesc">Exportação e importação de pacotes cifrados com segredos e apps para recuperação remota.</span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div class="card">
@@ -1237,6 +1403,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
                 <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
               </div>
               <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
+              <div class="guide-box">
+                <div class="guide-box-title">
+                  <span id="guideWhTitle">⚡ Automação com GitHub Webhooks</span>
+                </div>
+                <div class="guide-grid">
+                  <div class="guide-item">
+                    <strong id="guideWhSigTitle">🔒 Validação HMAC-SHA256</strong>
+                    <span id="guideWhSigDesc">Compara a assinatura do GitHub em tempo constante (evitando timing attacks) antes de acionar rebuilds.</span>
+                  </div>
+                  <div class="guide-item">
+                    <strong id="guideWhSshTitle">🔑 Deploy Key Ed25519</strong>
+                    <span id="guideWhSshDesc">Chave SSH somente leitura para clonar repositórios privados sem expor senhas ou tokens globais.</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1252,6 +1433,25 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
               <p class="card-desc" id="doctorDesc">Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.</p>
             </div>
             <div id="doctorReportBox"></div>
+            <div class="guide-box">
+              <div class="guide-box-title">
+                <span id="guideDoctorTitle">🩺 Como o Doctor protege o cluster</span>
+              </div>
+              <div class="guide-grid">
+                <div class="guide-item">
+                  <strong id="guideDoctorOomTitle">🚨 Detecção de OOMKilled</strong>
+                  <span id="guideDoctorOomDesc">Identifica containers mortos pelo kernel por estouro de RAM e sugere novos limites de memória.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideDoctorLoopTitle">🔄 Detecção de Crash Loops</strong>
+                  <span id="guideDoctorLoopDesc">Alerta quando containers falham repetidamente e diagnostica códigos de saída anormais.</span>
+                </div>
+                <div class="guide-item">
+                  <strong id="guideDoctorFixTitle">🛠️ Ações Corretivas 1-Click</strong>
+                  <span id="guideDoctorFixDesc">Botão de reinicialização direta para reanimar containers com problemas sem sair do painel.</span>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1497,7 +1697,65 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         btnRemoveSecret: "Remover",
         sizeLabel: "Tamanho:",
         stoppedStatus: "Parado",
-        onDemandStatus: "Sob demanda"
+        onDemandStatus: "Sob demanda",
+        guideAppsTitle: "💡 Funções de Gestão & Ciclo de Vida",
+        guideAppsRollbackTitle: "⏪ Rollback em 1s",
+        guideAppsRollbackDesc: "Restaura o container para a imagem anterior instantaneamente caso o novo deploy falhe ou contenha bugs.",
+        guideAppsLimitsTitle: "⚡ Limites de Memória & CPU",
+        guideAppsLimitsDesc: "Isolamento cgroups do kernel Linux que impede que um app consuma toda a RAM do host ou trave outros containers.",
+        guideAppsActionsTitle: "🛠️ Ações Rápidas (ENV, Logs, Restart)",
+        guideAppsActionsDesc: "Edite segredos no cofre sem re-build, consulte logs em tempo real e reinicie containers sem downtime desnecessário.",
+        guideAppsLoopbackTitle: "🔒 Isolamento Loopback",
+        guideAppsLoopbackDesc: "Containers escutam exclusivamente em 127.0.0.1:4000-4998, sem portas expostas no firewall ou roteador.",
+        guideExposeTitle: "🛡️ Como funcionam os Modos de Publicação",
+        guideExposePublicTitle: "🌐 Público (Cloudflare Tunnel)",
+        guideExposePublicDesc: "Túnel QUIC criptografado com DNS CNAME proxied e certificado SSL automático sem abrir portas.",
+        guideExposeZTTitle: "🛡️ Zero Trust (PIN por E-mail)",
+        guideExposeZTDesc: "Protege o app exigindo código OTP no e-mail antes do acesso. Recomendado para painéis e bancos.",
+        guideExposeTailscaleTitle: "🔒 Tailscale (VPN Privada)",
+        guideExposeTailscaleDesc: "Expõe o serviço de forma privada diretamente na sua Tailnet WireGuard, sem acesso público.",
+        guideVaultTitle: "🔐 Arquitetura de Segurança do Cofre (AES-256-GCM)",
+        guideVaultScopesTitle: "📁 Escopos Isolados",
+        guideVaultScopesDesc: "O escopo <code>system</code> guarda tokens de nuvem. Cada aplicação possui seu próprio escopo exclusivo.",
+        guideVaultGcmTitle: "🛡️ Criptografia AES-256-GCM",
+        guideVaultGcmDesc: "Dados cifrados em repouso com IV aleatório de 96 bits e autenticação GCM contra adulterações.",
+        guideVaultInjectionTitle: "⚡ Injeção Segura",
+        guideVaultInjectionDesc: "Variáveis são descriptografadas em memória na partida do container, sem nunca vazarem no código ou git.",
+        guideVaultMasterKeyTitle: "🔑 Chave Mestra 0600",
+        guideVaultMasterKeyDesc: "Guardada em arquivo local com permissões restritas (0600), acessível apenas pelo daemon do PaaS.",
+        guideDbTitle: "🗄️ Como funciona o Banco Multi-Tenant",
+        guideDbIsolationTitle: "🐘 PostgreSQL 16 & Redis 7",
+        guideDbIsolationDesc: "Cada app recebe um banco lógico e usuário exclusivo com senha forte, isolado dos demais.",
+        guideDbInjectionTitle: "🔗 DATABASE_URL Automática",
+        guideDbInjectionDesc: "A URL de conexão é salva no Cofre do app e injetada no container sem configuração manual.",
+        guideBackupTitle: "🛡️ Como funcionam os Snapshots & Restore",
+        guideBackupDumpTitle: "📸 Dumps Consistentes",
+        guideBackupDumpDesc: "Executa <code>pg_dump</code> transacional ou RDB em tempo de execução sem interromper os serviços.",
+        guideBackupCryptoTitle: "🔐 Criptografia em Repouso",
+        guideBackupCryptoDesc: "O dump é criptografado com chave AES-256-GCM antes de ser gravado no diretório de backups.",
+        guideBackupIntegrityTitle: "🛡️ Checksum SHA-256",
+        guideBackupIntegrityDesc: "Todo snapshot calcula um hash SHA-256 que é estritamente verificado antes de qualquer restauração.",
+        guideBackupRestoreTitle: "⏪ Restore 1-Click",
+        guideBackupRestoreDesc: "Restaura o banco instantaneamente para recuperação de desastres ou testes de migração.",
+        guideFedTitle: "🌐 Redundância e Alta Disponibilidade",
+        guideFedTokenTitle: "🤝 Handshake HMAC-SHA256",
+        guideFedTokenDesc: "Pareia nós com token assinado e expiração de 15 minutos, impedindo conexões não autorizadas.",
+        guideFedActiveTitle: "⚡ Active-Active (Cloudflare)",
+        guideFedActiveDesc: "Múltiplos servidores atendem no mesmo túnel com balanceamento de carga e failover automático.",
+        guideFedWarmTitle: "📦 Warm Standby & Sync",
+        guideFedWarmDesc: "Exportação e importação de pacotes cifrados com segredos e apps para recuperação remota.",
+        guideWhTitle: "⚡ Automação com GitHub Webhooks",
+        guideWhSigTitle: "🔒 Validação HMAC-SHA256",
+        guideWhSigDesc: "Compara a assinatura do GitHub em tempo constante (evitando timing attacks) antes de acionar rebuilds.",
+        guideWhSshTitle: "🔑 Deploy Key Ed25519",
+        guideWhSshDesc: "Chave SSH somente leitura para clonar repositórios privados sem expor senhas ou tokens globais.",
+        guideDoctorTitle: "🩺 Como o Doctor protege o cluster",
+        guideDoctorOomTitle: "🚨 Detecção de OOMKilled",
+        guideDoctorOomDesc: "Identifica containers mortos pelo kernel por estouro de RAM e sugere novos limites de memória.",
+        guideDoctorLoopTitle: "🔄 Detecção de Crash Loops",
+        guideDoctorLoopDesc: "Alerta quando containers falham repetidamente e diagnostica códigos de saída anormais.",
+        guideDoctorFixTitle: "🛠️ Ações Corretivas 1-Click",
+        guideDoctorFixDesc: "Botão de reinicialização direta para reanimar containers com problemas sem sair do painel."
       },
       en: {
         setupTitle: "🧭 First-time setup: what do you need?",
@@ -1663,7 +1921,65 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
         btnRemoveSecret: "Remove",
         sizeLabel: "Size:",
         stoppedStatus: "Stopped",
-        onDemandStatus: "On demand"
+        onDemandStatus: "On demand",
+        guideAppsTitle: "💡 Lifecycle Management & Functions",
+        guideAppsRollbackTitle: "⏪ 1-Second Rollback",
+        guideAppsRollbackDesc: "Instantly restores container to the previous working build if the new deploy fails or has bugs.",
+        guideAppsLimitsTitle: "⚡ Memory & CPU Limits",
+        guideAppsLimitsDesc: "Linux kernel cgroups isolation preventing memory leaks from freezing the host or other apps.",
+        guideAppsActionsTitle: "🛠️ Quick Actions (ENV, Logs, Restart)",
+        guideAppsActionsDesc: "Edit secrets in vault without rebuilds, monitor real-time logs, and restart containers without friction.",
+        guideAppsLoopbackTitle: "🔒 Loopback Isolation",
+        guideAppsLoopbackDesc: "Containers listen strictly on 127.0.0.1:4000-4998, with zero exposed ports in firewall or router.",
+        guideExposeTitle: "🛡️ How Publishing Modes Work",
+        guideExposePublicTitle: "🌐 Public (Cloudflare Tunnel)",
+        guideExposePublicDesc: "Encrypted outbound QUIC tunnel with proxied DNS CNAME and automatic SSL without open ports.",
+        guideExposeZTTitle: "🛡️ Zero Trust (Email OTP PIN)",
+        guideExposeZTDesc: "Protects the route requiring email verification before access. Recommended for admin tools and databases.",
+        guideExposeTailscaleTitle: "🔒 Tailscale (Private VPN)",
+        guideExposeTailscaleDesc: "Exposes the service privately to your WireGuard Tailnet mesh, with zero public exposure.",
+        guideVaultTitle: "🔐 Vault Security Architecture (AES-256-GCM)",
+        guideVaultScopesTitle: "📁 Isolated Scopes",
+        guideVaultScopesDesc: "The <code>system</code> scope holds cloud tokens. Each application has its own dedicated secret scope.",
+        guideVaultGcmTitle: "🛡️ AES-256-GCM Encryption",
+        guideVaultGcmDesc: "Data encrypted at rest using a 96-bit random IV and GCM authentication tag against tampering.",
+        guideVaultInjectionTitle: "⚡ Safe Injection",
+        guideVaultInjectionDesc: "Variables are decrypted in memory when starting the container, never committed to git or logs.",
+        guideVaultMasterKeyTitle: "🔑 0600 Master Key",
+        guideVaultMasterKeyDesc: "Preserved in a local file with strict 0600 permissions, accessible only by the PaaS daemon.",
+        guideDbTitle: "🗄️ How Isolated Multi-Tenant Databases Work",
+        guideDbIsolationTitle: "🐘 PostgreSQL 16 & Redis 7",
+        guideDbIsolationDesc: "Each app gets its own logical database and dedicated user with strong password, isolated from other apps.",
+        guideDbInjectionTitle: "🔗 Automatic DATABASE_URL",
+        guideDbInjectionDesc: "Connection string is written into the app Vault and auto-injected into containers without manual setup.",
+        guideBackupTitle: "🛡️ How Snapshots & Restore Work",
+        guideBackupDumpTitle: "📸 Consistent Dumps",
+        guideBackupDumpDesc: "Runs transactional <code>pg_dump</code> or Redis RDB in real time without taking services down.",
+        guideBackupCryptoTitle: "🔐 Encrypted at Rest",
+        guideBackupCryptoDesc: "The raw dump is encrypted with an AES-256-GCM key before being saved to backup storage.",
+        guideBackupIntegrityTitle: "🛡️ SHA-256 Checksum",
+        guideBackupIntegrityDesc: "Every snapshot calculates a SHA-256 hash strictly re-verified before performing any restore.",
+        guideBackupRestoreTitle: "⏪ 1-Click Restore",
+        guideBackupRestoreDesc: "Restores database state instantly for disaster recovery or testing migrations.",
+        guideFedTitle: "🌐 Redundancy & High Availability",
+        guideFedTokenTitle: "🤝 HMAC-SHA256 Handshake",
+        guideFedTokenDesc: "Pairs nodes with signed tokens and 15-minute expiration, blocking unauthorized cluster connections.",
+        guideFedActiveTitle: "⚡ Active-Active (Cloudflare)",
+        guideFedActiveDesc: "Multiple servers serve traffic on the same tunnel with automatic load balancing and failover.",
+        guideFedWarmTitle: "📦 Warm Standby & Sync",
+        guideFedWarmDesc: "Exports and imports encrypted bundles containing configs and vault data to keep standby nodes in sync.",
+        guideWhTitle: "⚡ Automation with GitHub Webhooks",
+        guideWhSigTitle: "🔒 HMAC-SHA256 Validation",
+        guideWhSigDesc: "Verifies GitHub webhook payloads in constant time (preventing timing attacks) before rebuilding.",
+        guideWhSshTitle: "🔑 Ed25519 Deploy Key",
+        guideWhSshDesc: "Read-only SSH deploy key to pull private repositories without exposing accounts or personal tokens.",
+        guideDoctorTitle: "🩺 How Doctor Protects the Cluster",
+        guideDoctorOomTitle: "🚨 OOMKilled Detection",
+        guideDoctorOomDesc: "Detects containers killed by the kernel due to RAM limits and suggests memory limit adjustments.",
+        guideDoctorLoopTitle: "🔄 Crash Loop Detection",
+        guideDoctorLoopDesc: "Alerts when containers restart repeatedly and reports abnormal process exit codes.",
+        guideDoctorFixTitle: "🛠️ 1-Click Corrective Actions",
+        guideDoctorFixDesc: "Provides instant restart actions to recover degraded containers directly from the dashboard."
       }
     };
 
@@ -1690,7 +2006,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
       'presetSaas', 'presetCompose', 'presetSpa', 'chipSystemScope',
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
       'archPillar1Title', 'archPillar1Desc', 'archPillar2Title', 'archPillar2Desc', 'archPillar3Title', 'archPillar3Desc', 'archPillar4Title', 'archPillar4Desc',
-      'agentsTitle', 'agentsDesc', 'archTitle', 'archDesc', 'logsTitle', 'btnCloseLogs'
+      'agentsTitle', 'agentsDesc', 'archTitle', 'archDesc', 'logsTitle', 'btnCloseLogs',
+      'guideAppsTitle', 'guideAppsRollbackTitle', 'guideAppsRollbackDesc', 'guideAppsLimitsTitle', 'guideAppsLimitsDesc', 'guideAppsActionsTitle', 'guideAppsActionsDesc', 'guideAppsLoopbackTitle', 'guideAppsLoopbackDesc',
+      'guideExposeTitle', 'guideExposePublicTitle', 'guideExposePublicDesc', 'guideExposeZTTitle', 'guideExposeZTDesc', 'guideExposeTailscaleTitle', 'guideExposeTailscaleDesc',
+      'guideVaultTitle', 'guideVaultScopesTitle', 'guideVaultScopesDesc', 'guideVaultGcmTitle', 'guideVaultGcmDesc', 'guideVaultInjectionTitle', 'guideVaultInjectionDesc', 'guideVaultMasterKeyTitle', 'guideVaultMasterKeyDesc',
+      'guideDbTitle', 'guideDbIsolationTitle', 'guideDbIsolationDesc', 'guideDbInjectionTitle', 'guideDbInjectionDesc',
+      'guideBackupTitle', 'guideBackupDumpTitle', 'guideBackupDumpDesc', 'guideBackupCryptoTitle', 'guideBackupCryptoDesc', 'guideBackupIntegrityTitle', 'guideBackupIntegrityDesc', 'guideBackupRestoreTitle', 'guideBackupRestoreDesc',
+      'guideFedTitle', 'guideFedTokenTitle', 'guideFedTokenDesc', 'guideFedActiveTitle', 'guideFedActiveDesc', 'guideFedWarmTitle', 'guideFedWarmDesc',
+      'guideWhTitle', 'guideWhSigTitle', 'guideWhSigDesc', 'guideWhSshTitle', 'guideWhSshDesc',
+      'guideDoctorTitle', 'guideDoctorOomTitle', 'guideDoctorOomDesc', 'guideDoctorLoopTitle', 'guideDoctorLoopDesc', 'guideDoctorFixTitle', 'guideDoctorFixDesc'
     ];
 
     function esc(str) {
