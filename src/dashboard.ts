@@ -4,6 +4,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock } from "./config.js";
+import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
   ConfirmationRequiredError,
@@ -98,13 +99,35 @@ async function readJsonBody(req: http.IncomingMessage): Promise<Record<string, u
   return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
 }
 
+// Signed session cookie: "<expiry>.<hmac>". The key mixes the token and the 2FA secret, so a session
+// cannot be forged from the token alone, and changing either one logs everybody out.
+const SESSION_TTL_MS = 7 * 24 * 3600 * 1000;
+
+function sessionKey(expectedToken: string): Buffer {
+  return crypto.createHash("sha256").update(`${expectedToken}|${getDashboardTotpSecret() || ""}`).digest();
+}
+
+function createSession(expectedToken: string): string {
+  const exp = String(Date.now() + SESSION_TTL_MS);
+  return `${exp}.${crypto.createHmac("sha256", sessionKey(expectedToken)).update(exp).digest("hex")}`;
+}
+
+function isValidSession(value: string | undefined, expectedToken: string): boolean {
+  const [exp, sig] = String(value || "").split(".");
+  if (!exp || !sig || Number(exp) < Date.now()) return false;
+  return timingSafeCompare(sig, crypto.createHmac("sha256", sessionKey(expectedToken)).update(exp).digest("hex"));
+}
+
 function isAuthenticated(req: http.IncomingMessage, expectedToken: string): boolean {
+  const cookies = parseCookies(req.headers.cookie);
+  if (isValidSession(cookies.paasmcp_session, expectedToken)) return true;
+  // With two-factor on, the token alone (header or old cookie) is never enough.
+  if (isDashboardTwoFactorEnabled()) return false;
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const provided = authHeader.slice("Bearer ".length).trim();
     if (timingSafeCompare(provided, expectedToken)) return true;
   }
-  const cookies = parseCookies(req.headers.cookie);
   if (cookies.paasmcp_token && timingSafeCompare(cookies.paasmcp_token, expectedToken)) {
     return true;
   }
@@ -187,12 +210,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       }
       try {
         const body = await readJsonBody(req);
-        if (typeof body.token === "string" && timingSafeCompare(body.token.trim(), expectedToken)) {
+        const totpSecret = getDashboardTotpSecret();
+        const tokenOk = typeof body.token === "string" && timingSafeCompare(body.token.trim(), expectedToken);
+        const codeOk = !totpSecret || verifyTotp(totpSecret, String(body.code || ""));
+        if (tokenOk && codeOk) {
+          const secureFlag = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
           res.writeHead(200, {
             "Content-Type": "application/json",
-            "Set-Cookie": `paasmcp_token=${encodeURIComponent(
-              expectedToken
-            )}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800`,
+            "Set-Cookie": `paasmcp_session=${createSession(expectedToken)}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${SESSION_TTL_MS / 1000}${secureFlag}`,
           });
           res.end(JSON.stringify({ ok: true }));
         } else {
@@ -209,7 +234,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
     if (pathname === "/api/logout" && req.method === "POST") {
       res.writeHead(200, {
         "Content-Type": "application/json",
-        "Set-Cookie": "paasmcp_token=; HttpOnly; Path=/; Max-Age=0",
+        "Set-Cookie": ["paasmcp_session=; HttpOnly; Path=/; Max-Age=0", "paasmcp_token=; HttpOnly; Path=/; Max-Age=0"],
       });
       res.end(JSON.stringify({ ok: true }));
       return;
@@ -225,7 +250,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       if (req.method === "HEAD") {
         res.end();
       } else {
-        res.end(renderDashboardHtml(authed, cfEmail));
+        res.end(renderDashboardHtml(authed, cfEmail, isDashboardTwoFactorEnabled()));
       }
       return;
     }
@@ -375,6 +400,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const mode =
             (body.mode as "active-active-tunnel" | "warm-standby") ||
             "active-active-tunnel";
+          confirmFromBody("federation.invite", { peer: "join-token" }, body);
           const invite = generateFederationJoinToken({ endpointUrl, mode });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(invite));
@@ -510,7 +536,7 @@ function escapeHtmlServer(s?: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
+function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = false): string {
   const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
   const sharedCss = `
     :root, [data-theme="dark"] {
@@ -734,6 +760,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     <p id="loginDesc"></p>
     ${safeCfEmail ? `<div style="margin-bottom:16px;"><span class="badge success">✓ Cloudflare Zero Trust: ${safeCfEmail}</span></div>` : ""}
     <input type="password" id="token" placeholder="Token..." autofocus style="margin-bottom: 14px;" />
+    ${twoFactor ? `<input type="text" id="code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" aria-label="2FA" style="margin-bottom: 14px;" />` : ""}
     <button onclick="doLogin()" style="width:100%; padding: 11px;" id="loginBtn"></button>
     <div class="err" id="err"></div>
     <div class="help-box">
@@ -775,11 +802,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string): string {
     function toggleLang() { currentLang = currentLang === 'pt' ? 'en' : 'pt'; localStorage.setItem('paasmcp_lang', currentLang); applyPrefs(); }
     async function doLogin() {
       const token = document.getElementById('token').value.trim();
-      const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
+      const codeEl = document.getElementById('code');
+      const code = codeEl ? codeEl.value.trim() : undefined;
+      const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, code }) });
       if (res.ok) location.reload();
       else document.getElementById('err').style.display = 'block';
     }
     document.getElementById('token').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+    if (document.getElementById('code')) document.getElementById('code').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
     applyPrefs();
   </script>
 </body>

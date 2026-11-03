@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { PAAS_DATA_DIR, ensureDirectories, writeFileAtomic } from "./config.js";
+import { PAAS_DATA_DIR, ensureDirectories, loadState, writeFileAtomic } from "./config.js";
+import { isDashboardTwoFactorEnabled } from "./totp.js";
 
 /**
  * Risk policy for every action that can hurt the server or its data.
@@ -77,9 +78,15 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       const mode = String(params.mode);
       if (subject === DASHBOARD_APP_NAME) {
         if (mode === "public") {
-          throw new ForbiddenActionError(
-            "The dashboard controls the whole server (it holds the Docker socket) and cannot be published on the open internet protected only by a token. Use mode 'zero-trust' (Cloudflare Access login) or 'tailscale'."
-          );
+          if (!isDashboardTwoFactorEnabled()) {
+            throw new ForbiddenActionError(
+              "The dashboard controls the whole server (it holds the Docker socket) and cannot be published on the open internet protected only by a token. Enable two-factor login first (`paasmcp dashboard 2fa enable`), or use mode 'zero-trust' (Cloudflare Access login) or 'tailscale'."
+            );
+          }
+          return risk(action, subject, "strong",
+            "The dashboard controls the whole server and will be reachable by anyone on the internet, protected by token + two-factor code. Zero Trust or Tailscale remain safer.",
+            "O painel controla o servidor inteiro e ficará acessível a qualquer pessoa na internet, protegido por token + código de dois fatores. Zero Trust ou Tailscale continuam mais seguros.",
+            params);
         }
         return risk(action, subject, "confirm",
           `The dashboard controls the whole server. It will be reachable through ${mode === "tailscale" ? "your Tailnet" : "Cloudflare Zero Trust (email login)"}.`,
@@ -103,6 +110,21 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       return risk(action, subject, "confirm",
         `Removes ${String(params.keyName)} from '${subject}'. The app may stop working; the previous value is kept in the vault's deleted archive.`,
         `Remove ${String(params.keyName)} de '${subject}'. O app pode parar; o valor anterior fica guardado no arquivo de apagados do cofre.`,
+        params);
+    case "dashboard.2fa-off":
+      if (loadState().apps[DASHBOARD_APP_NAME]?.domains.some((d) => d.mode === "public")) {
+        throw new ForbiddenActionError(
+          "The dashboard is published on the open internet; two-factor login cannot be turned off while it is. Unpublish it first."
+        );
+      }
+      return risk(action, "dashboard", "confirm",
+        "Turns off two-factor login: the dashboard token alone will be enough again. If the dashboard is public, unpublish it first.",
+        "Desliga o login com dois fatores: o token do painel volta a bastar sozinho. Se o painel estiver público, tire-o do ar antes.",
+        params);
+    case "federation.invite":
+      return risk(action, subject, "confirm",
+        "Creates a join token that carries the cluster key. Whoever holds it in the next 15 minutes can pair a server with this one.",
+        "Cria um token de pareamento que leva a chave do cluster. Quem tiver o token nos próximos 15 minutos consegue parear um servidor com este.",
         params);
     case "federation.join":
       return risk(action, subject, "confirm",

@@ -19,6 +19,7 @@ import {
   withStateLock,
 } from "./config.js";
 import {
+  assessRisk,
   authorizeAgent,
   ConfirmationRequiredError,
   ForbiddenActionError,
@@ -51,6 +52,7 @@ import {
   registerFederationPeer,
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
+import { levelAllows, TokenLevel } from "./tokens.js";
 import {
   deleteSecretKey,
   importDotEnvFile,
@@ -106,17 +108,6 @@ export function getSystemStatusSummary(includeMetrics = true) {
   };
 }
 
-const server = new Server(
-  {
-    name: "paasmcp-mcp",
-    version: "1.1.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
 
 // Tools that can trigger a confirmation accept the id of a request a person approved.
 const APPROVAL_ID_PROPERTY = {
@@ -133,13 +124,31 @@ const TOOLS_WITH_APPROVAL = new Set([
   "paas_app_lifecycle",
   "paas_node_federation",
 ]);
-// Read-only tools skip the state lock so they answer while a long deploy runs.
+// Read-only tools skip the state lock so they answer while a long deploy runs; they are all a "read" token sees.
 const READ_ONLY_TOOLS = new Set(["paas_system_status", "paas_secret_list", "paas_doctor", "paas_approvals"]);
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+/**
+ * One MCP server per connection. `level` comes from the caller: stdio runs on the server itself
+ * ("destroy"), HTTP callers get the level of their personal token (tokens.ts).
+ */
+export function createMcpServer(level: TokenLevel = "destroy"): Server {
+  const server = new Server(
+    { name: "paasmcp-mcp", version: "1.2.0" },
+    { capabilities: { tools: {} } }
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => listToolsFor(level));
+  server.setRequestHandler(CallToolRequestSchema, async (request) =>
+    handleToolCall(request.params.name, request.params.arguments ?? {}, level)
+  );
+  return server;
+}
+
+async function listToolsFor(level: TokenLevel) {
   const listed = await listTools();
   return {
-    tools: listed.tools.map((tool) =>
+    tools: listed.tools
+      .filter((tool) => level !== "read" || READ_ONLY_TOOLS.has(tool.name))
+      .map((tool) =>
       TOOLS_WITH_APPROVAL.has(tool.name)
         ? {
             ...tool,
@@ -149,9 +158,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           }
         : tool
-    ),
+      ),
   };
-});
+}
 
 async function listTools() {
   return {
@@ -539,12 +548,14 @@ async function listTools() {
   };
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args = {} } = request.params;
+export async function handleToolCall(name: string, args: Record<string, unknown>, level: TokenLevel) {
   try {
+    if (!READ_ONLY_TOOLS.has(name) && !levelAllows(level, "deploy")) {
+      throw new ForbiddenActionError(`This token has level '${level}' and can only use read-only tools.`);
+    }
     return READ_ONLY_TOOLS.has(name)
-      ? await callTool(name, args)
-      : await withStateLock(() => callTool(name, args));
+      ? await callTool(name, args, level)
+      : await withStateLock(() => callTool(name, args, level));
   } catch (err) {
     if (err instanceof ConfirmationRequiredError) {
       return {
@@ -577,10 +588,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       ],
     };
   }
-});
+}
 
-async function callTool(name: string, args: Record<string, unknown>) {
+async function callTool(name: string, args: Record<string, unknown>, level: TokenLevel) {
   const approvalId = args.approvalId ? String(args.approvalId) : undefined;
+  // Risky actions need a "destroy" token, and then still a person's approval.
+  const authorize = (action: string, params: Record<string, unknown>) => {
+    if (assessRisk(action, params) && !levelAllows(level, "destroy")) {
+      throw new ForbiddenActionError(
+        `'${action}' needs a token with level 'destroy' (this one is '${level}'), and then a person's approval.`
+      );
+    }
+    authorizeAgent(action, params, approvalId);
+  };
   {
     switch (name) {
       case "paas_approvals": {
@@ -664,7 +684,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       case "paas_dashboard": {
         const port = args.port ? Number(args.port) : 4099;
         if (args.exposeMode) {
-          authorizeAgent("app.expose", { appName: "paasmcp-dashboard", mode: String(args.exposeMode) }, approvalId);
+          authorize("app.expose", { appName: "paasmcp-dashboard", mode: String(args.exposeMode) });
         }
         const info = ensureDashboardBackgroundService(port);
         let exposure: unknown = undefined;
@@ -785,7 +805,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       case "paas_secret_delete": {
         const scope = String(args.scope);
         const keyName = String(args.keyName);
-        authorizeAgent("secret.delete", { scope, keyName }, approvalId);
+        authorize("secret.delete", { scope, keyName });
         const deleted = deleteSecretKey(scope, keyName);
         return {
           content: [
@@ -830,7 +850,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
           if (!args.backupId) {
             throw new Error("'backupId' is required when action='restore'.");
           }
-          authorizeAgent("db.restore", { backupId: String(args.backupId) }, approvalId);
+          authorize("db.restore", { backupId: String(args.backupId) });
           const result = restoreDatabase(String(args.backupId));
           return {
             content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -842,7 +862,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       case "paas_app_deploy": {
         const trusted = typeof args.trusted === "boolean" ? args.trusted : undefined;
         if (trusted && !loadState().apps[sanitizeSlug(String(args.appName))]?.trusted) {
-          authorizeAgent("app.trust", { appName: sanitizeSlug(String(args.appName)) }, approvalId);
+          authorize("app.trust", { appName: sanitizeSlug(String(args.appName)) });
         }
         const result = deployApp({
           trusted,
@@ -862,7 +882,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       }
 
       case "paas_app_expose": {
-        authorizeAgent("app.expose", { appName: String(args.appName), mode: String(args.mode) }, approvalId);
+        authorize("app.expose", { appName: String(args.appName), mode: String(args.mode) });
         const result = await exposeApplication({
           appName: String(args.appName),
           subdomain: args.subdomain ? String(args.subdomain) : undefined,
@@ -876,7 +896,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       case "paas_app_lifecycle": {
         const action = args.action as AppLifecycleAction;
         if (action === "destroy" || action === "purge") {
-          authorizeAgent(`app.${action}`, { appName: String(args.appName) }, approvalId);
+          authorize(`app.${action}`, { appName: String(args.appName) });
         }
         const output = manageAppLifecycle(
           String(args.appName),
@@ -911,6 +931,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
           };
         }
         if (action === "create-join-token") {
+          authorize("federation.invite", { peer: "join-token" });
           const endpointUrl = String(args.endpointUrl || "https://paas.example.com");
           const mode =
             (args.mode as "active-active-tunnel" | "warm-standby") ||
@@ -928,7 +949,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
             throw new Error("'joinToken' is required when action='join-cluster'.");
           }
           const verified = parseAndVerifyFederationJoinToken(String(args.joinToken));
-          authorizeAgent("federation.join", { peer: verified.primaryName, joinToken: String(args.joinToken) }, approvalId);
+          authorize("federation.join", { peer: verified.primaryName, joinToken: String(args.joinToken) });
           setSecretEntries("system", {
             FEDERATION_CLUSTER_KEY: verified.clusterKeyHex,
           });
@@ -975,7 +996,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
               "'encryptedBase64' and 'hmacSignature' are required when action='import-sync-bundle'."
             );
           }
-          authorizeAgent("federation.import", { peer: "sync-bundle", hmacSignature: String(args.hmacSignature) }, approvalId);
+          authorize("federation.import", { peer: "sync-bundle", hmacSignature: String(args.hmacSignature) });
           const imported = applyEncryptedFederationSyncBundle(
             String(args.encryptedBase64),
             String(args.hmacSignature)
@@ -995,7 +1016,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
 
 async function main() {
   const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await createMcpServer("destroy").connect(transport);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -39,7 +39,15 @@ import {
   registerFederationPeer,
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
+import { startMcpHttpServer } from "./mcp-http.js";
 import { getSystemStatusSummary } from "./mcp-server.js";
+import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
+import {
+  enableDashboardTwoFactor,
+  isDashboardTwoFactorEnabled,
+  newTotpSecret,
+  otpauthUri,
+} from "./totp.js";
 import {
   deleteSecretKey,
   importDotEnvFile,
@@ -136,6 +144,23 @@ async function runCli() {
         console.log(
           JSON.stringify({ dashboardToken: getOrCreateDashboardToken() }, null, 2)
         );
+      } else if (sub === "2fa") {
+        const action = rest[1];
+        if (action === "enable") {
+          const secret = newTotpSecret();
+          console.error("Add this key to an authenticator app (Aegis, Google Authenticator, 1Password...):");
+          console.error(`  ${otpauthUri(secret)}`);
+          console.error(`  manual key: ${secret}`);
+          const code = getFlagValue(rest, "--code") ?? (await ask("Type the 6-digit code shown by the app: "));
+          enableDashboardTwoFactor(secret, code || "");
+          console.log(JSON.stringify({ twoFactor: "enabled", note: "Everyone was logged out; sign in again with token + code." }, null, 2));
+        } else if (action === "disable") {
+          await confirmInCli("dashboard.2fa-off", {}, rest);
+          deleteSecretKey("system", "DASHBOARD_TOTP_SECRET");
+          console.log(JSON.stringify({ twoFactor: "disabled" }, null, 2));
+        } else {
+          console.log(JSON.stringify({ twoFactor: isDashboardTwoFactorEnabled() ? "enabled" : "disabled" }, null, 2));
+        }
       } else if (sub === "serve") {
         startDashboardServer(port, host);
         console.log(`PaaSMCP Dashboard listening on http://${host}:${port}`);
@@ -381,6 +406,35 @@ async function runCli() {
       break;
     }
 
+    case "mcp": {
+      if (rest[0] !== "serve") throw new Error("Usage: paasmcp mcp serve [--port 4098] [--host 127.0.0.1|tailscale]");
+      const port = Number(getFlagValue(rest, "--port") || 4098);
+      const host = getFlagValue(rest, "--host") || "127.0.0.1";
+      startMcpHttpServer(port, host);
+      console.error(`PaaSMCP MCP over HTTP listening on http://${host}:${port}/mcp (Bearer token required)`);
+      break;
+    }
+
+    case "token": {
+      const [sub, arg] = rest;
+      if (sub === "create") {
+        if (!arg) throw new Error("Usage: paasmcp token create <name> [--level read|deploy|destroy]");
+        const level = (getFlagValue(rest, "--level") || "deploy") as TokenLevel;
+        if (level === "destroy") {
+          console.error("⚠️  A 'destroy' token can request risky actions (they still need a person's approval).");
+        }
+        const { token, record } = createToken(arg, level);
+        console.error("Copy the token now: it is not stored and will not be shown again.");
+        console.log(JSON.stringify({ token, id: record.id, name: record.name, level: record.level }, null, 2));
+      } else if (sub === "revoke") {
+        if (!arg) throw new Error("Usage: paasmcp token revoke <id>");
+        console.log(JSON.stringify({ revoked: revokeToken(arg) }, null, 2));
+      } else {
+        console.log(JSON.stringify(listTokens(), null, 2));
+      }
+      break;
+    }
+
     case "trash": {
       // For a daily cron/systemd timer: deletes apps trashed more than 30 days ago.
       if (rest[0] !== "purge-expired") throw new Error("Usage: paasmcp trash purge-expired");
@@ -431,6 +485,9 @@ Commands:
   paasmcp restore <app>                              Bring an app back from the trash
   paasmcp purge <app> [--confirm-name <app>]         Delete a trashed app for good (strong confirmation)
   paasmcp trash purge-expired                        Delete apps trashed more than 30 days ago (cron)
+  paasmcp dashboard 2fa <enable|disable|status>      Two-factor login for the dashboard (needed to publish it openly)
+  paasmcp mcp serve [--port 4098] [--host tailscale] MCP over HTTP for remote AI clients (token required)
+  paasmcp token <create|list|revoke> ...             Personal MCP tokens (levels: read, deploy, destroy)
   paasmcp approvals [--all]                          List confirmation requests made by AI agents
   paasmcp approve|reject <id> [--confirm-name <x>]   Decide a confirmation request (people only)
   paasmcp node <status|invite|join|export-sync>      Multi-Server HA Handshake & Federation`);
@@ -440,7 +497,7 @@ Commands:
 }
 
 // Read-only commands and the long-running dashboard server skip the state lock.
-const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", undefined]);
+const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", "mcp", "token", undefined]);
 const command = process.argv[2];
 (LOCK_FREE_COMMANDS.has(command) ? runCli() : withStateLock(runCli)).catch((err) => {
   console.error("Error:", err instanceof Error ? err.message : String(err));
