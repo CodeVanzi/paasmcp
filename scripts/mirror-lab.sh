@@ -17,6 +17,15 @@ done
 export PAASMCP_DOCKER_NETWORK=paasmcp-lab-net
 docker network inspect "$PAASMCP_DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$PAASMCP_DOCKER_NETWORK" >/dev/null
 rm -rf /tmp/labA /tmp/labB
+# Cleanup runs on success and on failure (set -e would otherwise skip it).
+cleanup() {
+  echo; echo "=== cleanup"
+  docker rm -f paasmcp-postgres paasmcp-mirror-server-a >/dev/null 2>&1 || true
+  docker network rm "$PAASMCP_DOCKER_NETWORK" >/dev/null 2>&1 || true
+  # Postgres files belong to the container user; remove them from a throwaway container.
+  docker run --rm -v /tmp:/t alpine:3.20 rm -rf /t/labA /t/labB >/dev/null 2>&1 || rm -rf /tmp/labA /tmp/labB
+}
+trap cleanup EXIT
 step() { echo; echo "=== $*"; }
 runA() { PAASMCP_ROOT=/tmp/labA node --input-type=module -e "$1"; }
 runB() { PAASMCP_ROOT=/tmp/labB node --input-type=module -e "$1"; }
@@ -66,8 +75,7 @@ runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirr
 
 step "Failback: A comes back, rejoins as a copy of B, gets the data back"
 docker start paasmcp-postgres >/dev/null; sleep 3
-GW=$(docker network inspect "$PAASMCP_DOCKER_NETWORK" -f '{{(index .IPAM.Config 0).Gateway}}')
-TOKEN2=$(runB "const m=await import('./dist/mirror.js');const r=await m.offerMirror({peerName:'server-a',peerCidr:'172.16.0.0/12',advertiseHost:'$GW',fromCopyOf:'server-a'});console.log(r.token)")
+TOKEN2=$(runB "const m=await import('./dist/mirror.js');const r=await m.offerMirror({peerName:'server-a',peerCidr:'172.16.0.0/12',advertiseHost:'paasmcp-mirror-server-a',advertisePort:5432,fromCopyOf:'server-a'});console.log(r.token)")
 runA "const m=await import('./dist/mirror.js');const r=m.acceptMirror('$TOKEN2',{rejoin:true});console.log('A old data kept at', r.movedAside)"
 sleep 3
 pb "INSERT INTO notas(txt) SELECT 'b'||g FROM generate_series(1,5) g;" >/dev/null; sleep 2
@@ -84,8 +92,4 @@ sleep 4
 echo "rows A: $(pa 'SELECT count(*) FROM notas')  B copy: $(pb 'SELECT count(*) FROM notas')"
 runB 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus().receiving))'
 
-step "cleanup"
-docker rm -f paasmcp-postgres paasmcp-mirror-server-a >/dev/null
-docker network rm "$PAASMCP_DOCKER_NETWORK" >/dev/null
-# Postgres files belong to the container user; remove them from a throwaway container.
-docker run --rm -v /tmp:/t alpine:3.20 rm -rf /t/labA /t/labB
+echo; echo "=== all steps passed"
