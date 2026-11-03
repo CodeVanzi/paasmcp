@@ -90,6 +90,10 @@ export interface MirrorReplicaRecord {
   acceptedAt: string;
   promotedAt?: string;
   promotedEpoch?: number;
+  /** Failback: this server's own Postgres is (temporarily) the read-only copy of the peer. */
+  failback?: boolean;
+  /** Set on the server that served a peer's data once it hands it back; the copy is then stale. */
+  handedBackAt?: string;
 }
 
 export interface MirrorConfig {
@@ -97,8 +101,14 @@ export interface MirrorConfig {
   epoch: number;
   /** Tailscale IP where Postgres / Garage S3 are also published for the peer. */
   bindIp?: string;
-  offers: Record<string, { peerCidr: string; slot: string; offeredAt: string }>;
+  offers: Record<string, { peerCidr: string; slot: string; offeredAt: string; source?: string }>;
   replicas: Record<string, MirrorReplicaRecord>;
+  /** Third vote for automatic failover (`paasmcp arbiter serve`). */
+  arbiterUrl?: string;
+  /** Peers this server may take over automatically (needs arbiterUrl). */
+  auto?: string[];
+  /** Set when the arbiter says another server now serves this server's data: own apps stay stopped. */
+  fenced?: { byNodeId: string; epoch: number; at: string };
 }
 
 export interface FederationPeerRecord {

@@ -74,6 +74,26 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `This server takes over the apps of '${subject}' using its copy of the database. If '${subject}' is still running, both sides would accept changes (split brain): make sure it is really down or cut off. Changes made on '${subject}' after the last replicated moment stay only there.`,
         `Este servidor assume os apps de '${subject}' com a cópia do banco que tem aqui. Se '${subject}' ainda estiver ligado, os dois lados aceitariam alterações (cérebro dividido): confirme que ele caiu de verdade ou está isolado. O que foi gravado em '${subject}' depois do último momento copiado fica só lá.`,
         params);
+    case "mirror.auto":
+      if (!params.arbiterUrl && !loadState().mirror?.arbiterUrl) {
+        throw new ForbiddenActionError(
+          "Automatic failover needs an arbiter (paasmcp arbiter serve on a third device). Without one, a network split would make both servers take the data (split brain). Use manual 'mirror promote' instead."
+        );
+      }
+      return risk(action, subject, "strong",
+        `This server will take over '${subject}' on its own when both this server and the arbiter lose it for over a minute and its copy stops streaming. Changes made on '${subject}' in its last seconds may stay only there.`,
+        `Este servidor vai assumir '${subject}' sozinho quando ele e o árbitro perderem contato com '${subject}' por mais de um minuto e a cópia parar de receber. O que '${subject}' gravou nos últimos segundos pode ficar só lá.`,
+        params);
+    case "mirror.rejoin":
+      return risk(action, "rejoin", "confirm",
+        "This server's database is stopped, moved aside (kept on disk, not deleted) and replaced by a read-only copy of the server that took over. Its apps stay stopped until you hand back.",
+        "O banco deste servidor é parado, movido para o lado (fica guardado no disco, não é apagado) e trocado por uma cópia só de leitura do servidor que assumiu. Os apps daqui ficam parados até a devolução.",
+        params);
+    case "mirror.handback":
+      return risk(action, subject, "confirm",
+        `The apps of '${subject}' stop here and the data goes back to '${subject}' once its copy has every change. Then run 'paasmcp mirror promote' there.`,
+        `Os apps de '${subject}' param aqui e os dados voltam para '${subject}' assim que a cópia dele tiver tudo. Depois rode 'paasmcp mirror promote' lá.`,
+        params);
     case "app.trust":
       return risk(action, subject, "strong",
         `Marks app '${subject}' as trusted: its docker-compose.yml keeps privileged mode, host network, capabilities, devices and host folders (including /var/run/docker.sock). A trusted app can take full control of this server.`,

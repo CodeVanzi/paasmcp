@@ -8,7 +8,17 @@ import {
   updatePlatformConfig,
   withStateLock,
 } from "./config.js";
-import { acceptMirror, mirrorStatus, offerMirror, promoteMirror } from "./mirror.js";
+import { deriveArbiterKey, startArbiterServer } from "./arbiter.js";
+import {
+  acceptMirror,
+  handbackMirror,
+  installMirrorWatch,
+  mirrorStatus,
+  offerMirror,
+  promoteMirror,
+  setAutoFailover,
+  watchTick,
+} from "./mirror.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import {
   backupAppVolumes,
@@ -306,19 +316,68 @@ async function runCli() {
       if (sub === "offer" && arg1) {
         const peerCidr = getFlagValue(rest, "--peer-ip");
         if (!peerCidr) throw new Error("Usage: paasmcp mirror offer <peerName> --peer-ip <peer Tailscale IP> [--advertise <this server's IP>] [--no-backups]");
-        const r = await offerMirror({ peerName: arg1, peerCidr, advertiseHost: getFlagValue(rest, "--advertise"), withBackups: !rest.includes("--no-backups") });
+        const r = await offerMirror({
+          peerName: arg1,
+          peerCidr,
+          advertiseHost: getFlagValue(rest, "--advertise"),
+          withBackups: !rest.includes("--no-backups"),
+          fromCopyOf: getFlagValue(rest, "--from-copy-of"),
+        });
         console.error(`Run on '${arg1}' within one hour (the token carries passwords; do not paste it into chats):`);
         console.log(`paasmcp mirror accept ${r.token}`);
         console.error(JSON.stringify({ ...r, token: undefined }, null, 2));
       } else if (sub === "accept" && arg1) {
-        console.log(JSON.stringify(acceptMirror(arg1), null, 2));
+        const rejoin = rest.includes("--rejoin");
+        if (rejoin && !loadState().mirror?.fenced) await confirmInCli("mirror.rejoin", {}, rest);
+        console.log(JSON.stringify(acceptMirror(arg1, { rejoin }), null, 2));
+      } else if (sub === "handback" && arg1) {
+        await confirmInCli("mirror.handback", { peer: arg1 }, rest);
+        console.log(JSON.stringify(await handbackMirror(arg1), null, 2));
+      } else if (sub === "auto" && (arg1 === "on" || arg1 === "off") && rest[2]) {
+        const arbiterUrl = getFlagValue(rest, "--arbiter");
+        if (arg1 === "on") await confirmInCli("mirror.auto", { peer: rest[2], arbiterUrl }, rest);
+        console.log(JSON.stringify(setAutoFailover(rest[2], arg1 === "on", arbiterUrl), null, 2));
+      } else if (sub === "watch") {
+        for (;;) {
+          try {
+            const r = await withStateLock(() => watchTick());
+            if (Object.keys(r).some((k) => k !== "epoch")) console.log(new Date().toISOString(), JSON.stringify(r));
+          } catch (err) {
+            console.error(new Date().toISOString(), err instanceof Error ? err.message : String(err));
+          }
+          if (rest.includes("--once")) break;
+          await new Promise((r) => setTimeout(r, 15_000));
+        }
+      } else if (sub === "install-watch") {
+        console.log(installMirrorWatch());
       } else if (sub === "promote" && arg1) {
         await confirmInCli("mirror.promote", { peer: arg1 }, rest);
         console.log(JSON.stringify(await promoteMirror(arg1), null, 2));
       } else if (!sub || sub === "status") {
         console.log(JSON.stringify(mirrorStatus(), null, 2));
       } else {
-        throw new Error("Usage: paasmcp mirror <offer <peer> --peer-ip <ip>|accept <token>|status|promote <peer>>");
+        throw new Error(
+          "Usage: paasmcp mirror <offer <peer> --peer-ip <ip> [--from-copy-of <peer>]|accept <token> [--rejoin]|status|promote <peer>|handback <peer>|auto on|off <peer> [--arbiter <url>]|watch [--once]|install-watch>"
+        );
+      }
+      break;
+    }
+
+    case "arbiter": {
+      const [sub] = rest;
+      if (sub === "key") {
+        console.error("Give this key to the arbiter device only (it cannot decrypt tokens or the vault):");
+        console.log(deriveArbiterKey());
+      } else if (sub === "serve") {
+        const key = getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY;
+        const host = getFlagValue(rest, "--host");
+        if (!key || !host) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP> [--port 4097] --key <from 'paasmcp arbiter key'> (or PAASMCP_ARBITER_KEY)");
+        const port = Number(getFlagValue(rest, "--port") || 4097);
+        startArbiterServer({ port, host, key });
+        console.error(`Arbiter listening on http://${host}:${port}/arbiter`);
+        await new Promise(() => {});
+      } else {
+        throw new Error("Usage: paasmcp arbiter <key|serve>");
       }
       break;
     }
@@ -553,7 +612,9 @@ Commands:
   paasmcp secret list <scope>                        List masked secrets in scope
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
-  paasmcp mirror <offer|accept|status|promote>      Live Postgres copy between two servers + manual failover
+  paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
+                                                    Live Postgres copy between two servers, failover, failback
+  paasmcp arbiter <key|serve>                       Third vote for automatic failover (run on a small third device)
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
                                                     Restore test, off-site sync (S3/R2/B2), daily timer, master key export
@@ -578,7 +639,9 @@ Commands:
 // Read-only commands and the long-running dashboard server skip the state lock.
 const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", "mcp", "token", undefined]);
 const command = process.argv[2];
-(LOCK_FREE_COMMANDS.has(command) ? runCli() : withStateLock(runCli)).catch((err) => {
+// Long-running loops take the lock per round instead of holding it.
+const lockFree = LOCK_FREE_COMMANDS.has(command) || command === "arbiter" || (command === "mirror" && process.argv[3] === "watch");
+(lockFree ? runCli() : withStateLock(runCli)).catch((err) => {
   console.error("Error:", err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

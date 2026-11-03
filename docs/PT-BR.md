@@ -29,8 +29,15 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
    - Parear: `paasmcp node invite` num servidor e `paasmcp node join` no outro (token assinado, expira em 15 minutos). A sincronização de configuração e Cofre nunca sobrescreve um app que já existe no servidor de destino, e troca a porta se houver conflito.
    - Espelhar: no servidor A, `paasmcp mirror offer B --peer-ip <IP do Tailscale de B>`; ele mostra um comando `paasmcp mirror accept ...` para rodar em B em até 1 hora. B passa a ter uma cópia viva, só de leitura, do Postgres de A, e os backups de B passam a ir para o Garage de A. Repita no sentido contrário para um ser o espelho do outro.
    - Se B ficar fora do ar, A guarda até 10 GB de alterações e B se atualiza sozinho quando volta. `paasmcp mirror status` mostra se está transmitindo, se está em dia e quantos segundos atrás.
-   - Troca manual: se A cair, `paasmcp mirror promote A` em B (pede para digitar o nome). B assume os apps de A com a cópia, sobe o número de época, aponta o DNS para si. **Confirme que A caiu mesmo**: se os dois ficarem ligados, cada um aceitaria alterações. Troca automática (com árbitro) e volta guiada vêm na parte 2.
-   - Testado com dois containers Postgres (`scripts/mirror-lab.sh`); falta repetir em duas máquinas.
+   - Troca manual: se A cair, `paasmcp mirror promote A` em B (pede para digitar o nome). B assume os apps de A com a cópia, sobe o número de época, aponta o DNS para si. **Confirme que A caiu mesmo**: se os dois ficarem ligados, cada um aceitaria alterações.    - Troca automática: só com um **árbitro**, um terceiro aparelho pequeno (Raspberry, VPS) que dá o voto de desempate. Nele: `paasmcp arbiter serve --host <IP do Tailscale> --key <saída de 'paasmcp arbiter key'>`. Nos servidores: `paasmcp mirror auto on A --arbiter http://<árbitro>:4097` (pede para digitar o nome) e `sudo paasmcp mirror install-watch`. B só assume se ele **e** o árbitro perderam A por mais de um minuto **e** a cópia parou de receber. Sem árbitro, a troca automática é proibida (numa queda de rede, os dois assumiriam).
+   - Cerca: quando A volta e o árbitro diz que B serve os dados dele, A para os próprios apps e recusa deploy até a volta guiada.
+   - Volta guiada (A volta a ser o principal):
+     1. Em B: `paasmcp mirror offer A --peer-ip <IP de A> --from-copy-of A`.
+     2. Em A: `paasmcp mirror accept <token> --rejoin` (o banco antigo de A é movido para o lado, nunca apagado, e A vira cópia de B).
+     3. Em B: `paasmcp mirror handback A` (para os apps de A em B e espera A ter tudo).
+     4. Em A: `paasmcp mirror promote B`.
+     5. Para B voltar a ser espelho: `mirror offer B ...` em A e `mirror accept` em B (a cópia velha é movida para o lado).
+   - Testado com containers Postgres reais (`scripts/mirror-lab.sh`: cópia, queda do espelho, troca, volta completa); falta repetir em duas máquinas.
 8. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---
