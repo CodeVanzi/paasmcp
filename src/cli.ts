@@ -11,7 +11,7 @@ import {
 } from "./config.js";
 import { deriveArbiterKey, installArbiterService, resolveArbiterHost, startArbiterServer } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
-import { activeReadiness, activeStatus, publishActiveState, setActiveActive, syncActivePeers } from "./active.js";
+import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActivePeers } from "./active.js";
 import { addEdgeSite, edgeStatus, installEdge, refreshEdge, removeEdgeSite, uninstallEdge } from "./edge.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
@@ -387,17 +387,7 @@ async function runCli() {
           for (const w of ready.warnings) console.error(`⚠️  ${w}`);
           await confirmInCli("app.active", { appName: slug }, rest);
         }
-        const r = await setActiveActive(slug, sub === "on");
-        // Redeploy the same version: publishes the port on Tailscale and tells the other server.
-        const app = loadState().apps[slug];
-        let redeploy: unknown = "skipped (no git repository recorded)";
-        if (app.repoUrl) {
-          const d = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha });
-          redeploy = { commit: d.commitHash, warning: d.warning };
-        }
-        const published = publishActiveState();
-        refreshEdge();
-        console.log(JSON.stringify({ ...r, redeploy, published }, null, 2));
+        console.log(JSON.stringify(await switchActiveActive(slug, sub === "on"), null, 2));
         if (sub === "on") {
           console.error("On the other server, the app starts within ~15 s if 'paasmcp mirror watch' runs there, or at the next 'paasmcp poll' (timer). To do it now: paasmcp active sync");
           console.error("Entry: with Cloudflare Tunnel, run cloudflared on the other server with this tunnel's token. Without it: paasmcp edge install (on a server with a public IP).");

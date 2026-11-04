@@ -232,6 +232,9 @@ export interface ActiveReadiness {
   ok: boolean;
   problems: string[];
   warnings: string[];
+  /** Same items as codes (+ values) the dashboard translates. */
+  problemCodes: string[];
+  warningCodes: { code: string; value?: string }[];
   peers: string[];
 }
 
@@ -240,29 +243,37 @@ export function activeReadiness(appName: string, state = loadState()): ActiveRea
   const slug = sanitizeSlug(appName);
   const app = state.apps[slug];
   const problems: string[] = [];
+  const problemCodes: string[] = [];
   const warnings: string[] = [];
+  const warningCodes: { code: string; value?: string }[] = [];
+  const problem = (code: string, text: string) => (problemCodes.push(code), problems.push(text));
+  const warn = (code: string, text: string, value?: string) => (warningCodes.push({ code, value }), warnings.push(text));
   const m = state.mirror;
   const peers = Object.keys(m?.offers || {});
-  if (!app) return { app: slug, ok: false, problems: [`App '${slug}' not found.`], warnings, peers };
-  if (app.trashedAt) problems.push("The app is in the trash.");
-  if (app.originNodeId) problems.push("This app came from the other server: turn the mode on there, where the app was created.");
-  if (!app.repoUrl || fs.existsSync(app.repoUrl)) problems.push("The app was deployed from a local folder; the other server needs a git repository to build the same version.");
-  if (!app.lastCommitSha && app.repoUrl && !fs.existsSync(app.repoUrl)) problems.push("Deploy the app once more so this server records the exact commit it runs.");
-  if (!peers.length) problems.push("No server receives a live copy of this one yet: set up the mirror first ('paasmcp mirror offer <peer> --peer-ip <ip>' here, 'paasmcp mirror accept' there).");
-  else if (!m?.bindIp) problems.push("The mirror was offered without a Tailscale IP, so the other server cannot reach this database. Offer it again with --advertise <this server's Tailscale IP>.");
-  if (m?.fenced) problems.push("This server is fenced: another server serves its data now.");
-  if (app.healthcheckDisabled) problems.push("The app has no HTTP health check, and the entry needs one to stop sending requests to a server that is down.");
+  if (!app) {
+    problem("notFound", `App '${slug}' not found.`);
+    return { app: slug, ok: false, problems, warnings, problemCodes, warningCodes, peers };
+  }
+  const fromGit = Boolean(app.repoUrl) && !fs.existsSync(app.repoUrl!);
+  if (app.trashedAt) problem("trashed", "The app is in the trash.");
+  if (app.originNodeId) problem("fromPeer", "This app came from the other server: turn the mode on there, where the app was created.");
+  if (!fromGit) problem("localSource", "The app was deployed from a local folder; the other server needs a git repository to build the same version.");
+  if (fromGit && !app.lastCommitSha) problem("noCommit", "Deploy the app once more so this server records the exact commit it runs.");
+  if (!peers.length) problem("noMirror", "No server receives a live copy of this one yet: set up the mirror first ('paasmcp mirror offer <peer> --peer-ip <ip>' here, 'paasmcp mirror accept' there).");
+  else if (!m?.bindIp) problem("noBindIp", "The mirror was offered without a Tailscale IP, so the other server cannot reach this database. Offer it again with --advertise <this server's Tailscale IP>.");
+  if (m?.fenced) problem("fenced", "This server is fenced: another server serves its data now.");
+  if (app.healthcheckDisabled) problem("noHealthcheck", "The app has no HTTP health check, and the entry needs one to stop sending requests to a server that is down.");
   else if (!app.healthcheckPath || app.healthcheckPath === "/") {
-    warnings.push("Use a health check path that queries the database (for example /healthz). With '/', a server that lost the database keeps receiving requests.");
+    warn("rootHealthPath", "Use a health check path that queries the database (for example /healthz). With '/', a server that lost the database keeps receiving requests.");
+  }
+  if (app.domains.some((d) => d.mode === "zero-trust")) {
+    warn("zeroTrustBypass", "The app is behind Cloudflare Access (zero-trust). Running on both servers also publishes its port on the Tailscale IPs, where any device of your Tailnet reaches it without that login. Keep the app's own login on, or limit the Tailnet with ACLs.");
   }
   const vols = localVolumes(app);
   if (vols.length) {
-    warnings.push(`The app writes to local volumes (${vols.join(", ")}): files there will differ between the servers. Store uploads in S3 (paas_storage_provision) instead.`);
+    warn("localVolumes", `The app writes to local volumes (${vols.join(", ")}): files there will differ between the servers. Store uploads in S3 (paas_storage_provision) instead.`, vols.join(", "));
   }
-  if (Object.values(state.apps).some((a) => a.name !== slug && a.localPort === app.localPort && a.originNodeId)) {
-    warnings.push(`Port ${app.localPort} is also used by an app from the other server; check 'paasmcp active status' there after turning this on.`);
-  }
-  return { app: slug, ok: problems.length === 0, problems, warnings, peers };
+  return { app: slug, ok: problems.length === 0, problems, warnings, problemCodes, warningCodes, peers };
 }
 
 /** True when the shared Redis exists but is not published on the mirror's Tailscale IP yet. */
@@ -297,6 +308,27 @@ export async function setActiveActive(appName: string, on: boolean): Promise<{ a
   saveState(state);
   audit({ event: on ? "active.on" : "active.off", app: slug });
   return { app: slug, activeActive: on, warnings, redisRebound };
+}
+
+/**
+ * Turns the mode on/off and finishes the job: redeploys the same version (publishes or drops the
+ * Tailscale port), tells the other server through the control channel and updates the edge.
+ * Callers check readiness and the guard ("app.active") first.
+ */
+export async function switchActiveActive(appName: string, on: boolean): Promise<Record<string, unknown>> {
+  const r = await setActiveActive(appName, on);
+  const app = loadState().apps[r.app];
+  let redeployed: string | undefined;
+  let warning: string | undefined;
+  if (app.repoUrl && !OFFLINE()) {
+    const d = await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha });
+    redeployed = d.commitHash;
+    warning = d.warning;
+  }
+  const published = publishActiveState();
+  const { refreshEdge } = await import("./edge.js");
+  refreshEdge();
+  return { ...r, redeployed, warning, published };
 }
 
 type DeployFn = (app: AppRecord, commit: string | undefined) => Promise<unknown>;
@@ -336,7 +368,9 @@ function peerRecord(slug: string, sent: Partial<AppRecord>, existing: AppRecord 
     appDir,
     runtimeType: String(sent.runtimeType || existing?.runtimeType || "unknown"),
     databases: Array.isArray(sent.databases) ? sent.databases.map(String) : [],
-    domains: Array.isArray(sent.domains) ? sent.domains : [],
+    domains: (Array.isArray(sent.domains) ? sent.domains : [])
+      .filter((d) => d && typeof d.hostname === "string" && /^[a-z0-9.:-]{1,253}$/.test(d.hostname) && ["public", "zero-trust", "tailscale", "local"].includes(d.mode))
+      .map((d) => ({ hostname: d.hostname, mode: d.mode, url: String(d.url || "").slice(0, 300) })),
     createdAt: existing?.createdAt || now,
     updatedAt: existing?.updatedAt || now,
     memoryLimit: validateResourceLimit(sent.memoryLimit, "memory"),

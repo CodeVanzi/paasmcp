@@ -59,8 +59,7 @@ import {
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { levelAllows, TokenLevel } from "./tokens.js";
-import { activeReadiness, activeStatus, publishActiveState, setActiveActive } from "./active.js";
-import { refreshEdge } from "./edge.js";
+import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import {
   deleteSecretKey,
   importDotEnvFile,
@@ -944,16 +943,7 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           if (!ready.ok) throw new Error(`App '${slug}' cannot run on both servers yet:\n- ${ready.problems.join("\n- ")}`);
           authorize("app.active", { appName: slug });
         }
-        const r = await setActiveActive(slug, action === "on");
-        const app = loadState().apps[slug];
-        const redeploy = app.repoUrl
-          ? await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha })
-          : undefined;
-        const published = publishActiveState();
-        refreshEdge();
-        return {
-          content: [{ type: "text", text: JSON.stringify({ ...r, redeployed: redeploy?.commitHash, warning: redeploy?.warning, published }, null, 2) }],
-        };
+        return { content: [{ type: "text", text: JSON.stringify(await switchActiveActive(slug, action === "on"), null, 2) }] };
       }
 
       case "paas_email_provision": {
