@@ -57,7 +57,14 @@ export interface AppRecord {
    */
   activeActive?: boolean;
   /** Peer side: what was last deployed from the origin's control channel, and the last error. */
-  activeSync?: { commit?: string; configHash?: string; at?: string; error?: string };
+  activeSync?: {
+    commit?: string;
+    configHash?: string;
+    at?: string;
+    error?: string;
+    /** Last refresh of this server's copy of the app's bucket. */
+    files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string };
+  };
 }
 
 export interface DatabaseRecord {

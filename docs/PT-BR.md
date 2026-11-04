@@ -52,8 +52,8 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
      2. Em A: `paasmcp active check <app>` mostra o que falta; `paasmcp active on <app>` (pede confirmação) refaz o deploy da mesma versão e avisa B pelo próprio Postgres, cifrado com a chave do grupo. B monta **o mesmo commit** de A, nunca a ponta do branch.
      3. Entrada com Cloudflare Tunnel: rode o `cloudflared` com o mesmo token do túnel em B.
      4. Entrada sem cloud: num servidor com IP público, `sudo paasmcp edge install --email voce@exemplo.com` (pede para digitar `edge`, abre as portas 80 e 443) e `paasmcp edge add <app> loja.exemplo.com`; aponte o DNS (registro A) para o IP público desse servidor. O Caddy pega o HTTPS sozinho, divide as visitas e confere a saúde de cada servidor a cada 5 segundos.
-     - Use um caminho de saúde que consulte o banco (`/healthz`) e guarde arquivos enviados no S3, não em volume local. Migrações de banco devem funcionar com a versão anterior, porque B troca de versão alguns segundos depois de A.
-     - Se A cair, a troca automática promove a cópia em B, e o app em B passa a usar o banco e o Redis locais (as sessões guardadas no Redis se perdem). Testado em `scripts/active-lab.sh`.
+     - Use um caminho de saúde que consulte o banco (`/healthz`) e guarde arquivos enviados no S3, não em volume local. B guarda uma cópia do bucket de cada app ativo, com a mesma chave, atualizada a cada minuto (o que A apaga, B apaga também); arquivos acima de 512 MB não são copiados e aparecem no painel. Migrações de banco devem funcionar com a versão anterior, porque B troca de versão alguns segundos depois de A.
+     - Se A cair, a troca automática promove a cópia em B, e o app em B passa a usar o banco e o Redis locais (as sessões guardadas no Redis se perdem) e o S3 local, com as fotos que já estavam copiadas. Na volta guiada, o `mirror handback` devolve para A o que foi enviado em B durante a queda, sem apagar nada. Testado em `scripts/active-lab.sh` e `scripts/files-lab.sh`.
 9. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---

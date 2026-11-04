@@ -37,6 +37,9 @@ async function admin<T = any>(method: string, route: string, body?: unknown): Pr
 
 export async function ensureGarage(capacityGb = Number(process.env.PAASMCP_GARAGE_CAPACITY_GB || 100)): Promise<void> {
   const { rpcSecret, adminToken } = garageSecrets();
+  // Inside the container only (the host ports stay on 127.0.0.1 / the Tailscale IP). Garage panics
+  // on "[::]" when the host kernel has IPv6 turned off, as some VPS images ship.
+  const any = fs.existsSync("/proc/net/if_inet6") ? "[::]" : "0.0.0.0";
   if (!OFFLINE()) {
     ensureDockerNetwork();
     fs.mkdirSync(PAAS_GARAGE_DIR, { recursive: true, mode: 0o700 });
@@ -46,17 +49,17 @@ export async function ensureGarage(capacityGb = Number(process.env.PAASMCP_GARAG
 data_dir = "/var/lib/garage/data"
 db_engine = "sqlite"
 replication_factor = 1
-rpc_bind_addr = "[::]:3901"
+rpc_bind_addr = "${any}:3901"
 rpc_public_addr = "127.0.0.1:3901"
 rpc_secret = "${rpcSecret}"
 
 [s3_api]
 s3_region = "${GARAGE_REGION}"
-api_bind_addr = "[::]:3900"
+api_bind_addr = "${any}:3900"
 root_domain = ".s3.garage.localhost"
 
 [admin]
-api_bind_addr = "[::]:3903"
+api_bind_addr = "${any}:3903"
 admin_token = "${adminToken}"
 `,
       { mode: 0o600 }
@@ -126,6 +129,39 @@ export async function createBucketWithKey(
     permissions: { read: true, write: true, owner: false },
   });
   return { bucketId: bucketInfo.id, accessKeyId: key.accessKeyId, secretAccessKey: key.secretAccessKey };
+}
+
+/** This server's S3 API as seen from the host (labs run a second Garage on other ports). */
+export const localS3Url = () => process.env.PAASMCP_GARAGE_S3_URL || "http://127.0.0.1:3900";
+
+/**
+ * Active-active peer: the same bucket and the same access key as on the origin, so the app's
+ * S3_* variables keep working here after a failover. Idempotent.
+ */
+export async function ensureBucketWithImportedKey(bucket: string, accessKeyId: string, secretAccessKey: string, keyName: string): Promise<void> {
+  if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error(`Invalid bucket name '${bucket}'.`);
+  if (!/^[A-Za-z0-9]{8,128}$/.test(accessKeyId) || !/^[A-Za-z0-9/+=]{8,256}$/.test(secretAccessKey)) throw new Error("Unexpected S3 key format.");
+  try {
+    await admin("GET", "/v1/status");
+  } catch {
+    await ensureGarage();
+  }
+  let bucketInfo: { id: string };
+  try {
+    bucketInfo = await admin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
+  } catch {
+    bucketInfo = await admin("POST", "/v1/bucket", { globalAlias: bucket });
+  }
+  try {
+    await admin("GET", `/v1/key?id=${encodeURIComponent(accessKeyId)}`);
+  } catch {
+    await admin("POST", "/v1/key/import", { name: keyName, accessKeyId, secretAccessKey });
+  }
+  await admin("POST", "/v1/bucket/allow", {
+    bucketId: bucketInfo.id,
+    accessKeyId,
+    permissions: { read: true, write: true, owner: false },
+  });
 }
 
 export async function provisionStorage(appName: string): Promise<{ record: StorageRecord; injectedKeys: string[]; reused: boolean }> {

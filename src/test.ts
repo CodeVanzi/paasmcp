@@ -976,6 +976,9 @@ volumes:
         DATABASE_URL: "postgresql://u:p@paasmcp-postgres:5432/db_shop",
         REDIS_URL: "redis://:apass@paasmcp-redis:6379/2",
         S3_ENDPOINT: "http://paasmcp-garage:3900",
+        S3_BUCKET: "shop-files",
+        S3_ACCESS_KEY_ID: "GK0123456789abcdef01234567",
+        S3_SECRET_ACCESS_KEY: "f".repeat(64),
       });
 
       let ready = active.activeReadiness("shop");
@@ -1092,6 +1095,34 @@ volumes:
       assert.match(fs.readFileSync(path.join(edge.EDGE_DIR, "compose.yaml"), "utf-8"), /image: caddy:2\.8\.4-alpine/);
       assert.equal(active.activeStatus().apps.find((a) => a.app === "shop")?.entries.edge[0], "shop.example.com");
 
+      // Uploaded files: the peer refreshes its copy of the bucket, at most once a minute unless it failed.
+      const fileCalls: string[] = [];
+      let fileResult: { copied: number; removed: number; tooLarge: string[]; errors: string[] } = { copied: 2, removed: 1, tooLarge: ["big.iso"], errors: [] };
+      const syncFiles = (now: number) =>
+        active.syncActivePeers({
+          read: () => body, deploy: async () => undefined, stop: () => undefined, now,
+          files: async (rec, app, env) => {
+            fileCalls.push(`${rec.peerName}:${app}:${env.S3_BUCKET}:${active.bucketTargets(rec, env).origin.endpoint}`);
+            return fileResult;
+          },
+        });
+      const t0 = Date.parse("2026-01-01T00:00:00Z");
+      res = (await syncFiles(t0)).find((r) => r.peer === "server-a")!;
+      assert.deepEqual(fileCalls, ["server-a:shop:shop-files:http://100.64.0.1:3900"], "the origin's Garage is reached on its Tailscale IP");
+      assert.equal(res.status, "applied");
+      assert.deepEqual(res.files, [{ app: "shop", copied: 2, removed: 1 }]);
+      assert.equal(config.loadState().apps.shop.activeSync?.files?.tooLarge, 1);
+      assert.equal(config.loadState().apps.shop.activeSync?.commit, sha2, "the file copy keeps the deploy record");
+      await syncFiles(t0 + 30_000);
+      assert.equal(fileCalls.length, 1, "throttled");
+      fileResult = { copied: 0, removed: 0, tooLarge: [], errors: ["PUT a.jpg: HTTP 500"] };
+      res = (await syncFiles(t0 + active.FILES_EVERY_MS)).find((r) => r.peer === "server-a")!;
+      assert.equal(res.status, "error");
+      assert.match(res.errors[0].error, /files: PUT a\.jpg/);
+      assert.equal(active.activeStatus().apps.find((a) => a.app === "shop")?.files?.error, "PUT a.jpg: HTTP 500");
+      await syncFiles(t0 + active.FILES_EVERY_MS + 1000);
+      assert.equal(fileCalls.length, 3, "a failed copy is retried on the next round");
+
       // The origin stops running it on both: the peer stops its copy.
       body = active.encodeManifest({ ...manifest, apps: {} });
       res = (await sync()).find((r) => r.peer === "server-a")!;
@@ -1124,6 +1155,106 @@ volumes:
       assert.throws(() => github.cloneOrUpdateRepo("acme/x", path.join(tempRoot, "nope"), "main", "abc; rm"), /full 40-character SHA/);
     } finally {
       fs.writeFileSync(config.STATE_FILE_PATH, saved);
+    }
+  });
+
+  await t.test("28. Uploaded files: list parsing, sync plan, and a bucket copy against a fake S3", async () => {
+    const fsync = await import("./filesync.js");
+    const page = fsync.parseListObjects(
+      `<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>a &amp; b.jpg</Key><ETag>&quot;e1&quot;</ETag><Size>3</Size>` +
+        `<LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents><NextContinuationToken>tok&amp;1</NextContinuationToken></ListBucketResult>`
+    );
+    assert.deepEqual(page, { objects: [{ key: "a & b.jpg", etag: "e1", size: 3, lastModified: "2026-01-01T00:00:00.000Z" }], next: "tok&1" });
+    assert.equal(fsync.parseListObjects("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>").next, undefined);
+
+    const o = (key: string, etag: string, lastModified = "2026-01-01T00:00:00.000Z", size = 1) => ({ key, etag, size, lastModified });
+    const from = [o("same", "1"), o("changed", "2"), o("new", "3"), o("huge", "4", undefined, fsync.MAX_OBJECT_BYTES + 1)];
+    const to = [o("same", "1"), o("changed", "old"), o("gone", "5")];
+    const mirrorPlan = fsync.planFileSync(from, to, "mirror");
+    assert.deepEqual(mirrorPlan.copy.map((x) => x.key), ["changed", "new"]);
+    assert.deepEqual(mirrorPlan.remove, ["gone"]);
+    assert.deepEqual(mirrorPlan.tooLarge, ["huge"]);
+    assert.deepEqual(fsync.planFileSync([o("../other-bucket/x", "1"), o("a/./b", "2")], [o("..", "3")], "mirror"), { copy: [], remove: [], tooLarge: [], unsafe: ["../other-bucket/x", "a/./b"] }, "dot segments never reach a URL");
+    assert.deepEqual(fsync.planFileSync([o("mp", "abc-3")], [o("mp", "def", "2026-01-02T00:00:00.000Z")], "mirror").copy, [], "multipart ETags do not force a re-copy");
+    assert.equal(fsync.planFileSync([o("mp", "abc-3", "2026-01-03T00:00:00.000Z")], [o("mp", "def", "2026-01-02T00:00:00.000Z")], "mirror").copy.length, 1);
+    // Handback: only what is missing or newer goes back, and nothing is deleted.
+    const back = fsync.planFileSync([o("x", "1", "2026-01-02T00:00:00.000Z"), o("y", "2", "2026-01-01T00:00:00.000Z"), o("z", "3")], [o("x", "0"), o("y", "0", "2026-01-03T00:00:00.000Z")], "additive");
+    assert.deepEqual(back.copy.map((x) => x.key), ["x", "z"]);
+    assert.deepEqual(back.remove, []);
+
+    // A tiny S3 server (two objects per listing page) for the network side.
+    const http = await import("node:http");
+    const buckets: Record<string, Map<string, { body: Buffer; type: string; at: string }>> = { src: new Map(), dst: new Map() };
+    const seenAuth: string[] = [];
+    const srv = http.createServer((req, res) => {
+      seenAuth.push(String(req.headers.authorization || ""));
+      const url = new URL(req.url || "/", "http://x");
+      const [, bucket, ...rest] = url.pathname.split("/");
+      const key = rest.map(decodeURIComponent).join("/");
+      const b = buckets[decodeURIComponent(bucket)];
+      if (!b) return res.writeHead(404).end();
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        if (req.method === "GET" && !key) {
+          const keys = [...b.keys()].sort();
+          const start = Number(url.searchParams.get("continuation-token") || 0);
+          const slice = keys.slice(start, start + 2);
+          const more = start + 2 < keys.length;
+          const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+          return res.end(
+            `<ListBucketResult><IsTruncated>${more}</IsTruncated>` +
+              slice.map((k) => `<Contents><Key>${esc(k)}</Key><ETag>"${crypto.createHash("md5").update(b.get(k)!.body).digest("hex")}"</ETag><Size>${b.get(k)!.body.length}</Size><LastModified>${b.get(k)!.at}</LastModified></Contents>`).join("") +
+              (more ? `<NextContinuationToken>${start + 2}</NextContinuationToken>` : "") + "</ListBucketResult>"
+          );
+        }
+        if (req.method === "GET") {
+          const obj = b.get(key);
+          return obj ? res.writeHead(200, { "content-type": obj.type }).end(obj.body) : res.writeHead(404).end();
+        }
+        if (req.method === "PUT") {
+          b.set(key, { body: Buffer.concat(chunks), type: String(req.headers["content-type"] || ""), at: new Date().toISOString() });
+          return res.end();
+        }
+        if (req.method === "DELETE") {
+          b.delete(key);
+          return res.writeHead(204).end();
+        }
+        res.writeHead(405).end();
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    try {
+      const endpoint = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+      const at = "2026-01-01T00:00:00.000Z";
+      for (const [k, v] of [["photos/a b.jpg", "A"], ["photos/ç(1).png", "B"], ["doc.pdf", "C"]]) buckets.src.set(k, { body: Buffer.from(v), type: "image/jpeg", at });
+      buckets.dst.set("stale.txt", { body: Buffer.from("old"), type: "text/plain", at });
+      const key = { accessKeyId: "GKtest", secretAccessKey: "s".repeat(64) };
+      const src = { endpoint, bucket: "src", ...key };
+      const dst = { endpoint, bucket: "dst", ...key };
+      let r = await fsync.syncBucket(src, dst, "mirror");
+      assert.deepEqual(r, { copied: 3, removed: 1, tooLarge: [], errors: [] });
+      assert.deepEqual([...buckets.dst.keys()].sort(), ["doc.pdf", "photos/a b.jpg", "photos/ç(1).png"]);
+      assert.equal(buckets.dst.get("photos/ç(1).png")!.body.toString(), "B");
+      assert.equal(buckets.dst.get("doc.pdf")!.type, "image/jpeg", "content type travels with the object");
+      assert.ok(seenAuth.every((h) => h.startsWith("AWS4-HMAC-SHA256 Credential=GKtest/")), "every call is signed with the app's key");
+      r = await fsync.syncBucket(src, dst, "mirror");
+      assert.deepEqual(r, { copied: 0, removed: 0, tooLarge: [], errors: [] }, "nothing to do the second time");
+      // Back on the origin after a failover: new uploads return, nothing is deleted.
+      buckets.dst.set("during-outage.jpg", { body: Buffer.from("D"), type: "image/jpeg", at: "2026-02-01T00:00:00.000Z" });
+      buckets.src.set("only-on-origin.jpg", { body: Buffer.from("E"), type: "image/jpeg", at });
+      r = await fsync.syncBucket(dst, src, "additive");
+      assert.equal(r.copied, 1);
+      assert.ok(buckets.src.has("during-outage.jpg") && buckets.src.has("only-on-origin.jpg"));
+      await assert.rejects(fsync.syncBucket({ ...src, bucket: "missing" }, dst, "mirror"), /HTTP 404/);
+      buckets.src.clear();
+      await assert.rejects(fsync.syncBucket(src, dst, "mirror"), /is empty while the copy here has 4 file/);
+      assert.equal(buckets.dst.size, 4, "an emptied origin never wipes the copy");
+      srv.close();
+      srv.closeAllConnections();
+      await assert.rejects(fsync.syncBucket(src, dst, "mirror"), /S3 at 127\.0\.0\.1:\d+ did not answer/);
+    } finally {
+      srv.close();
     }
   });
 
