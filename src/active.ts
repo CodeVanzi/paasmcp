@@ -267,6 +267,7 @@ export function activeReadiness(appName: string, state = loadState()): ActiveRea
   const fromGit = Boolean(app.repoUrl) && !fs.existsSync(app.repoUrl!);
   if (app.trashedAt) problem("trashed", "The app is in the trash.");
   if (app.originNodeId) problem("fromPeer", "This app came from the other server: turn the mode on there, where the app was created.");
+  if (app.pool?.enabled) problem("pool", "The app has copies on helper PCs: go back to one copy first ('paasmcp scale off <app>'). In this phase an app uses either helpers or both servers.");
   if (!fromGit) problem("localSource", "The app was deployed from a local folder; the other server needs a git repository to build the same version.");
   if (fromGit && !app.lastCommitSha) problem("noCommit", "Deploy the app once more so this server records the exact commit it runs.");
   if (!peers.length) problem("noMirror", "No server receives a live copy of this one yet: set up the mirror first ('paasmcp mirror offer <peer> --peer-ip <ip>' here, 'paasmcp mirror accept' there).");

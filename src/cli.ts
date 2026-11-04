@@ -15,7 +15,7 @@ import {
 } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
 import {
-  DiaryLang, installScaleTimer, scaleDiary, scaleHistory, scaleStatus, scaleTick, setDiaryLanguage, setScaleRule, uninstallScaleTimer,
+  DiaryLang, installScaleTimer, scaleDiary, scaleHistory, scaleStatus, scaleTick, setDiaryLanguage, setScaleRule, uninstallScaleTimer, ruleFor
 } from "./scale.js";
 import { capacityTest, saveCapacity, validateTestPath } from "./loadtest.js";
 import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActiveFiles, syncActivePeers } from "./active.js";
@@ -46,6 +46,9 @@ import {
   testRestore,
 } from "./backup.js";
 import { assessRisk, authorizeHuman, decideApproval, listApprovals } from "./guard.js";
+import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies } from "./pool.js";
+import { joinPool, leavePool, previewJoin, updateWorker } from "./pooljoin.js";
+import { validateHelperName } from "./poolproto.js";
 import {
   ensureDashboardBackgroundService,
   getOrCreateDashboardToken,
@@ -113,6 +116,8 @@ async function ask(question: string): Promise<string | undefined> {
  * Asks the person at the terminal before risky actions (guard.ts). `--yes` skips normal
  * confirmations; strong ones need the name typed or `--confirm-name <name>`.
  */
+const SCALE_SUBCOMMANDS = new Set(["tick", "status", "history", "diary", "rule", "language", "test", "install-timer", "uninstall-timer", "set", "off"]);
+
 async function confirmInCli(action: string, params: Record<string, unknown>, args: string[]): Promise<void> {
   const r = assessRisk(action, params);
   if (!r) return;
@@ -126,6 +131,18 @@ async function confirmInCli(action: string, params: Record<string, unknown>, arg
     confirmed = (await ask("Continue? [y/N] "))?.toLowerCase() === "y";
   }
   authorizeHuman(action, params, { confirmed, confirmName, by: `cli:${process.env.USER || "unknown"}` });
+}
+
+/**
+ * The same question for actions on a helper PC (pool join/leave), which may not be a PaaSMCP server:
+ * nothing is written to this machine's audit log or state.
+ */
+async function confirmOnHelper(action: string, params: Record<string, unknown>, args: string[]): Promise<void> {
+  const r = assessRisk(action, params);
+  if (!r) return;
+  console.error(`⚠️  ${r.warning.en}`);
+  const confirmed = args.includes("--yes") || (await ask("Continue? [y/N] "))?.toLowerCase() === "y";
+  if (!confirmed) throw new Error("Not confirmed. Nothing was changed. (Add --yes to skip the question.)");
 }
 
 async function runCli() {
@@ -579,13 +596,79 @@ async function runCli() {
         });
         await withStateLock(() => saveCapacity(slug, result, `cli:${process.env.USER || "unknown"}`));
         console.log(JSON.stringify(result, null, 2));
+      } else if ((sub === "set" && arg1 && rest[2]) || (sub && /^\d+$/.test(arg1 || "") && !SCALE_SUBCOMMANDS.has(sub))) {
+        // Manual copies (pool.ts): `scale set <app> <n>` or `scale <app> <n>`.
+        const [appArg, nArg] = sub === "set" ? [arg1, rest[2]] : [sub, arg1];
+        const slug = sanitizeSlug(appArg);
+        const app = loadState().apps[slug];
+        if (!app) throw new Error(`App '${slug}' not found.`);
+        const copies = Number(nArg);
+        await confirmInCli("app.pool", { appName: slug, copies, enabling: !app.pool?.enabled, max: ruleFor(app).max }, rest);
+        console.log(JSON.stringify(await setCopies(slug, copies, { by: `cli:${process.env.USER || "unknown"}`, log: (l) => console.error(l) }), null, 2));
+      } else if (sub === "off" && arg1) {
+        console.log(JSON.stringify(await disablePool(arg1, { by: `cli:${process.env.USER || "unknown"}`, log: (l) => console.error(l) }), null, 2));
       } else if (sub === "install-timer") {
         console.log(JSON.stringify(installScaleTimer(Number(getFlagValue(rest, "--seconds") || 15)), null, 2));
       } else if (sub === "uninstall-timer") {
         console.log(JSON.stringify(uninstallScaleTimer(), null, 2));
       } else {
         throw new Error(
-          "Usage: paasmcp scale [status [app]]|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--up-rounds n] [--down-after s] [--cooldown s]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
+          "Usage: paasmcp scale [status [app]]|set <app> <copies> [--yes]|<app> <copies>|off <app>|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--up-rounds n] [--down-after s] [--cooldown s]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
+        );
+      }
+      break;
+    }
+
+    case "pool": {
+      const [sub, arg1, arg2] = rest;
+      const by = `cli:${process.env.USER || "unknown"}`;
+      const log = (l: string) => console.error(l);
+      if (sub === "invite" && arg1) {
+        const name = validateHelperName(arg1);
+        await confirmInCli("pool.invite", { helper: name }, rest);
+        const r = await createInvite(name, { advertise: getFlagValue(rest, "--advertise"), by });
+        console.error(`Invite for '${r.name}' (valid until ${r.expiresAt}). On the PC, run:\n`);
+        console.error(`  ${r.joinCommand}\n`);
+        for (const n of r.next) console.error(`- ${n}`);
+        if (r.published.length) console.error(`- Published on ${r.originIp} for helpers: ${r.published.join(", ")}.`);
+        console.log(JSON.stringify({ name: r.name, expiresAt: r.expiresAt, originIp: r.originIp, keyFingerprint: r.keyFingerprint }, null, 2));
+      } else if (sub === "join" && arg1) {
+        const opts = { cpus: getFlagValue(rest, "--cpus"), memory: getFlagValue(rest, "--memory"), ip: getFlagValue(rest, "--ip") };
+        const p = previewJoin(arg1, opts);
+        console.error(`Server: ${p.originName} (${p.originIp}), key ${p.originKeyFingerprint}`);
+        console.error(`This PC: '${p.name}' at ${p.ip || "?"}, gives up to ${p.give.cpus} CPUs and ${p.give.memMb} MB to copies.`);
+        for (const w of p.warnings) console.error(`⚠️  ${w}`);
+        await confirmOnHelper("pool.join", { origin: p.originName, originIp: p.originIp, cpus: p.give.cpus, memMb: p.give.memMb }, rest);
+        const r = joinPool(arg1, opts);
+        console.error("Done. Next:");
+        for (const n of r.next) console.error(`- ${n}`);
+        console.log(JSON.stringify({ name: r.name, ip: r.ip || null, give: r.give, origin: r.originName }, null, 2));
+      } else if (sub === "leave") {
+        await confirmOnHelper("pool.leave", {}, rest);
+        console.log(JSON.stringify(leavePool(), null, 2));
+      } else if (sub === "update-worker") {
+        console.log(JSON.stringify(updateWorker(), null, 2));
+      } else if (sub === "add" && arg1 && arg2) {
+        const sshPort = getFlagValue(rest, "--ssh-port");
+        console.log(JSON.stringify(await addHelper(arg1, arg2, { sshPort: sshPort ? Number(sshPort) : undefined, by }), null, 2));
+      } else if (!sub || sub === "status" || sub === "list") {
+        console.log(JSON.stringify(await poolStatus({ probe: !rest.includes("--no-probe") && sub !== "list" }), null, 2));
+      } else if ((sub === "pause" || sub === "resume") && arg1) {
+        console.log(JSON.stringify(await pauseHelper(arg1, sub === "pause", { by, log }), null, 2));
+      } else if (sub === "remove" && arg1) {
+        const name = validateHelperName(arg1);
+        await confirmInCli("pool.remove", { helper: name }, rest);
+        console.log(JSON.stringify(await removeHelper(name, { by, log }), null, 2));
+      } else if (sub === "check" && arg1) {
+        console.log(JSON.stringify(poolReadiness(arg1), null, 2));
+      } else if (sub === "acl") {
+        const a = poolAcl();
+        console.log(a.acl);
+        console.error("");
+        for (const st of a.steps) console.error(`- ${st}`);
+      } else {
+        throw new Error(
+          "Usage: paasmcp pool status [--no-probe]|list|invite <name> [--advertise <ip>] [--yes]|add <name> <tailscale-ip> [--ssh-port 22]|pause <name>|resume <name>|remove <name> [--yes]|check <app>|acl\n       On a helper PC: sudo paasmcp pool join '<invite>' [--cpus n] [--memory 2g] [--ip <tailscale-ip>] [--yes] | sudo paasmcp pool update-worker (after updating PaaSMCP there) | sudo paasmcp pool leave [--yes]"
         );
       }
       break;
@@ -799,6 +882,8 @@ async function runCli() {
       if (!appName) throw new Error(`Usage: paasmcp ${cmd} <appName>`);
       if (cmd === "destroy" || cmd === "purge") await confirmInCli(`app.${cmd}`, { appName }, rest);
       console.log(manageAppLifecycle(appName, cmd as AppLifecycleAction));
+      const poolNote = await poolAfterLifecycle(appName, cmd, (l) => console.error(l));
+      if (poolNote) console.log(poolNote);
       break;
     }
 
@@ -887,7 +972,11 @@ Commands:
   paasmcp edge <status|install|add|remove|reload|uninstall>  Self-hosted entry (Caddy) splitting requests between both servers
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp scale <status|tick|history|diary|rule|language|test|install-timer|uninstall-timer>
-                                                    Measure apps for 24 h and rehearse scaling decisions (never acts yet)
+                                                    Measure apps for 24 h and rehearse scaling decisions
+  paasmcp scale <app> <copies> | scale off <app>     Run copies of an app on helper PCs, set by hand
+  paasmcp pool <status|invite|add|pause|resume|remove|check|acl>
+                                                    Your own PCs as helpers (orders over SSH, nothing runs idle)
+  sudo paasmcp pool join '<invite>' | pool leave     On the helper PC: obey this server's orders, or stop
   paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
   paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
@@ -945,8 +1034,11 @@ const command = process.argv[2];
 // Scale rounds only read state.json (they keep their own files), so a long deploy never pauses the
 // measuring; the capacity test takes the lock only to save its result.
 const SCALE_LOCK_FREE = new Set(["tick", "status", "history", "diary", "test", undefined]);
+// On a helper PC, join/leave never touch PaaSMCP's own files; status and acl only read.
+const POOL_LOCK_FREE = new Set(["join", "leave", "update-worker", "status", "list", "acl", "check", undefined]);
 const lockFree =
   LOCK_FREE_COMMANDS.has(command) ||
+  (command === "pool" && POOL_LOCK_FREE.has(process.argv[3])) ||
   command === "arbiter" ||
   (command === "mirror" && process.argv[3] === "watch") ||
   (command === "scale" && SCALE_LOCK_FREE.has(process.argv[3]));

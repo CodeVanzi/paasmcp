@@ -1980,5 +1980,353 @@ volumes:
     config.saveState(st2);
   });
 
+  await t.test("34. Helper pool (phase 3): invites, restricted orders, variables only in memory, balancer, guard and screens", async () => {
+    const proto = await import("./poolproto.js");
+    const pool = await import("./pool.js");
+    const worker = await import("./worker.js");
+    const pooljoin = await import("./pooljoin.js");
+    const edge = await import("./edge.js");
+    const scale = await import("./scale.js");
+    const guard = await import("./guard.js");
+    const mcp = await import("./mcp-server.js");
+    const active = await import("./active.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const { execFileSync } = await import("node:child_process");
+    const vm = await import("node:vm");
+
+    // Invites: round trip, expiry, clock skew, every field checked.
+    const keyBlob = Buffer.concat([Buffer.from([0, 0, 0, 11]), Buffer.from("ssh-ed25519"), Buffer.from([0, 0, 0, 32]), crypto.randomBytes(32)]);
+    const pub = `ssh-ed25519 ${keyBlob.toString("base64")} someone@laptop`;
+    const now = Date.now();
+    const inv = {
+      v: 1 as const,
+      id: "0123456789abcdef",
+      name: "notebook",
+      originNodeId: "primary",
+      originName: "server",
+      originIp: "100.64.0.1",
+      originKey: proto.cleanPublicKey(pub),
+      proofKey: "a".repeat(64),
+      exp: now + proto.INVITE_TTL_MS,
+    };
+    const invText = proto.encodeInvite(inv);
+    assert.deepEqual(proto.decodeInvite(`'${invText}'`, now), inv);
+    assert.equal(proto.cleanPublicKey(pub).includes("someone"), false);
+    assert.throws(() => proto.decodeInvite(invText, now + proto.INVITE_TTL_MS + 1000), /expired/);
+    assert.throws(() => proto.decodeInvite(proto.encodeInvite({ ...inv, exp: now + 60 * 60 * 1000 }), now), /clock/);
+    assert.throws(() => proto.decodeInvite(proto.encodeInvite({ ...inv, originIp: "127.0.0.1" }), now), /origin IP/);
+    assert.throws(() => proto.decodeInvite(proto.encodeInvite({ ...inv, originKey: "ssh-rsa AAAAB3" }), now), /ssh-ed25519/);
+    assert.throws(() => proto.decodeInvite(proto.encodeInvite({ ...inv, name: "Bad;name" }), now), /helper name/);
+    assert.throws(() => proto.decodeInvite("paasmcp-pool://%%%", now), /damaged/);
+    const proof = proto.helloProof(inv.proofKey, inv.id, "ab".repeat(16), "notebook");
+    assert.match(proof, /^[0-9a-f]{64}$/);
+    assert.notEqual(proof, proto.helloProof(inv.proofKey, inv.id, "cd".repeat(16), "notebook"));
+
+    // The helper's key: only from the origin, only the worker, no terminal or forwarding.
+    const keyLine = proto.authorizedKeysLine({ originIp: "100.64.0.1", command: "/usr/bin/node /usr/local/lib/paasmcp-worker/worker.js", publicKey: pub });
+    assert.match(keyLine, /^from="100\.64\.0\.1",command="\/usr\/bin\/node \/usr\/local\/lib\/paasmcp-worker\/worker\.js",restrict ssh-ed25519 \S+ paasmcp-pool$/);
+    assert.throws(() => proto.authorizedKeysLine({ originIp: "100.64.0.1", command: '/bin/sh -c "x"', publicKey: pub }), /unexpected characters/);
+
+    // Orders: a fixed list with strict arguments, never a shell line.
+    assert.throws(() => proto.parseOrder(""), /never opens a terminal/);
+    assert.throws(() => proto.parseOrder("bash -i"), /Unknown order/);
+    assert.throws(() => proto.parseOrder("hello; rm -rf /"), /Unknown order/);
+    assert.throws(() => proto.parseOrder("list extra"), /Bad arguments/);
+    assert.throws(() => proto.parseOrder("stop ../../etc/passwd"), /Bad arguments/);
+    assert.throws(() => proto.parseOrder("load paasmcp-pool/app:0123456789ab"), /Bad arguments/);
+    assert.deepEqual(proto.parseOrder(`load paasmcp-pool/app:0123456789ab ${"f".repeat(64)}`).args, ["paasmcp-pool/app:0123456789ab", "f".repeat(64)]);
+    assert.equal(proto.parseOrder("stop pool-a-0a1b2c").op, "stop");
+
+    // Variables: one file, sourced by the wrapper, quoted so nothing is run; read back by a real shell.
+    const envText = proto.renderEnvFile({ A: "it's", B: "line1\nline2", C: "$(touch /tmp/pwned)`id`", D: "" });
+    assert.equal(envText, "A='it'\\''s'\nB='line1\\nline2'\nC='$(touch /tmp/pwned)`id`'\nD=''\n");
+    const envDir = fs.mkdtempSync(path.join(tempRoot, "env-"));
+    fs.writeFileSync(path.join(envDir, "env"), envText);
+    const echoed = execFileSync("sh", ["-c", 'set -a; . "$1"; set +a; printf "%s|%s|%s|%s" "$A" "$B" "$C" "$D"', "sh", path.join(envDir, "env")], { encoding: "utf-8" });
+    assert.equal(echoed, "it's|line1\\nline2|$(touch /tmp/pwned)`id`|");
+    assert.throws(() => proto.renderEnvFile({ "BAD-KEY": "x" }), /Invalid variable name/);
+
+    // Copy orders are checked field by field; the variables never reach the command line.
+    const fp = "e".repeat(64);
+    const spec = {
+      app: "pool-a",
+      copyId: "pool-a-0a1b2c",
+      image: `paasmcp-pool/pool-a:${fp.slice(0, 12)}`,
+      fingerprint: fp,
+      port: 4100,
+      internalPort: 3000,
+      env: { DATABASE_URL: "postgres://u:s3cr3t-value@paasmcp-postgres:5432/db" },
+      memory: "256m",
+      cpus: "0.5",
+      originIp: "100.64.0.1",
+      originNodeId: "primary",
+    };
+    const okSpec = proto.validateCopySpec(spec);
+    assert.throws(() => proto.validateCopySpec({ ...spec, image: `paasmcp-pool/other:${fp.slice(0, 12)}` }), /image tag/);
+    assert.throws(() => proto.validateCopySpec({ ...spec, copyId: "other-0a1b2c" }), /copy id/);
+    assert.throws(() => proto.validateCopySpec({ ...spec, port: 22 }), /port/);
+    assert.throws(() => proto.validateCopySpec({ ...spec, memory: "1g" }), /memory/);
+    assert.throws(() => proto.validateCopySpec({ ...spec, env: { "A B": "x" } }), /variable name/);
+    assert.throws(() => proto.validateCopySpec({ ...spec, env: { BIG: "x".repeat(300 * 1024) } }), /too large/);
+    const runArgs = proto.buildRunArgs(okSpec, "100.64.0.7", "/run/paasmcp-worker/pool-a-0a1b2c.env", ["docker-entrypoint.sh"], ["node", "server.js"]);
+    assert.equal(runArgs.some((a) => a.includes("s3cr3t")), false);
+    assert.equal(runArgs.some((a) => a.includes("0.0.0.0") || a === "--env-file" || a === "-e" || a === "--env"), false);
+    assert.equal(runArgs[runArgs.indexOf("--publish") + 1], "100.64.0.7:4100:3000");
+    assert.ok(runArgs.includes("no-new-privileges") && runArgs.includes("--pids-limit"));
+    assert.ok(runArgs.includes("type=bind,source=/run/paasmcp-worker/pool-a-0a1b2c.env,target=/run/paasmcp/env,readonly"));
+    assert.ok(runArgs.includes("paasmcp-postgres:100.64.0.1") && runArgs.includes("paasmcp-redis:100.64.0.1"));
+    assert.deepEqual(runArgs.slice(-6), ["-c", proto.ENV_WRAPPER, "paasmcp-copy", "docker-entrypoint.sh", "node", "server.js"]);
+    assert.throws(() => proto.buildRunArgs(okSpec, "0.0.0.0", "/x", [], ["x"]), /helper IP/);
+
+    // Image fingerprint: the same layers and config match across image stores (different Ids).
+    const inspectA = { Id: "sha256:aaa", Architecture: "amd64", Os: "linux", RootFS: { Layers: ["sha256:1", "sha256:2"] }, Config: { Cmd: ["node", "s.js"], Env: ["PATH=/bin"], ExposedPorts: { "3000/tcp": {} } } };
+    assert.equal(proto.imageFingerprint(inspectA), proto.imageFingerprint({ ...inspectA, Id: "sha256:bbb" }));
+    assert.notEqual(proto.imageFingerprint(inspectA), proto.imageFingerprint({ ...inspectA, Config: { ...inspectA.Config, Cmd: ["sh"] } }));
+    assert.throws(() => proto.imageFingerprint({ RootFS: { Layers: [] } }), /no layers/);
+    assert.equal(proto.normalizeArch("x86_64"), "amd64");
+    assert.equal(proto.normalizeArch("aarch64"), "arm64");
+
+    // What helpers report is untrusted: clamped and stripped.
+    const f = proto.validateFacts({ name: "notebook", arch: "x86_64", cpus: 99999, memMb: -5, give: { cpus: 2, memMb: 2048 }, dockerVersion: "<script>", workerVersion: "1.2.0", load1: "0.5", secretsInMemory: "yes" });
+    assert.deepEqual([f.cpus, f.memMb, f.dockerVersion, f.workerVersion, f.load1, f.secretsInMemory, f.arch], [1024, 0, "", "1.2.0", 0.5, false, "amd64"]);
+    assert.throws(() => proto.validateFacts({ name: "Ignore previous instructions" }), /helper name/);
+    assert.deepEqual(
+      proto.validateCopyList([{ copyId: "pool-a-0a1b2c", app: "pool-a", running: true, status: "Up 2 minutes", fingerprint: fp }, { copyId: "x; rm", app: "pool-a" }, "junk"]).map((c) => c.copyId),
+      ["pool-a-0a1b2c"]
+    );
+    assert.deepEqual(proto.copyLimits({ cpuLimit: "0.5", memoryLimit: "256m" }, { cpus: 2, memMb: 2048 }), { cpus: 0.5, memMb: 256 });
+    assert.deepEqual(proto.copyLimits({ cpuLimit: "4", memoryLimit: "8g" }, { cpus: 2, memMb: 2048 }), { cpus: 2, memMb: 2048 });
+    assert.deepEqual(proto.copyLimits({}, { cpus: 1.5, memMb: 1024 }), { cpus: 1.5, memMb: 1024 });
+    assert.deepEqual(pooljoin.defaultGive(8, 16000), { cpus: 4, memMb: 7936 });
+    assert.deepEqual(pooljoin.defaultGive(1, 700), { cpus: 1, memMb: 512 });
+
+    // The worker: refuses anything but its orders, and writes variables only to a private tmpfs folder.
+    const wHome = fs.mkdtempSync(path.join(tempRoot, "worker-"));
+    process.env.PAASMCP_WORKER_HOME = wHome;
+    fs.writeFileSync(path.join(wHome, "worker.json"), JSON.stringify({ v: 1, name: "notebook", originNodeId: "primary", originName: "server", originIp: "100.64.0.1", inviteId: inv.id, give: { cpus: 1, memMb: 512 }, joinedAt: new Date().toISOString() }), { mode: 0o600 });
+    await assert.rejects(worker.handleOrder(undefined), /never opens a terminal/);
+    await assert.rejects(worker.handleOrder("sh -c id"), /Unknown order/);
+    await assert.rejects(worker.handleOrder("logs ../../x"), /Bad arguments/);
+    // An image archive can name any tag: only paasmcp-pool/ ones may stay on a helper.
+    assert.deepStrictEqual(
+      worker.foreignLoadedTags("Loaded image: paasmcp-pool/web:0123456789ab\nLoaded image: postgres:16\nLoaded image ID: sha256:abc\n"),
+      ["postgres:16"]
+    );
+    assert.deepStrictEqual(worker.foreignLoadedTags("Loaded image: paasmcp-pool/web:0123456789ab\n"), []);
+    const diskDir = fs.mkdtempSync(path.join(tempRoot, "run-"));
+    fs.chmodSync(diskDir, 0o700);
+    assert.throws(() => worker.checkSecretsDir(diskDir), /not in memory/);
+    fs.chmodSync(diskDir, 0o755);
+    assert.throws(() => worker.checkSecretsDir(diskDir), /mode 700/);
+    fs.symlinkSync(diskDir, path.join(tempRoot, "run-link"));
+    assert.throws(() => worker.checkSecretsDir(path.join(tempRoot, "run-link")), /plain folder/);
+    if (fs.existsSync("/dev/shm")) {
+      const shm = fs.mkdtempSync("/dev/shm/paasmcp-test-");
+      fs.chmodSync(shm, 0o700);
+      try {
+        worker.checkSecretsDir(shm);
+      } finally {
+        fs.rmSync(shm, { recursive: true, force: true });
+      }
+    }
+    delete process.env.PAASMCP_WORKER_HOME;
+
+    // An app ready for helpers, and the reasons others are not.
+    const st = config.loadState();
+    const baseApp = {
+      ...st.apps[Object.keys(st.apps)[0]],
+      name: "pool-a",
+      containerName: "paasmcp-pool-a",
+      localPort: 4100,
+      internalPort: 3000,
+      healthcheckPath: "/healthz",
+      healthcheckDisabled: undefined,
+      cpuLimit: "0.5",
+      memoryLimit: "256m",
+      domains: [],
+      status: "running",
+      lastCommit: "abc1234",
+      activeActive: undefined,
+      originNodeId: undefined,
+      composePassThrough: undefined,
+      trusted: undefined,
+      trashedAt: undefined,
+      pool: undefined,
+    } as import("./config.js").AppRecord;
+    st.apps["pool-a"] = baseApp;
+    config.saveState(st);
+    let r = pool.poolReadiness("pool-a", config.loadState(), {});
+    assert.equal(r.ok, true);
+    assert.deepEqual(r.warningCodes.map((w) => w.code), ["noHelpers"]);
+    const variant = (patch: Partial<import("./config.js").AppRecord>) => pool.poolReadiness("pool-a", { ...config.loadState(), apps: { "pool-a": { ...baseApp, ...patch } } }, {});
+    assert.deepEqual(variant({ activeActive: true }).problemCodes, ["activeActive"]);
+    assert.deepEqual(variant({ composePassThrough: true }).problemCodes, ["ownCompose"]);
+    assert.deepEqual(variant({ healthcheckDisabled: true }).problemCodes, ["noHealthcheck"]);
+    assert.deepEqual(variant({ trusted: true }).problemCodes, ["trusted"]);
+    assert.deepEqual(variant({ originNodeId: "peer-1" }).problemCodes, ["fromPeer"]);
+    assert.ok(variant({ healthcheckPath: "/", cpuLimit: undefined }).warningCodes.some((w) => w.code === "rootHealthPath"));
+    assert.ok(variant({ cpuLimit: undefined }).warningCodes.some((w) => w.code === "noLimits"));
+    assert.deepEqual(
+      pool.localReferences({ A: "postgres://u:p@paasmcp-postgres:5432/db", B: "http://localhost:3000", C: "redis://paasmcp-redis:6379", D: "http://paasmcp-other-app:80", E: "https://example.com", F: "127.0.0.1:9000", LOCAL_REDIS_URL: "redis://:p@127.0.0.1:6379/1" }),
+      ["B", "D", "F"]
+    );
+    r = pool.poolReadiness("pool-a", config.loadState(), { API: "http://localhost:9000" });
+    assert.deepEqual(r.warningCodes.find((w) => w.code === "localRefs")?.value, "API");
+
+    // Guard: inviting, the first copies on helpers and removing a PC ask a person; moving within the rule's max is free.
+    assert.equal(guard.assessRisk("pool.invite", { helper: "notebook" })?.level, "confirm");
+    assert.equal(guard.assessRisk("pool.remove", { helper: "notebook" })?.level, "confirm");
+    assert.equal(guard.assessRisk("app.pool", { appName: "pool-a", copies: 2, enabling: true, max: 3 })?.level, "confirm");
+    assert.equal(guard.assessRisk("app.pool", { appName: "pool-a", copies: 3, enabling: false, max: 3 }), null);
+    assert.equal(guard.assessRisk("app.pool", { appName: "pool-a", copies: 4, enabling: false, max: 3 })?.level, "confirm");
+    assert.equal(guard.assessRisk("app.pool", { appName: "pool-a", copies: 1, enabling: true, max: 3 }), null);
+    assert.match(guard.assessRisk("pool.join", { origin: "server", originIp: "100.64.0.1", cpus: 2, memMb: 2048 })!.warning.pt, /paasmcp-worker/);
+
+    // Invite on the server: the proof key is derived from the vault and never lands in state.json.
+    // Helpers use the address the mirror already publishes on (an earlier test set one up).
+    const originIp = config.loadState().mirror?.bindIp || "100.64.0.1";
+    if (config.loadState().mirror?.bindIp) await assert.rejects(pool.createInvite("notebook", { advertise: "100.64.0.99" }), /same address/);
+    const created = await pool.createInvite("notebook", { advertise: originIp });
+    const decoded = proto.decodeInvite(created.joinCommand.match(/'(paasmcp-pool:\/\/[^']+)'/)![1]);
+    assert.equal(decoded.originIp, originIp);
+    assert.equal(decoded.proofKey, pool.proofKeyFor(decoded.id));
+    assert.equal(fs.readFileSync(path.join(tempRoot, "paasmcp", "state.json"), "utf-8").includes(decoded.proofKey), false);
+    assert.equal(fs.statSync(path.join(pool.POOL_DIR, "pool_ed25519")).mode & 0o777, 0o600);
+    assert.equal(config.loadState().pool?.bindIp, originIp);
+    await assert.rejects(pool.createInvite("bad name;"), /helper name/);
+    // Finishing it needs the PC to answer over SSH (offline here): nothing is added.
+    await assert.rejects(pool.addHelper("notebook", "100.64.0.7"), /Could not finish adding/);
+    await assert.rejects(pool.addHelper("laptop", "100.64.0.8"), /No open invite/);
+    assert.equal(Object.keys(config.loadState().pool?.helpers || {}).length, 0);
+    assert.ok(pool.poolAcl().acl.includes(`"dst": ["${originIp}:5432,6379,3900"]`));
+    assert.match(pool.poolAcl().acl, /tag:paasmcp-helper:22,4000-4998/);
+
+    // Helpers (as `pool add` records them) and where copies go: same CPU type, not paused, room left.
+    const helper = (name: string, ip: string, extra: Partial<import("./config.js").PoolHelperRecord> = {}): import("./config.js").PoolHelperRecord => ({
+      name, ip, sshPort: 22, tier: "own", arch: "amd64", cpus: 4, memMb: 8192, diskFreeGb: 50, give: { cpus: 2, memMb: 2048 }, addedAt: new Date().toISOString(), ...extra,
+    });
+    const st2 = config.loadState();
+    st2.pool!.helpers = {
+      notebook: helper("notebook", "100.64.0.7"),
+      big: helper("big", "100.64.0.9", { give: { cpus: 4, memMb: 4096 } }),
+      oracle: helper("oracle", "100.64.0.8", { arch: "arm64" }),
+      resting: helper("resting", "100.64.0.10", { paused: { at: new Date().toISOString(), by: "test" } }),
+    };
+    config.saveState(st2);
+    const picked = pool.pickHelpers(config.loadState(), baseApp, "amd64", new Set(["notebook", "big", "oracle", "resting"]), 3);
+    assert.deepEqual(picked.picked.map((h) => h.name), ["big", "notebook"]);
+    assert.deepEqual(picked.skipped.map((s) => s.helper).sort(), ["oracle", "resting"]);
+    assert.deepEqual(pool.pickHelpers(config.loadState(), baseApp, "amd64", new Set(["big"]), 3).picked.map((h) => h.name), ["big"]);
+
+    // With copies placed: the balancer splits visits, the edge lists the copies, the tunnel points at the balancer.
+    const st3 = config.loadState();
+    st3.apps["pool-a"].pool = {
+      enabled: true,
+      copies: 3,
+      enabledAt: new Date().toISOString(),
+      placed: [
+        { id: "pool-a-0a1b2c", helper: "big", port: 4100, fingerprint: fp, configHash: "x", cpus: 0.5, memMb: 256, startedAt: new Date().toISOString() },
+        { id: "pool-a-0d0e0f", helper: "resting", port: 4100, fingerprint: fp, configHash: "x", cpus: 0.5, memMb: 256, startedAt: new Date().toISOString() },
+      ],
+    };
+    config.saveState(st3);
+    const caddy = pool.buildBalancerCaddyfile(config.loadState());
+    assert.match(caddy, /:4100 \{\n\treverse_proxy paasmcp-pool-a:3000 100\.64\.0\.9:4100 \{/);
+    assert.equal(caddy.includes("100.64.0.10"), false);
+    for (const line of ["health_uri /healthz", "health_interval 3s", "health_fails 2", "health_passes 1", "lb_try_duration 5s", "admin unix//data/admin.sock"]) assert.ok(caddy.includes(line), line);
+    // A health path edited by hand into state.json cannot add Caddy directives.
+    const hacked = config.loadState();
+    hacked.apps["pool-a"].healthcheckPath = "/x\n\t}\n}\n:80 {\n\trespond hi";
+    assert.ok(pool.buildBalancerCaddyfile(hacked).includes("\t\thealth_uri /\n"));
+    assert.equal(pool.buildBalancerCaddyfile(hacked).includes("respond"), false);
+    assert.deepEqual(edge.edgeBackends(config.loadState(), "pool-a").map((b) => b.address), ["127.0.0.1:4100", "100.64.0.9:4100"]);
+    assert.equal(config.appServiceUrl(config.loadState().apps["pool-a"]), "http://paasmcp-pool-lb:4100");
+    assert.equal(config.appServiceUrl(baseApp), "http://paasmcp-pool-a:3000");
+    assert.equal(pool.usedOnHelpers(config.loadState()).big.cpus, 0.5);
+    const ing = pool.rewriteIngress(
+      [{ hostname: "a.example.com", service: "http://paasmcp-pool-a:3000" }, { hostname: "b.example.com", service: "http://paasmcp-b:80" }, { service: "http_status:404" }],
+      ["a.example.com"], "http://paasmcp-pool-a:3000", "http://paasmcp-pool-lb:4100"
+    );
+    assert.deepEqual(ing.changed, ["a.example.com"]);
+    assert.deepEqual(ing.ingress.map((x) => x.service), ["http://paasmcp-pool-lb:4100", "http://paasmcp-b:80", "http_status:404"]);
+    assert.deepEqual(active.activeReadiness("pool-a").problemCodes.includes("pool"), true);
+
+    // The rehearsal sees the real copies: this server's CPU is only its share of the load.
+    assert.equal(scale.realCopies(config.loadState().apps["pool-a"]), 3);
+    const rule = { ...scale.DEFAULT_RULE, min: 1, max: 5, targetCpu: 70 };
+    const base = scale.freshRehearsal(rule);
+    assert.equal(scale.rehearse(rule, base, { t: now, cpu: 40, ok: true, lat: 10 }, { cpuRefCores: 1, gapMs: 90_000 }).state.aboveStreak, 0);
+    assert.equal(scale.rehearse(rule, base, { t: now, cpu: 40, ok: true, lat: 10 }, { cpuRefCores: 1, gapMs: 90_000, realCopies: 2 }).state.aboveStreak, 1);
+    const sst = scale.scaleStatus({ app: "pool-a" }).apps[0];
+    assert.deepEqual([sst.copies, sst.wantedCopies], [3, 3]);
+
+    // MCP: reading is free, inviting needs a destroy token and a person, changing copies needs deploy.
+    const mcpText = async (args: Record<string, unknown>, level: "read" | "deploy" | "destroy", tool = "paas_pool") =>
+      JSON.parse((await mcp.handleToolCall(tool, args, level)).content[0].text);
+    const status = await mcpText({ action: "status", probe: false }, "read");
+    assert.deepEqual(status.helpers.map((h: { name: string }) => h.name), ["big", "notebook", "oracle", "resting"]);
+    assert.equal(status.helpers.find((h: { name: string }) => h.name === "resting").state, "paused");
+    assert.match((await mcp.handleToolCall("paas_pool", { action: "invite", name: "pc2" }, "read")).content[0].text, /level 'deploy'/);
+    assert.match((await mcp.handleToolCall("paas_pool", { action: "invite", name: "pc2" }, "deploy")).content[0].text, /level 'destroy'/);
+    assert.equal((await mcpText({ action: "invite", name: "pc2" }, "destroy")).confirmationRequired, true);
+    assert.match((await mcp.handleToolCall("paas_scale", { action: "set", appName: "pool-a", copies: 2 }, "read")).content[0].text, /level 'deploy'/);
+    assert.equal((await mcpText({ action: "check", appName: "pool-a" }, "read")).ok, true);
+
+    // Dashboard: the Helpers screen and the copies selector answer, and the page's script compiles.
+    const dashToken = dashboard.getOrCreateDashboardToken();
+    const srv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((res) => srv.once("listening", res));
+    const baseUrl = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      assert.ok(page.includes('id="tab-pool"') && page.includes('id="copiesBox"'));
+      const scripts = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+      assert.ok(scripts.length > 0);
+      for (const code of scripts) new vm.Script(code);
+      const poolRes = await (await fetch(`${baseUrl}/api/pool`, { headers: { cookie } })).json();
+      assert.equal(poolRes.helpers.length, 4);
+      assert.match(poolRes.acl.acl, /tag:paasmcp-helper/);
+      // Copies on PCs that never answered (offline here) are not counted as running.
+      const poolApp = poolRes.apps.find((a: { app: string }) => a.app === "pool-a");
+      assert.equal(poolApp.running, 1);
+      assert.ok(poolApp.copies.length > 0 && poolApp.copies.every((c: { answering: boolean }) => c.answering === false));
+      const inviteRes = await fetch(`${baseUrl}/api/pool/invite`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify({ name: "pc3" }) });
+      assert.equal(inviteRes.status, 409);
+      const scaleRes = await (await fetch(`${baseUrl}/api/scale?app=pool-a`, { headers: { cookie } })).json();
+      assert.equal(scaleRes.pool.readiness.app, "pool-a");
+      assert.deepEqual(scaleRes.pool.copies.map((c: { helper: string }) => c.helper), ["big", "resting"]);
+    } finally {
+      srv.close();
+    }
+
+    // Back to one copy: helpers that do not answer (offline here) leave the balancer, and the balancer goes away.
+    const off = await pool.disablePool("pool-a");
+    assert.ok(off.disabled && "stopped" in off);
+    assert.deepEqual(off.stopped.map((s) => s.helper).sort(), ["big", "resting"]);
+    assert.equal(config.loadState().apps["pool-a"].pool, undefined);
+    assert.equal(config.loadState().pool?.balancerAt, undefined);
+    assert.equal(config.appServiceUrl(config.loadState().apps["pool-a"]), "http://paasmcp-pool-a:3000");
+
+    // Turning copies on (offline: no Docker image to send) keeps this server's copy and reports why.
+    await assert.rejects(pool.setCopies("pool-a", 0), /from 1 to 20/);
+    const on = await pool.setCopies("pool-a", 2);
+    assert.ok("errors" in on);
+    assert.equal(on.running, 1);
+    assert.ok(on.errors.some((e) => /offline test/.test(e.error)));
+    assert.ok(fs.readFileSync(path.join(pool.LB_DIR, "conf", "Caddyfile"), "utf-8").includes(":4100 {"));
+    assert.equal(config.loadState().apps["pool-a"].pool?.copies, 2);
+    assert.match(String(await pool.poolAfterLifecycle("pool-a", "destroy")), /stopped/);
+    assert.equal(config.loadState().apps["pool-a"].pool, undefined);
+
+    const st4 = config.loadState();
+    delete st4.apps["pool-a"];
+    delete st4.pool;
+    config.saveState(st4);
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

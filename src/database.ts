@@ -13,6 +13,7 @@ import {
   PAAS_REDIS_DIR,
   sanitizeSlug,
   saveState,
+  tailnetBindIp,
 } from "./config.js";
 import {
   encryptBinaryPayload,
@@ -52,8 +53,9 @@ export function ensureSharedPostgresCluster(): { adminUser: string; adminPass: s
   const envFile = path.join(PAAS_DB_DIR, ".env");
   fs.writeFileSync(envFile, `POSTGRES_PASSWORD=${adminPass}\n`, { mode: 0o600 });
 
-  // Published on the Tailscale IP only when a mirror peer streams from this server (pg_hba still limits who).
-  const mirrorBind = loadState().mirror?.bindIp;
+  // Published on the Tailscale IP only when a mirror peer streams from this server or helper PCs run
+  // copies of apps (pool.ts); the password and pg_hba still limit who gets in.
+  const mirrorBind = tailnetBindIp(loadState());
   const composeFile = path.join(PAAS_DB_DIR, "compose.yaml");
   const composeContent = `services:
   postgres:
@@ -117,9 +119,9 @@ export function ensureSharedRedisCluster(): { redisPass: string } {
     setSecretEntries("system", { REDIS_ROOT_PASSWORD: redisPass });
   }
 
-  // Published on the Tailscale IP when a mirror peer exists: active-active apps on the peer keep
+  // Published on the Tailscale IP when a mirror peer or helper PCs exist: app copies there keep
   // sessions and carts in this Redis (password required; Tailscale encrypts the link).
-  const mirrorBind = loadState().mirror?.bindIp;
+  const mirrorBind = tailnetBindIp(loadState());
   const composeFile = path.join(PAAS_REDIS_DIR, "compose.yaml");
   const composeContent = `services:
   redis:

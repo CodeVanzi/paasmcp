@@ -271,14 +271,15 @@ export function freshRehearsal(rule: ScaleRule): RehearsalState {
 
 /**
  * Runs the decision rule on one sample as if the app could have more copies. `copies` is how many
- * copies the rule would be running by now; the measured CPU (one real copy carries all the load) is
- * spread over them. Pure: returns the next state and, when something would happen, a diary event.
+ * copies the rule would be running by now; the measured CPU (of this server's copy) is spread over them.
+ * With copies on helper PCs (`realCopies`, set by hand in phase 3), this server's copy carries only its
+ * share of the visits, so the whole load is estimated as its CPU times the real copies. Pure: returns the next state and, when something would happen, a diary event.
  */
 export function rehearse(
   rule: ScaleRule,
   prev: RehearsalState,
   s: Pick<Sample, "t" | "cpu" | "ok" | "lat">,
-  opts: { cpuRefCores: number; gapMs: number; path?: string }
+  opts: { cpuRefCores: number; gapMs: number; path?: string; realCopies?: number }
 ): { state: RehearsalState; event?: { kind: DiaryKind; p: Record<string, number | string> } } {
   const st: RehearsalState = { ...prev };
   st.copies = Math.min(rule.max, Math.max(rule.min, st.copies || rule.min));
@@ -308,7 +309,7 @@ export function rehearse(
   }
   if (s.cpu === null) return { state: st, event: recovered };
 
-  const perCopy = s.cpu / opts.cpuRefCores / st.copies;
+  const perCopy = (s.cpu * Math.max(1, opts.realCopies ?? 1)) / opts.cpuRefCores / st.copies;
   const inCooldown = st.lastActionAt !== undefined && s.t - st.lastActionAt < rule.cooldownSeconds * 1000;
 
   if (perCopy > rule.targetCpu) {
@@ -597,6 +598,12 @@ function takeLock(): boolean {
   }
 }
 
+/** Copies of the app running now: this server's plus those on helper PCs (pool.ts). */
+export function realCopies(app: Pick<AppRecord, "pool">): number {
+  if (!app.pool?.enabled || app.pool.stoppedAt) return 1;
+  return 1 + app.pool.placed.length;
+}
+
 /** Apps that can be measured here (only those whose container is running get a sample). */
 export function measuredApps(state: PaaSState): AppRecord[] {
   return Object.values(state.apps).filter((a) => !a.trashedAt);
@@ -680,7 +687,7 @@ export async function scaleTick(
       ensureScaleDir();
       appendHistory(app.name, done, now);
 
-      const r = rehearse(rule, file.rehearsal, sample, { cpuRefCores: cpuReference(app), gapMs, path: app.healthcheckPath || "/" });
+      const r = rehearse(rule, file.rehearsal, sample, { cpuRefCores: cpuReference(app), gapMs, path: app.healthcheckPath || "/", realCopies: realCopies(app) });
       file.rehearsal = r.state;
       let eventText: string | undefined;
       if (r.event) {
@@ -710,6 +717,11 @@ export interface AppScaleStatus {
   cpuLimited: boolean;
   /** Copies the rehearsal would be running now. */
   rehearsalCopies: number;
+  /** Copies really running now (this server's plus those on helper PCs, set by hand). */
+  copies: number;
+  /** Copies asked for by hand (`scale set`); absent when the app runs only here. */
+  wantedCopies?: number;
+  poolError?: string;
   rule: ScaleRule;
   capacity?: CapacityResult;
   lastEvent?: { t: string; text: string };
@@ -742,6 +754,9 @@ export function scaleStatus(opts: { app?: string; lang?: DiaryLang; now?: number
         cpuReferenceCores: ref,
         cpuLimited: Boolean(app.cpuLimit),
         rehearsalCopies: file?.rehearsal.copies ?? ruleFor(app).min,
+        copies: realCopies(app),
+        ...(app.pool?.enabled ? { wantedCopies: app.pool.copies } : {}),
+        ...(app.pool?.lastError ? { poolError: app.pool.lastError } : {}),
         rule: ruleFor(app),
         ...(app.scale?.capacity ? { capacity: app.scale.capacity } : {}),
         ...(ev ? { lastEvent: { t: ev.t, text: renderDiary(ev, lang) } } : {}),

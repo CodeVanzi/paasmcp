@@ -119,6 +119,49 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `Sends up to ${Number(params.maxConcurrency) || 32} parallel GET requests to app '${subject}' on ${String(params.path || "/")} for up to a few minutes, to find how much one copy handles. Visitors may find the app slower meanwhile. Use a path that only reads (it is called thousands of times).`,
         `Manda até ${Number(params.maxConcurrency) || 32} requisições GET ao mesmo tempo para o app '${subject}' em ${String(params.path || "/")} por até alguns minutos, para descobrir quanto uma cópia aguenta. Quem visitar o app nesse meio tempo pode achá-lo mais lento. Use um caminho que só lê (ele é chamado milhares de vezes).`,
         params);
+    case "pool.invite": {
+      const helper = String(params.helper);
+      return risk(action, helper, "confirm",
+        `Creates a one-use invite for the PC '${helper}'. Whoever runs it on a PC within 15 minutes lets this server give that PC orders: run copies of the apps you choose there, with their variables (secrets included). The first time, this server's Postgres, Redis and S3 are also published on its Tailscale IP (a few seconds of restart), so those copies can reach them.`,
+        `Cria um convite de uso único para o PC '${helper}'. Quem rodar o convite num PC nos próximos 15 minutos deixa este servidor dar ordens a ele: rodar lá cópias dos apps que você escolher, com as variáveis deles (inclusive senhas). Na primeira vez, o Postgres, o Redis e o S3 deste servidor também passam a ser publicados no IP Tailscale dele (alguns segundos de reinício), para essas cópias alcançarem.`,
+        params);
+    }
+    case "pool.remove": {
+      const helper = String(params.helper);
+      return risk(action, helper, "confirm",
+        `The PC '${helper}' leaves the pool: its copies leave the balancer, get 30 s to finish the visits in progress and stop, and this server's key is removed from it. Copies move to other helpers when there is room.`,
+        `O PC '${helper}' sai do pool: as cópias dele saem do balanceador, têm 30 s para terminar as visitas em curso e param, e a chave deste servidor é apagada de lá. As cópias vão para outros ajudantes quando houver espaço.`,
+        params);
+    }
+    case "app.pool": {
+      // Free while the app already uses helpers and stays within its scale rule's maximum (decided in
+      // the plan: moving inside limits a person set is free; the first time and going past them is not).
+      const copies = Number(params.copies);
+      const max = Number(params.max);
+      if (!(copies > 1) || (!params.enabling && copies <= max)) return null;
+      if (!params.enabling) {
+        return risk(action, subject, "confirm",
+          `App '${subject}' goes to ${copies} copies, above the maximum of ${max} in its scale rule.`,
+          `O app '${subject}' vai para ${copies} cópias, acima do máximo de ${max} da regra de escala dele.`,
+          params);
+      }
+      return risk(action, subject, "confirm",
+        `App '${subject}' will run ${copies} copies: this server's and ${copies - 1} on helper PCs. Each helper receives the app's image and variables (secrets included, kept only in memory there), its copies reach this server's database, Redis and S3 over Tailscale, and the app's visits go through a small balancer on this server.`,
+        `O app '${subject}' vai rodar ${copies} cópias: a deste servidor e ${copies - 1} em PCs ajudantes. Cada ajudante recebe a imagem e as variáveis do app (inclusive senhas, guardadas só na memória dele), as cópias acessam o banco, o Redis e o S3 daqui pela Tailscale, e as visitas do app passam por um pequeno balanceador neste servidor.`,
+        params);
+    }
+    case "pool.join": {
+      const origin = String(params.origin);
+      return risk(action, origin, "confirm",
+        `This PC will take orders from the server '${origin}' (${String(params.originIp)}): a user 'paasmcp-worker' is created in the docker group, and that server's key can run app copies here (up to ${String(params.cpus)} CPUs and ${String(params.memMb)} MB), and nothing else: no terminal, no files. Undo with 'sudo paasmcp pool leave'.`,
+        `Este PC vai receber ordens do servidor '${origin}' (${String(params.originIp)}): é criado um usuário 'paasmcp-worker' no grupo docker, e a chave daquele servidor pode rodar cópias de apps aqui (até ${String(params.cpus)} CPUs e ${String(params.memMb)} MB), e nada mais: sem terminal, sem arquivos. Para desfazer: 'sudo paasmcp pool leave'.`,
+        params);
+    }
+    case "pool.leave":
+      return risk(action, "pool", "confirm",
+        "The app copies running on this PC stop, their images are removed, and the user 'paasmcp-worker' with the server's key is deleted. Remove the PC on the server too ('paasmcp pool remove <name>').",
+        "As cópias de apps que rodam neste PC param, as imagens delas são apagadas e o usuário 'paasmcp-worker' com a chave do servidor é removido. Remova o PC no servidor também ('paasmcp pool remove <nome>').",
+        params);
     case "update.apply":
       return risk(action, String(params.component), "confirm",
         `${String(params.component)} restarts on ${String(params.image)} (a few seconds of downtime for every app that uses it). Databases are backed up first; if it does not come back healthy in 60 s, the previous version is restored.`,

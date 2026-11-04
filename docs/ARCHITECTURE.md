@@ -21,7 +21,9 @@ By default, PaaSMCP stores all runtime state under `PAASMCP_ROOT` (`/opt/homelab
 │   │   └── <app-slug>.enc.json   # Encrypted environment variables per application
 │   ├── backups/
 │   │   └── <id>.enc.bak          # Binary AES-256-GCM encrypted pg_dump / Redis / volume snapshots (mode 0600)
-│   └── mirror/<peer>/            # Streaming copy of a peer's Postgres (its own compose.yaml + data/)
+│   ├── mirror/<peer>/            # Streaming copy of a peer's Postgres (its own compose.yaml + data/)
+│   └── pool/                     # Helper pool: pool_ed25519 (own SSH key, 0600), known_hosts (pinned PCs), seen.json (last answers)
+├── paasmcp-pool-lb/              # Pool balancer (Caddy), only while an app has copies on helper PCs
 ├── paasmcp-postgres/             # Shared PostgreSQL 16 cluster (127.0.0.1:5432)
 ├── paasmcp-redis/                # Shared Redis 7 cluster (127.0.0.1:6379)
 ├── paasmcp-garage/               # Garage S3 object storage (127.0.0.1:3900, admin 127.0.0.1:3903)
@@ -287,7 +289,93 @@ Phase 1 of the automatic scaling plan only measures and rehearses; it never star
   per-copy target. The client runs on the same server, so the numbers are a lower bound.
 - **Not measured yet:** requests per second per app in live traffic. Cloudflare Tunnel and the Caddy edge
   (2.8) do not split their counters by site, so phase 1 decides on CPU and uses the capacity test for
-  requests per second; a per-app counter comes when the balancer of phase 3 sits in the traffic path.
+  requests per second; a per-app counter can come from the phase 3 balancer (below) when phase 4 needs it.
+- **With copies on helpers** (phase 3), this server's copy carries only its share of the visits, so the
+  rehearsal estimates the whole load as its CPU times the copies really running (`realCopies`);
+  `scale status` shows both numbers.
+
+## 10b. Helper pool, phase 3: your own PCs, copies set by hand (`src/pool.ts`, `src/poolproto.ts`, `src/worker.ts`, `src/pooljoin.ts`)
+
+The origin keeps everything (vault, image, decisions, entry); a helper PC only runs stateless copies when
+told. Nothing is resident on a helper: each order is one SSH session that runs `worker.js` and exits.
+
+- **Join** (`pool invite <name>`, guard `pool.invite`, confirm): first, `preparePool` picks this server's
+  Tailscale IP (`--advertise`, else the mirror's, else `tailscale ip -4`; a mirror on a different address
+  is refused) and republishes Postgres, Redis and Garage there (`tailnetBindIp`, a few seconds of restart,
+  once). The invite is `paasmcp-pool://` + base64url JSON: name, this server's node id, name, Tailscale IP,
+  the pool's public key (`pool/pool_ed25519`, created once, never the Git deploy key), a proof key and an
+  expiry (15 min, checked against the PC's clock). The proof key is HMAC(`POOL_INVITE_KEY` in the system
+  vault, invite id), so `state.json` keeps only the id. On the PC, `sudo node dist/cli.js pool join`
+  (`pooljoin.ts`, guard text `pool.join`, asked at the terminal, nothing written to PaaSMCP's own files)
+  checks Docker, the `docker` group and sshd, then: a system user `paasmcp-worker` (password `*`, in the
+  `docker` group); a root-owned copy of `worker.js` + `poolproto.js` in `/usr/local/lib/paasmcp-worker`
+  (Node.js must be installed for every user); `authorized_keys` with one line,
+  `from="<origin IP>",command="<node> /usr/local/lib/paasmcp-worker/worker.js",restrict <key>`;
+  `worker.json` (0600: origin, invite id, proof key, what the owner gives: `--cpus`, `--memory`, default
+  half); and `/etc/tmpfiles.d/paasmcp-worker.conf` for `/run/paasmcp-worker` (0700, tmpfs, recreated at
+  boot, no service). It then runs `worker.js --selftest` as that user. `pool add <name> <ip>` (within an
+  hour) connects with `StrictHostKeyChecking=accept-new` under `HostKeyAlias=paasmcp-pool-<name>`, sends
+  `hello` with a fresh nonce and accepts the PC only if it answers HMAC(proof key, id, nonce, name); the
+  PC deletes its proof key after answering, so an invite works once. From then on every SSH call uses
+  `StrictHostKeyChecking=yes`, `BatchMode`, `IdentitiesOnly`, the pool's own `known_hosts` and a 6 s
+  connect timeout. `pool update-worker` reinstalls the worker after PaaSMCP is updated on the PC;
+  `pool leave` undoes everything there.
+- **Orders** (`parseOrder`): `SSH_ORIGINAL_COMMAND` is an order name and at most two arguments, each
+  matched against a fixed pattern: `hello`, `facts`, `list`, `has-image <tag> <fingerprint>`,
+  `load <tag> <fingerprint>` (image on stdin), `run` (JSON spec on stdin, at most 1 MB), `stop <copy>`,
+  `logs <copy>` (40 lines), `forget`. Anything else, including no command, is refused; the answer is one
+  JSON line. Everything a PC sends back is validated (`validateFacts`, `validateCopyList`: names, numbers
+  clamped, versions stripped) and treated as data.
+- **Image:** the fingerprint is SHA-256 over the layer digests and the config a container runs with
+  (architecture, OS, entrypoint, cmd, env, user, workdir, ports), because the image `Id` differs between
+  Docker's classic and containerd stores. If the PC lacks it, the origin tags `paasmcp-pool/<app>:<fp12>`,
+  pipes `docker save` through `ssh -C` into `docker load`, and the PC removes it unless its fingerprint
+  matches. Each PC keeps only the newest image of each app; a PC of another CPU architecture is skipped.
+- **Copies** (`buildRunArgs`): `docker run -d --restart no --memory --cpus --pids-limit 1024
+  --security-opt no-new-privileges`, published only on the IP the order arrived on (`SSH_CONNECTION`,
+  the PC's Tailscale IP), `--add-host` for `paasmcp-postgres`, `paasmcp-redis` and `paasmcp-garage`
+  pointing at the origin, so the app's variables are the same as here. CPU and memory are the app's limits
+  capped by what the owner gave (the whole share if the app has none); the worker refuses a copy that would
+  pass the share. **Variables:** the spec carries the same values as this server's `.env.runtime`; the
+  worker writes them as one shell-quoted file in `/run/paasmcp-worker` (it checks: a real directory of
+  this user, mode 700, tmpfs) and bind-mounts it read-only at `/run/paasmcp/env`; the entrypoint becomes
+  `/bin/sh -c 'set -a; . /run/paasmcp/env; set +a; exec "$@"'` followed by the image's own entrypoint and
+  command. Never `--env`/`--env-file`, which Docker keeps in the container's config on disk. The file is
+  deleted when the copy stops; a reboot wipes the folder and copies do not restart by themselves.
+- **Balancer** (`paasmcp-pool-lb`, Caddy 2.8, `mem_limit 128m`, on the Docker network, no published port,
+  admin on a unix socket): one site per pooled app on the app's own port number, with this server's
+  container and each helper copy (`<PC IP>:<port>`), round robin, `lb_try_duration 5s`, active health
+  checks on the app's health path every 3 s (2 s timeout, 2xx, out after 2 failures, back after 1). It
+  exists only while an app uses helpers. Turning copies on moves the app's Cloudflare Tunnel hostnames to
+  `http://paasmcp-pool-lb:<port>` (`appServiceUrl`, also used by `expose`), and `scale off` moves them
+  back before the balancer forgets the app. A self-hosted edge on this server lists the helper copies as
+  backends directly (`edgeBackends`).
+- **Reconcile** (`reconcilePool`, under the state lock): asks every PC what it runs (`list`, in
+  parallel), then (1) copies that are gone, stopped, on paused PCs or beyond the number wanted leave the
+  balancer, get `PAASMCP_POOL_DRAIN_SECONDS` (30) and stop; a PC that does not answer keeps its copy in the
+  balancer only if it is current, where the health checks decide; copies no record knows are stopped;
+  (2) copies with an older image, other variables or other limits are replaced one at a time on the same
+  PC (image sent first, old copy drained and stopped, new one must answer its health path with 2xx from
+  here); (3) missing copies go to reachable, unpaused PCs of the same architecture with room, the one with
+  the most free CPU first, at most one copy of an app per PC. It runs after `scale set`, deploys,
+  rollbacks, restarts, start/stop, destroy (`poolAfterLifecycle`) and pool changes. A fenced server
+  (`mirror watch`) stops every helper copy at once, without draining.
+- **Who may use it:** `poolReadiness` refuses the dashboard, apps in the trash, apps from a peer,
+  active-active apps (a pooled app is refused by `activeReadiness` too), apps with their own compose,
+  trusted apps, apps without an HTTP health check, and a fenced server; it warns about a `/` health path,
+  missing limits, zero-trust apps (copies sit on Tailscale IPs, outside Cloudflare Access), variables
+  pointing at `localhost` or at containers that exist only here, and no PC added yet. Enabling also
+  requires this server's copy to answer its health path with 2xx.
+- **Guard:** `pool.invite` and `pool.remove` confirm; `app.pool` confirms the first time an app goes above
+  one copy and whenever it goes above its scale rule's `max`; moving within that is free (the plan's
+  "within limits a person already set"). MCP: `paas_pool` and `paas_scale set|off`.
+- **Tailscale:** `pool acl` prints rules for the tag `tag:paasmcp-helper`: this server reaches helpers on
+  22 and 4000-4998; helpers reach only 5432, 6379 and 3900 here. Helpers are not given an auth key: a
+  node that sleeps (a notebook) must not drop off the Tailnet as an ephemeral one would.
+- **Limits of this phase:** only the owner's own PCs (whoever controls a PC can read the variables of the
+  copies it runs); requests in progress on a PC that vanishes are lost (new ones go elsewhere within about
+  6 s, retried while connecting); copies of one app may briefly run two versions during a rolling
+  replace; no automatic decisions (phase 4).
 
 ## 11. Environment variables
 
@@ -305,6 +393,9 @@ Phase 1 of the automatic scaling plan only measures and rehearses; it never star
 | `PAASMCP_ARBITER_KEY` | — | Key(s) for `paasmcp arbiter serve` (from `paasmcp arbiter key`), comma-separated for several clusters, instead of `--key`. |
 | `PAASMCP_ARBITER_ENV_FILE` | `/etc/paasmcp-arbiter.env` | Where the arbiter device keeps its keys (0600). |
 | `PAASMCP_MIRROR_NAME_SUFFIX`, `PAASMCP_MIRROR_PORT_BASE` | —, `5433` | Labs only: copy container name suffix and first local port, so several copies of one server fit on one Docker host. |
+| `PAASMCP_POOL_DRAIN_SECONDS` | `30` | Seconds a helper copy keeps its visits in progress after it leaves the balancer, before it stops. |
+| `PAASMCP_WORKER_HOME`, `PAASMCP_WORKER_RUN_DIR` | `/var/lib/paasmcp-worker`, `/run/paasmcp-worker` | Tests only: where the helper's worker keeps its settings and the in-memory variables folder. |
+| `PAASMCP_WORKER_ALLOW_DISK` | — | Tests only: `1` lets the worker write variables outside tmpfs. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
 
 ## 12. Test labs
@@ -314,6 +405,14 @@ Phase 1 of the automatic scaling plan only measures and rehearses; it never star
   steady load and after it. CPU must reach the limit under load (and not read far above it), traffic and a
   slower answer must show, the rehearsal must climb and come back to one copy without flapping, the
   history must get one point per minute, files must be 0600, and the capacity test must blame the app's CPU.
+- `scripts/pool-lab.sh`: scale phase 3 with real Docker. Two Ubuntu containers with Docker inside and sshd
+  play helper PCs on a lab network whose gateway plays this server's Tailscale IP. Both join and are added;
+  the SSH key gives no command, no shell, no terminal, no forwarding, and is refused from another machine;
+  an app that counts visits in Redis runs 3 copies and every copy answers, shares Redis and got the secret,
+  which is in no container setting and nowhere on a PC's disk; under 4 parallel visitors a PC is cut off
+  the network: from 10 s after the cut every visit succeeds in under a second; pause and resume; a new
+  deploy rolls every copy to v2; `scale off`, `pool remove` (the key stops working) and `pool leave`.
+  Builds its helper image if missing (`POOL_LAB_BUILD_FLAGS` passes extra build flags).
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,
