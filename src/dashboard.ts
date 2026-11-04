@@ -1247,7 +1247,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <button class="nav-btn" onclick="switchTab('federation', this)" id="navFederation">🔗 Conexões e webhook</button>
           <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Diagnóstico</button>
           <button class="nav-btn" onclick="switchTab('agents', this)" id="navAgents">🤖 Conectar IA</button>
-          <button class="nav-btn" onclick="switchTab('help', this)" id="navHelp">❓ Ajuda</button>
         </nav>
       </div>
       <div class="sidebar-footer">
@@ -1931,16 +1930,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
         </div>
 
-        <div class="tab-pane" id="tab-help">
-          <div class="card">
-            <div class="card-header">
-              <h2 data-i18n="helpTitle"></h2>
-              <p class="card-desc" data-i18n="helpDesc"></p>
-            </div>
-            <div id="helpGlossary"></div>
-          </div>
-        </div>
-
         <!-- TAB 5: DOCTOR & DIAGNOSTICS -->
         <div class="tab-pane" id="tab-doctor">
           <div class="card">
@@ -2567,7 +2556,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "navFederation": "🔗 Conexões e webhook",
           "navDoctor": "🩺 Diagnóstico",
           "navAgents": "🤖 Conectar IA",
-          "navHelp": "❓ Ajuda",
           "homeTitle": "🏠 Início",
           "setupTitle": "🧭 Integrações opcionais",
           "appsTitle": "📦 Seus apps",
@@ -2835,25 +2823,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "compRedis": "Cache (Redis)",
           "compGarage": "Arquivos (Garage)",
           "updatesMajorQ": "E as versões grandes (ex.: PostgreSQL 17)?",
-          "updatesMajorA": "Mudam o formato dos dados e precisam de migração própria. O painel não instala sozinho.",
-          "helpTitle": "❓ Ajuda",
-          "helpDesc": "As palavras que aparecem no painel, em uma frase cada. Detalhes técnicos estão em docs/ARCHITECTURE.md no repositório.",
-          "glApp": "App",
-          "glAppDesc": "Um site ou sistema seu rodando no servidor.",
-          "glBackup": "Cópia de segurança",
-          "glBackupDesc": "Foto dos seus dados para recuperar se algo quebrar.",
-          "glOffsite": "Fora do servidor",
-          "glOffsiteDesc": "Cópia guardada em outro lugar, para o caso de o servidor inteiro se perder.",
-          "glMirror": "Segundo servidor",
-          "glMirrorDesc": "Outra máquina que guarda uma cópia ao vivo e pode assumir os apps.",
-          "glArbiter": "Juiz",
-          "glArbiterDesc": "Terceiro aparelho que decide quem assume quando os dois servidores perdem contato.",
-          "glApproval": "Pedido de aprovação",
-          "glApprovalDesc": "Ação arriscada pedida pela IA que só acontece se você aprovar no Início.",
-          "glTrash": "Lixeira",
-          "glTrashDesc": "App apagado fica guardado por um tempo antes de sumir de vez.",
-          "glScope": "Escopo",
-          "glScopeDesc": "A gaveta de senhas de cada app. “system” guarda as chaves do próprio painel."
+          "updatesMajorA": "Mudam o formato dos dados e precisam de migração própria. O painel não instala sozinho."
     });
     Object.assign(I18N.en, {
           "sidebarSubtitle": "Your app server",
@@ -2867,7 +2837,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "navFederation": "🔗 Connections & webhook",
           "navDoctor": "🩺 Diagnostics",
           "navAgents": "🤖 Connect AI",
-          "navHelp": "❓ Help",
           "homeTitle": "🏠 Home",
           "setupTitle": "🧭 Optional integrations",
           "appsTitle": "📦 Your apps",
@@ -3124,25 +3093,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "compRedis": "Cache (Redis)",
           "compGarage": "Files (Garage)",
           "updatesMajorQ": "What about big versions (e.g. PostgreSQL 17)?",
-          "updatesMajorA": "They change the data format and need their own migration. The dashboard does not install them by itself.",
-          "helpTitle": "❓ Help",
-          "helpDesc": "The words you see in the dashboard, one sentence each. Technical details are in docs/ARCHITECTURE.md in the repository.",
-          "glApp": "App",
-          "glAppDesc": "A site or system of yours running on the server.",
-          "glBackup": "Backup",
-          "glBackupDesc": "A snapshot of your data to recover if something breaks.",
-          "glOffsite": "Off the server",
-          "glOffsiteDesc": "A copy kept somewhere else, in case the whole server is lost.",
-          "glMirror": "Second server",
-          "glMirrorDesc": "Another machine that keeps a live copy and can take over the apps.",
-          "glArbiter": "Arbiter",
-          "glArbiterDesc": "A third device that decides who takes over when the two servers lose contact.",
-          "glApproval": "Approval request",
-          "glApprovalDesc": "A risky action the AI asked for that only happens if you approve it on Home.",
-          "glTrash": "Trash",
-          "glTrashDesc": "A deleted app is kept for a while before it is gone for good.",
-          "glScope": "Scope",
-          "glScopeDesc": "Each app's password drawer. “system” holds the dashboard's own keys."
+          "updatesMajorA": "They change the data format and need their own migration. The dashboard does not install them by itself."
     });
 
     Object.assign(I18N.pt, {
@@ -3249,7 +3200,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
       'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
       'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navUpdates', 'navHelp', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
       'topHealthBadge', 'btnRefresh', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -3643,8 +3594,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         '<div style="color:var(--muted);margin-top:4px;">' + esc(t(st[0] + 'Desc')) + '</div></div>' +
         (st[1] ? badge('success', t('done')) : '<button class="secondary" onclick="goTab(&#39;' + st[2] + '&#39;)">' + esc(t('openStep')) + '</button>') +
         '</div>')).join('');
-      const g = document.getElementById('helpGlossary');
-      if (g) g.innerHTML = ['App', 'Backup', 'Offsite', 'Mirror', 'Arbiter', 'Approval', 'Trash', 'Scope'].map(k => card('<strong>' + esc(t('gl' + k)) + '</strong><div style="color:var(--muted);margin-top:4px;">' + esc(t('gl' + k + 'Desc')) + '</div>')).join('');
     }
 
     async function loadEmail() {
