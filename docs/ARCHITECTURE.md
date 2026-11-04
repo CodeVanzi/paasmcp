@@ -151,8 +151,10 @@ There is still **one writer**: the origin's Postgres.
   start empty), keeping the commit it already ran.
 - **Uploaded files** (`src/filesync.ts`): for each active app with S3 secrets, the peer creates the same bucket
   on its own Garage and imports the **same access key** (admin API, `ensureBucketWithImportedKey`), so the app's
-  `S3_*` variables keep working there after a failover. At most once a minute (retried on the next round after
-  an error) it lists both buckets with the app's key (SigV4) and copies new or changed objects from the origin's
+  `S3_*` variables keep working there after a failover. `syncActiveFiles` runs in the background of `mirror watch`,
+  outside the state lock, so a slow or unreachable origin never delays a failover check or a deploy (`active sync`
+  and `poll run` call it directly, with a 5-minute budget). It stops between objects as soon as this server takes
+  over. At most once a minute (sooner after an error or an unfinished run) it lists both buckets with the app's key (SigV4) and copies new or changed objects from the origin's
   S3 API on its Tailscale IP, deleting what the origin deleted. Objects go through memory one at a time; above
   512 MB they are skipped and counted in the status. An empty origin bucket next to a non-empty copy is refused
   (nothing deleted). `mirror handback` first copies back, without deleting, what was uploaded on the peer while

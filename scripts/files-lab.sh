@@ -90,8 +90,11 @@ docker run -d --name paasmcp-garage-b -p 127.0.0.1:3910:3900 -p 127.0.0.1:3913:3
 # Layout for B's node (ensureGarage without Docker: the container above already runs).
 runB "process.env.PAASMCP_OFFLINE_TEST='1';const st=await import('$REPO/dist/storage.js');await st.ensureGarage(1);"
 
-SYNC="const a=await import('$REPO/dist/active.js');const r=await a.syncActivePeers({read:()=>process.argv[1],deploy:async()=>undefined,now:Number(process.argv[2]||Date.now())});
-const x=r[0];console.log(JSON.stringify({status:x.status,files:x.files,errors:x.errors}));"
+# One round as on the peer: import/deploy (stubbed), then the bucket copy (run outside the lock by mirror watch).
+SYNC="const a=await import('$REPO/dist/active.js');const p=await a.syncActivePeers({read:()=>process.argv[1],deploy:async()=>undefined});
+if(p[0].errors.length)throw new Error(JSON.stringify(p[0].errors));
+const f=await a.syncActiveFiles({now:Number(process.argv[2]||Date.now())});const errors=f.filter(x=>x.error).map(x=>({app:x.app,error:'files: '+x.error}));
+console.log(JSON.stringify({status:errors.length?'error':f.length?'applied':'unchanged',files:f.filter(x=>!x.error).map(({peer,error,...x})=>x),errors}));"
 syncB() { runB "$SYNC" "$MANIFEST" "${1:-}"; }
 
 step "B imports the shop and copies its bucket (same name, same key)"

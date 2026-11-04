@@ -1095,33 +1095,44 @@ volumes:
       assert.match(fs.readFileSync(path.join(edge.EDGE_DIR, "compose.yaml"), "utf-8"), /image: caddy:2\.8\.4-alpine/);
       assert.equal(active.activeStatus().apps.find((a) => a.app === "shop")?.entries.edge[0], "shop.example.com");
 
-      // Uploaded files: the peer refreshes its copy of the bucket, at most once a minute unless it failed.
+      // Uploaded files: the peer refreshes its copy of the bucket, at most once a minute unless it failed
+      // or did not finish. It runs outside the state lock; only the short writes go through `lock`.
       const fileCalls: string[] = [];
-      let fileResult: { copied: number; removed: number; tooLarge: string[]; errors: string[] } = { copied: 2, removed: 1, tooLarge: ["big.iso"], errors: [] };
+      let fileResult: { copied: number; removed: number; tooLarge: string[]; unsafe: string[]; errors: string[]; partial?: boolean } = { copied: 2, removed: 1, tooLarge: ["big.iso"], unsafe: [], errors: [] };
+      let locked = 0;
+      let budgetLeft = true;
       const syncFiles = (now: number) =>
-        active.syncActivePeers({
-          read: () => body, deploy: async () => undefined, stop: () => undefined, now,
-          files: async (rec, app, env) => {
+        active.syncActiveFiles({
+          now,
+          lock: (fn) => void (locked++, fn()),
+          files: async (rec, app, env, keepGoing) => {
             fileCalls.push(`${rec.peerName}:${app}:${env.S3_BUCKET}:${active.bucketTargets(rec, env).origin.endpoint}`);
+            budgetLeft = keepGoing();
             return fileResult;
           },
         });
       const t0 = Date.parse("2026-01-01T00:00:00Z");
-      res = (await syncFiles(t0)).find((r) => r.peer === "server-a")!;
+      let filesOut = await syncFiles(t0);
       assert.deepEqual(fileCalls, ["server-a:shop:shop-files:http://100.64.0.1:3900"], "the origin's Garage is reached on its Tailscale IP");
-      assert.equal(res.status, "applied");
-      assert.deepEqual(res.files, [{ app: "shop", copied: 2, removed: 1 }]);
+      assert.deepEqual(filesOut, [{ peer: "server-a", app: "shop", copied: 2, removed: 1 }]);
+      assert.equal(budgetLeft, true);
+      assert.equal(locked, 1, "state written under the lock");
       assert.equal(config.loadState().apps.shop.activeSync?.files?.tooLarge, 1);
       assert.equal(config.loadState().apps.shop.activeSync?.commit, sha2, "the file copy keeps the deploy record");
       await syncFiles(t0 + 30_000);
       assert.equal(fileCalls.length, 1, "throttled");
-      fileResult = { copied: 0, removed: 0, tooLarge: [], errors: ["PUT a.jpg: HTTP 500"] };
-      res = (await syncFiles(t0 + active.FILES_EVERY_MS)).find((r) => r.peer === "server-a")!;
-      assert.equal(res.status, "error");
-      assert.match(res.errors[0].error, /files: PUT a\.jpg/);
-      assert.equal(active.activeStatus().apps.find((a) => a.app === "shop")?.files?.error, "PUT a.jpg: HTTP 500");
+      fileResult = { copied: 1, removed: 0, tooLarge: [], unsafe: [], errors: [], partial: true };
+      filesOut = await syncFiles(t0 + active.FILES_EVERY_MS);
+      assert.equal(filesOut[0].partial, true);
       await syncFiles(t0 + active.FILES_EVERY_MS + 1000);
-      assert.equal(fileCalls.length, 3, "a failed copy is retried on the next round");
+      assert.equal(fileCalls.length, 3, "an unfinished copy continues on the next round");
+      fileResult = { copied: 0, removed: 0, tooLarge: [], unsafe: [], errors: ["PUT a.jpg: HTTP 500"] };
+      filesOut = await syncFiles(t0 + active.FILES_EVERY_MS + 2000);
+      assert.equal(filesOut[0].error, "PUT a.jpg: HTTP 500");
+      assert.equal(active.activeStatus().apps.find((a) => a.app === "shop")?.files?.error, "PUT a.jpg: HTTP 500");
+      await syncFiles(t0 + active.FILES_EVERY_MS + 3000);
+      assert.equal(fileCalls.length, 5, "a failed copy is retried on the next round");
+      assert.deepEqual(await active.syncActiveFiles({ files: async () => assert.fail("no time left"), now: t0 + 9e9, budgetMs: 0 }), [], "no budget, no copy");
 
       // The origin stops running it on both: the peer stops its copy.
       body = active.encodeManifest({ ...manifest, apps: {} });
@@ -1141,6 +1152,7 @@ volumes:
       const after = active.activeComposeExtras(config.loadState(), config.loadState().apps.shop, 3000, vault.getSecrets("shop"));
       assert.deepEqual(after.extraHosts, [], "after promotion everything is local");
       assert.equal((await sync()).find((r) => r.peer === "server-a")!.status, "skipped");
+      assert.deepEqual(await active.syncActiveFiles({ files: async () => assert.fail("promoted: the local bucket is the live one now"), now: t0 + 9e9 }), []);
 
       // Pass-through compose gets the same extras.
       const composeDir = fs.mkdtempSync(path.join(tempRoot, "aa-"));
@@ -1233,13 +1245,13 @@ volumes:
       const src = { endpoint, bucket: "src", ...key };
       const dst = { endpoint, bucket: "dst", ...key };
       let r = await fsync.syncBucket(src, dst, "mirror");
-      assert.deepEqual(r, { copied: 3, removed: 1, tooLarge: [], errors: [] });
+      assert.deepEqual(r, { copied: 3, removed: 1, tooLarge: [], unsafe: [], errors: [] });
       assert.deepEqual([...buckets.dst.keys()].sort(), ["doc.pdf", "photos/a b.jpg", "photos/ç(1).png"]);
       assert.equal(buckets.dst.get("photos/ç(1).png")!.body.toString(), "B");
       assert.equal(buckets.dst.get("doc.pdf")!.type, "image/jpeg", "content type travels with the object");
       assert.ok(seenAuth.every((h) => h.startsWith("AWS4-HMAC-SHA256 Credential=GKtest/")), "every call is signed with the app's key");
       r = await fsync.syncBucket(src, dst, "mirror");
-      assert.deepEqual(r, { copied: 0, removed: 0, tooLarge: [], errors: [] }, "nothing to do the second time");
+      assert.deepEqual(r, { copied: 0, removed: 0, tooLarge: [], unsafe: [], errors: [] }, "nothing to do the second time");
       // Back on the origin after a failover: new uploads return, nothing is deleted.
       buckets.dst.set("during-outage.jpg", { body: Buffer.from("D"), type: "image/jpeg", at: "2026-02-01T00:00:00.000Z" });
       buckets.src.set("only-on-origin.jpg", { body: Buffer.from("E"), type: "image/jpeg", at });

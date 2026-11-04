@@ -346,7 +346,7 @@ export async function switchActiveActive(appName: string, on: boolean): Promise<
 /** How often the peer refreshes its copy of each app bucket (it lists both sides each time). */
 export const FILES_EVERY_MS = 60_000;
 
-type FilesFn = (rec: MirrorReplicaRecord, app: string, env: Record<string, string>) => Promise<FileSyncResult>;
+type FilesFn = (rec: MirrorReplicaRecord, app: string, env: Record<string, string>, keepGoing: () => boolean) => Promise<FileSyncResult>;
 
 /** The origin's S3 API as seen from here: its Tailscale IP, port 3900 (labs override it). */
 export const peerS3Url = (rec: MirrorReplicaRecord) => process.env.PAASMCP_PEER_S3_URL || `http://${rec.peerHost}:3900`;
@@ -357,11 +357,71 @@ export function bucketTargets(rec: MirrorReplicaRecord, env: Record<string, stri
   return { origin: { ...base, endpoint: peerS3Url(rec) }, local: { ...base, endpoint: localS3Url() } };
 }
 
-const defaultFiles: FilesFn = async (rec, app, env) => {
+const defaultFiles: FilesFn = async (rec, app, env, keepGoing) => {
   await ensureBucketWithImportedKey(env.S3_BUCKET, env.S3_ACCESS_KEY_ID, env.S3_SECRET_ACCESS_KEY, `paasmcp-${app}`);
   const t = bucketTargets(rec, env);
-  return syncBucket(t.origin, t.local, "mirror");
+  return syncBucket(t.origin, t.local, "mirror", keepGoing);
 };
+
+export interface ActiveFilesResult {
+  peer: string;
+  app: string;
+  copied: number;
+  removed: number;
+  partial?: boolean;
+  error?: string;
+}
+
+/** True while this server still follows that peer (not promoted, no failback): copying may go on. */
+const stillFollowing = (peerName: string) => {
+  const r = loadState().mirror?.replicas[peerName];
+  return !!r && !r.promotedAt && !r.failback;
+};
+
+/**
+ * Peer side: refreshes this server's copy of each active app's bucket, at most every FILES_EVERY_MS
+ * (sooner after an error or an unfinished run). Meant to run OUTSIDE the state lock (`mirror watch`
+ * starts it in the background so failover checks never wait for a copy): `lock` wraps the short
+ * state writes, and `budgetMs` bounds one run; whatever is left continues on the next one.
+ */
+export async function syncActiveFiles(
+  opts: { files?: FilesFn; now?: number; budgetMs?: number; lock?: (fn: () => void) => Promise<void> | void } = {}
+): Promise<ActiveFilesResult[]> {
+  const files = opts.files || (OFFLINE() ? undefined : defaultFiles);
+  if (!files) return [];
+  const now = opts.now ?? Date.now();
+  const deadline = Date.now() + (opts.budgetMs ?? 10 * 60 * 1000);
+  const lock = opts.lock || ((fn: () => void) => fn());
+  const out: ActiveFilesResult[] = [];
+  const state = loadState();
+  for (const rec of Object.values(state.mirror?.replicas || {})) {
+    for (const app of Object.values(state.apps)) {
+      if (!stillFollowing(rec.peerName)) break;
+      if (app.originNodeId !== rec.peerNodeId || !app.activeActive || app.trashedAt) continue;
+      const env = getSecrets(app.name);
+      if (!env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
+      const last = app.activeSync?.files;
+      if (last?.at && !last.error && !last.pending && now - Date.parse(last.at) < FILES_EVERY_MS) continue;
+      if (Date.now() >= deadline) break;
+      const keepGoing = () => Date.now() < deadline && stillFollowing(rec.peerName);
+      let record: NonNullable<NonNullable<AppRecord["activeSync"]>["files"]>;
+      try {
+        const r = await files(rec, app.name, env, keepGoing);
+        const error = r.errors.length ? r.errors.slice(0, 3).join("; ") : undefined;
+        record = { at: new Date(now).toISOString(), copied: r.copied, removed: r.removed, tooLarge: r.tooLarge.length || undefined, error, pending: r.partial || undefined };
+        if (r.copied || r.removed || error || r.partial) {
+          out.push({ peer: rec.peerName, app: app.name, copied: r.copied, removed: r.removed, ...(r.partial ? { partial: true } : {}), ...(error ? { error } : {}) });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        record = { at: new Date(now).toISOString(), error: msg };
+        out.push({ peer: rec.peerName, app: app.name, copied: 0, removed: 0, error: msg });
+      }
+      await lock(() => patchApp(app.name, (a) => (a.activeSync = { ...(a.activeSync || {}), files: record })));
+    }
+  }
+  return out;
+}
 
 type DeployFn = (app: AppRecord, commit: string | undefined) => Promise<unknown>;
 
@@ -422,8 +482,6 @@ export interface ActiveSyncResult {
   detail?: string;
   deployed: string[];
   stopped: string[];
-  /** Buckets whose copy changed in this run. */
-  files: { app: string; copied: number; removed: number; error?: string }[];
   errors: { app: string; error: string }[];
 }
 
@@ -437,12 +495,8 @@ export async function syncActivePeers(
     read?: (rec: MirrorReplicaRecord) => string | undefined;
     deploy?: DeployFn;
     stop?: (app: string) => Promise<void> | void;
-    files?: FilesFn;
-    now?: number;
   } = {}
 ): Promise<ActiveSyncResult[]> {
-  const files = opts.files || (OFFLINE() ? undefined : defaultFiles);
-  const now = opts.now ?? Date.now();
   const read = opts.read || readMetaFromCopy;
   const deploy = opts.deploy || defaultDeploy;
   const stop = opts.stop || defaultStop;
@@ -451,7 +505,7 @@ export async function syncActivePeers(
   const m = state0.mirror;
 
   for (const rec of Object.values(m?.replicas || {})) {
-    const out: ActiveSyncResult = { peer: rec.peerName, status: "unchanged", deployed: [], stopped: [], files: [], errors: [] };
+    const out: ActiveSyncResult = { peer: rec.peerName, status: "unchanged", deployed: [], stopped: [], errors: [] };
     results.push(out);
     if (rec.promotedAt || rec.failback) {
       out.status = "skipped";
@@ -531,31 +585,7 @@ export async function syncActivePeers(
       }
     }
 
-    // Uploaded files: keep a copy of each app bucket here, refreshed at most every FILES_EVERY_MS.
-    for (const name of files ? Object.keys(manifest.apps) : []) {
-      const app = loadState().apps[name];
-      if (!app || app.originNodeId !== rec.peerNodeId || !app.activeActive) continue;
-      const env = getSecrets(app.name);
-      if (!env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
-      const last = app.activeSync?.files;
-      if (last?.at && !last.error && now - Date.parse(last.at) < FILES_EVERY_MS) continue;
-      try {
-        const r = await files!(rec, app.name, env);
-        const error = r.errors.length ? r.errors.slice(0, 3).join("; ") : undefined;
-        patchApp(app.name, (a) => {
-          a.activeSync = { ...(a.activeSync || {}), files: { at: new Date(now).toISOString(), copied: r.copied, removed: r.removed, tooLarge: r.tooLarge.length || undefined, error } };
-        });
-        if (r.copied || r.removed || error) out.files.push({ app: app.name, copied: r.copied, removed: r.removed, ...(error ? { error } : {}) });
-        if (error) out.errors.push({ app: app.name, error: `files: ${error}` });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
-        patchApp(app.name, (a) => {
-          a.activeSync = { ...(a.activeSync || {}), files: { at: new Date(now).toISOString(), error: msg } };
-        });
-        out.errors.push({ app: app.name, error: `files: ${msg}` });
-      }
-    }
-    out.status = out.errors.length ? "error" : out.deployed.length || out.stopped.length || out.files.length ? "applied" : "unchanged";
+    out.status = out.errors.length ? "error" : out.deployed.length || out.stopped.length ? "applied" : "unchanged";
   }
   return results;
 }
@@ -570,7 +600,7 @@ export interface ActiveAppStatus {
   syncedAt?: string;
   error?: string;
   /** Copy side: last refresh of the local copy of the app's bucket. */
-  files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string };
+  files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string; pending?: boolean };
   entries: { tunnel: string[]; edge: string[] };
 }
 

@@ -2684,6 +2684,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaHere": "este servidor",
           "aaFiles": "arquivos copiados às {time}",
           "aaFilesErr": "cópia dos arquivos falhou",
+          "aaFilesPending": "o resto continua na próxima rodada",
           "aaFilesBig": "{n} arquivo(s) acima de 512 MB não copiados",
           "aaRemove": "Remover",
           "aaDns": "Site adicionado. Agora crie no DNS um registro A de {host} para o IP público deste servidor.",
@@ -2961,6 +2962,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaHere": "this server",
           "aaFiles": "files copied at {time}",
           "aaFilesErr": "file copy failed",
+          "aaFilesPending": "the rest continues on the next round",
           "aaFilesBig": "{n} file(s) over 512 MB not copied",
           "aaRemove": "Remove",
           "aaDns": "Site added. Now create a DNS A record for {host} pointing at this server's public IP.",
@@ -3764,6 +3766,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aaRunning')) + ': ' + esc(a.commit || '?') +
             (a.wanted ? ' · ' + esc(t('aaWanted')) + ': ' + esc(a.wanted) : '') +
             (a.files ? ' · ' + (a.files.error ? badge('danger', t('aaFilesErr') + ': ' + a.files.error) : esc(t('aaFiles').replace('{time}', new Date(a.files.at).toLocaleTimeString()))) : '') +
+            (a.files && a.files.pending && !a.files.error ? ' · ' + esc(t('aaFilesPending')) : '') +
             (a.files && a.files.tooLarge ? ' · ' + badge('warning', t('aaFilesBig').replace('{n}', String(a.files.tooLarge))) : '') + '</div>')).join('')
         : card(esc(t('aaNone')));
       const sel = document.getElementById('aaApp');

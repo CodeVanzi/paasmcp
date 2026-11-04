@@ -63,7 +63,7 @@ export interface AppRecord {
     at?: string;
     error?: string;
     /** Last refresh of this server's copy of the app's bucket. */
-    files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string };
+    files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string; pending?: boolean };
   };
 }
 

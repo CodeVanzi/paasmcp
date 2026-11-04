@@ -33,7 +33,7 @@ export async function s3Request(
   t: S3Target,
   method: "GET" | "PUT" | "DELETE" | "HEAD",
   key: string,
-  opts: { query?: Record<string, string>; body?: Buffer; contentType?: string } = {}
+  opts: { query?: Record<string, string>; body?: Buffer; contentType?: string; timeoutMs?: number } = {}
 ): Promise<Response> {
   const path = `/${enc(t.bucket)}${key ? "/" + key.split("/").map(enc).join("/") : ""}`;
   const url = new URL(`${t.endpoint.replace(/\/+$/, "")}${path}`);
@@ -49,7 +49,7 @@ export async function s3Request(
   });
   delete headers.host;
   try {
-    return await fetch(url, { method, headers, body: opts.body ? new Uint8Array(opts.body) : undefined, signal: AbortSignal.timeout(10 * 60 * 1000) });
+    return await fetch(url, { method, headers, body: opts.body ? new Uint8Array(opts.body) : undefined, signal: AbortSignal.timeout(opts.timeoutMs ?? 10 * 60 * 1000) });
   } catch (err) {
     const cause = (err as { cause?: { code?: string } }).cause?.code || (err instanceof Error ? err.message : String(err));
     throw new Error(`S3 at ${url.host} did not answer (${cause}).`);
@@ -75,7 +75,10 @@ export async function listObjects(t: S3Target): Promise<S3Object[]> {
   const all: S3Object[] = [];
   let token: string | undefined;
   for (let page = 0; page < 10_000; page++) {
-    const res = await s3Request(t, "GET", "", { query: { "list-type": "2", ...(token ? { "continuation-token": token } : {}) } });
+    const res = await s3Request(t, "GET", "", {
+      query: { "list-type": "2", ...(token ? { "continuation-token": token } : {}) },
+      timeoutMs: 20_000, // a server that went away must not hold the caller for minutes
+    });
     const text = await res.text();
     if (!res.ok) throw new Error(`List ${t.bucket} on ${t.endpoint}: HTTP ${res.status} ${text.slice(0, 200)}`);
     const { objects, next } = parseListObjects(text);
@@ -137,10 +140,23 @@ export interface FileSyncResult {
   copied: number;
   removed: number;
   tooLarge: string[];
+  /** Keys with dot segments, never copied (not an error: retrying would not change them). */
+  unsafe: string[];
   errors: string[];
+  /** Stopped early because `keepGoing` said so; the rest is done on the next run. */
+  partial?: boolean;
 }
 
-export async function syncBucket(from: S3Target, to: S3Target, mode: "mirror" | "additive"): Promise<FileSyncResult> {
+/**
+ * Makes `to` follow `from`. `keepGoing` is asked before each object: the caller's time budget, or
+ * "this server has not taken over in the meantime".
+ */
+export async function syncBucket(
+  from: S3Target,
+  to: S3Target,
+  mode: "mirror" | "additive",
+  keepGoing: () => boolean = () => true
+): Promise<FileSyncResult> {
   const source = await listObjects(from);
   const target = await listObjects(to);
   // An empty source next to a full copy looks like a reinstalled or wrong bucket, not like a shop
@@ -149,8 +165,9 @@ export async function syncBucket(from: S3Target, to: S3Target, mode: "mirror" | 
     throw new Error(`The bucket '${from.bucket}' at ${from.endpoint} is empty while the copy here has ${target.length} file(s); nothing was deleted.`);
   }
   const plan = planFileSync(source, target, mode);
-  const out: FileSyncResult = { copied: 0, removed: 0, tooLarge: plan.tooLarge, errors: plan.unsafe.map((k) => `Skipped unsafe key '${k.slice(0, 100)}'`) };
+  const out: FileSyncResult = { copied: 0, removed: 0, tooLarge: plan.tooLarge, unsafe: plan.unsafe, errors: [] };
   for (const o of plan.copy) {
+    if (!keepGoing()) return { ...out, partial: true };
     try {
       await copyObject(from, to, o);
       out.copied++;
@@ -159,6 +176,7 @@ export async function syncBucket(from: S3Target, to: S3Target, mode: "mirror" | 
     }
   }
   for (const key of plan.remove) {
+    if (!keepGoing()) return { ...out, partial: true };
     const res = await s3Request(to, "DELETE", key);
     if (res.ok || res.status === 404) out.removed++;
     else out.errors.push(`DELETE ${key}: HTTP ${res.status}`);
