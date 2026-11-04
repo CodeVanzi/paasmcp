@@ -719,6 +719,24 @@ volumes:
       assert.deepEqual((tick.fenced as { by: string }).by, "other-server");
       assert.equal(config.loadState().mirror?.fenced?.epoch, 5);
       await assert.rejects(() => deployer.deployApp({ appName: "fresh-app", repoSource: "/tmp" }), /fenced/);
+      // Dashboard check: health probe, right key, wrong key, nothing listening, bad address.
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter" });
+      const good = await mirror.checkArbiter(`${url}/arbiter`);
+      assert.equal(good.ok, true);
+      assert.equal(good.url, url, "a pasted /arbiter suffix is dropped");
+      assert.ok(good.nodes?.some((n) => n.isMe && n.secondsAgo === 0));
+      const other = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", key: "0".repeat(64), stateFile: path.join(tempRoot, "arb2.json") });
+      await new Promise((r) => other.once("listening", r));
+      const otherPort = (other.address() as { port: number }).port;
+      assert.equal((await mirror.checkArbiter(`http://127.0.0.1:${otherPort}`)).errorCode, "badKey");
+      other.close();
+      await new Promise((r) => other.once("close", r));
+      assert.equal((await mirror.checkArbiter(`http://127.0.0.1:${otherPort}`)).errorCode, "unreachable");
+      assert.equal((await mirror.checkArbiter("ftp://x; rm")).errorCode, "badUrl");
+      assert.equal((await mirror.checkArbiter()).url, url, "falls back to the saved address");
+      assert.equal(mirror.setArbiterUrl(`${url}/`).arbiterUrl, url);
+      assert.throws(() => mirror.setArbiterUrl("100.64.0.9:4097"), /Invalid arbiter URL/);
+      assert.throws(() => arbiter.installArbiterService({ host: "tailscale", port: 4097, key: "short" }), /64-character/);
     } finally {
       srv.close();
       const st3 = config.loadState();

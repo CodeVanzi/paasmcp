@@ -428,11 +428,83 @@ export async function handbackMirror(peerName: string, waitMs = 120_000): Promis
   return { peer, epoch: m.epoch, stoppedApps };
 }
 
+const ARBITER_URL_RE = /^https?:\/\/[a-zA-Z0-9.:[\]-]+(\/.*)?$/;
+
+/** Saves the arbiter address alone (both servers need it: the one that sends a copy heartbeats and gets fenced). */
+export function setArbiterUrl(arbiterUrl: string): MirrorConfig {
+  const url = arbiterUrl.trim().replace(/\/+$/, "").replace(/\/arbiter$/, "");
+  if (!ARBITER_URL_RE.test(url)) throw new Error(`Invalid arbiter URL '${arbiterUrl}'. Use http://<Tailscale IP of the arbiter>:4097`);
+  return saveMirror((m) => {
+    m.arbiterUrl = url;
+  });
+}
+
+export interface ArbiterCheck {
+  configured: boolean;
+  url?: string;
+  ok?: boolean;
+  /** Plain-language reason when the arbiter cannot be used, and a code the dashboard translates. */
+  error?: string;
+  /** The raw cause (HTTP status, network error), for the curious. */
+  detail?: string;
+  errorCode?: "badUrl" | "badKey" | "clock" | "notPaired" | "notArbiter" | "unreachable";
+  /** What the arbiter hears right now: this server and every other server it knows. */
+  nodes?: { nodeId: string; name: string; isMe: boolean; secondsAgo: number }[];
+  /** Whether `paasmcp mirror watch` (systemd) runs here; null when unknown. */
+  watchActive?: boolean | null;
+  auto?: string[];
+}
+
+/**
+ * Talks to the arbiter once (a normal heartbeat, so it is harmless) and explains the result: reachable,
+ * right key, clock in sync, which servers it hears. Used by the dashboard's "Test arbiter" button.
+ */
+export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> {
+  const m = mirrorState();
+  const url = (urlOverride || m.arbiterUrl || "").trim().replace(/\/+$/, "").replace(/\/arbiter$/, "");
+  const watchActive = OFFLINE()
+    ? null
+    : (() => {
+        try {
+          return execFileSync("systemctl", ["is-active", "paasmcp-mirror-watch.service"], { encoding: "utf-8" }).trim() === "active";
+        } catch {
+          return false;
+        }
+      })();
+  const base = { watchActive, auto: m.auto || [] };
+  if (!url) return { configured: false, ...base };
+  if (!ARBITER_URL_RE.test(url)) return { configured: true, url, ok: false, errorCode: "badUrl", error: "Invalid address. Use http://<Tailscale IP of the arbiter>:4097", ...base };
+  const state = loadState();
+  const me = state.federation?.nodeId || "primary";
+  const names: Record<string, string> = { [me]: state.federation?.nodeName || os.hostname() };
+  for (const p of Object.values(state.federation?.peers || {})) names[p.nodeId] = p.name;
+  for (const r of Object.values(m.replicas)) names[r.peerNodeId] = r.peerName;
+  try {
+    const r = await askArbiter(url, { op: "heartbeat", node: me, epoch: m.epoch });
+    const nodes = Object.entries(r.nodes || {})
+      .map(([nodeId, n]) => ({ nodeId, name: names[nodeId] || nodeId, isMe: nodeId === me, secondsAgo: Math.max(0, Math.round((r.now - n.lastSeen) / 1000)) }))
+      .sort((a, b) => Number(b.isMe) - Number(a.isMe) || a.secondsAgo - b.secondsAgo);
+    return { configured: true, url, ok: true, nodes, ...base };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const [errorCode, error]: [NonNullable<ArbiterCheck["errorCode"]>, string] = /HTTP 401/.test(msg)
+      ? ["badKey", "The arbiter answered but refused the key. On the arbiter, use the output of 'paasmcp arbiter key' from one of these servers (both give the same key once they are paired)."]
+      : /clock skew/.test(msg)
+        ? ["clock", "The arbiter answered but its clock is more than 1 minute off from this server. Turn on automatic time (NTP) on both."]
+        : /No cluster key/.test(msg)
+          ? ["notPaired", "This server is not paired with the other one yet: pair them in Connections & webhook first."]
+          : /HTTP 404/.test(msg)
+            ? ["notArbiter", "Something answered at that address, but it is not the arbiter. Check the port (default 4097)."]
+            : ["unreachable", `The arbiter did not answer (${msg.split("\n")[0].slice(0, 120)}). Check that it is running on the third device ('systemctl status paasmcp-arbiter'), that the address is its Tailscale IP and that the port is right.`];
+    return { configured: true, url, ok: false, errorCode, error, detail: msg.split("\n")[0].slice(0, 160), ...base };
+  }
+}
+
 /** Turns automatic failover on/off for a peer. On needs an arbiter (guard: forbidden without one, strong with one). */
 export function setAutoFailover(peerName: string, on: boolean, arbiterUrl?: string): MirrorConfig {
   const peer = sanitizeSlug(peerName);
   if (on && !mirrorState().replicas[peer]) throw new Error(`This server holds no copy of '${peer}'.`);
-  if (arbiterUrl && !/^https?:\/\/[a-zA-Z0-9.:[\]-]+(\/.*)?$/.test(arbiterUrl)) throw new Error(`Invalid arbiter URL '${arbiterUrl}'.`);
+  if (arbiterUrl && !ARBITER_URL_RE.test(arbiterUrl)) throw new Error(`Invalid arbiter URL '${arbiterUrl}'.`);
   return saveMirror((m) => {
     if (arbiterUrl) m.arbiterUrl = arbiterUrl;
     const set = new Set(m.auto || []);
