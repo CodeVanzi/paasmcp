@@ -1,0 +1,527 @@
+import { execFileSync } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import YAML from "yaml";
+import {
+  AppRecord,
+  loadState,
+  MirrorReplicaRecord,
+  PaaSState,
+  PAAS_APPS_DIR,
+  PAAS_REDIS_DIR,
+  sanitizeSlug,
+  saveState,
+  validateBranchName,
+  validateEnvKey,
+  validateResourceLimit,
+} from "./config.js";
+import { deployApp, manageAppLifecycle, validateHealthcheckPath, validateHealthcheckTimeout } from "./deployer.js";
+import { audit } from "./guard.js";
+import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, saveSecrets } from "./vault.js";
+
+// Active-active: an app marked here also runs on the mirror peer, and both servers take requests.
+// Writes still go to one Postgres (the origin's): on the peer, the app's container resolves
+// paasmcp-postgres / paasmcp-redis / paasmcp-garage to the origin's Tailscale IP, so the vault
+// variables are the same on both servers.
+//
+// Control channel: the origin writes an encrypted manifest (app record, vault scope, commit) into
+// its own Postgres (database paasmcp_meta). The peer's live copy receives it within seconds, and the
+// peer applies it from a run of `paasmcp active sync` (poll timer / mirror watch). No new port, no
+// new daemon: PaaSMCP stays at 0 MB while idle.
+
+const OFFLINE = () => process.env.PAASMCP_OFFLINE_TEST === "1";
+const PRIMARY = "paasmcp-postgres";
+export const META_DB = "paasmcp_meta";
+/** Shared services whose names point at the origin inside a peer's app container. */
+export const SHARED_SERVICE_NAMES = ["paasmcp-postgres", "paasmcp-redis", "paasmcp-garage"];
+const IPV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
+
+export interface ActiveManifestApp {
+  record: Partial<AppRecord>;
+  secrets: Record<string, string>;
+  /** Full SHA the origin runs. */
+  commit: string;
+  /** Hash of the secrets and deploy settings: a change redeploys the peer. */
+  configHash: string;
+}
+
+export interface ActiveManifest {
+  v: 1;
+  nodeId: string;
+  epoch: number;
+  apps: Record<string, ActiveManifestApp>;
+}
+
+function clusterKey(): Buffer {
+  const hex = getSecrets("system").FEDERATION_CLUSTER_KEY;
+  if (!hex || hex.length !== 64) throw new Error("Pair the two servers first: the control channel is encrypted with the cluster key.");
+  return Buffer.from(hex, "hex");
+}
+
+const sha256 = (s: string) => crypto.createHash("sha256").update(s).digest("hex");
+const sortedJson = (o: Record<string, unknown>) => JSON.stringify(Object.keys(o).sort().map((k) => [k, o[k]]));
+
+/** Deploy settings that travel to the peer. Everything else (paths, image tags, status) stays local. */
+const SHARED_FIELDS = [
+  "repoUrl", "branch", "localPort", "internalPort", "runtimeType", "databases", "domains", "memoryLimit",
+  "cpuLimit", "trusted", "healthcheckPath", "healthcheckTimeoutSeconds", "healthcheckDisabled", "composePassThrough",
+] as const;
+
+export function buildActiveManifest(
+  state: PaaSState,
+  secretsOf: (scope: string) => Record<string, string> = getSecrets
+): ActiveManifest {
+  const apps: Record<string, ActiveManifestApp> = {};
+  for (const app of Object.values(state.apps)) {
+    if (!app.activeActive || app.originNodeId || app.trashedAt) continue;
+    const record: Partial<AppRecord> = {};
+    for (const f of SHARED_FIELDS) if (app[f] !== undefined) (record as Record<string, unknown>)[f] = app[f];
+    const secrets = secretsOf(app.name);
+    apps[app.name] = {
+      record,
+      secrets,
+      commit: app.lastCommitSha || "",
+      configHash: sha256(sortedJson({ ...record, ...Object.fromEntries(Object.entries(secrets).map(([k, v]) => [`env:${k}`, v])) })),
+    };
+  }
+  return { v: 1, nodeId: state.federation?.nodeId || "primary", epoch: state.mirror?.epoch || 0, apps };
+}
+
+export const encodeManifest = (m: ActiveManifest, key = clusterKey()) =>
+  encryptBinaryPayload(Buffer.from(JSON.stringify(m)), key).toString("base64");
+
+export function decodeManifest(body: string, key = clusterKey()): ActiveManifest {
+  let parsed: ActiveManifest;
+  try {
+    parsed = JSON.parse(decryptBinaryPayload(Buffer.from(body.trim(), "base64"), key).toString("utf-8"));
+  } catch {
+    throw new Error("The control channel could not be decrypted (different cluster key, or the data was changed).");
+  }
+  if (parsed.v !== 1 || typeof parsed.nodeId !== "string" || typeof parsed.apps !== "object") throw new Error("Unknown control channel format.");
+  return parsed;
+}
+
+function psql(container: string, sqlText: string, db = "postgres"): string {
+  return execFileSync("docker", ["exec", "-i", container, "psql", "-U", "paasmcp_admin", "-d", db, "-tA", "-v", "ON_ERROR_STOP=1"], {
+    input: sqlText,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+}
+
+function writeMeta(body: string): void {
+  if (!/^[A-Za-z0-9+/=]+$/.test(body)) throw new Error("Unexpected manifest encoding.");
+  psql(
+    PRIMARY,
+    `SELECT 'CREATE DATABASE ${META_DB}' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname='${META_DB}')\\gexec
+REVOKE ALL ON DATABASE ${META_DB} FROM PUBLIC;
+\\c ${META_DB}
+CREATE TABLE IF NOT EXISTS active_manifest (id int PRIMARY KEY, body text NOT NULL, published_at timestamptz NOT NULL DEFAULT now());
+REVOKE ALL ON active_manifest FROM PUBLIC;
+INSERT INTO active_manifest (id, body) VALUES (1, '${body}') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body, published_at = now();
+`
+  );
+}
+
+/** Reads the origin's manifest from this server's live copy of its Postgres. */
+export function readMetaFromCopy(rec: MirrorReplicaRecord): string | undefined {
+  try {
+    const out = psql(rec.container, "SELECT body FROM active_manifest WHERE id = 1;", META_DB);
+    return out || undefined;
+  } catch {
+    return undefined; // the origin has not published anything yet
+  }
+}
+
+/**
+ * Origin side: writes the manifest of this server's active apps into its Postgres. Called after
+ * every deploy of an active app and by `active on/off`. Skips identical writes; a fenced server
+ * never publishes (another server serves its data).
+ */
+export function publishActiveState(write: (body: string) => void = writeMeta): { published: boolean; apps: string[]; reason?: string } {
+  const state = loadState();
+  const m = state.mirror;
+  const manifest = buildActiveManifest(state);
+  const apps = Object.keys(manifest.apps);
+  if (m?.fenced) return { published: false, apps, reason: "this server is fenced" };
+  if (!m || Object.keys(m.offers).length === 0) {
+    return { published: false, apps, reason: apps.length ? "no mirror peer receives a copy of this server yet" : "nothing to publish" };
+  }
+  const hash = sha256(JSON.stringify(manifest));
+  if (hash === m.activePublishedHash) return { published: false, apps, reason: "unchanged" };
+  const body = encodeManifest(manifest);
+  // Offline tests pass their own writer; the default one needs Docker.
+  if (!OFFLINE() || write !== writeMeta) write(body);
+  const latest = loadState();
+  latest.mirror = { ...(latest.mirror || { epoch: 0, offers: {}, replicas: {} }), activePublishedHash: hash, activePublishedAt: new Date().toISOString() };
+  saveState(latest);
+  return { published: true, apps };
+}
+
+function detectTailscaleIp(): string | undefined {
+  if (OFFLINE()) return undefined;
+  try {
+    const ip = execFileSync("tailscale", ["ip", "-4"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).split("\n")[0].trim();
+    return IPV4.test(ip) ? ip : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The address where this server publishes active apps for the peer and the edge (Tailscale). */
+export function activeBindIp(state: PaaSState): string | undefined {
+  return state.mirror?.bindIp || detectTailscaleIp();
+}
+
+/** The live copy this server keeps of `nodeId`, while that server is still the one serving its data. */
+export function liveCopyOf(state: PaaSState, nodeId?: string): MirrorReplicaRecord | undefined {
+  if (!nodeId) return undefined;
+  return Object.values(state.mirror?.replicas || {}).find((r) => r.peerNodeId === nodeId && !r.promotedAt && !r.failback);
+}
+
+export interface ActiveComposeExtras {
+  /** host:ip entries for every service of the app (peer side: shared services live on the origin). */
+  extraHosts: string[];
+  /** Extra published ports (the Tailscale IP, so the peer's edge can reach this copy of the app). */
+  extraPorts: string[];
+  /** Extra runtime variables (DATABASE_REPLICA_URL). */
+  extraEnv: Record<string, string>;
+  warnings: string[];
+}
+
+/** What an active app's containers need on this server; empty for other apps. */
+export function activeComposeExtras(
+  state: PaaSState,
+  app: Pick<AppRecord, "activeActive" | "originNodeId" | "localPort">,
+  internalPort: number,
+  env: Record<string, string>
+): ActiveComposeExtras {
+  const out: ActiveComposeExtras = { extraHosts: [], extraPorts: [], extraEnv: {}, warnings: [] };
+  if (!app.activeActive) return out;
+  const bind = activeBindIp(state);
+  if (bind && IPV4.test(bind) && !bind.startsWith("127.")) out.extraPorts.push(`${bind}:${app.localPort}:${internalPort}`);
+  else out.warnings.push("No Tailscale IP found: the app is published on 127.0.0.1 only, so a self-hosted entry on the other server cannot reach it.");
+  if (!app.originNodeId) {
+    if (env.DATABASE_URL) out.extraEnv.DATABASE_REPLICA_URL = env.DATABASE_URL;
+    return out;
+  }
+  const rec = liveCopyOf(state, app.originNodeId);
+  if (!rec) return out; // the origin's data is served here now (promoted): everything is local
+  if (IPV4.test(rec.peerHost)) {
+    out.extraHosts = SHARED_SERVICE_NAMES.map((h) => `${h}:${rec.peerHost}`);
+  } else {
+    out.warnings.push(`The origin advertised '${rec.peerHost}', not an IP: the app here resolves the shared services by that network instead.`);
+  }
+  if (env.DATABASE_URL) out.extraEnv.DATABASE_REPLICA_URL = env.DATABASE_URL.replace(`@${PRIMARY}:5432/`, `@${rec.container}:5432/`);
+  return out;
+}
+
+/** Named volumes in the app's compose file: files written there differ on each server. */
+function localVolumes(app: AppRecord): string[] {
+  try {
+    const parsed = YAML.parse(fs.readFileSync(path.join(app.appDir, "compose.yaml"), "utf-8")) as { volumes?: Record<string, unknown> };
+    return Object.keys(parsed?.volumes || {});
+  } catch {
+    return [];
+  }
+}
+
+export interface ActiveReadiness {
+  app: string;
+  ok: boolean;
+  problems: string[];
+  warnings: string[];
+  /** Same items as codes (+ values) the dashboard translates. */
+  problemCodes: string[];
+  warningCodes: { code: string; value?: string }[];
+  peers: string[];
+}
+
+/** Checks, on the origin server, whether an app can run on both servers. */
+export function activeReadiness(appName: string, state = loadState()): ActiveReadiness {
+  const slug = sanitizeSlug(appName);
+  const app = state.apps[slug];
+  const problems: string[] = [];
+  const problemCodes: string[] = [];
+  const warnings: string[] = [];
+  const warningCodes: { code: string; value?: string }[] = [];
+  const problem = (code: string, text: string) => (problemCodes.push(code), problems.push(text));
+  const warn = (code: string, text: string, value?: string) => (warningCodes.push({ code, value }), warnings.push(text));
+  const m = state.mirror;
+  const peers = Object.keys(m?.offers || {});
+  if (!app) {
+    problem("notFound", `App '${slug}' not found.`);
+    return { app: slug, ok: false, problems, warnings, problemCodes, warningCodes, peers };
+  }
+  const fromGit = Boolean(app.repoUrl) && !fs.existsSync(app.repoUrl!);
+  if (app.trashedAt) problem("trashed", "The app is in the trash.");
+  if (app.originNodeId) problem("fromPeer", "This app came from the other server: turn the mode on there, where the app was created.");
+  if (!fromGit) problem("localSource", "The app was deployed from a local folder; the other server needs a git repository to build the same version.");
+  if (fromGit && !app.lastCommitSha) problem("noCommit", "Deploy the app once more so this server records the exact commit it runs.");
+  if (!peers.length) problem("noMirror", "No server receives a live copy of this one yet: set up the mirror first ('paasmcp mirror offer <peer> --peer-ip <ip>' here, 'paasmcp mirror accept' there).");
+  else if (!m?.bindIp) problem("noBindIp", "The mirror was offered without a Tailscale IP, so the other server cannot reach this database. Offer it again with --advertise <this server's Tailscale IP>.");
+  if (m?.fenced) problem("fenced", "This server is fenced: another server serves its data now.");
+  if (app.healthcheckDisabled) problem("noHealthcheck", "The app has no HTTP health check, and the entry needs one to stop sending requests to a server that is down.");
+  else if (!app.healthcheckPath || app.healthcheckPath === "/") {
+    warn("rootHealthPath", "Use a health check path that queries the database (for example /healthz). With '/', a server that lost the database keeps receiving requests.");
+  }
+  if (app.domains.some((d) => d.mode === "zero-trust")) {
+    warn("zeroTrustBypass", "The app is behind Cloudflare Access (zero-trust). Running on both servers also publishes its port on the Tailscale IPs, where any device of your Tailnet reaches it without that login. Keep the app's own login on, or limit the Tailnet with ACLs.");
+  }
+  const vols = localVolumes(app);
+  if (vols.length) {
+    warn("localVolumes", `The app writes to local volumes (${vols.join(", ")}): files there will differ between the servers. Store uploads in S3 (paas_storage_provision) instead.`, vols.join(", "));
+  }
+  return { app: slug, ok: problems.length === 0, problems, warnings, problemCodes, warningCodes, peers };
+}
+
+/** True when the shared Redis exists but is not published on the mirror's Tailscale IP yet. */
+export function redisNeedsRebind(state = loadState()): boolean {
+  const bind = state.mirror?.bindIp;
+  const file = path.join(PAAS_REDIS_DIR, "compose.yaml");
+  if (!bind || !fs.existsSync(file)) return false;
+  return !fs.readFileSync(file, "utf-8").includes(`${bind}:6379:6379`);
+}
+
+/** Origin side: turns the mode on/off for an app. The caller redeploys the app afterwards. */
+export async function setActiveActive(appName: string, on: boolean): Promise<{ app: string; activeActive: boolean; warnings: string[]; redisRebound: boolean }> {
+  const slug = sanitizeSlug(appName);
+  const state = loadState();
+  if (!state.apps[slug]) throw new Error(`App '${slug}' not found.`);
+  let warnings: string[] = [];
+  let redisRebound = false;
+  if (on) {
+    const r = activeReadiness(slug, state);
+    if (!r.ok) throw new Error(`App '${slug}' cannot run on both servers yet:\n- ${r.problems.join("\n- ")}`);
+    warnings = r.warnings;
+    // Sessions and carts in Redis must be shared: publish Redis on the Tailscale IP too (password kept).
+    if (!OFFLINE() && redisNeedsRebind(state)) {
+      const { ensureSharedRedisCluster } = await import("./database.js");
+      ensureSharedRedisCluster();
+      redisRebound = true;
+    }
+  } else if (state.apps[slug].originNodeId) {
+    throw new Error("This app came from the other server: turn the mode off there.");
+  }
+  state.apps[slug].activeActive = on || undefined;
+  saveState(state);
+  audit({ event: on ? "active.on" : "active.off", app: slug });
+  return { app: slug, activeActive: on, warnings, redisRebound };
+}
+
+/**
+ * Turns the mode on/off and finishes the job: redeploys the same version (publishes or drops the
+ * Tailscale port), tells the other server through the control channel and updates the edge.
+ * Callers check readiness and the guard ("app.active") first.
+ */
+export async function switchActiveActive(appName: string, on: boolean): Promise<Record<string, unknown>> {
+  const r = await setActiveActive(appName, on);
+  const app = loadState().apps[r.app];
+  let redeployed: string | undefined;
+  let warning: string | undefined;
+  if (app.repoUrl && !OFFLINE()) {
+    const d = await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha });
+    redeployed = d.commitHash;
+    warning = d.warning;
+  }
+  const published = publishActiveState();
+  const { refreshEdge } = await import("./edge.js");
+  refreshEdge();
+  return { ...r, redeployed, warning, published };
+}
+
+type DeployFn = (app: AppRecord, commit: string | undefined) => Promise<unknown>;
+
+const defaultDeploy: DeployFn = async (app, commit) => {
+  if (!app.repoUrl) throw new Error("no repository recorded");
+  return deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit, trusted: app.trusted });
+};
+
+const defaultStop = (appName: string) => {
+  manageAppLifecycle(appName, "stop");
+};
+
+function patchApp(slug: string, patch: (a: AppRecord) => void): void {
+  const s = loadState();
+  if (s.apps[slug]) {
+    patch(s.apps[slug]);
+    saveState(s);
+  }
+}
+
+/** Builds the peer-side record from what the origin sent, keeping only known fields with valid values. */
+function peerRecord(slug: string, sent: Partial<AppRecord>, existing: AppRecord | undefined, originNodeId: string, appDir: string): AppRecord {
+  const port = Number(sent.localPort);
+  const internalPort = Number(sent.internalPort);
+  if (!Number.isInteger(port) || port < 4000 || port > 4998) throw new Error(`invalid port ${sent.localPort}`);
+  if (!Number.isInteger(internalPort) || internalPort < 1 || internalPort > 65535) throw new Error(`invalid internal port ${sent.internalPort}`);
+  const now = new Date().toISOString();
+  return {
+    ...(existing || {}),
+    name: slug,
+    repoUrl: typeof sent.repoUrl === "string" && !sent.repoUrl.startsWith("-") ? sent.repoUrl : undefined,
+    branch: validateBranchName(sent.branch || "main"),
+    localPort: port,
+    internalPort,
+    containerName: `paasmcp-${slug}`,
+    appDir,
+    runtimeType: String(sent.runtimeType || existing?.runtimeType || "unknown"),
+    databases: Array.isArray(sent.databases) ? sent.databases.map(String) : [],
+    domains: (Array.isArray(sent.domains) ? sent.domains : [])
+      .filter((d) => d && typeof d.hostname === "string" && /^[a-z0-9.:-]{1,253}$/.test(d.hostname) && ["public", "zero-trust", "tailscale", "local"].includes(d.mode))
+      .map((d) => ({ hostname: d.hostname, mode: d.mode, url: String(d.url || "").slice(0, 300) })),
+    createdAt: existing?.createdAt || now,
+    updatedAt: existing?.updatedAt || now,
+    memoryLimit: validateResourceLimit(sent.memoryLimit, "memory"),
+    cpuLimit: validateResourceLimit(sent.cpuLimit, "cpu"),
+    trusted: sent.trusted === true,
+    healthcheckPath: validateHealthcheckPath(sent.healthcheckPath),
+    healthcheckTimeoutSeconds: validateHealthcheckTimeout(sent.healthcheckTimeoutSeconds),
+    healthcheckDisabled: sent.healthcheckDisabled === true || undefined,
+    originNodeId,
+    activeActive: true,
+  };
+}
+
+export interface ActiveSyncResult {
+  peer: string;
+  status: "applied" | "unchanged" | "no manifest" | "skipped" | "error";
+  detail?: string;
+  deployed: string[];
+  stopped: string[];
+  errors: { app: string; error: string }[];
+}
+
+/**
+ * Peer side (run by `paasmcp active sync`, the poll timer and `mirror watch`): reads each origin's
+ * manifest from the live copy here, imports the app record and its vault scope, and redeploys the
+ * exact commit the origin runs when the commit or the settings changed.
+ */
+export async function syncActivePeers(
+  opts: { read?: (rec: MirrorReplicaRecord) => string | undefined; deploy?: DeployFn; stop?: (app: string) => Promise<void> | void } = {}
+): Promise<ActiveSyncResult[]> {
+  const read = opts.read || readMetaFromCopy;
+  const deploy = opts.deploy || defaultDeploy;
+  const stop = opts.stop || defaultStop;
+  const results: ActiveSyncResult[] = [];
+  const state0 = loadState();
+  const m = state0.mirror;
+
+  for (const rec of Object.values(m?.replicas || {})) {
+    const out: ActiveSyncResult = { peer: rec.peerName, status: "unchanged", deployed: [], stopped: [], errors: [] };
+    results.push(out);
+    if (rec.promotedAt || rec.failback) {
+      out.status = "skipped";
+      out.detail = rec.promotedAt ? "this server serves that peer's data now" : "failback in progress";
+      continue;
+    }
+    const body = OFFLINE() && !opts.read ? undefined : read(rec);
+    if (!body) {
+      out.status = "no manifest";
+      continue;
+    }
+    let manifest: ActiveManifest;
+    try {
+      manifest = decodeManifest(body);
+      if (manifest.nodeId !== rec.peerNodeId) throw new Error(`the manifest comes from '${manifest.nodeId}', not '${rec.peerNodeId}'`);
+    } catch (err) {
+      out.status = "error";
+      out.detail = err instanceof Error ? err.message : String(err);
+      continue;
+    }
+    if (manifest.epoch < (loadState().mirror?.epoch || 0)) {
+      out.status = "skipped";
+      out.detail = `the manifest is from epoch ${manifest.epoch}, older than this server's`;
+      continue;
+    }
+
+    // Apps the origin no longer runs on both servers stop here.
+    for (const app of Object.values(loadState().apps)) {
+      if (app.originNodeId !== rec.peerNodeId || !app.activeActive || manifest.apps[app.name]) continue;
+      try {
+        if (app.status === "running" || app.activeSync) await stop(app.name);
+        patchApp(app.name, (a) => {
+          a.activeActive = undefined;
+          a.activeSync = undefined;
+          a.status = "stopped";
+        });
+        out.stopped.push(app.name);
+      } catch (err) {
+        out.errors.push({ app: app.name, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    for (const [name, entry] of Object.entries(manifest.apps)) {
+      let slug = name;
+      try {
+        slug = sanitizeSlug(name);
+        const state = loadState();
+        const existing = state.apps[slug];
+        if (existing && existing.originNodeId !== rec.peerNodeId) throw new Error("an app with this name already lives on this server");
+        const record = peerRecord(slug, entry.record, existing, rec.peerNodeId, path.join(PAAS_APPS_DIR, slug));
+        const clash = Object.values(state.apps).find((a) => a.name !== slug && a.localPort === record.localPort && !a.trashedAt);
+        if (clash) throw new Error(`port ${record.localPort} is taken here by '${clash.name}'; both servers must use the same port`);
+        if (!/^[0-9a-f]{40}$/.test(entry.commit)) throw new Error("the origin did not send a full commit; redeploy the app there");
+        const secrets: Record<string, string> = {};
+        for (const [k, v] of Object.entries(entry.secrets || {})) secrets[validateEnvKey(k)] = String(v);
+        saveSecrets(slug, secrets);
+        state.apps[slug] = record;
+        saveState(state);
+
+        if (existing?.activeSync?.commit === entry.commit && existing.activeSync.configHash === entry.configHash && !existing.activeSync.error) continue;
+        try {
+          await deploy(record, entry.commit);
+          patchApp(slug, (a) => {
+            a.activeSync = { commit: entry.commit, configHash: entry.configHash, at: new Date().toISOString() };
+          });
+          out.deployed.push(slug);
+          audit({ event: "active.sync-deploy", app: slug, commit: entry.commit.slice(0, 12) });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+          patchApp(slug, (a) => {
+            a.activeSync = { ...(a.activeSync || {}), at: new Date().toISOString(), error: msg };
+          });
+          throw new Error(msg);
+        }
+      } catch (err) {
+        out.errors.push({ app: slug, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    out.status = out.errors.length ? "error" : out.deployed.length || out.stopped.length ? "applied" : "unchanged";
+  }
+  return results;
+}
+
+export interface ActiveAppStatus {
+  app: string;
+  role: "origin" | "copy";
+  /** Commit running on this server. */
+  commit?: string;
+  /** Copy side: commit the origin asked for, when it was applied, and the last error. */
+  wanted?: string;
+  syncedAt?: string;
+  error?: string;
+  entries: { tunnel: string[]; edge: string[] };
+}
+
+export function activeStatus(state = loadState()): { apps: ActiveAppStatus[]; publishedAt?: string; bindIp?: string; peers: string[] } {
+  const apps = Object.values(state.apps)
+    .filter((a) => a.activeActive && !a.trashedAt)
+    .map((a): ActiveAppStatus => ({
+      app: a.name,
+      role: a.originNodeId ? "copy" : "origin",
+      commit: a.lastCommit,
+      ...(a.originNodeId ? { wanted: a.activeSync?.commit?.slice(0, 7), syncedAt: a.activeSync?.at, error: a.activeSync?.error } : {}),
+      entries: {
+        tunnel: a.domains.filter((d) => d.mode === "public" || d.mode === "zero-trust").map((d) => d.hostname),
+        edge: Object.entries(state.edge?.sites || {}).filter(([, s]) => s.app === a.name).map(([h]) => h),
+      },
+    }));
+  return {
+    apps,
+    publishedAt: state.mirror?.activePublishedAt,
+    bindIp: state.mirror?.bindIp,
+    peers: [...Object.keys(state.mirror?.offers || {}), ...Object.keys(state.mirror?.replicas || {})].filter((v, i, a) => a.indexOf(v) === i),
+  };
+}

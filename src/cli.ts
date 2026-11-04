@@ -11,6 +11,8 @@ import {
 } from "./config.js";
 import { deriveArbiterKey, installArbiterService, resolveArbiterHost, startArbiterServer } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
+import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActivePeers } from "./active.js";
+import { addEdgeSite, edgeStatus, installEdge, refreshEdge, removeEdgeSite, uninstallEdge } from "./edge.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import {
@@ -350,6 +352,13 @@ async function runCli() {
           } catch (err) {
             console.error(new Date().toISOString(), err instanceof Error ? err.message : String(err));
           }
+          // Active-active apps of the other server follow its version within one round (~15 s).
+          try {
+            const sync = await withStateLock(() => runActiveSync());
+            if (sync.some((p) => p.status !== "unchanged" && p.status !== "no manifest")) console.log(new Date().toISOString(), JSON.stringify({ activeSync: sync }));
+          } catch (err) {
+            console.error(new Date().toISOString(), "active sync:", err instanceof Error ? err.message : String(err));
+          }
           if (rest.includes("--once")) break;
           await new Promise((r) => setTimeout(r, 15_000));
         }
@@ -364,6 +373,57 @@ async function runCli() {
         throw new Error(
           "Usage: paasmcp mirror <offer <peer> --peer-ip <ip> [--from-copy-of <peer>]|accept <token> [--rejoin]|status|promote <peer>|handback <peer>|auto on|off <peer> [--arbiter <url>]|watch [--once]|install-watch>"
         );
+      }
+      break;
+    }
+
+    case "active": {
+      const [sub, arg1] = rest;
+      if ((sub === "on" || sub === "off") && arg1) {
+        const slug = sanitizeSlug(arg1);
+        if (sub === "on") {
+          const ready = activeReadiness(slug);
+          if (!ready.ok) throw new Error(`App '${slug}' cannot run on both servers yet:\n- ${ready.problems.join("\n- ")}`);
+          for (const w of ready.warnings) console.error(`⚠️  ${w}`);
+          await confirmInCli("app.active", { appName: slug }, rest);
+        }
+        console.log(JSON.stringify(await switchActiveActive(slug, sub === "on"), null, 2));
+        if (sub === "on") {
+          console.error("On the other server, the app starts within ~15 s if 'paasmcp mirror watch' runs there, or at the next 'paasmcp poll' (timer). To do it now: paasmcp active sync");
+          console.error("Entry: with Cloudflare Tunnel, run cloudflared on the other server with this tunnel's token. Without it: paasmcp edge install (on a server with a public IP).");
+        }
+      } else if (sub === "check" && arg1) {
+        console.log(JSON.stringify(activeReadiness(arg1), null, 2));
+      } else if (sub === "sync") {
+        console.log(JSON.stringify(await runActiveSync(), null, 2));
+      } else if (sub === "publish") {
+        console.log(JSON.stringify(publishActiveState(), null, 2));
+      } else if (!sub || sub === "status") {
+        console.log(JSON.stringify(activeStatus(), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp active <status|check <app>|on <app>|off <app>|sync|publish>");
+      }
+      break;
+    }
+
+    case "edge": {
+      const [sub, arg1, arg2] = rest;
+      if (sub === "install") {
+        await confirmInCli("edge.install", {}, rest);
+        console.log(JSON.stringify(await installEdge({ email: getFlagValue(rest, "--email") }), null, 2));
+      } else if (sub === "add" && arg1 && arg2) {
+        await confirmInCli("app.expose", { appName: sanitizeSlug(arg1), mode: "public" }, rest);
+        console.log(JSON.stringify(addEdgeSite(arg1, arg2), null, 2));
+      } else if (sub === "remove" && arg1) {
+        console.log(JSON.stringify(removeEdgeSite(arg1), null, 2));
+      } else if (sub === "reload") {
+        console.log(JSON.stringify({ changed: refreshEdge() }, null, 2));
+      } else if (sub === "uninstall") {
+        console.log(JSON.stringify(uninstallEdge(), null, 2));
+      } else if (!sub || sub === "status") {
+        console.log(JSON.stringify(await edgeStatus(), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp edge <status|install [--email you@example.com]|add <app> <hostname>|remove <hostname>|reload|uninstall>");
       }
       break;
     }
@@ -403,7 +463,14 @@ async function runCli() {
     case "poll": {
       const [sub, arg1] = rest;
       if (!sub || sub === "run") {
-        console.log(JSON.stringify(await pollRepos(), null, 2));
+        const polled = await pollRepos();
+        let activeSync: unknown;
+        try {
+          activeSync = await runActiveSync();
+        } catch (err) {
+          activeSync = { error: err instanceof Error ? err.message : String(err) };
+        }
+        console.log(JSON.stringify({ ...polled, activeSync }, null, 2));
       } else if ((sub === "enable" || sub === "disable") && arg1) {
         console.log(JSON.stringify(setPolling(arg1, sub === "enable"), null, 2));
       } else if (sub === "install-timer") {
@@ -704,6 +771,8 @@ Commands:
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp arbiter <key|serve|install-service|check> Third vote for automatic failover (run on a small third device)
+  paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
+  paasmcp edge <status|install|add|remove|reload|uninstall>  Self-hosted entry (Caddy) splitting requests between both servers
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
   paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email
@@ -726,6 +795,13 @@ Commands:
       break;
     }
   }
+}
+
+/** Peer side of active-active, then the edge picks up new or removed backends. */
+async function runActiveSync() {
+  const r = await syncActivePeers();
+  if (r.some((p) => p.deployed.length || p.stopped.length)) refreshEdge();
+  return r;
 }
 
 // Read-only commands and the long-running dashboard server skip the state lock.

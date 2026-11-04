@@ -19,7 +19,8 @@ import {
 } from "./config.js";
 import { ensureDockerNetwork, provisionDatabase } from "./database.js";
 import { cloneOrUpdateRepo, DetectedBuildPlan, detectOrGenerateDockerfile } from "./github.js";
-import { setSecretEntries, writeRuntimeEnvFile } from "./vault.js";
+import { getSecrets, setSecretEntries, writeRuntimeEnvFile } from "./vault.js";
+import { activeComposeExtras, publishActiveState } from "./active.js";
 
 export interface DeployOptions {
   appName: string;
@@ -39,6 +40,8 @@ export interface DeployOptions {
   healthcheckTimeoutSeconds?: number;
   /** true = old behaviour (no candidate, no probe) for apps that do not speak HTTP; kept for later deploys. */
   skipHealthcheck?: boolean;
+  /** Exact full commit SHA to build instead of the branch head (active-active peers). */
+  commit?: string;
 }
 
 export function syncHomepageDashboard(): void {
@@ -126,6 +129,9 @@ export function generateSanitizedComposeFromRepo(opts: {
   memoryLimit?: string;
   cpuLimit?: string;
   trusted?: boolean;
+  /** Active-active (active.ts): host:ip entries for every service and extra published ports for the primary one. */
+  extraHosts?: string[];
+  extraPorts?: string[];
 }): { yaml: string; findings: string[]; primaryImage?: string } {
   const raw = fs.readFileSync(opts.repoComposePath, "utf-8");
   const parsed = YAML.parse(raw) as {
@@ -190,6 +196,10 @@ export function generateSanitizedComposeFromRepo(opts: {
     cleanSvc.restart = "unless-stopped";
     if (cleanSvc.network_mode === undefined) cleanSvc.networks = [DOCKER_NETWORK];
 
+    if (opts.extraHosts?.length) {
+      const own = Array.isArray(cleanSvc.extra_hosts) ? (cleanSvc.extra_hosts as string[]) : [];
+      cleanSvc.extra_hosts = [...own, ...opts.extraHosts];
+    }
     if (opts.memoryLimit) cleanSvc.mem_limit = opts.memoryLimit;
     if (opts.cpuLimit) cleanSvc.cpus = Number(opts.cpuLimit);
 
@@ -198,7 +208,7 @@ export function generateSanitizedComposeFromRepo(opts: {
       cleanSvc.container_name = opts.containerName;
       // A fixed tag lets the blue/green cutover restore the old image and keeps rollback working.
       if (cleanSvc.build !== undefined && cleanSvc.image === undefined) cleanSvc.image = `paasmcp/${opts.slug}:latest`;
-      cleanSvc.ports = [`127.0.0.1:${opts.localPort}:${opts.internalPort}`];
+      cleanSvc.ports = [`127.0.0.1:${opts.localPort}:${opts.internalPort}`, ...(opts.extraPorts || [])];
     } else {
       cleanSvc.container_name = `${opts.containerName}-${ sanitizeSlug(svcName) }`;
       delete cleanSvc.ports;
@@ -421,14 +431,23 @@ export async function deployApp(opts: DeployOptions): Promise<{
     provisionedDatabases.push(res.record.name);
   }
 
-  const { commitHash } = cloneOrUpdateRepo(opts.repoSource, repoDir, branch);
+  const { commitHash, commitSha } = cloneOrUpdateRepo(opts.repoSource, repoDir, branch, opts.commit);
   const buildPlan: DetectedBuildPlan = detectOrGenerateDockerfile(repoDir, opts.internalPort);
   const internalPort = opts.internalPort || buildPlan.detectedPort;
+
+  // Active-active: shared services on the origin, Tailscale port, replica URL (empty for other apps).
+  const active = activeComposeExtras(
+    loadState(),
+    { activeActive: prior?.activeActive, originNodeId: prior?.originNodeId, localPort },
+    internalPort,
+    getSecrets(slug)
+  );
 
   const runtimeEnvPath = path.join(appDir, ".env.runtime");
   writeRuntimeEnvFile(slug, runtimeEnvPath, {
     PORT: String(internalPort),
     NODE_ENV: "production",
+    ...active.extraEnv,
   });
 
   const currentImg = `paasmcp/${slug}:latest`;
@@ -452,6 +471,8 @@ export async function deployApp(opts: DeployOptions): Promise<{
       memoryLimit,
       cpuLimit,
       trusted,
+      extraHosts: active.extraHosts,
+      extraPorts: active.extraPorts,
     });
     composeFindings = sanitized.findings;
     primaryService = buildPlan.primaryServiceName;
@@ -460,6 +481,10 @@ export async function deployApp(opts: DeployOptions): Promise<{
   } else {
     const memLine = memoryLimit ? `    mem_limit: ${memoryLimit}\n` : "";
     const cpuLine = cpuLimit ? `    cpus: ${cpuLimit}\n` : "";
+    const extraPortLines = active.extraPorts.map((p) => `\n      - "${p}"`).join("");
+    const hostsBlock = active.extraHosts.length
+      ? `    extra_hosts:\n${active.extraHosts.map((h) => `      - "${h}"\n`).join("")}`
+      : "";
     const composeContent = `services:
   app:
     build:
@@ -471,8 +496,8 @@ export async function deployApp(opts: DeployOptions): Promise<{
 ${memLine}${cpuLine}    env_file:
       - .env.runtime
     ports:
-      - "127.0.0.1:${localPort}:${internalPort}"
-    networks:
+      - "127.0.0.1:${localPort}:${internalPort}"${extraPortLines}
+${hostsBlock}    networks:
       - ${DOCKER_NETWORK}
 
 networks:
@@ -589,6 +614,7 @@ networks:
     updatedAt: now,
     status: "running",
     lastCommit: commitHash,
+    lastCommitSha: commitSha || (opts.repoSource === existing?.repoUrl ? existing?.lastCommitSha : undefined),
     previousImageTag: previousImageSaved ? prevImg : existing?.previousImageTag,
     composePassThrough: isComposePassThrough,
     memoryLimit: memoryLimit || existing?.memoryLimit,
@@ -602,6 +628,17 @@ networks:
   latestState.apps[slug] = record;
   saveState(latestState);
   syncHomepageDashboard();
+
+  // Origin of an active-active app: tell the other server which version and settings to run.
+  if (record.activeActive && !record.originNodeId) {
+    try {
+      const pub = publishActiveState();
+      if (!pub.published && pub.reason !== "unchanged") active.warnings.push(`The other server was not told about this version: ${pub.reason}.`);
+    } catch (err) {
+      active.warnings.push(`The other server was not told about this version: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+    }
+  }
+  if (active.warnings.length) warning = [warning, ...active.warnings].filter(Boolean).join(" ");
 
   return {
     app: record,

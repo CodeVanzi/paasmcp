@@ -2,6 +2,8 @@ import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
+import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
+import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
@@ -606,6 +608,32 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/mirror/arbiter" && req.method === "POST") {
           const body = await readJsonBody(req);
           return reply(setArbiterUrl(String(body.url || "")));
+        }
+        // App on both servers (active.ts) and the self-hosted entry (edge.ts).
+        if (pathname === "/api/active" && req.method === "GET") {
+          const state = loadState();
+          const candidates = Object.values(state.apps)
+            .filter((a) => !a.originNodeId && !a.trashedAt && a.name !== "paasmcp-dashboard")
+            .map((a) => ({ ...activeReadiness(a.name, state), on: Boolean(a.activeActive) }));
+          return reply({ ...activeStatus(state), candidates, edge: await edgeStatus() });
+        }
+        if (pathname === "/api/active" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const appName = sanitizeSlug(String(body.appName || ""));
+          const on = body.on === true;
+          if (on) {
+            const ready = activeReadiness(appName);
+            if (!ready.ok) throw new Error(ready.problems.join(" "));
+            confirmFromBody("app.active", { appName }, body);
+          }
+          return reply(await switchActiveActive(appName, on));
+        }
+        if (pathname === "/api/edge/site" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const appName = sanitizeSlug(String(body.appName || ""));
+          if (body.remove === true) return reply(removeEdgeSite(String(body.hostname || "")));
+          confirmFromBody("app.expose", { appName, mode: "public" }, body);
+          return reply(addEdgeSite(appName, String(body.hostname || "")));
         }
         if (pathname === "/api/mirror/auto" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -1831,6 +1859,36 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <p class="card-desc" data-i18n="autoStep7Desc"></p>
             <button class="secondary" onclick="loadArbiterStatus(true)" data-i18n="btnArbRefresh"></button>
           </div>
+          <div class="card" id="activeCard">
+            <div class="card-header"><h2 data-i18n="aaTitle"></h2><p class="card-desc" data-i18n="aaDesc"></p></div>
+            <div id="activeStatusBox" style="margin-bottom:6px;"></div>
+
+            <h3 data-i18n="aaStep1" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="aaStep1Desc"></p>
+
+            <h3 data-i18n="aaStep2" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="aaStep2Desc" style="margin-bottom:10px;"></p>
+            <label class="field-label" for="aaApp" data-i18n="lblAppName"></label>
+            <select id="aaApp" onchange="renderActiveCheck()"></select>
+            <div id="aaCheckBox" style="margin-top:10px;"></div>
+
+            <h3 data-i18n="aaStep3" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="aaStep3Desc" style="margin-bottom:10px;"></p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button onclick="activeSwitch(true)" data-i18n="btnAaOn"></button>
+              <button class="secondary" onclick="activeSwitch(false)" data-i18n="btnAaOff"></button>
+            </div>
+
+            <h3 data-i18n="aaStep4" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="aaStep4Desc"></p>
+            <p class="card-desc" data-i18n="aaTunnel" style="margin-top:8px;"></p>
+            <p class="card-desc" data-i18n="aaEdge" style="margin-top:8px;"></p>
+            <pre style="user-select:all;">sudo paasmcp edge install --email voce@exemplo.com</pre>
+            <label class="field-label" for="aaHost" data-i18n="lblAaHost"></label>
+            <input id="aaHost" placeholder="loja.exemplo.com" />
+            <div style="margin-top:10px;"><button onclick="edgeAddSite()" data-i18n="btnAaSite"></button></div>
+            <div id="edgeStatusBox" style="margin-top:10px;"></div>
+          </div>
           <div class="card">
             <div class="card-header"><h2 data-i18n="failbackTitle"></h2></div>
             <ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.7;">
@@ -2596,6 +2654,47 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorTitle": "🔁 Segundo servidor",
           "mirrorDesc": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro pode assumir os apps dele com os dados até o último segundo. Antes, conecte os dois em Conexões e webhook.",
           "mirrorNone": "Nenhuma cópia configurada ainda. Use os dois quadros abaixo: um servidor oferece, o outro recebe.",
+          "aaTitle": "⚖️ App nos dois servidores",
+          "aaDesc": "O app roda aqui e no outro servidor ao mesmo tempo, e os dois recebem visitas. Os dados continuam gravados num banco só, o deste servidor: o outro grava nele pela Tailscale. Se este servidor cair, a troca automática acima faz o outro seguir sozinho.",
+          "aaNone": "Nenhum app rodando nos dois servidores ainda.",
+          "aaOrigin": "criado aqui, roda nos dois",
+          "aaCopy": "vem de {peer}, roda aqui também",
+          "aaRunning": "versão aqui",
+          "aaWanted": "versão pedida",
+          "aaStep1": "1. Antes: cópia e vigia",
+          "aaStep1Desc": "Este servidor precisa mandar cópia para o outro (quadro “Oferecer cópia” acima, com o IP do Tailscale), e o vigia precisa rodar no outro servidor (passo 6 da troca automática). É o vigia que mantém o app do outro servidor na mesma versão deste, em até 15 segundos.",
+          "aaStep2": "2. Escolha o app e confira",
+          "aaStep2Desc": "Só aparecem apps criados neste servidor. O quadro diz o que falta e o que vale ajustar antes de ligar.",
+          "aaReady": "Pronto para rodar nos dois",
+          "aaIsOn": "Já está rodando nos dois",
+          "aaStep3": "3. Ligue",
+          "aaStep3Desc": "Ao ligar, o painel pede confirmação, refaz o deploy da mesma versão aqui e avisa o outro servidor, que sobe o app em seguida. Desligar faz o outro servidor parar a cópia do app.",
+          "btnAaOn": "Rodar nos dois",
+          "btnAaOff": "Rodar só aqui",
+          "aaSwitched": "Feito. O outro servidor acompanha em até 15 segundos.",
+          "aaStep4": "4. Escolha por onde as visitas entram",
+          "aaStep4Desc": "Dá para usar uma das duas entradas, ou as duas.",
+          "aaTunnel": "Com Cloudflare Tunnel: no outro servidor, rode o cloudflared com o mesmo token do túnel deste. O endereço do app não muda, e a Cloudflare tira do caminho o servidor que cair.",
+          "aaEdge": "Sem depender de cloud: num servidor com IP público (normalmente o VPS), ligue a entrada própria pelo terminal com o comando abaixo. Ela abre as portas 80 e 443, pega o HTTPS sozinha e confere a cada 5 segundos se o app responde em cada servidor. Depois adicione o site aqui e aponte o DNS (registro A) para o IP público desse servidor.",
+          "lblAaHost": "Endereço do site",
+          "btnAaSite": "Adicionar site à entrada própria",
+          "aaEdgeOff": "A entrada própria não está ligada neste servidor.",
+          "aaEdgeOn": "Entrada própria ligada",
+          "aaEdgeStopped": "Entrada própria instalada, mas parada",
+          "aaHere": "este servidor",
+          "aaRemove": "Remover",
+          "aaDns": "Site adicionado. Agora crie no DNS um registro A de {host} para o IP público deste servidor.",
+          "aaP_trashed": "O app está na lixeira.",
+          "aaP_fromPeer": "Este app veio do outro servidor: ligue lá, onde ele foi criado.",
+          "aaP_localSource": "O app foi publicado de uma pasta local. O outro servidor precisa de um repositório git para montar a mesma versão.",
+          "aaP_noCommit": "Faça o deploy do app mais uma vez, para este servidor guardar o commit exato que está no ar.",
+          "aaP_noMirror": "Nenhum servidor recebe cópia deste ainda. Configure a cópia primeiro, nos quadros acima.",
+          "aaP_noBindIp": "A cópia foi oferecida sem o IP do Tailscale, então o outro servidor não alcança este banco. Ofereça de novo pelo terminal com --advertise <IP do Tailscale deste servidor>.",
+          "aaP_fenced": "Este servidor está bloqueado: outro servidor serve os dados dele agora.",
+          "aaP_noHealthcheck": "O app não tem verificação de saúde por HTTP, e a entrada precisa dela para parar de mandar visitas a um servidor que caiu.",
+          "aaW_rootHealthPath": "Use um caminho de verificação de saúde que consulte o banco (por exemplo /healthz). Com “/”, um servidor que perdeu o banco continua recebendo visitas.",
+          "aaW_zeroTrustBypass": "O app está atrás do login da Cloudflare (Zero Trust). Rodando nos dois, a porta dele também fica no IP do Tailscale, onde qualquer aparelho da sua Tailnet chega sem esse login. Mantenha o login do próprio app, ou limite a Tailnet com ACLs.",
+          "aaW_localVolumes": "O app grava arquivos em volumes locais ({v}): esses arquivos ficariam diferentes em cada servidor. Guarde os envios no armazenamento S3 (tela Armazenamento).",
           "mirrorAuto": "Troca automática",
           "mirrorArbiter": "Juiz",
           "mirrorSendingTo": "Mandando cópia para",
@@ -2829,6 +2928,36 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorTitle": "🔁 Second server",
           "mirrorDesc": "Both servers keep a live copy of each other. If one goes down, the other can take over its apps with data up to the last second. First connect both in Connections & webhook.",
           "mirrorNone": "No copy set up yet. Use the two boxes below: one server offers, the other receives.",
+          "aaTitle": "⚖️ App on both servers",
+          "aaDesc": "The app runs here and on the other server at the same time, and both take visits. Data is still written to one database, this server's: the other one writes to it over Tailscale. If this server goes down, the automatic failover above keeps the other one going alone.",
+          "aaNone": "No app runs on both servers yet.",
+          "aaOrigin": "created here, runs on both",
+          "aaCopy": "comes from {peer}, also runs here",
+          "aaRunning": "version here",
+          "aaWanted": "version asked",
+          "aaStep1": "1. First: copy and watchdog",
+          "aaStep1Desc": "This server must send a copy to the other one (“Offer a copy” above, with the Tailscale IP), and the watchdog must run on the other server (step 6 of automatic failover). The watchdog keeps the other server's app on this server's version within 15 seconds.",
+          "aaStep2": "2. Pick the app and check it",
+          "aaStep2Desc": "Only apps created on this server are listed. The box says what is missing and what is worth fixing before turning it on.",
+          "aaReady": "Ready to run on both",
+          "aaIsOn": "Already running on both",
+          "aaStep3": "3. Turn it on",
+          "aaStep3Desc": "Turning it on asks for confirmation, redeploys the same version here and tells the other server, which starts the app next. Turning it off makes the other server stop its copy of the app.",
+          "btnAaOn": "Run on both",
+          "btnAaOff": "Run here only",
+          "aaSwitched": "Done. The other server follows within 15 seconds.",
+          "aaStep4": "4. Choose where visits come in",
+          "aaStep4Desc": "Use either entry, or both.",
+          "aaTunnel": "With Cloudflare Tunnel: on the other server, run cloudflared with this tunnel's token. The app's address stays the same, and Cloudflare stops using a server that goes down.",
+          "aaEdge": "Without a cloud: on a server with a public IP (usually the VPS), start the self-hosted entry from the terminal with the command below. It opens ports 80 and 443, gets HTTPS by itself and checks every 5 seconds whether the app answers on each server. Then add the site here and point its DNS (A record) at that server's public IP.",
+          "lblAaHost": "Site address",
+          "btnAaSite": "Add site to the self-hosted entry",
+          "aaEdgeOff": "The self-hosted entry is not running on this server.",
+          "aaEdgeOn": "Self-hosted entry on",
+          "aaEdgeStopped": "Self-hosted entry installed but stopped",
+          "aaHere": "this server",
+          "aaRemove": "Remove",
+          "aaDns": "Site added. Now create a DNS A record for {host} pointing at this server's public IP.",
           "mirrorAuto": "Automatic takeover",
           "mirrorArbiter": "Arbiter",
           "mirrorSendingTo": "Sending copy to",
@@ -3521,6 +3650,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (m.arbiterUrl && !document.getElementById('mArbiter').value) document.getElementById('mArbiter').value = m.arbiterUrl;
       renderArbiterInstall();
       loadArbiterStatus();
+      loadActive();
     }
     async function mirrorOffer() {
       const r = await postJson('/api/mirror/offer', {
@@ -3611,6 +3741,65 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       const url = document.getElementById('mArbiter').value.trim();
       if (!url) return;
       if (await postJson('/api/mirror/arbiter', { url })) { showToast(t('saved')); loadMirror(); }
+    }
+
+    // ---- App on both servers (active-active) and the self-hosted entry ----
+    let activeData = null;
+    // Translated text for a code, or the server's English text when there is none.
+    const tr = (key, fallback) => { const d = I18N[currentLang] || I18N.pt; return d[key] !== undefined ? d[key] : fallback; };
+    async function loadActive() {
+      const res = await fetch('/api/active');
+      if (!res.ok) return;
+      activeData = await res.json();
+      const box = document.getElementById('activeStatusBox');
+      box.innerHTML = (activeData.apps || []).length
+        ? activeData.apps.map(a => card('<strong>' + esc(a.app) + '</strong> ' +
+            (a.error ? badge('danger', a.error) : badge('success', a.role === 'origin' ? t('aaOrigin') : t('aaCopy').replace('{peer}', (activeData.peers || [])[0] || '?'))) +
+            '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aaRunning')) + ': ' + esc(a.commit || '?') +
+            (a.wanted ? ' · ' + esc(t('aaWanted')) + ': ' + esc(a.wanted) : '') + '</div>')).join('')
+        : card(esc(t('aaNone')));
+      const sel = document.getElementById('aaApp');
+      const keep = sel.value;
+      sel.innerHTML = (activeData.candidates || []).map(c => '<option value="' + esc(c.app) + '">' + esc(c.app) + (c.on ? ' · ' + esc(t('aaIsOn')) : '') + '</option>').join('');
+      if (keep && (activeData.candidates || []).some(c => c.app === keep)) sel.value = keep;
+      renderActiveCheck();
+      renderEdge();
+    }
+    function renderActiveCheck() {
+      const box = document.getElementById('aaCheckBox');
+      const c = ((activeData && activeData.candidates) || []).find(x => x.app === document.getElementById('aaApp').value);
+      if (!c) { box.innerHTML = ''; return; }
+      const line = (cls, sym, txt) => '<div style="margin:3px 0;">' + badge(cls, sym) + ' ' + esc(txt) + '</div>';
+      box.innerHTML = card(
+        '<div style="font-weight:600;margin-bottom:6px;">' + esc(c.on ? t('aaIsOn') : c.ok ? t('aaReady') : t('arbNotReady')) + '</div>' +
+        (c.problemCodes || []).map((code, i) => line('danger', '✗', tr('aaP_' + code, c.problems[i]))).join('') +
+        (c.warningCodes || []).map((w, i) => line('warning', '!', tr('aaW_' + w.code, c.warnings[i]).replace('{v}', w.value || ''))).join(''));
+    }
+    async function activeSwitch(on) {
+      const appName = document.getElementById('aaApp').value;
+      if (!appName) return;
+      const r = await postJson('/api/active', { appName, on });
+      if (r) { showToast(r.warning ? r.warning : t('aaSwitched')); loadActive(); }
+    }
+    function renderEdge() {
+      const e = (activeData && activeData.edge) || { installed: false, sites: [] };
+      let html = card(e.installed ? (e.running === false ? badge('warning', t('aaEdgeStopped')) : badge('success', t('aaEdgeOn'))) : esc(t('aaEdgeOff')));
+      (e.sites || []).forEach(site => {
+        html += card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(site.hostname) + '</strong> → ' + esc(site.app) +
+          '<div style="margin-top:4px;">' + (site.backends || []).map(b => badge(b.healthy === false ? 'danger' : b.healthy ? 'success' : '', (b.where === 'here' ? t('aaHere') : b.where) + (b.detail ? ' · ' + b.detail : ''))).join(' ') + '</div></div>' +
+          '<button class="secondary" onclick="edgeRemoveSite(&#39;' + esc(site.hostname) + '&#39;)">' + esc(t('aaRemove')) + '</button></div>');
+      });
+      document.getElementById('edgeStatusBox').innerHTML = html;
+    }
+    async function edgeAddSite() {
+      const appName = document.getElementById('aaApp').value;
+      const hostname = document.getElementById('aaHost').value.trim();
+      if (!appName || !hostname) return;
+      const r = await postJson('/api/edge/site', { appName, hostname });
+      if (r) { showToast(t('aaDns').replace('{host}', r.hostname)); loadActive(); }
+    }
+    async function edgeRemoveSite(hostname) {
+      if (await postJson('/api/edge/site', { hostname, remove: true })) loadActive();
     }
 
     async function loadUpdates() {

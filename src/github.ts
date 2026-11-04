@@ -143,9 +143,14 @@ export function gitEnv(): NodeJS.ProcessEnv {
 export function cloneOrUpdateRepo(
   repoSource: string,
   targetDir: string,
-  branch = "main"
-): { commitHash: string; sourceType: "local" | "git" } {
+  branch = "main",
+  /** Exact commit to check out (active-active peers run the origin's version, not the branch head). */
+  commit?: string
+): { commitHash: string; commitSha?: string; sourceType: "local" | "git" } {
   const safeBranch = validateBranchName(branch);
+  if (commit !== undefined && !/^[0-9a-f]{40}$/.test(commit)) {
+    throw new Error(`Invalid commit '${commit}': a full 40-character SHA is expected.`);
+  }
 
   // Support local directory path directly as well as GitHub shorthand or URL
   if (fs.existsSync(repoSource) && fs.statSync(repoSource).isDirectory()) {
@@ -188,8 +193,20 @@ export function cloneOrUpdateRepo(
     }
   }
 
+  if (commit) {
+    // Shallow clones may not hold it yet; GitHub serves any reachable commit by id.
+    try {
+      execFileSync("git", ["fetch", "--depth", "1", "origin", commit], { cwd: targetDir, env, stdio: "pipe" });
+    } catch {
+      execFileSync("git", ["fetch", "origin"], { cwd: targetDir, env, stdio: "pipe" });
+    }
+    execFileSync("git", ["checkout", "--detach", commit], { cwd: targetDir, env, stdio: "pipe" });
+  }
+
   let commitHash = "unknown";
+  let commitSha: string | undefined;
   try {
+    commitSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: targetDir, encoding: "utf-8" }).trim();
     commitHash = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: targetDir,
       encoding: "utf-8",
@@ -197,7 +214,7 @@ export function cloneOrUpdateRepo(
   } catch {
     // ignore
   }
-  return { commitHash, sourceType: "git" };
+  return { commitHash, commitSha, sourceType: "git" };
 }
 
 export interface DetectedBuildPlan {

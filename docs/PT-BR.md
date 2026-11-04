@@ -47,6 +47,13 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
      4. Em A: `paasmcp mirror promote B`.
      5. Para B voltar a ser espelho: `mirror offer B ...` em A e `mirror accept` em B (a cópia velha é movida para o lado).
    - Testado com containers Postgres reais (`scripts/mirror-lab.sh`: cópia, queda do espelho, troca, volta completa); falta repetir em duas máquinas.
+   - **App nos dois servidores (ativo-ativo, `active` / `paas_active`):** o app roda em A e em B ao mesmo tempo, e os dois recebem visitas. As gravações continuam indo para o Postgres de A; em B o app alcança o Postgres, o Redis e o S3 de A pela Tailscale, com as mesmas variáveis. O painel tem o passo a passo em **Segundo servidor → App nos dois servidores**. Pelo terminal:
+     1. Antes: A oferece cópia para B com o IP do Tailscale, e `mirror watch` roda em B (é ele que mantém a versão igual, em até 15 segundos).
+     2. Em A: `paasmcp active check <app>` mostra o que falta; `paasmcp active on <app>` (pede confirmação) refaz o deploy da mesma versão e avisa B pelo próprio Postgres, cifrado com a chave do grupo. B monta **o mesmo commit** de A, nunca a ponta do branch.
+     3. Entrada com Cloudflare Tunnel: rode o `cloudflared` com o mesmo token do túnel em B.
+     4. Entrada sem cloud: num servidor com IP público, `sudo paasmcp edge install --email voce@exemplo.com` (pede para digitar `edge`, abre as portas 80 e 443) e `paasmcp edge add <app> loja.exemplo.com`; aponte o DNS (registro A) para o IP público desse servidor. O Caddy pega o HTTPS sozinho, divide as visitas e confere a saúde de cada servidor a cada 5 segundos.
+     - Use um caminho de saúde que consulte o banco (`/healthz`) e guarde arquivos enviados no S3, não em volume local. Migrações de banco devem funcionar com a versão anterior, porque B troca de versão alguns segundos depois de A.
+     - Se A cair, a troca automática promove a cópia em B, e o app em B passa a usar o banco e o Redis locais (as sessões guardadas no Redis se perdem). Testado em `scripts/active-lab.sh`.
 9. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---

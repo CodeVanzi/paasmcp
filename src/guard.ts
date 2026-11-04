@@ -94,6 +94,16 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `The apps of '${subject}' stop here and the data goes back to '${subject}' once its copy has every change. Then run 'paasmcp mirror promote' there.`,
         `Os apps de '${subject}' param aqui e os dados voltam para '${subject}' assim que a cópia dele tiver tudo. Depois rode 'paasmcp mirror promote' lá.`,
         params);
+    case "app.active":
+      return risk(action, subject, "confirm",
+        `App '${subject}' will also run on the other server and both will take requests. The other server receives its settings and secrets, reaches this server's database, Redis and S3 over Tailscale, and the app's port is published on this server's Tailscale IP.`,
+        `O app '${subject}' vai rodar também no outro servidor, e os dois vão receber requisições. O outro servidor recebe as configurações e os segredos do app, acessa o banco, o Redis e o S3 daqui pela Tailscale, e a porta do app passa a ser publicada no IP Tailscale deste servidor.`,
+        params);
+    case "edge.install":
+      return risk(action, "edge", "strong",
+        "Starts a web server (Caddy) on ports 80 and 443 of this server, open to the internet. It only serves the sites you add with 'edge add', and gets their HTTPS certificates from Let's Encrypt.",
+        "Liga um servidor web (Caddy) nas portas 80 e 443 deste servidor, aberto para a internet. Ele só atende os sites que você adicionar com 'edge add' e pega os certificados HTTPS no Let's Encrypt.",
+        params);
     case "update.apply":
       return risk(action, String(params.component), "confirm",
         `${String(params.component)} restarts on ${String(params.image)} (a few seconds of downtime for every app that uses it). Databases are backed up first; if it does not come back healthy in 60 s, the previous version is restored.`,

@@ -119,6 +119,46 @@ Automatic failover with only two servers would split the brain when the link bet
   arbiter hears and how long ago, and whether `mirror watch` runs here. `POST /api/mirror/arbiter` saves
   the address alone (the server that only sends a copy still needs it to heartbeat and be fenced).
 
+### Active-active: an app on both servers (`src/active.ts`, `src/edge.ts`)
+
+`paasmcp active on <app>` (guard `app.active`, confirm; MCP `paas_active`; dashboard **Second server → App on
+both servers**) makes an app run on the origin server **and** on the mirror peer, both taking requests.
+There is still **one writer**: the origin's Postgres.
+
+- **Readiness** (`activeReadiness`): the app comes from git and has a recorded full commit
+  (`lastCommitSha`), a peer receives a copy of this server (`mirror offer`) published on a Tailscale IP
+  (`bindIp`), the app has an HTTP health check; warnings for `/` as health path (should query the database)
+  and for named volumes (files would differ per server: use S3).
+- **Control channel through Postgres:** the origin writes an encrypted manifest (AES-256-GCM with the
+  cluster key: app record whitelist, vault scope, full commit, config hash) into `paasmcp_meta.active_manifest`
+  on its own Postgres (`REVOKE ALL ... FROM PUBLIC`: app users cannot connect). The peer's live copy receives it
+  within seconds; no new port or service. It is written after every deploy of an active app and on
+  `active on/off`, skipped when identical or when this server is fenced.
+- **Peer side** (`syncActivePeers`, run by `mirror watch` every ~15 s, by `paasmcp poll` and by `paasmcp active
+  sync`): reads the manifest from the local copy, refuses a different node id or an older epoch, validates every
+  field (ports 4000-4998, env keys, branch, health path, resource limits), never overwrites an app of its own,
+  requires the same port as the origin, then deploys the **exact commit** (blue/green) when the commit or the
+  config hash changed. Apps the origin turned off are stopped.
+- **Shared services:** on the peer, the app's containers get `extra_hosts` mapping `paasmcp-postgres`,
+  `paasmcp-redis` and `paasmcp-garage` to the origin's Tailscale IP, so `DATABASE_URL`, `REDIS_URL` and
+  `S3_ENDPOINT` are identical on both servers. Redis is now also published on the mirror's Tailscale IP
+  (password required). `DATABASE_REPLICA_URL` points at the local copy on the peer (at the primary on the
+  origin) for read-only queries that tolerate a few seconds of lag.
+- **Ports:** an active app is also published on this server's Tailscale IP, same port on both servers, so an
+  edge on either server can reach both copies.
+- **Failover:** `promoteMirror` redeploys the app without `extra_hosts` (the copy is local now), points
+  `DATABASE_URL` at the promoted copy and `REDIS_URL` / `LOCAL_REDIS_URL` at this server's Redis (sessions
+  start empty), keeping the commit it already ran.
+- **Entry, option 1 — Cloudflare Tunnel:** run `cloudflared` with the same tunnel token on both servers. The
+  tunnel's ingress points at `http://paasmcp-<app>:<port>`, which exists on both. Cloudflare does not health
+  check origins: if the link between the servers breaks while both stay up, the peer's share of requests fails.
+- **Entry, option 2 — self-hosted edge** (`paasmcp edge install|add|remove|status|uninstall`): a pinned Caddy
+  (`caddy:2.8.4-alpine`, host network, admin API on a unix socket in its 0700 data folder) on a server with a
+  public IP. `edge install` is guard `edge.install` (*strong*: opens 80/443), `edge add <app> <hostname>` is
+  `app.expose` public. The Caddyfile lists this server's copy (`127.0.0.1:<port>`) and the peer's copy
+  (`<Tailscale IP>:<port>`) with round robin, active health checks on the app's `healthcheckPath` every 5 s
+  and passive failure tracking; certificates come from Let's Encrypt. `edge status` probes each backend once.
+
 ## 7. Backups off-site (`src/backup.ts`)
 
 - Nightly systemd timer (`paasmcp backup install-timer`): database dumps, named volumes, upload to any
@@ -170,3 +210,7 @@ memory and nothing needs to be reachable from the internet.
 - `scripts/mirror-lab.sh`: two simulated servers on one Docker host (own network, ports 5432/5433):
   offer, accept, replication, promote, fencing, failback and handback. Refuses to run over an existing
   install and removes everything it created on exit.
+- `scripts/active-lab.sh`: active-active on one Docker host. A publishes through `paasmcp_meta`, B's copy
+  receives it, B builds A's exact commit (and ignores a newer unpublished one), B's app reads and writes A's
+  database through the shared-service names and reads its local copy, the Caddy edge serves B and skips A's
+  dead backend, and after A dies B is promoted and keeps serving from its copy.

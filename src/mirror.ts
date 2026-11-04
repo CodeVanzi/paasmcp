@@ -13,7 +13,7 @@ import {
   sanitizeSlug,
   saveState,
 } from "./config.js";
-import { ensureDockerNetwork, ensureSharedPostgresCluster } from "./database.js";
+import { ensureDockerNetwork, ensureSharedPostgresCluster, ensureSharedRedisCluster } from "./database.js";
 import { deployApp, manageAppLifecycle } from "./deployer.js";
 import { askArbiter } from "./arbiter.js";
 import { audit } from "./guard.js";
@@ -364,11 +364,24 @@ export async function promoteMirror(peerName: string, opts: { epoch?: number } =
       if (env.DATABASE_URL && !rec.failback) {
         setSecretEntries(app.name, { DATABASE_URL: env.DATABASE_URL.replace(`@${PRIMARY}:5432/`, `@${rec.container}:5432/`) });
       }
+      // The peer's Redis is gone with it: point the app at this server's Redis (its data, e.g.
+      // sessions, starts empty). The URL carried the peer's password.
+      if ((env.REDIS_URL || env.LOCAL_REDIS_URL) && !rec.failback) {
+        const pass = OFFLINE() ? getSecrets("system").REDIS_ROOT_PASSWORD : ensureSharedRedisCluster().redisPass;
+        const withPass = (u?: string) => (u ? u.replace(/^redis:\/\/:[^@]*@/, `redis://:${pass}@`) : undefined);
+        if (pass) {
+          setSecretEntries(app.name, Object.fromEntries(
+            Object.entries({ REDIS_URL: withPass(env.REDIS_URL), LOCAL_REDIS_URL: withPass(env.LOCAL_REDIS_URL) }).filter(([, v]) => v)
+          ) as Record<string, string>);
+        }
+      }
       if (rec.failback) {
         if (!OFFLINE()) manageAppLifecycle(app.name, "start");
       } else {
         if (!app.repoUrl) throw new Error("no repository recorded; deploy it by hand");
-        if (!OFFLINE()) await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted });
+        // An active-active app keeps the version it already ran here.
+        const commit = app.activeActive && app.activeSync?.commit ? app.activeSync.commit : undefined;
+        if (!OFFLINE()) await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, commit });
       }
       // DNS switch: re-exposing points the hostname at this server's tunnel.
       const base = state.cloudflare.baseDomain;
