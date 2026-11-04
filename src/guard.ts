@@ -89,6 +89,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "This server's database is stopped, moved aside (kept on disk, not deleted) and replaced by a read-only copy of the server that took over. Its apps stay stopped until you hand back.",
         "O banco deste servidor é parado, movido para o lado (fica guardado no disco, não é apagado) e trocado por uma cópia só de leitura do servidor que assumiu. Os apps daqui ficam parados até a devolução.",
         params);
+    case "mirror.retire":
+      return risk(action, subject, "confirm",
+        `This server stops following '${subject}' for good: the copies of its apps here stop and its copy of the database stays on disk, read-only. Do this on every server that did NOT take over '${subject}'. A new offer rebuilds the copy later.`,
+        `Este servidor deixa de seguir '${subject}' de vez: as cópias dos apps dele param aqui e a cópia do banco fica guardada no disco, só leitura. Faça isso em cada servidor que NÃO assumiu '${subject}'. Uma nova oferta refaz a cópia depois.`,
+        params);
     case "mirror.handback":
       return risk(action, subject, "confirm",
         `The apps of '${subject}' stop here and the data goes back to '${subject}' once its copy has every change. Then run 'paasmcp mirror promote' there.`,

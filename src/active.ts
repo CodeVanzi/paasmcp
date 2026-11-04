@@ -186,7 +186,7 @@ export function activeBindIp(state: PaaSState): string | undefined {
 /** The live copy this server keeps of `nodeId`, while that server is still the one serving its data. */
 export function liveCopyOf(state: PaaSState, nodeId?: string): MirrorReplicaRecord | undefined {
   if (!nodeId) return undefined;
-  return Object.values(state.mirror?.replicas || {}).find((r) => r.peerNodeId === nodeId && !r.promotedAt && !r.failback);
+  return Object.values(state.mirror?.replicas || {}).find((r) => r.peerNodeId === nodeId && !r.promotedAt && !r.failback && !r.supersededBy);
 }
 
 export interface ActiveComposeExtras {
@@ -392,7 +392,7 @@ export interface ActiveFilesResult {
 /** True while this server still follows that peer (not promoted, no failback): copying may go on. */
 const stillFollowing = (peerName: string) => {
   const r = loadState().mirror?.replicas[peerName];
-  return !!r && !r.promotedAt && !r.failback;
+  return !!r && !r.promotedAt && !r.failback && !r.supersededBy;
 };
 
 /**
@@ -526,9 +526,13 @@ export async function syncActivePeers(
   for (const rec of Object.values(m?.replicas || {})) {
     const out: ActiveSyncResult = { peer: rec.peerName, status: "unchanged", deployed: [], stopped: [], errors: [] };
     results.push(out);
-    if (rec.promotedAt || rec.failback) {
+    if (rec.promotedAt || rec.failback || rec.supersededBy) {
       out.status = "skipped";
-      out.detail = rec.promotedAt ? "this server serves that peer's data now" : "failback in progress";
+      out.detail = rec.promotedAt
+        ? "this server serves that peer's data now"
+        : rec.failback
+          ? "failback in progress"
+          : "another server took over that peer's data: this copy waits to be rebuilt";
       continue;
     }
     const body = OFFLINE() && !opts.read ? undefined : read(rec);

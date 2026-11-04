@@ -26,6 +26,7 @@ import {
   mirrorStatus,
   offerMirror,
   promoteMirror,
+  retireCopy,
   checkArbiter,
   setAutoFailover,
   watchTick,
@@ -394,12 +395,15 @@ async function runCli() {
         console.log(installMirrorWatch());
       } else if (sub === "promote" && arg1) {
         await confirmInCli("mirror.promote", { peer: arg1 }, rest);
-        console.log(JSON.stringify(await promoteMirror(arg1), null, 2));
+        console.log(JSON.stringify(await promoteMirror(arg1, { stale: rest.includes("--stale") }), null, 2));
+      } else if (sub === "retire" && arg1) {
+        await confirmInCli("mirror.retire", { peer: arg1 }, rest);
+        console.log(JSON.stringify(retireCopy(arg1), null, 2));
       } else if (!sub || sub === "status") {
         console.log(JSON.stringify(mirrorStatus(), null, 2));
       } else {
         throw new Error(
-          "Usage: paasmcp mirror <offer <peer> --peer-ip <ip> [--from-copy-of <peer>]|accept <token> [--rejoin]|status|promote <peer>|handback <peer>|auto on|off <peer> [--arbiter <url>]|watch [--once]|install-watch>"
+          "Usage: paasmcp mirror <offer <peer> --peer-ip <ip> [--from-copy-of <peer>]|accept <token> [--rejoin]|status|promote <peer> [--stale]|retire <peer>|handback <peer>|auto on|off <peer> [--arbiter <url>]|watch [--once]|install-watch>"
         );
       }
       break;

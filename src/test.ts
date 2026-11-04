@@ -1436,7 +1436,22 @@ volumes:
       assert.equal((await tick())?.action, "none", "and stays out while fenced");
       const st6 = config.loadState();
       st6.mirror!.fenced = undefined;
+      // Several copies: a copy whose origin's data moved to another server steps out at once too.
+      const keep6 = st6.activeTunnel;
+      delete st6.activeTunnel;
+      st6.activeTunnelCopy = { fromNodeId: "node-z", tokenHash: "x", at: "x" };
+      st6.mirror!.replicas["zz"] = { peerName: "zz", peerNodeId: "node-z", peerHost: "100.64.0.26", slot: "s", container: "c", localPort: 5499, dataDir: "/nonexistent", acceptedAt: "x", supersededBy: { nodeId: "node-y", epoch: 3, at: "x" } };
+      st6.apps.shop.originNodeId = "node-z";
       config.saveState(st6);
+      running = true;
+      assert.equal((await tick())?.action, "leave", "a copy left behind steps out, healthy or not");
+      assert.equal((await tick())?.action, "none", "and stays out");
+      const st6b = config.loadState();
+      st6b.activeTunnel = keep6;
+      delete st6b.activeTunnelCopy;
+      delete st6b.mirror!.replicas["zz"];
+      st6b.apps.shop.originNodeId = undefined;
+      config.saveState(st6b);
 
       // Off: addresses back on the main tunnel, token and connector gone, B told through the manifest.
       const st7 = config.loadState();
@@ -1528,6 +1543,99 @@ volumes:
       assert.equal(fs.readFileSync(process.env.PAASMCP_ARBITER_ENV_FILE, "utf-8"), `PAASMCP_ARBITER_KEY=${k2}\n`);
     } finally {
       delete process.env.PAASMCP_ARBITER_ENV_FILE;
+    }
+  });
+
+  await t.test("31. Several copies of one server: one takes over, the others step aside, and a new offer rebuilds them", async () => {
+    const arbiter = await import("./arbiter.js");
+    const mirror = await import("./mirror.js");
+    const active = await import("./active.js");
+    const me = config.loadState().federation?.nodeId || "primary";
+    const key = Buffer.from(vault.getSecrets("system").FEDERATION_CLUSTER_KEY, "hex");
+    const tokenFrom = (slot: string, epoch: number) =>
+      "pmirror_" + vault.encryptBinaryPayload(Buffer.from(JSON.stringify({
+        v: 1, fromNodeId: "node-star-a", fromName: "star-a", host: "100.64.0.31", port: 5432, slot, password: "p", epoch, expiresAt: Date.now() + 60_000,
+      })), key).toString("base64url");
+    const rec0 = mirror.acceptMirror(tokenFrom("mirror_c", 2)).replica;
+    assert.equal(rec0.peerNodeId, "node-star-a");
+    const st = config.loadState();
+    st.apps["star-shop"] = { ...Object.values(st.apps)[0], name: "star-shop", originNodeId: "node-star-a", activeActive: true, domains: [], repoUrl: "o/r", trashedAt: undefined };
+    config.saveState(st);
+
+    const stateFile = path.join(tempRoot, "arb-star.json");
+    const srv = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", key: arbiter.deriveArbiterKey(), stateFile });
+    await new Promise((r) => srv.once("listening", r));
+    const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const ageNode = (node: string, ms: number) => {
+      const f = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+      for (const c of Object.values(f.clusters) as { nodes: Record<string, { lastSeen: number }> }[]) if (c.nodes[node]) c.nodes[node].lastSeen -= ms;
+      fs.writeFileSync(stateFile, JSON.stringify(f));
+    };
+    let streaming = true;
+    const tick = () => mirror.watchTick({ streaming: () => streaming });
+    try {
+      mirror.setAutoFailover("star-a", true, url);
+      await arbiter.askArbiter(url, { op: "heartbeat", node: "node-star-a", epoch: 2 });
+      await tick();
+      assert.ok(config.loadState().mirror?.replicas["star-a"].streamedAt, "seen streaming while the origin is alive");
+
+      // The origin dies. A copy that has not streamed for a long time never takes over on its own.
+      ageNode("node-star-a", 120_000);
+      streaming = false;
+      const st1 = config.loadState();
+      const fresh = st1.mirror!.replicas["star-a"].streamedAt;
+      st1.mirror!.replicas["star-a"].streamedAt = new Date(Date.now() - mirror.STREAMED_TRUST_MS - 1000).toISOString();
+      config.saveState(st1);
+      const t1 = await tick();
+      assert.match(String(t1["notTaken:star-a"]), /may lack the last writes/);
+      assert.equal(Object.keys(await tick()).some((k) => k.startsWith("notTaken")), false, "said once, not every round");
+      assert.equal(config.loadState().mirror?.replicas["star-a"].promotedAt, undefined);
+
+      // Another copy (server B) gets there first: this one steps aside and never claims.
+      const st2 = config.loadState();
+      st2.mirror!.replicas["star-a"].streamedAt = fresh;
+      config.saveState(st2);
+      assert.equal((await arbiter.askArbiter(url, { op: "claim", node: "node-star-b", epoch: 9, dataOf: "node-star-a" })).granted, true);
+      const t2 = await tick();
+      assert.deepEqual(t2["superseded:star-a"], { peer: "star-a", by: "node-star-b", stoppedApps: ["star-shop"] });
+      assert.equal(Object.keys(t2).some((k) => k.startsWith("promoted")), false);
+      const rec = config.loadState().mirror!.replicas["star-a"];
+      assert.equal(rec.supersededBy?.nodeId, "node-star-b");
+      assert.equal(rec.promotedAt, undefined);
+      assert.equal(Object.keys(await tick()).some((k) => k.startsWith("superseded") || k.startsWith("promoted")), false, "nothing more happens");
+      assert.equal(active.liveCopyOf(config.loadState(), "node-star-a"), undefined);
+      const sync = await active.syncActivePeers({ read: () => "x", deploy: async () => assert.fail("no deploy from a copy left behind") });
+      assert.match(String(sync.find((s) => s.peer === "star-a")?.detail), /another server took over/);
+      await assert.rejects(mirror.promoteMirror("star-a"), /behind for good: server node-star-b took over/);
+      const status = mirror.mirrorStatus().receiving as { peer: string; supersededBy?: { nodeId: string } }[];
+      assert.equal(status.find((r) => r.peer === "star-a")?.supersededBy?.nodeId, "node-star-b");
+
+      // Once the data has a home again, a new offer rebuilds the copy (the old one is moved aside, not deleted).
+      fs.mkdirSync(rec.dataDir, { recursive: true });
+      fs.writeFileSync(path.join(rec.dataDir, "PG_VERSION"), "16");
+      const rebuilt = mirror.acceptMirror(tokenFrom("mirror_c", 11));
+      assert.match(String(rebuilt.movedAside), /\.superseded-/);
+      assert.ok(fs.existsSync(rebuilt.movedAside!));
+      assert.equal(rebuilt.replica.supersededBy, undefined);
+      assert.ok(config.loadState().mirror!.epoch >= 11, "the offer's epoch is kept");
+      // A copy that still follows its origin is never replaced that way.
+      fs.mkdirSync(rec.dataDir, { recursive: true });
+      fs.writeFileSync(path.join(rec.dataDir, "PG_VERSION"), "16");
+      assert.throws(() => mirror.acceptMirror(tokenFrom("mirror_c", 11)), /already holds a copy/);
+
+      // Without an arbiter (manual failover): a person retires the copy on each server that did not take over.
+      assert.equal(guard.assessRisk("mirror.retire", { peer: "star-a" })?.level, "confirm");
+      assert.equal(mirror.retireCopy("star-a").by, "manual");
+      await assert.rejects(mirror.promoteMirror("star-a"), /retired by hand/);
+      assert.throws(() => mirror.retireCopy("nobody"), /no copy/);
+    } finally {
+      srv.close();
+      const s = config.loadState();
+      delete s.mirror!.replicas["star-a"];
+      delete s.apps["star-shop"];
+      s.mirror!.auto = (s.mirror!.auto || []).filter((p) => p !== "star-a");
+      delete s.mirror!.arbiterUrl;
+      config.saveState(s);
     }
   });
 

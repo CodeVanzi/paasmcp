@@ -1,6 +1,6 @@
 import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
-import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setArbiterUrl, setAutoFailover } from "./mirror.js";
+import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
@@ -597,6 +597,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const peer = String(body.peer || "");
           confirmFromBody("mirror.promote", { peer }, body);
           return reply(await promoteMirror(peer));
+        }
+        if (pathname === "/api/mirror/retire" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const peer = String(body.peer || "");
+          confirmFromBody("mirror.retire", { peer }, body);
+          return reply(retireCopy(peer));
         }
         if (pathname === "/api/mirror/handback" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -2734,6 +2740,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorNotStreaming": "Parada",
           "mirrorServingHere": "Apps rodando aqui",
           "mirrorPromoteDesc": "Se esse servidor cair, você pode assumir os apps dele aqui.",
+          "btnRetire": "Parar de seguir",
+          "mirrorRetireDesc": "Se outro servidor já assumiu {peer} à mão, use Parar de seguir aqui: esta cópia ficou para trás e não deve assumir.",
+          "mirrorRetired": "Este servidor parou de seguir.",
+          "mirrorBehind": "Ficou para trás",
+          "mirrorBehindBy": "O servidor {who} assumiu esses dados.",
+          "mirrorBehindManual": "Você marcou que outro servidor assumiu esses dados.",
+          "mirrorBehindDesc": "Esta cópia não recebe mais nada e nunca assume sozinha. Quando {peer} voltar a ser a casa dos dados, peça uma nova oferta lá para refazê-la (a cópia antiga fica guardada no disco).",
           "mirrorPromotedDesc": "Os apps dele estão rodando aqui. Quando ele voltar, siga a devolução abaixo.",
           "btnPromote": "Assumir os apps",
           "btnHandback": "Devolver os apps",
@@ -3014,6 +3027,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorNotStreaming": "Stopped",
           "mirrorServingHere": "Apps running here",
           "mirrorPromoteDesc": "If that server goes down, you can take over its apps here.",
+          "btnRetire": "Stop following",
+          "mirrorRetireDesc": "If another server already took over {peer} by hand, use Stop following here: this copy is behind and must not take over.",
+          "mirrorRetired": "This server stopped following.",
+          "mirrorBehind": "Behind",
+          "mirrorBehindBy": "Server {who} took over this data.",
+          "mirrorBehindManual": "You marked that another server took over this data.",
+          "mirrorBehindDesc": "This copy receives nothing more and never takes over on its own. Once {peer} is the data's home again, ask for a new offer there to rebuild it (the old copy stays on disk).",
           "mirrorPromotedDesc": "Its apps run here. When it comes back, follow the hand-back steps below.",
           "btnPromote": "Take over the apps",
           "btnHandback": "Hand the apps back",
@@ -3673,15 +3693,26 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           (o.walStatus === 'lost' ? '<div style="margin-top:6px;">' + esc(t('mirrorLost')) + '</div>' : ''));
       });
       (m.receiving || []).forEach(r => {
+        if (r.supersededBy) {
+          // Another server took over this peer's data: this copy only waits to be rebuilt.
+          const by = r.supersededBy.nodeId === 'manual' ? t('mirrorBehindManual') : t('mirrorBehindBy').replace('{who}', r.supersededBy.name || r.supersededBy.nodeId);
+          html += card('<strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + '</strong> ' + badge('warning', t('mirrorBehind')) +
+            '<div style="color:var(--muted);margin-top:4px;">' + esc(by) + ' ' + esc(t('mirrorBehindDesc').split('{peer}').join(r.peer)) + '</div>');
+          return;
+        }
         const state = r.error ? badge('danger', r.error)
           : r.promotedAt ? badge('warning', t('mirrorServingHere'))
           : r.streaming ? badge('success', t('mirrorUpToDate') + (r.secondsSinceLastChangeApplied != null ? ' (' + r.secondsSinceLastChangeApplied + ' s)' : ''))
           : badge('warning', t('mirrorNotStreaming'));
         const action = r.promotedAt
           ? '<button class="secondary" onclick="mirrorHandback(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnHandback')) + '</button>'
-          : '<button class="danger" onclick="mirrorPromote(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnPromote')) + '</button>';
+          : '<button class="danger" onclick="mirrorPromote(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnPromote')) + '</button>' +
+            // A stopped copy: if another server already took over by hand, this one should step aside.
+            (!r.streaming && !r.error ? ' <button class="secondary" onclick="mirrorRetire(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnRetire')) + '</button>' : '');
         html += card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + '</strong> ' + state +
-          '<div style="color:var(--muted);margin-top:4px;">' + esc(r.promotedAt ? t('mirrorPromotedDesc') : t('mirrorPromoteDesc')) + '</div></div>' + action + '</div>');
+          '<div style="color:var(--muted);margin-top:4px;">' + esc(r.promotedAt ? t('mirrorPromotedDesc') : t('mirrorPromoteDesc')) + '</div>' +
+          (!r.promotedAt && !r.streaming && !r.error ? '<div style="color:var(--muted);margin-top:4px;">' + esc(t('mirrorRetireDesc').split('{peer}').join(r.peer)) + '</div>' : '') +
+          '</div><div style="display:flex;gap:6px;flex-wrap:wrap;">' + action + '</div></div>');
       });
       if (!(m.sending || []).length && !(m.receiving || []).length) html += card(esc(t('mirrorNone')));
       document.getElementById('mirrorStatusBox').innerHTML = html;
@@ -3716,6 +3747,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (r) { showToast(t('mirrorAccepted')); loadMirror(); }
     }
     async function mirrorPromote(peer) { if (await postJson('/api/mirror/promote', { peer })) { showToast(t('mirrorPromoted')); loadMirror(); loadAll(); } }
+    async function mirrorRetire(peer) { if (await postJson('/api/mirror/retire', { peer })) { showToast(t('mirrorRetired')); loadMirror(); loadAll(); } }
     async function mirrorHandback(peer) { if (await postJson('/api/mirror/handback', { peer })) { showToast(t('mirrorHandedBack')); loadMirror(); loadAll(); } }
     async function mirrorAuto(on) {
       const peer = document.getElementById('mAutoPeer').value.trim();

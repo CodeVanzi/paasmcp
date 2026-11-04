@@ -103,6 +103,18 @@ PaaSMCP enables optional multi-server redundancy without the RAM overhead of Kub
 5. **Failback** is guided, never automatic: `offer --from-copy-of <peer>` on the server that took over,
    `accept --rejoin` on the returning server (rebuilds its Postgres from the copy), then
    `mirror handback` stops the apps here and `mirror promote` on the original server takes them back.
+6. **Several servers (star).** One server can offer its data to any number of others (`mirror offer`
+   once per server, one slot each); every copy follows it, and active-active apps run on all of them
+   (each copy reads the same manifest; the tunnel and the edge list every copy). When the origin fails,
+   the arbiter grants the takeover to exactly one copy. Every other copy of it is then **superseded**
+   (`supersededBy` on the replica record, set by `mirror watch` when the arbiter names another owner,
+   or by hand with `mirror retire <peer>`, guard *confirm*): it misses every write from then on, so its
+   app copies stop, it leaves the tunnel, it never takes over, and `mirror promote` refuses it without
+   `--stale`. It stays on disk, read-only; once the origin is home again (failback), a new offer
+   rebuilds it and the old folder is moved aside (`.superseded-<time>`), never deleted.
+7. **Trust for an automatic takeover:** `mirror watch` records when it last saw a copy streaming
+   (`streamedAt`, refreshed every 4 minutes while the origin is alive). A copy last seen streaming over
+   15 minutes before the origin vanished (or never) does not take over on its own; the watch says so once.
 
 ## 6. Arbiter and automatic failover (`src/arbiter.ts`)
 
@@ -244,6 +256,7 @@ memory and nothing needs to be reachable from the internet.
 | `PAASMCP_GARAGE_CAPACITY_GB` | `100` | Capacity declared for this server's Garage node. |
 | `PAASMCP_ARBITER_KEY` | — | Key(s) for `paasmcp arbiter serve` (from `paasmcp arbiter key`), comma-separated for several clusters, instead of `--key`. |
 | `PAASMCP_ARBITER_ENV_FILE` | `/etc/paasmcp-arbiter.env` | Where the arbiter device keeps its keys (0600). |
+| `PAASMCP_MIRROR_NAME_SUFFIX`, `PAASMCP_MIRROR_PORT_BASE` | —, `5433` | Labs only: copy container name suffix and first local port, so several copies of one server fit on one Docker host. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
 
 ## 12. Test labs
@@ -256,6 +269,10 @@ memory and nothing needs to be reachable from the internet.
 - `scripts/mirror-lab.sh`: two simulated servers on one Docker host (own network, ports 5432/5433):
   offer, accept, replication, promote, fencing, failback and handback. Refuses to run over an existing
   install and removes everything it created on exit.
+- `scripts/star-lab.sh`: three simulated servers in a star plus a real arbiter (ports 5432/5433/5443/4197). A
+  offers to B and C and both follow; A dies, the first copy to ask takes over and the other steps aside and
+  refuses to be promoted; A comes back fenced, failback; the copy left behind is rebuilt from a new offer and
+  has every row.
 - `scripts/active-lab.sh`: active-active on one Docker host. A publishes through `paasmcp_meta`, B's copy
   receives it, B builds A's exact commit (and ignores a newer unpublished one), B's app reads and writes A's
   database through the shared-service names and reads its local copy, the Caddy edge serves B and skips A's
