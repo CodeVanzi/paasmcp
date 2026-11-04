@@ -410,9 +410,13 @@ export async function tunnelWatchTick(
     mem.good = 0;
   }
   const running = docker.running();
-  // The origin keeps serving unless it is fenced: the two servers never step out together.
-  const mayLeave = !state.activeTunnel || Boolean(state.mirror?.fenced);
-  const action = running === undefined ? "none" : tunnelDecision({ running, mayLeave, mem, fenced: Boolean(state.mirror?.fenced) });
+  // The origin keeps serving unless it is fenced: the two servers never step out together. A copy
+  // whose origin's data moved to another server (several copies) steps out at once, like a fenced one.
+  const from = state.activeTunnelCopy?.fromNodeId;
+  const copyBehind = Boolean(from) && Object.values(state.mirror?.replicas || {}).some((r) => r.peerNodeId === from && r.supersededBy && !r.promotedAt);
+  const stepOut = Boolean(state.mirror?.fenced) || copyBehind;
+  const mayLeave = !state.activeTunnel || stepOut;
+  const action = running === undefined ? "none" : tunnelDecision({ running, mayLeave, mem, fenced: stepOut });
   if (action === "leave") docker.stop();
   if (action === "return") docker.start();
   if (action !== "none") audit({ event: action === "leave" ? "active.tunnel.leave" : "active.tunnel.return", unhealthy: results.filter((r) => !r.healthy).map((r) => r.app) });

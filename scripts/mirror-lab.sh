@@ -36,6 +36,8 @@ step "A: start Postgres, cluster key, data"
 name() { node --input-type=module -e "const c=await import('./dist/config.js');const s=c.loadState();s.federation={...(s.federation||{nodeId:'node-'+'$1',role:'standalone',redundancyMode:'warm-standby',peers:{}}),nodeId:'node-$1',nodeName:'$1'};c.saveState(s);"; }
 PAASMCP_ROOT=/tmp/labA name server-a; PAASMCP_ROOT=/tmp/labB name server-b
 runA 'const d=await import("./dist/database.js");d.ensureSharedPostgresCluster();const f=await import("./dist/federation.js");f.getOrCreateFederationClusterKey();'
+# The image's first start runs a socket-only init server, then restarts: wait for the real one (TCP).
+for _ in $(seq 60); do docker exec paasmcp-postgres psql -h 127.0.0.1 -U paasmcp_admin -d postgres -tAc 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
 pa "CREATE TABLE notas(id serial primary key, txt text); INSERT INTO notas(txt) SELECT 'n'||g FROM generate_series(1,100) g;"
 KEY=$(runA 'const v=await import("./dist/vault.js");console.log(v.getSecrets("system").FEDERATION_CLUSTER_KEY)')
 

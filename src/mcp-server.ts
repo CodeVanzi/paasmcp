@@ -37,7 +37,7 @@ import {
 import { provisionEmail } from "./email.js";
 import { setPolling } from "./poller.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
-import { mirrorStatus, promoteMirror } from "./mirror.js";
+import { mirrorStatus, promoteMirror, retireCopy } from "./mirror.js";
 import { provisionStorage } from "./storage.js";
 import { backupAppVolumes, fetchOffsite, syncOffsite, testRestore } from "./backup.js";
 import { ensureDashboardBackgroundService, getOrCreateDashboardToken } from "./dashboard.js";
@@ -366,12 +366,12 @@ async function listTools() {
       {
         name: "paas_mirror",
         description:
-          "Two-server mirror. 'status' shows, per peer, whether its Postgres copy is streaming, caught up and how many seconds behind, plus WAL kept for a peer that is away and the current epoch. 'promote' makes this server take over a peer's apps with its copy (manual failover): needs a person's strong confirmation, raises the epoch, redeploys the peer's apps here and points their DNS here. Pairing (offer/accept) is CLI-only because the token carries passwords.",
+          "Two-server mirror. 'status' shows, per peer, whether its Postgres copy is streaming, caught up and how many seconds behind, plus WAL kept for a peer that is away and the current epoch. 'promote' makes this server take over a peer's apps with its copy (manual failover): needs a person's strong confirmation, raises the epoch, redeploys the peer's apps here and points their DNS here. 'retire' (needs a person's confirmation): with several copies of one server, after another server took it over by hand, this copy stops following it for good (its app copies stop; a new offer rebuilds it). With an arbiter this happens on its own. Pairing (offer/accept) is CLI-only because the token carries passwords.",
         inputSchema: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["status", "promote"] },
-            peer: { type: "string", description: "Peer server name (required for promote)." },
+            action: { type: "string", enum: ["status", "promote", "retire"] },
+            peer: { type: "string", description: "Peer server name (required for promote and retire)." },
           },
           required: ["action"],
         },
@@ -928,6 +928,11 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           if (!args.peer) throw new Error("'peer' is required for promote.");
           authorize("mirror.promote", { peer: String(args.peer) });
           return { content: [{ type: "text", text: JSON.stringify(await promoteMirror(String(args.peer)), null, 2) }] };
+        }
+        if (args.action === "retire") {
+          if (!args.peer) throw new Error("'peer' is required for retire.");
+          authorize("mirror.retire", { peer: String(args.peer) });
+          return { content: [{ type: "text", text: JSON.stringify(retireCopy(String(args.peer)), null, 2) }] };
         }
         return { content: [{ type: "text", text: JSON.stringify(mirrorStatus(), null, 2) }] };
       }

@@ -118,6 +118,13 @@ export interface MirrorReplicaRecord {
   failback?: boolean;
   /** Set on the server that served a peer's data once it hands it back; the copy is then stale. */
   handedBackAt?: string;
+  /**
+   * Several copies of one server (star): another server took over the data this copy follows, so it
+   * is behind for good. It never takes over, its app copies stop, and a new offer rebuilds it.
+   */
+  supersededBy?: { nodeId: string; epoch: number; at: string };
+  /** Last time `mirror watch` saw this copy streaming (refreshed every few minutes, not every round). */
+  streamedAt?: string;
 }
 
 export interface MirrorConfig {
