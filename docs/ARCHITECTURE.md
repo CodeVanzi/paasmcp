@@ -111,6 +111,13 @@ Automatic failover with only two servers would split the brain when the link bet
 - Each server sends signed heartbeats (`mirror watch`, systemd timer). A server may take over its peer's
   data only if the arbiter has **also** not heard from that peer for 60 s and the requested epoch is
   higher than the current owner's. Requests older than 60 s of clock skew are rejected.
+- `paasmcp arbiter install-service --key <k> [--host tailscale] [--port 4097]` keeps it running under
+  systemd; the key lives in `/etc/paasmcp-arbiter.env` (0600), never in the unit or argv. `GET /health`
+  is an unsigned liveness probe that reveals nothing.
+- `checkArbiter` (`paasmcp arbiter check [url]`, dashboard `GET /api/mirror/arbiter[?url=]`) sends one
+  normal heartbeat and explains the result: reachable, key accepted, clock in sync, which servers the
+  arbiter hears and how long ago, and whether `mirror watch` runs here. `POST /api/mirror/arbiter` saves
+  the address alone (the server that only sends a copy still needs it to heartbeat and be fenced).
 
 ## 7. Backups off-site (`src/backup.ts`)
 

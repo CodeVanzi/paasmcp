@@ -9,7 +9,7 @@ import {
   updatePlatformConfig,
   withStateLock,
 } from "./config.js";
-import { deriveArbiterKey, startArbiterServer } from "./arbiter.js";
+import { deriveArbiterKey, installArbiterService, resolveArbiterHost, startArbiterServer } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
@@ -20,6 +20,7 @@ import {
   mirrorStatus,
   offerMirror,
   promoteMirror,
+  checkArbiter,
   setAutoFailover,
   watchTick,
 } from "./mirror.js";
@@ -374,14 +375,27 @@ async function runCli() {
         console.log(deriveArbiterKey());
       } else if (sub === "serve") {
         const key = getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY;
-        const host = getFlagValue(rest, "--host");
-        if (!key || !host) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP> [--port 4097] --key <from 'paasmcp arbiter key'> (or PAASMCP_ARBITER_KEY)");
+        const hostFlag = getFlagValue(rest, "--host");
+        if (!key || !hostFlag) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP|tailscale> [--port 4097] --key <from 'paasmcp arbiter key'> (or PAASMCP_ARBITER_KEY)");
+        const host = resolveArbiterHost(hostFlag);
         const port = Number(getFlagValue(rest, "--port") || 4097);
         startArbiterServer({ port, host, key });
         console.error(`Arbiter listening on http://${host}:${port}/arbiter`);
+        console.error(`On the servers, use the arbiter address http://${host}:${port}`);
         await new Promise(() => {});
+      } else if (sub === "install-service") {
+        const key = getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY;
+        if (!key) throw new Error("Usage: sudo paasmcp arbiter install-service --key <from 'paasmcp arbiter key'> [--host tailscale] [--port 4097]");
+        const port = Number(getFlagValue(rest, "--port") || 4097);
+        const hostFlag = getFlagValue(rest, "--host") || "tailscale";
+        const out = installArbiterService({ host: hostFlag, port, key });
+        console.log(JSON.stringify(out, null, 2));
+        const shown = hostFlag === "tailscale" ? (() => { try { return resolveArbiterHost("tailscale"); } catch { return "<Tailscale IP of this device>"; } })() : hostFlag;
+        console.error(`Arbiter running. On the servers, use the arbiter address http://${shown}:${port}`);
+      } else if (sub === "check") {
+        console.log(JSON.stringify(await checkArbiter(rest[1]), null, 2));
       } else {
-        throw new Error("Usage: paasmcp arbiter <key|serve>");
+        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|check [url]>");
       }
       break;
     }
@@ -689,7 +703,7 @@ Commands:
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
-  paasmcp arbiter <key|serve>                       Third vote for automatic failover (run on a small third device)
+  paasmcp arbiter <key|serve|install-service|check> Third vote for automatic failover (run on a small third device)
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
   paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email

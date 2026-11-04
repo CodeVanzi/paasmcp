@@ -1,6 +1,6 @@
 import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
-import { acceptMirror, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setAutoFailover } from "./mirror.js";
+import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
@@ -600,6 +600,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const peer = String(body.peer || "");
           confirmFromBody("mirror.handback", { peer }, body);
           return reply(await handbackMirror(peer));
+        }
+        // Test the arbiter (the saved one, or ?url= typed in the form before saving). A plain heartbeat.
+        if (pathname === "/api/mirror/arbiter" && req.method === "GET") return reply(await checkArbiter(url.searchParams.get("url") || undefined));
+        if (pathname === "/api/mirror/arbiter" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(setArbiterUrl(String(body.url || "")));
         }
         if (pathname === "/api/mirror/auto" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -1781,14 +1787,49 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
           <div class="card">
             <div class="card-header"><h2 data-i18n="autoTitle"></h2><p class="card-desc" data-i18n="autoDesc"></p></div>
-            <div class="grid-2">
-              <div><label class="field-label" for="mAutoPeer" data-i18n="lblPeerName"></label><input id="mAutoPeer" /></div>
-              <div><label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label><input id="mArbiter" placeholder="http://100.64.0.9:4097" /></div>
+            <div id="arbStatusBox" style="margin-bottom:6px;"></div>
+            <p class="card-desc" data-i18n="autoBefore"></p>
+
+            <h3 data-i18n="autoStep1" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep1Desc"></p>
+
+            <h3 data-i18n="autoStep2" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep2Desc"></p>
+            <pre style="user-select:all;">sudo paasmcp arbiter key</pre>
+
+            <h3 data-i18n="autoStep3" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep3Desc"></p>
+            <pre id="arbInstallCmd" style="user-select:all;white-space:pre-wrap;word-break:break-all;"></pre>
+            <button class="secondary" onclick="copyText(document.getElementById('arbInstallCmd').textContent)" data-i18n="aiCopy"></button>
+            <p class="card-desc" data-i18n="autoStep3Check" style="margin-top:10px;"></p>
+            <pre style="user-select:all;">curl http://$(tailscale ip -4):4097/health</pre>
+
+            <h3 data-i18n="autoStep4" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep4Desc" style="margin-bottom:10px;"></p>
+            <label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label>
+            <input id="mArbiter" placeholder="http://100.64.0.9:4097" />
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+              <button class="secondary" onclick="arbiterTest()" id="btnArbTest" data-i18n="btnArbTest"></button>
+              <button onclick="arbiterSave()" data-i18n="btnArbSave"></button>
             </div>
+            <div id="arbTestBox" style="margin-top:10px;"></div>
+
+            <h3 data-i18n="autoStep5" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep5Desc" style="margin-bottom:10px;"></p>
+            <label class="field-label" for="mAutoPeer" data-i18n="lblAutoPeer"></label>
+            <select id="mAutoPeer"></select>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
               <button onclick="mirrorAuto(true)" data-i18n="btnAutoOn"></button>
               <button class="secondary" onclick="mirrorAuto(false)" data-i18n="btnAutoOff"></button>
             </div>
+
+            <h3 data-i18n="autoStep6" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep6Desc"></p>
+            <pre style="user-select:all;">sudo paasmcp mirror install-watch</pre>
+
+            <h3 data-i18n="autoStep7" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="autoStep7Desc"></p>
+            <button class="secondary" onclick="loadArbiterStatus(true)" data-i18n="btnArbRefresh"></button>
           </div>
           <div class="card">
             <div class="card-header"><h2 data-i18n="failbackTitle"></h2></div>
@@ -2586,7 +2627,50 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorPromoted": "Apps assumidos.",
           "mirrorHandedBack": "Apps devolvidos. Agora assuma-os no outro servidor.",
           "autoTitle": "Troca automática",
-          "autoDesc": "Se o outro servidor sumir por mais de 1 minuto, este assume sozinho. Precisa de um juiz: um terceiro aparelho pequeno (Raspberry Pi ou VPS barata) com paasmcp arbiter serve. Sem juiz, se só a internet entre os dois cair, cada um acharia que o outro morreu.",
+          "autoDesc": "Se o outro servidor sumir por mais de 1 minuto, este assume os apps dele sozinho. Para isso precisa de um juiz: um terceiro aparelho que dá o voto de desempate. Sem juiz, se só a conexão entre os dois cair, cada um acharia que o outro morreu e os dois gravariam dados diferentes.",
+          "autoBefore": "Antes de começar: a cópia já precisa estar funcionando (aparece “Cópia de …” no topo desta página) e os três aparelhos precisam estar na mesma rede Tailscale. Faça os passos abaixo uma vez, nesta ordem.",
+          "autoStep1": "1. Escolha o aparelho do juiz",
+          "autoStep1Desc": "Qualquer aparelho ligado 24 horas que não seja nenhum dos dois servidores: um Raspberry Pi, uma VPS barata ou um PC velho. De preferência em outro lugar ou outra internet. Ele precisa de Node.js 20 ou mais novo e do Tailscale ligado na mesma conta. Não precisa de Docker e quase não usa memória.",
+          "autoStep2": "2. Pegue a chave do juiz (neste servidor)",
+          "autoStep2Desc": "No terminal deste servidor, rode o comando abaixo e copie a linha que aparecer (64 letras e números). Os dois servidores dão a mesma chave, porque ela vem do pareamento. Ela só serve para o juiz: não abre senhas, apps nem dados.",
+          "autoStep3": "3. Instale e ligue o juiz (no terceiro aparelho)",
+          "autoStep3Desc": "No terminal do aparelho do juiz, rode os comandos abaixo, trocando os dois trechos entre < >. O juiz passa a rodar sozinho, volta depois de reiniciar e atende só no endereço Tailscale do aparelho, porta 4097. No fim ele mostra o endereço para usar no passo 4.",
+          "autoStep3Check": "Para conferir no próprio aparelho do juiz, rode o comando abaixo. Se responder {&quot;ok&quot;:true}, o juiz está no ar.",
+          "autoRepoPlaceholder": "<mesmo repositório que você usou nos servidores>",
+          "autoKeyPlaceholder": "<chave do passo 2>",
+          "autoStep4": "4. Informe o endereço do juiz (neste servidor e no outro)",
+          "autoStep4Desc": "É http:// + o IP do Tailscale do aparelho do juiz + :4097, por exemplo http://100.64.0.9:4097. O IP aparece no app do Tailscale ou com “tailscale ip -4” no aparelho do juiz. Clique em Testar: tem que aparecer “O juiz respondeu”. Depois Salvar. Repita este passo no painel do outro servidor, com o mesmo endereço.",
+          "btnArbTest": "Testar",
+          "btnArbSave": "Salvar",
+          "autoStep5": "5. Escolha qual servidor este pode substituir",
+          "autoStep5Desc": "É o servidor cujos apps este vai assumir se ele cair. A lista mostra só os servidores dos quais este já guarda uma cópia. Ao ligar, o painel pede para digitar o nome para confirmar. Se a cópia é nos dois sentidos e você quer que qualquer um assuma o outro, faça este passo também no outro servidor.",
+          "lblAutoPeer": "Servidor que este pode substituir",
+          "autoNoCopy": "Nenhuma cópia recebida ainda (use “Receber cópia” acima)",
+          "autoNoPeer": "Escolha o servidor na lista. Se ela estiver vazia, este servidor ainda não guarda cópia de nenhum outro.",
+          "autoStep6": "6. Ligue o vigia (nos dois servidores)",
+          "autoStep6Desc": "O vigia conversa com o juiz a cada 15 segundos. É ele que avisa o juiz que o servidor está vivo, troca sozinho quando precisa e bloqueia o servidor que volta depois de ter sido substituído. Rode o comando abaixo no terminal de cada um dos dois servidores.",
+          "autoStep7": "7. Confira se está funcionando",
+          "autoStep7Desc": "O quadro no topo deste cartão mostra o que o juiz está ouvindo. Está pronto quando tudo fica verde: o juiz respondeu, ouviu este servidor e o outro há menos de 1 minuto, o vigia está rodando aqui e a troca está ligada. Se o outro servidor não aparece ou aparece com tempo alto, falta o passo 4 ou 6 nele.",
+          "btnArbRefresh": "Verificar de novo",
+          "arbNotSet": "Juiz ainda não informado (passo 4).",
+          "arbOk": "O juiz respondeu e aceitou a chave",
+          "arbThisServer": "este servidor",
+          "arbHeard": "O juiz ouviu {who} há {s} s",
+          "arbHeardOld": "mais de 1 minuto: o vigia está ligado nele?",
+          "arbPeerUnknown": "O juiz nunca ouviu {who}. Faça os passos 4 e 6 no painel e no terminal de {who}. Enquanto isso, se a cópia parar, este servidor assume.",
+          "arbWatchOn": "Vigia rodando neste servidor",
+          "arbWatchOff": "Vigia desligado neste servidor (passo 6)",
+          "arbAutoOn": "Troca automática ligada para: {who}",
+          "arbAutoOff": "Troca automática desligada neste servidor (passo 5)",
+          "arbAutoTag": "troca ligada",
+          "arbReady": "✅ Troca automática pronta",
+          "arbNotReady": "Ainda falta algo:",
+          "arbErr_badUrl": "Endereço inválido. Use http://<IP do Tailscale do juiz>:4097",
+          "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Reinstale o juiz com a chave do passo 2.",
+          "arbErr_clock": "O juiz respondeu, mas o relógio dele está mais de 1 minuto diferente. Ligue o horário automático nos aparelhos.",
+          "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso em Conexões e webhook.",
+          "arbErr_notArbiter": "Algo respondeu nesse endereço, mas não é o juiz. Confira a porta (padrão 4097).",
+          "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 3), se o IP é o do Tailscale dele e se a porta é 4097.",
           "lblArbiter": "Endereço do juiz",
           "btnAutoOn": "Ligar",
           "btnAutoOff": "Desligar",
@@ -2776,7 +2860,50 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorPromoted": "Apps taken over.",
           "mirrorHandedBack": "Apps handed back. Now take them over on the other server.",
           "autoTitle": "Automatic takeover",
-          "autoDesc": "If the other server disappears for more than 1 minute, this one takes over. Needs an arbiter: a small third device (Raspberry Pi or cheap VPS) running paasmcp arbiter serve. Without it, if only the link between the two breaks, each would think the other died.",
+          "autoDesc": "If the other server disappears for more than 1 minute, this one takes over its apps. That needs an arbiter: a third device that casts the deciding vote. Without it, if only the link between the two breaks, each would think the other died and both would write different data.",
+          "autoBefore": "Before you start: the copy must already work (“Copy of …” shows at the top of this page) and all three devices must be on the same Tailscale network. Do the steps below once, in this order.",
+          "autoStep1": "1. Pick the arbiter device",
+          "autoStep1Desc": "Any device that stays on 24/7 and is neither of the two servers: a Raspberry Pi, a cheap VPS or an old PC. Ideally somewhere else or on another internet link. It needs Node.js 20 or newer and Tailscale on the same account. No Docker, and it barely uses memory.",
+          "autoStep2": "2. Get the arbiter key (on this server)",
+          "autoStep2Desc": "In this server's terminal, run the command below and copy the line it prints (64 letters and digits). Both servers print the same key, because it comes from the pairing. It only works for the arbiter: it opens no passwords, apps or data.",
+          "autoStep3": "3. Install and start the arbiter (on the third device)",
+          "autoStep3Desc": "In the arbiter device's terminal, run the commands below, replacing both parts between < >. The arbiter then runs on its own, comes back after a reboot and only answers on the device's Tailscale address, port 4097. At the end it prints the address to use in step 4.",
+          "autoStep3Check": "To check on the arbiter device itself, run the command below. If it answers {&quot;ok&quot;:true}, the arbiter is up.",
+          "autoRepoPlaceholder": "<same repository you used on the servers>",
+          "autoKeyPlaceholder": "<key from step 2>",
+          "autoStep4": "4. Enter the arbiter address (on this server and the other)",
+          "autoStep4Desc": "It is http:// + the arbiter device's Tailscale IP + :4097, for example http://100.64.0.9:4097. The IP shows in the Tailscale app or with “tailscale ip -4” on the arbiter. Click Test: it must say “The arbiter answered”. Then Save. Repeat this step on the other server's dashboard, with the same address.",
+          "btnArbTest": "Test",
+          "btnArbSave": "Save",
+          "autoStep5": "5. Choose which server this one may replace",
+          "autoStep5Desc": "The server whose apps this one takes over if it goes down. The list only shows servers this one already holds a copy of. Turning it on asks you to type the name to confirm. If the copy goes both ways and either should replace the other, do this step on the other server too.",
+          "lblAutoPeer": "Server this one may replace",
+          "autoNoCopy": "No copy received yet (use “Receive a copy” above)",
+          "autoNoPeer": "Pick the server in the list. If it is empty, this server holds no copy of another one yet.",
+          "autoStep6": "6. Turn on the watchdog (on both servers)",
+          "autoStep6Desc": "The watchdog talks to the arbiter every 15 seconds. It tells the arbiter the server is alive, takes over when needed and blocks a server that comes back after being replaced. Run the command below in the terminal of each of the two servers.",
+          "autoStep7": "7. Check that it works",
+          "autoStep7Desc": "The box at the top of this card shows what the arbiter hears. It is ready when everything is green: the arbiter answered, heard this server and the other one less than 1 minute ago, the watchdog runs here and the takeover is on. If the other server is missing or shows a long time, step 4 or 6 is missing there.",
+          "btnArbRefresh": "Check again",
+          "arbNotSet": "No arbiter entered yet (step 4).",
+          "arbOk": "The arbiter answered and accepted the key",
+          "arbThisServer": "this server",
+          "arbHeard": "The arbiter heard {who} {s} s ago",
+          "arbHeardOld": "over 1 minute: is the watchdog on there?",
+          "arbPeerUnknown": "The arbiter never heard {who}. Do steps 4 and 6 on {who}'s dashboard and terminal. Meanwhile, if the copy stops, this server takes over.",
+          "arbWatchOn": "Watchdog running on this server",
+          "arbWatchOff": "Watchdog off on this server (step 6)",
+          "arbAutoOn": "Automatic takeover on for: {who}",
+          "arbAutoOff": "Automatic takeover off on this server (step 5)",
+          "arbAutoTag": "takeover on",
+          "arbReady": "✅ Automatic takeover ready",
+          "arbNotReady": "Something is still missing:",
+          "arbErr_badUrl": "Invalid address. Use http://<arbiter Tailscale IP>:4097",
+          "arbErr_badKey": "The arbiter answered but refused the key. Reinstall it with the key from step 2.",
+          "arbErr_clock": "The arbiter answered but its clock is more than 1 minute off. Turn on automatic time on the devices.",
+          "arbErr_notPaired": "This server is not paired with the other one yet: do it in Connections & webhook.",
+          "arbErr_notArbiter": "Something answered at that address, but it is not the arbiter. Check the port (default 4097).",
+          "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 3), that the IP is its Tailscale IP and that the port is 4097.",
           "lblArbiter": "Arbiter address",
           "btnAutoOn": "Turn on",
           "btnAutoOff": "Turn off",
@@ -3022,6 +3149,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
       renderHome();
       renderAi();
+      renderArbiterInstall();
       for (const k of I18N_KEYS) {
         const el = document.getElementById(k);
         if (el) {
@@ -3382,6 +3510,17 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       });
       if (!(m.sending || []).length && !(m.receiving || []).length) html += card(esc(t('mirrorNone')));
       document.getElementById('mirrorStatusBox').innerHTML = html;
+      // Step 5 only offers peers this server holds a copy of (the ones it could take over).
+      const sel = document.getElementById('mAutoPeer');
+      const keep = sel.value;
+      const peers = (m.receiving || []).filter(r => !r.promotedAt).map(r => r.peer);
+      sel.innerHTML = peers.length
+        ? peers.map(p => '<option value="' + esc(p) + '">' + esc(p) + ((m.auto || []).includes(p) ? ' · ' + esc(t('arbAutoTag')) : '') + '</option>').join('')
+        : '<option value="">' + esc(t('autoNoCopy')) + '</option>';
+      if (keep && peers.includes(keep)) sel.value = keep;
+      if (m.arbiterUrl && !document.getElementById('mArbiter').value) document.getElementById('mArbiter').value = m.arbiterUrl;
+      renderArbiterInstall();
+      loadArbiterStatus();
     }
     async function mirrorOffer() {
       const r = await postJson('/api/mirror/offer', {
@@ -3403,8 +3542,75 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     async function mirrorPromote(peer) { if (await postJson('/api/mirror/promote', { peer })) { showToast(t('mirrorPromoted')); loadMirror(); loadAll(); } }
     async function mirrorHandback(peer) { if (await postJson('/api/mirror/handback', { peer })) { showToast(t('mirrorHandedBack')); loadMirror(); loadAll(); } }
     async function mirrorAuto(on) {
-      const r = await postJson('/api/mirror/auto', { peer: document.getElementById('mAutoPeer').value.trim(), on, arbiterUrl: document.getElementById('mArbiter').value.trim() || undefined });
+      const peer = document.getElementById('mAutoPeer').value.trim();
+      if (!peer) { alert(t('autoNoPeer')); return; }
+      const r = await postJson('/api/mirror/auto', { peer, on, arbiterUrl: document.getElementById('mArbiter').value.trim() || undefined });
       if (r) { showToast(t('saved')); loadMirror(); }
+    }
+    function renderArbiterInstall() {
+      document.getElementById('arbInstallCmd').textContent =
+        'git clone ' + t('autoRepoPlaceholder') + ' paasmcp\\n' +
+        'cd paasmcp && npm install && npm run build\\n' +
+        'sudo node dist/cli.js arbiter install-service --key ' + t('autoKeyPlaceholder');
+    }
+    // Explains one arbiter check (GET /api/mirror/arbiter) in plain words: one line per thing to verify.
+    function renderArbiterCheck(c, opts) {
+      const ok = (txt) => '<div style="margin:3px 0;">' + badge('success', '✓') + ' ' + esc(txt) + '</div>';
+      const warn = (txt) => '<div style="margin:3px 0;">' + badge('warning', '!') + ' ' + esc(txt) + '</div>';
+      const bad = (txt) => '<div style="margin:3px 0;">' + badge('danger', '✗') + ' ' + esc(txt) + '</div>';
+      if (!c.configured) return card(warn(t('arbNotSet')));
+      let html = '';
+      if (!c.ok) {
+        html += bad(t('arbErr_' + (c.errorCode || 'unreachable'))) + '<div style="color:var(--muted);font-size:12px;margin-top:4px;">' + esc(c.url || '') + (c.detail ? ' · ' + esc(c.detail) : '') + '</div>';
+        return card(html);
+      }
+      html += ok(t('arbOk') + ' (' + c.url + ')');
+      const auto = c.auto || [];
+      (c.nodes || []).forEach(n => {
+        const who = n.isMe ? t('arbThisServer') + ' (' + n.name + ')' : n.name;
+        const line = t('arbHeard').replace('{who}', who).replace('{s}', String(n.secondsAgo));
+        html += n.isMe || n.secondsAgo <= 60 ? ok(line) : warn(line + ' · ' + t('arbHeardOld'));
+      });
+      if (!opts || !opts.testOnly) {
+        auto.forEach(p => {
+          const n = (c.nodes || []).find(x => !x.isMe && x.name === p);
+          if (!n) html += warn(t('arbPeerUnknown').split('{who}').join(p));
+        });
+        if (c.watchActive === true) html += ok(t('arbWatchOn'));
+        else if (c.watchActive === false) html += (auto.length ? bad : warn)(t('arbWatchOff'));
+        html += auto.length ? ok(t('arbAutoOn').replace('{who}', auto.join(', '))) : warn(t('arbAutoOff'));
+        const ready = c.ok && c.watchActive !== false && auto.length && auto.every(p => (c.nodes || []).some(x => !x.isMe && x.name === p && x.secondsAgo <= 60));
+        html = '<div style="font-weight:600;margin-bottom:6px;">' + esc(ready ? t('arbReady') : t('arbNotReady')) + '</div>' + html;
+      }
+      return card(html);
+    }
+    async function loadArbiterStatus() {
+      const box = document.getElementById('arbStatusBox');
+      box.innerHTML = card(esc(t('checking')));
+      const res = await fetch('/api/mirror/arbiter');
+      const c = await res.json().catch(() => ({}));
+      if (!res.ok) { box.innerHTML = card(badge('danger', c.error || 'error')); return; }
+      box.innerHTML = renderArbiterCheck(c);
+      const input = document.getElementById('mArbiter');
+      if (c.url && !input.value) input.value = c.url;
+    }
+    async function arbiterTest() {
+      const url = document.getElementById('mArbiter').value.trim();
+      const box = document.getElementById('arbTestBox');
+      if (!url) { box.innerHTML = card(esc(t('arbNotSet'))); return; }
+      const btn = document.getElementById('btnArbTest');
+      btn.disabled = true;
+      box.innerHTML = card(esc(t('checking')));
+      try {
+        const res = await fetch('/api/mirror/arbiter?url=' + encodeURIComponent(url));
+        const c = await res.json().catch(() => ({}));
+        box.innerHTML = res.ok ? renderArbiterCheck(c, { testOnly: true }) : card(badge('danger', c.error || 'error'));
+      } finally { btn.disabled = false; }
+    }
+    async function arbiterSave() {
+      const url = document.getElementById('mArbiter').value.trim();
+      if (!url) return;
+      if (await postJson('/api/mirror/arbiter', { url })) { showToast(t('saved')); loadMirror(); }
     }
 
     async function loadUpdates() {

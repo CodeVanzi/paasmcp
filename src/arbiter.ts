@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -52,8 +53,11 @@ export function arbiterDecide(state: ArbiterState, req: { op: Op; node: string; 
 
 export function startArbiterServer(opts: { port: number; host: string; key: string; stateFile?: string }): http.Server {
   const file = opts.stateFile || path.join(PAAS_DATA_DIR, "arbiter.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   const load = (): ArbiterState => (fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf-8")) : { nodes: {}, owners: {} });
   const server = http.createServer((req, res) => {
+    // Unsigned liveness probe for people checking the arbiter by hand (curl / browser). Reveals nothing.
+    if (req.method === "GET" && req.url === "/health") return res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true,"service":"paasmcp-arbiter"}');
     if (req.method !== "POST" || req.url !== "/arbiter") return res.writeHead(404).end();
     let body = "";
     req.on("data", (c) => {
@@ -94,4 +98,31 @@ export async function askArbiter(
   });
   if (!res.ok) throw new Error(`Arbiter answered HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json() as never;
+}
+
+/** `paasmcp arbiter serve --host tailscale` binds to this device's Tailscale IPv4. */
+export function resolveArbiterHost(host: string): string {
+  if (host !== "tailscale") return host;
+  return execFileSync("tailscale", ["ip", "-4"], { encoding: "utf-8" }).trim().split("\n")[0];
+}
+
+/**
+ * Keeps the arbiter running on the third device (systemd, survives reboots). The key goes into a
+ * root-only environment file, never into the unit or the process arguments.
+ */
+export function installArbiterService(opts: { host: string; port: number; key: string }): { service: string; envFile: string } {
+  if (!/^[a-f0-9]{64}$/.test(opts.key)) throw new Error("The key must be the 64-character output of 'paasmcp arbiter key' (run it on one of the servers).");
+  if (opts.host !== "tailscale" && !/^[a-zA-Z0-9.:[\]-]+$/.test(opts.host)) throw new Error(`Invalid --host '${opts.host}'.`);
+  if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) throw new Error(`Invalid --port '${opts.port}'.`);
+  const envFile = "/etc/paasmcp-arbiter.env";
+  fs.writeFileSync(envFile, `PAASMCP_ARBITER_KEY=${opts.key}\n`, { mode: 0o600 });
+  fs.chmodSync(envFile, 0o600);
+  const service = "/etc/systemd/system/paasmcp-arbiter.service";
+  fs.writeFileSync(
+    service,
+    `[Unit]\nDescription=PaaSMCP arbiter (third vote for automatic failover)\nAfter=network-online.target tailscaled.service\nWants=network-online.target\n\n[Service]\nEnvironment=PAASMCP_ROOT=${process.env.PAASMCP_ROOT || "/opt/homelab"}\nEnvironmentFile=${envFile}\nExecStart=${process.execPath} ${path.resolve(process.argv[1])} arbiter serve --host ${opts.host} --port ${opts.port}\n# The Tailscale address may not exist yet right after boot.\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=multi-user.target\n`
+  );
+  execFileSync("systemctl", ["daemon-reload"]);
+  execFileSync("systemctl", ["enable", "--now", "paasmcp-arbiter.service"]);
+  return { service, envFile };
 }
