@@ -114,6 +114,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "Starts a web server (Caddy) on ports 80 and 443 of this server, open to the internet. It only serves the sites you add with 'edge add', and gets their HTTPS certificates from Let's Encrypt.",
         "Liga um servidor web (Caddy) nas portas 80 e 443 deste servidor, aberto para a internet. Ele só atende os sites que você adicionar com 'edge add' e pega os certificados HTTPS no Let's Encrypt.",
         params);
+    case "scale.test":
+      return risk(action, subject, "confirm",
+        `Sends up to ${Number(params.maxConcurrency) || 32} parallel GET requests to app '${subject}' on ${String(params.path || "/")} for up to a few minutes, to find how much one copy handles. Visitors may find the app slower meanwhile. Use a path that only reads (it is called thousands of times).`,
+        `Manda até ${Number(params.maxConcurrency) || 32} requisições GET ao mesmo tempo para o app '${subject}' em ${String(params.path || "/")} por até alguns minutos, para descobrir quanto uma cópia aguenta. Quem visitar o app nesse meio tempo pode achá-lo mais lento. Use um caminho que só lê (ele é chamado milhares de vezes).`,
+        params);
     case "update.apply":
       return risk(action, String(params.component), "confirm",
         `${String(params.component)} restarts on ${String(params.image)} (a few seconds of downtime for every app that uses it). Databases are backed up first; if it does not come back healthy in 60 s, the previous version is restored.`,
