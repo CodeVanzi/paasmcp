@@ -1465,5 +1465,71 @@ volumes:
     }
   });
 
+  await t.test("30. One arbiter for several clusters: separate state per key, legacy file kept, keys managed by id", async () => {
+    const arbiter = await import("./arbiter.js");
+    const k1 = arbiter.deriveArbiterKey();
+    const k2 = crypto.randomBytes(32).toString("hex");
+    const id1 = arbiter.arbiterClusterId(k1);
+    const id2 = arbiter.arbiterClusterId(k2);
+    assert.match(id1, /^[a-f0-9]{16}$/);
+    assert.notEqual(id1, id2);
+    assert.deepEqual(arbiter.parseArbiterKeys(` ${k1.toUpperCase()}, ${k2} ${k1}`), [k1, k2]);
+    assert.throws(() => arbiter.parseArbiterKeys(`${k1},short`), /64-character/);
+
+    // A state file from a single-cluster arbiter belongs to the first key.
+    const stateFile = path.join(tempRoot, "arb-multi.json");
+    fs.writeFileSync(stateFile, JSON.stringify({ nodes: { A: { lastSeen: 1, epoch: 3 } }, owners: { A: { owner: "B", epoch: 3 } } }));
+    const srv = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", keys: [k1, k2], stateFile });
+    await new Promise((r) => srv.once("listening", r));
+    const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const raw = async (key: string, msg: Record<string, unknown>, cluster?: string) => {
+      const body = JSON.stringify({ ...msg, ts: Date.now() });
+      const headers: Record<string, string> = { "X-Paasmcp-Signature": crypto.createHmac("sha256", key).update(body).digest("hex") };
+      if (cluster !== undefined) headers["X-Paasmcp-Cluster"] = cluster;
+      const res = await fetch(`${url}/arbiter`, { method: "POST", body, headers });
+      return { status: res.status, body: (await res.json()) as { granted: boolean; cluster: string; owners: Record<string, { owner: string; epoch: number }> } };
+    };
+    try {
+      const r1 = await arbiter.askArbiter(url, { op: "heartbeat", node: "A", epoch: 3 });
+      assert.deepEqual(r1.owners.A, { owner: "B", epoch: 3 }, "the old single-cluster state is still there for the first key");
+      // Same node names in the second cluster: its own state, the first cluster is untouched.
+      const c2 = await raw(k2, { op: "claim", node: "B", epoch: 1, dataOf: "A" }, id2);
+      assert.equal(c2.status, 200);
+      assert.equal(c2.body.cluster, id2);
+      assert.equal(c2.body.granted, true, "A never spoke in cluster 2");
+      assert.deepEqual(c2.body.owners.A, { owner: "B", epoch: 1 });
+      assert.deepEqual((await arbiter.askArbiter(url, { op: "heartbeat", node: "A", epoch: 3 })).owners.A, { owner: "B", epoch: 3 });
+      // Older servers send no cluster id: the key that verifies picks the cluster.
+      assert.equal((await raw(k2, { op: "heartbeat", node: "C", epoch: 0 })).body.cluster, id2);
+      // A cluster id must come with its own key.
+      assert.equal((await raw(k2, { op: "heartbeat", node: "C", epoch: 0 }, id1)).status, 401);
+      assert.equal((await raw(crypto.randomBytes(32).toString("hex"), { op: "heartbeat", node: "C", epoch: 0 })).status, 401);
+      assert.equal((await raw(k1, { op: "heartbeat", node: "C", epoch: 0 }, "../../etc")).status, 401);
+      const saved = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+      assert.equal(saved.v, 2);
+      assert.deepEqual(Object.keys(saved.clusters).sort(), [id1, id2].sort());
+      assert.ok(!JSON.stringify(saved).includes(k1) && !JSON.stringify(saved).includes(k2), "keys never land in the state file");
+    } finally {
+      srv.close();
+    }
+
+    // Keys on the arbiter device: added and removed by cluster id; the file stays private.
+    process.env.PAASMCP_ARBITER_ENV_FILE = path.join(tempRoot, "arbiter.env");
+    try {
+      assert.deepEqual(arbiter.addArbiterKey(k1).clusters, [id1]);
+      assert.deepEqual(arbiter.addArbiterKey(k2).clusters, [id1, id2]);
+      assert.deepEqual(arbiter.addArbiterKey(k2).clusters, [id1, id2], "adding twice changes nothing");
+      assert.deepEqual(arbiter.listArbiterClusters(), [id1, id2]);
+      assert.equal(fs.statSync(process.env.PAASMCP_ARBITER_ENV_FILE).mode & 0o777, 0o600);
+      assert.throws(() => arbiter.addArbiterKey("not-a-key"), /64-character/);
+      assert.throws(() => arbiter.removeArbiterKey("ffffffffffffffff"), /No cluster/);
+      assert.deepEqual(arbiter.removeArbiterKey(id1).clusters, [id2]);
+      assert.throws(() => arbiter.removeArbiterKey(id2), /last cluster/);
+      assert.equal(fs.readFileSync(process.env.PAASMCP_ARBITER_ENV_FILE, "utf-8"), `PAASMCP_ARBITER_KEY=${k2}\n`);
+    } finally {
+      delete process.env.PAASMCP_ARBITER_ENV_FILE;
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

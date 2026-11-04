@@ -117,6 +117,15 @@ Automatic failover with only two servers would split the brain when the link bet
 - `paasmcp arbiter install-service --key <k> [--host tailscale] [--port 4097]` keeps it running under
   systemd; the key lives in `/etc/paasmcp-arbiter.env` (0600), never in the unit or argv. `GET /health`
   is an unsigned liveness probe that reveals nothing.
+- **One arbiter, several clusters.** `PAASMCP_ARBITER_KEY` holds a comma-separated list (at most 32).
+  Each key is one cluster, named by an id `sha256("paasmcp-arbiter-cluster:" + key)[0:16]` that reveals
+  nothing about the key. Servers send `X-Paasmcp-Cluster`; the arbiter checks the signature only against
+  that cluster's key (older servers without the header: whichever key verifies). State is kept per
+  cluster (`{v:2, clusters}`), so two clusters can reuse node names without touching each other; a
+  single-cluster state file is read as the first key's cluster. On the arbiter device,
+  `arbiter add-key <k>`, `arbiter remove-key <id>` (never the last one) and `arbiter clusters` (ids
+  only) edit the 0600 env file and restart the service; `install-service` on a device that already has
+  keys adds to them instead of replacing them.
 - `checkArbiter` (`paasmcp arbiter check [url]`, dashboard `GET /api/mirror/arbiter[?url=]`) sends one
   normal heartbeat and explains the result: reachable, key accepted, clock in sync, which servers the
   arbiter hears and how long ago, and whether `mirror watch` runs here. `POST /api/mirror/arbiter` saves
@@ -233,7 +242,8 @@ memory and nothing needs to be reachable from the internet.
 | `PAASMCP_CF_API_URL` | `https://api.cloudflare.com/client/v4` | Cloudflare API base used by the tunnel for apps on both servers (tests point it at a fake). |
 | `PAASMCP_PEER_S3_URL` | `http://<peer Tailscale IP>:3900` | The origin's Garage S3 API as seen from the peer (labs only). |
 | `PAASMCP_GARAGE_CAPACITY_GB` | `100` | Capacity declared for this server's Garage node. |
-| `PAASMCP_ARBITER_KEY` | — | Key for `paasmcp arbiter serve` (from `paasmcp arbiter key`), instead of `--key`. |
+| `PAASMCP_ARBITER_KEY` | — | Key(s) for `paasmcp arbiter serve` (from `paasmcp arbiter key`), comma-separated for several clusters, instead of `--key`. |
+| `PAASMCP_ARBITER_ENV_FILE` | `/etc/paasmcp-arbiter.env` | Where the arbiter device keeps its keys (0600). |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
 
 ## 12. Test labs

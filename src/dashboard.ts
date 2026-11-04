@@ -1840,6 +1840,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <button class="secondary" onclick="copyText(document.getElementById('arbInstallCmd').textContent)" data-i18n="aiCopy"></button>
             <p class="card-desc" data-i18n="autoStep3Check" style="margin-top:10px;"></p>
             <pre style="user-select:all;">curl http://$(tailscale ip -4):4097/health</pre>
+            <p class="card-desc" data-i18n="autoStep3Shared" style="margin-top:10px;"></p>
+            <pre style="user-select:all;white-space:pre-wrap;word-break:break-all;" id="arbAddKeyCmd"></pre>
 
             <h3 data-i18n="autoStep4" style="margin-top:16px;"></h3>
             <p class="card-desc" data-i18n="autoStep4Desc" style="margin-bottom:10px;"></p>
@@ -2761,6 +2763,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "autoStep3": "3. Instale e ligue o juiz (no terceiro aparelho)",
           "autoStep3Desc": "No terminal do aparelho do juiz, rode os comandos abaixo, trocando os dois trechos entre < >. O juiz passa a rodar sozinho, volta depois de reiniciar e atende só no endereço Tailscale do aparelho, porta 4097. No fim ele mostra o endereço para usar no passo 4.",
           "autoStep3Check": "Para conferir no próprio aparelho do juiz, rode o comando abaixo. Se responder {&quot;ok&quot;:true}, o juiz está no ar.",
+          "autoStep3Shared": "Se esse aparelho já é juiz de outro par de servidores, não instale de novo: rode só o comando abaixo. Cada par fica separado, com a própria chave.",
           "autoRepoPlaceholder": "<mesmo repositório que você usou nos servidores>",
           "autoKeyPlaceholder": "<chave do passo 2>",
           "autoStep4": "4. Informe o endereço do juiz (neste servidor e no outro)",
@@ -3040,6 +3043,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "autoStep3": "3. Install and start the arbiter (on the third device)",
           "autoStep3Desc": "In the arbiter device's terminal, run the commands below, replacing both parts between < >. The arbiter then runs on its own, comes back after a reboot and only answers on the device's Tailscale address, port 4097. At the end it prints the address to use in step 4.",
           "autoStep3Check": "To check on the arbiter device itself, run the command below. If it answers {&quot;ok&quot;:true}, the arbiter is up.",
+          "autoStep3Shared": "If this device is already the arbiter for another pair of servers, don't install it again: just run the command below. Each pair stays separate, with its own key.",
           "autoRepoPlaceholder": "<same repository you used on the servers>",
           "autoKeyPlaceholder": "<key from step 2>",
           "autoStep4": "4. Enter the arbiter address (on this server and the other)",
@@ -3724,6 +3728,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         'git clone ' + t('autoRepoPlaceholder') + ' paasmcp\\n' +
         'cd paasmcp && npm install && npm run build\\n' +
         'sudo node dist/cli.js arbiter install-service --key ' + t('autoKeyPlaceholder');
+      document.getElementById('arbAddKeyCmd').textContent =
+        'cd paasmcp && sudo node dist/cli.js arbiter add-key ' + t('autoKeyPlaceholder');
     }
     // Explains one arbiter check (GET /api/mirror/arbiter) in plain words: one line per thing to verify.
     function renderArbiterCheck(c, opts) {

@@ -10,9 +10,30 @@ import { getSecrets, timingSafeCompare } from "./vault.js";
 // when the arbiter, too, has stopped hearing from that peer. It runs anywhere small (Raspberry, VPS)
 // with `paasmcp arbiter serve`, and knows only a key derived from the cluster key (it cannot read
 // mirror tokens or vault bundles).
+//
+// One arbiter can serve several clusters (groups of paired servers): it holds one key per cluster and
+// keeps a separate state for each, so node names or epochs of one cluster never affect another. A
+// request names its cluster by an id derived from its key (X-Paasmcp-Cluster) and must be signed with
+// that key; requests without the header (older servers) are matched to the key that verifies them.
 
 export const DEAD_AFTER_MS = 60_000;
 const MAX_CLOCK_SKEW_MS = 60_000;
+
+export const MAX_ARBITER_KEYS = 32;
+const KEY_RE = /^[a-f0-9]{64}$/;
+const CLUSTER_ID_RE = /^[a-f0-9]{16}$/;
+export const ARBITER_ENV_FILE = () => process.env.PAASMCP_ARBITER_ENV_FILE || "/etc/paasmcp-arbiter.env";
+
+/** Public id of a cluster on the arbiter (reveals nothing about the key). */
+export const arbiterClusterId = (key: string) => crypto.createHash("sha256").update(`paasmcp-arbiter-cluster:${key}`).digest("hex").slice(0, 16);
+
+/** Keys from --key / PAASMCP_ARBITER_KEY: one or more 64-hex keys separated by commas or spaces. */
+export function parseArbiterKeys(raw: string | undefined): string[] {
+  const keys = [...new Set(String(raw || "").split(/[\s,]+/).map((k) => k.trim().toLowerCase()).filter(Boolean))];
+  for (const k of keys) if (!KEY_RE.test(k)) throw new Error("Each key must be the 64-character output of 'paasmcp arbiter key' (run it on one of the servers of that cluster).");
+  if (keys.length > MAX_ARBITER_KEYS) throw new Error(`At most ${MAX_ARBITER_KEYS} clusters per arbiter.`);
+  return keys;
+}
 
 export interface ArbiterState {
   nodes: Record<string, { lastSeen: number; epoch: number }>;
@@ -51,10 +72,25 @@ export function arbiterDecide(state: ArbiterState, req: { op: Op; node: string; 
   return { granted: true, state };
 }
 
-export function startArbiterServer(opts: { port: number; host: string; key: string; stateFile?: string }): http.Server {
+interface ArbiterFile {
+  v: 2;
+  clusters: Record<string, ArbiterState>;
+}
+
+/** Reads the state file; a single-cluster file from before belongs to the first key. */
+export function loadArbiterFile(file: string, firstKey: string): ArbiterFile {
+  if (!fs.existsSync(file)) return { v: 2, clusters: {} };
+  const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+  if (raw && raw.v === 2 && raw.clusters && typeof raw.clusters === "object") return raw as ArbiterFile;
+  return { v: 2, clusters: { [arbiterClusterId(firstKey)]: { nodes: raw?.nodes || {}, owners: raw?.owners || {} } } };
+}
+
+export function startArbiterServer(opts: { port: number; host: string; keys?: string[]; key?: string; stateFile?: string }): http.Server {
+  const keys = [...(opts.keys || []), ...(opts.key ? [opts.key] : [])];
+  if (!keys.length) throw new Error("The arbiter needs at least one key.");
+  const byId = new Map(keys.map((k) => [arbiterClusterId(k), k]));
   const file = opts.stateFile || path.join(PAAS_DATA_DIR, "arbiter.json");
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const load = (): ArbiterState => (fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf-8")) : { nodes: {}, owners: {} });
   const server = http.createServer((req, res) => {
     // Unsigned liveness probe for people checking the arbiter by hand (curl / browser). Reveals nothing.
     if (req.method === "GET" && req.url === "/health") return res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true,"service":"paasmcp-arbiter"}');
@@ -66,7 +102,17 @@ export function startArbiterServer(opts: { port: number; host: string; key: stri
     });
     req.on("end", () => {
       const reply = (code: number, o: unknown) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(o));
-      if (!timingSafeCompare(sign(opts.key, body), String(req.headers["x-paasmcp-signature"] || ""))) return reply(401, { error: "bad signature" });
+      const signature = String(req.headers["x-paasmcp-signature"] || "");
+      const claimed = String(req.headers["x-paasmcp-cluster"] || "");
+      // The cluster comes from the key that signed the request: a named cluster must match its own key.
+      let clusterId: string | undefined;
+      if (claimed) {
+        const key = CLUSTER_ID_RE.test(claimed) ? byId.get(claimed) : undefined;
+        if (key && timingSafeCompare(sign(key, body), signature)) clusterId = claimed;
+      } else {
+        for (const [id, key] of byId) if (timingSafeCompare(sign(key, body), signature)) clusterId = id;
+      }
+      if (!clusterId) return reply(401, { error: "bad signature" });
       let msg: { op: Op; node: string; epoch: number; ts: number; dataOf?: string; to?: string };
       try {
         msg = JSON.parse(body);
@@ -75,10 +121,12 @@ export function startArbiterServer(opts: { port: number; host: string; key: stri
       }
       const now = Date.now();
       if (Math.abs(now - msg.ts) > MAX_CLOCK_SKEW_MS) return reply(400, { error: "clock skew or replay" });
-      const state = load();
+      const all = loadArbiterFile(file, keys[0]);
+      const state = all.clusters[clusterId] || { nodes: {}, owners: {} };
       const out = arbiterDecide(state, msg, now);
-      writeFileAtomic(file, JSON.stringify(state, null, 2));
-      reply(200, { granted: out.granted, owner: out.owner, owners: state.owners, nodes: state.nodes, now });
+      all.clusters[clusterId] = state;
+      writeFileAtomic(file, JSON.stringify(all, null, 2));
+      reply(200, { granted: out.granted, owner: out.owner, owners: state.owners, nodes: state.nodes, now, cluster: clusterId });
     });
   });
   server.listen(opts.port, opts.host);
@@ -90,9 +138,10 @@ export async function askArbiter(
   msg: { op: Op; node: string; epoch: number; dataOf?: string; to?: string }
 ): Promise<{ granted: boolean; owner?: { owner: string; epoch: number }; owners: ArbiterState["owners"]; nodes: ArbiterState["nodes"]; now: number }> {
   const body = JSON.stringify({ ...msg, ts: Date.now() });
+  const key = deriveArbiterKey();
   const res = await fetch(`${url.replace(/\/+$/, "")}/arbiter`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Paasmcp-Signature": sign(deriveArbiterKey(), body) },
+    headers: { "Content-Type": "application/json", "X-Paasmcp-Signature": sign(key, body), "X-Paasmcp-Cluster": arbiterClusterId(key) },
     body,
     signal: AbortSignal.timeout(10_000),
   });
@@ -110,13 +159,15 @@ export function resolveArbiterHost(host: string): string {
  * Keeps the arbiter running on the third device (systemd, survives reboots). The key goes into a
  * root-only environment file, never into the unit or the process arguments.
  */
-export function installArbiterService(opts: { host: string; port: number; key: string }): { service: string; envFile: string } {
-  if (!/^[a-f0-9]{64}$/.test(opts.key)) throw new Error("The key must be the 64-character output of 'paasmcp arbiter key' (run it on one of the servers).");
+export function installArbiterService(opts: { host: string; port: number; key: string }): { service: string; envFile: string; clusters: string[] } {
+  const newKeys = parseArbiterKeys(opts.key);
+  if (!newKeys.length) throw new Error("The key must be the 64-character output of 'paasmcp arbiter key' (run it on one of the servers).");
   if (opts.host !== "tailscale" && !/^[a-zA-Z0-9.:[\]-]+$/.test(opts.host)) throw new Error(`Invalid --host '${opts.host}'.`);
   if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) throw new Error(`Invalid --port '${opts.port}'.`);
-  const envFile = "/etc/paasmcp-arbiter.env";
-  fs.writeFileSync(envFile, `PAASMCP_ARBITER_KEY=${opts.key}\n`, { mode: 0o600 });
-  fs.chmodSync(envFile, 0o600);
+  const envFile = ARBITER_ENV_FILE();
+  // Reinstalling keeps the clusters already served here.
+  const keys = parseArbiterKeys([...readArbiterKeys(), ...newKeys].join(","));
+  writeArbiterKeys(keys);
   const service = "/etc/systemd/system/paasmcp-arbiter.service";
   fs.writeFileSync(
     service,
@@ -124,5 +175,56 @@ export function installArbiterService(opts: { host: string; port: number; key: s
   );
   execFileSync("systemctl", ["daemon-reload"]);
   execFileSync("systemctl", ["enable", "--now", "paasmcp-arbiter.service"]);
-  return { service, envFile };
+  execFileSync("systemctl", ["restart", "paasmcp-arbiter.service"]);
+  return { service, envFile, clusters: keys.map(arbiterClusterId) };
 }
+
+function readArbiterKeys(): string[] {
+  const file = ARBITER_ENV_FILE();
+  if (!fs.existsSync(file)) return [];
+  const line = fs.readFileSync(file, "utf-8").split("\n").find((l) => l.startsWith("PAASMCP_ARBITER_KEY="));
+  return parseArbiterKeys(line?.slice("PAASMCP_ARBITER_KEY=".length));
+}
+
+function writeArbiterKeys(keys: string[]): void {
+  const file = ARBITER_ENV_FILE();
+  if (fs.existsSync(file)) fs.chmodSync(file, 0o600); // tighten before the keys go in
+  fs.writeFileSync(file, `PAASMCP_ARBITER_KEY=${keys.join(",")}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+}
+
+const restartArbiter = () => {
+  if (process.env.PAASMCP_OFFLINE_TEST === "1") return false;
+  try {
+    execFileSync("systemctl", ["restart", "paasmcp-arbiter.service"], { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** On the arbiter device: serve one more cluster (its key from 'paasmcp arbiter key' on one of its servers). */
+export function addArbiterKey(key: string): { cluster: string; clusters: string[]; restarted: boolean } {
+  const [k] = parseArbiterKeys(key);
+  if (!k) throw new Error("Usage: paasmcp arbiter add-key <key from 'paasmcp arbiter key'>");
+  const keys = parseArbiterKeys([...readArbiterKeys(), k].join(","));
+  writeArbiterKeys(keys);
+  return { cluster: arbiterClusterId(k), clusters: keys.map(arbiterClusterId), restarted: restartArbiter() };
+}
+
+/** On the arbiter device: stop serving a cluster (by its id from 'arbiter clusters', or its key). */
+export function removeArbiterKey(idOrKey: string): { removed: string; clusters: string[]; restarted: boolean } {
+  const want = String(idOrKey || "").trim().toLowerCase();
+  const keys = readArbiterKeys();
+  const left = keys.filter((k) => k !== want && arbiterClusterId(k) !== want);
+  if (left.length === keys.length) {
+    const label = CLUSTER_ID_RE.test(want) ? want : KEY_RE.test(want) ? arbiterClusterId(want) : "that value";
+    throw new Error(`No cluster '${label}' on this arbiter (see 'paasmcp arbiter clusters').`);
+  }
+  if (!left.length) throw new Error("That is the last cluster: the arbiter needs at least one key (uninstall it instead).");
+  writeArbiterKeys(left);
+  return { removed: CLUSTER_ID_RE.test(want) ? want : arbiterClusterId(want), clusters: left.map(arbiterClusterId), restarted: restartArbiter() };
+}
+
+/** Ids of the clusters this arbiter serves (never the keys). */
+export const listArbiterClusters = () => readArbiterKeys().map(arbiterClusterId);
