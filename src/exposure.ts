@@ -178,7 +178,9 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
     result?: Array<{ id: string }>;
   };
 
-  const cnameTarget = `${tunnelId}.cfargotunnel.com`;
+  // A hostname already served by the tunnel for apps on both servers stays on it (activetunnel.ts).
+  const onSecond = app.activeActive && state.activeTunnel?.routes[fullHostname] ? state.activeTunnel.tunnelId : undefined;
+  const cnameTarget = `${onSecond || tunnelId}.cfargotunnel.com`;
   if (existingDnsData.result && existingDnsData.result.length > 0) {
     const recordId = existingDnsData.result[0].id;
     await fetch(
@@ -271,9 +273,17 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
   saveState(state);
   syncHomepageDashboard();
 
+  // An app that runs on both servers moves to their tunnel once its copy there answers (activetunnel.ts).
+  let tunnelNote = "";
+  if (app.activeActive && state.activeTunnel) {
+    const { routeActiveTunnel } = await import("./activetunnel.js");
+    const r = await routeActiveTunnel().catch((err: unknown) => ({ error: err instanceof Error ? err.message : String(err) }));
+    tunnelNote = "error" in r ? ` Tunnel for apps on both servers: ${r.error}` : r.routed.includes(fullHostname) ? " Served by both servers (their tunnel)." : " Moves to the tunnel of both servers once the other server's copy answers.";
+  }
+
   return {
     url: publicUrl,
     mode: opts.mode,
-    details: `Cloudflare Tunnel route ${publicUrl} -> ${internalServiceUrl} configured with proxied CNAME DNS. ${zeroTrustStatus}`,
+    details: `Cloudflare Tunnel route ${publicUrl} -> ${internalServiceUrl} configured with proxied CNAME DNS. ${zeroTrustStatus}${tunnelNote}`,
   };
 }

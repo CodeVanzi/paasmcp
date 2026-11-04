@@ -2,14 +2,15 @@
 # Real-Docker check of active-active on one Docker host: server A (Postgres + control channel) and
 # server B (live copy + the app) share a lab network. B builds the exact commit A publishes, its app
 # reads and writes A's database through the shared-service names, a commit A has not published is
-# ignored, the self-hosted edge (Caddy) serves B's copy and skips a dead backend, and after A dies
+# ignored, the self-hosted edge (Caddy) serves B's copy and skips a dead backend, B runs A's tunnel
+# connector and steps out of it while its copy is sick, and after A dies
 # B is promoted and the app moves to the local copy.
 # Usage: sudo env PATH=$PATH scripts/active-lab.sh   (needs Docker and `npm run build`)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
 docker info >/dev/null 2>&1 || { echo "Docker is not reachable." >&2; exit 1; }
-for c in paasmcp-postgres paasmcp-mirror-server-a paasmcp-shop paasmcp-edge; do
+for c in paasmcp-postgres paasmcp-mirror-server-a paasmcp-shop paasmcp-edge paasmcp-tunnel-active; do
   if docker inspect "$c" >/dev/null 2>&1; then
     echo "Container '$c' already exists (a real PaaSMCP?). This lab never touches it: run it in a VM or a machine without PaaSMCP." >&2
     exit 1
@@ -23,7 +24,7 @@ A=$(mktemp -d); B=$(mktemp -d); SRC=$(mktemp -d)
 docker network create "$PAASMCP_DOCKER_NETWORK" >/dev/null
 cleanup() {
   echo; echo "=== cleanup"
-  docker rm -f paasmcp-postgres paasmcp-mirror-server-a paasmcp-shop paasmcp-shop-candidate paasmcp-edge >/dev/null 2>&1 || true
+  docker rm -f paasmcp-postgres paasmcp-mirror-server-a paasmcp-shop paasmcp-shop-candidate paasmcp-edge paasmcp-tunnel-active >/dev/null 2>&1 || true
   docker rmi paasmcp/shop:latest paasmcp/shop:previous >/dev/null 2>&1 || true
   docker network rm "$PAASMCP_DOCKER_NETWORK" >/dev/null 2>&1 || true
   docker run --rm -v "$A:/a" -v "$B:/b" alpine:3.20 sh -c 'rm -rf /a/* /b/*' >/dev/null 2>&1 || true
@@ -122,6 +123,34 @@ for i in $(seq 1 30); do
 done
 check "30 requests through the edge (A's backend is down in this lab)" "$ok" "30"
 runB "const e=await import('$REPO/dist/edge.js');console.log(JSON.stringify((await e.edgeStatus()).sites))"
+
+step "Tunnel for apps on both servers: B runs A's connector, steps out while its copy is sick"
+# A's side as after 'paasmcp active tunnel on' (no Cloudflare account in a lab: the token is a dummy).
+LABTOKEN=eyJhIjoibGFiIiwidCI6ImxhYiJ9LABTOKEN
+runA "const c=await import('$REPO/dist/config.js');const v=await import('$REPO/dist/vault.js');const s=c.loadState();
+  s.activeTunnel={tunnelId:'22222222-2222-4222-8222-222222222222',name:'paasmcp-active-server-a',createdAt:'x',routes:{}};c.saveState(s);
+  v.setSecretEntries('system',{ACTIVE_TUNNEL_TOKEN:'$LABTOKEN'});const a=await import('$REPO/dist/active.js');console.log(JSON.stringify(a.publishActiveState()));"
+sleep 2
+check "B starts the connector from the control channel" "$(runB "const a=await import('$REPO/dist/active.js');console.log((await a.syncActivePeers())[0].tunnel)")" "started"
+check "cloudflared got the token from its private env file" "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' paasmcp-tunnel-active | grep -c "^TUNNEL_TOKEN=$LABTOKEN$")" "1"
+check "pinned image" "$(docker inspect -f '{{.Config.Image}}' paasmcp-tunnel-active)" "cloudflare/cloudflared:2025.8.1"
+# The dummy token cannot connect to Cloudflare; a sleeping container stands in for the connector from here on.
+docker rm -f paasmcp-tunnel-active >/dev/null
+docker run -d --name paasmcp-tunnel-active alpine:3.20 sleep 3600 >/dev/null
+TICKS="const t=await import('$REPO/dist/activetunnel.js');const out=[];for(let i=0;i<2;i++){out.push((await t.tunnelWatchTick()).action);}console.log(out.join(','))"
+check "healthy copy stays in" "$(runB "$TICKS")" "none,none"
+docker pause paasmcp-postgres >/dev/null   # the link to A's database breaks; B's /healthz stops answering
+check "sick copy steps out after two rounds" "$(runB "$TICKS")" "none,leave"
+check "connector stopped" "$(docker inspect -f '{{.State.Running}}' paasmcp-tunnel-active)" "false"
+docker unpause paasmcp-postgres >/dev/null
+for i in $(seq 1 20); do curl -s --max-time 3 127.0.0.1:4100/healthz | grep -q '^v2' && break; sleep 1; done
+check "healthy again: back in after two rounds" "$(runB "$TICKS")" "none,return"
+check "connector running" "$(docker inspect -f '{{.State.Running}}' paasmcp-tunnel-active)" "true"
+runA "const c=await import('$REPO/dist/config.js');const v=await import('$REPO/dist/vault.js');const s=c.loadState();delete s.activeTunnel;c.saveState(s);
+  v.deleteSecretKey('system','ACTIVE_TUNNEL_TOKEN');const a=await import('$REPO/dist/active.js');console.log(JSON.stringify(a.publishActiveState()));"
+sleep 2
+check "A turns it off: B removes its connector" "$(runB "const a=await import('$REPO/dist/active.js');console.log((await a.syncActivePeers())[0].tunnel)")" "removed"
+check "container gone" "$(docker inspect paasmcp-tunnel-active >/dev/null 2>&1 && echo present || echo gone)" "gone"
 
 step "A dies; B is promoted; the app moves to B's copy"
 docker stop paasmcp-postgres >/dev/null

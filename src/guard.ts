@@ -99,6 +99,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `App '${subject}' will also run on the other server and both will take requests. The other server receives its settings and secrets, reaches this server's database, Redis and S3 over Tailscale, and the app's port is published on this server's Tailscale IP.`,
         `O app '${subject}' vai rodar também no outro servidor, e os dois vão receber requisições. O outro servidor recebe as configurações e os segredos do app, acessa o banco, o Redis e o S3 daqui pela Tailscale, e a porta do app passa a ser publicada no IP Tailscale deste servidor.`,
         params);
+    case "active.tunnel":
+      return risk(action, "tunnel", "confirm",
+        "Creates a second Cloudflare Tunnel used only by the apps that run on both servers, runs it on this server and on the other one, and moves the DNS of those apps' public addresses to it (each one once its copy on the other server answers). Apps that run only here stay on the current tunnel. The other server receives the tunnel's token through the encrypted control channel.",
+        "Cria um segundo túnel da Cloudflare, usado só pelos apps que rodam nos dois servidores, roda esse túnel aqui e no outro servidor e muda o DNS dos endereços públicos desses apps para ele (cada um quando a cópia no outro servidor responder). Os apps que rodam só aqui continuam no túnel atual. O outro servidor recebe o token do túnel pelo canal cifrado.",
+        params);
     case "edge.install":
       return risk(action, "edge", "strong",
         "Starts a web server (Caddy) on ports 80 and 443 of this server, open to the internet. It only serves the sites you add with 'edge add', and gets their HTTPS certificates from Let's Encrypt.",

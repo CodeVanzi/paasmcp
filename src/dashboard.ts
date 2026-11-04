@@ -3,6 +3,7 @@ import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./e
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
+import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
@@ -615,7 +616,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const candidates = Object.values(state.apps)
             .filter((a) => !a.originNodeId && !a.trashedAt && a.name !== "paasmcp-dashboard")
             .map((a) => ({ ...activeReadiness(a.name, state), on: Boolean(a.activeActive) }));
-          return reply({ ...activeStatus(state), candidates, edge: await edgeStatus() });
+          return reply({ ...activeStatus(state), candidates, edge: await edgeStatus(), tunnel: activeTunnelStatus(state) });
         }
         if (pathname === "/api/active" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -627,6 +628,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             confirmFromBody("app.active", { appName }, body);
           }
           return reply(await switchActiveActive(appName, on));
+        }
+        if (pathname === "/api/active/tunnel" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          if (body.on === true) {
+            confirmFromBody("active.tunnel", {}, body);
+            return reply(await enableActiveTunnel());
+          }
+          return reply(await disableActiveTunnel());
         }
         if (pathname === "/api/edge/site" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -1697,7 +1706,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   </div>
                   <div class="guide-item">
                     <strong id="guideFedActiveTitle">⚡ Active-Active (Cloudflare)</strong>
-                    <span id="guideFedActiveDesc">Múltiplos servidores atendem no mesmo túnel com balanceamento de carga e failover automático.</span>
+                    <span id="guideFedActiveDesc">Os apps ligados nos dois servidores ganham um túnel só deles, que roda nos dois; o servidor com a cópia doente sai do túnel sozinho.</span>
                   </div>
                   <div class="guide-item">
                     <strong id="guideFedWarmTitle">📦 Warm Standby & Sync</strong>
@@ -1882,6 +1891,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <h3 data-i18n="aaStep4" style="margin-top:16px;"></h3>
             <p class="card-desc" data-i18n="aaStep4Desc"></p>
             <p class="card-desc" data-i18n="aaTunnel" style="margin-top:8px;"></p>
+            <div id="aaTunnelBox" style="margin-top:8px;"></div>
             <p class="card-desc" data-i18n="aaEdge" style="margin-top:8px;"></p>
             <pre style="user-select:all;">sudo paasmcp edge install --email voce@exemplo.com</pre>
             <label class="field-label" for="aaHost" data-i18n="lblAaHost"></label>
@@ -2285,7 +2295,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         guideFedTokenTitle: "🤝 Handshake HMAC-SHA256",
         guideFedTokenDesc: "Pareia nós com token assinado e expiração de 15 minutos, impedindo conexões não autorizadas.",
         guideFedActiveTitle: "⚡ Active-Active (Cloudflare)",
-        guideFedActiveDesc: "Múltiplos servidores atendem no mesmo túnel com balanceamento de carga e failover automático.",
+        guideFedActiveDesc: "Os apps ligados nos dois servidores ganham um túnel só deles, que roda nos dois; o servidor com a cópia doente sai do túnel sozinho.",
         guideFedWarmTitle: "📦 Warm Standby & Sync",
         guideFedWarmDesc: "Exportação e importação de pacotes cifrados com segredos e apps para recuperação remota.",
         guideWhTitle: "⚡ Automação com GitHub Webhooks",
@@ -2518,7 +2528,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         guideFedTokenTitle: "🤝 HMAC-SHA256 Handshake",
         guideFedTokenDesc: "Pairs nodes with signed tokens and 15-minute expiration, blocking unauthorized cluster connections.",
         guideFedActiveTitle: "⚡ Active-Active (Cloudflare)",
-        guideFedActiveDesc: "Multiple servers serve traffic on the same tunnel with automatic load balancing and failover.",
+        guideFedActiveDesc: "Apps turned on for both servers get a tunnel of their own, run on both; a server whose copy is sick steps out by itself.",
         guideFedWarmTitle: "📦 Warm Standby & Sync",
         guideFedWarmDesc: "Exports and imports encrypted bundles containing configs and vault data to keep standby nodes in sync.",
         guideWhTitle: "⚡ Automation with GitHub Webhooks",
@@ -2674,7 +2684,19 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaSwitched": "Feito. O outro servidor acompanha em até 15 segundos.",
           "aaStep4": "4. Escolha por onde as visitas entram",
           "aaStep4Desc": "Dá para usar uma das duas entradas, ou as duas.",
-          "aaTunnel": "Com Cloudflare Tunnel: no outro servidor, rode o cloudflared com o mesmo token do túnel deste. O endereço do app não muda, e a Cloudflare tira do caminho o servidor que cair.",
+          "aaTunnel": "Com Cloudflare Tunnel: ligue o túnel dos dois servidores. O PaaSMCP cria um túnel só para estes apps, roda esse túnel aqui e no outro servidor, e muda o DNS de cada endereço quando a cópia no outro servidor responder. Os outros apps continuam no túnel atual. Se a cópia de um servidor ficar sem saúde, esse servidor sai do túnel sozinho até ela voltar. Para isso, o “paasmcp mirror watch” precisa rodar nos dois servidores.",
+          "btnAaTunnelOn": "Ligar o túnel dos dois servidores",
+          "btnAaTunnelOff": "Desligar o túnel dos dois servidores",
+          "aaTunOn": "Túnel dos dois servidores ligado",
+          "aaTunOff": "Túnel dos dois servidores desligado",
+          "aaTunCopy": "Este servidor roda o túnel do outro servidor",
+          "aaTunNoCf": "A Cloudflare não está configurada neste servidor.",
+          "aaTunHere": "conector aqui",
+          "aaTunRunning": "no túnel",
+          "aaTunStopped": "fora do túnel",
+          "aaTunAbsent": "não iniciado",
+          "aaTunHosts": "Endereços no túnel",
+          "aaTunSick": "sem saúde",
           "aaEdge": "Sem depender de cloud: num servidor com IP público (normalmente o VPS), ligue a entrada própria pelo terminal com o comando abaixo. Ela abre as portas 80 e 443, pega o HTTPS sozinha e confere a cada 5 segundos se o app responde em cada servidor. Depois adicione o site aqui e aponte o DNS (registro A) para o IP público desse servidor.",
           "lblAaHost": "Endereço do site",
           "btnAaSite": "Adicionar site à entrada própria",
@@ -2952,7 +2974,19 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaSwitched": "Done. The other server follows within 15 seconds.",
           "aaStep4": "4. Choose where visits come in",
           "aaStep4Desc": "Use either entry, or both.",
-          "aaTunnel": "With Cloudflare Tunnel: on the other server, run cloudflared with this tunnel's token. The app's address stays the same, and Cloudflare stops using a server that goes down.",
+          "aaTunnel": "With Cloudflare Tunnel: turn on the tunnel for both servers. PaaSMCP creates a tunnel just for these apps, runs it here and on the other server, and moves each address's DNS once the copy on the other server answers. Other apps stay on the current tunnel. If a server's copy becomes unhealthy, that server steps out of the tunnel by itself until it recovers. This needs “paasmcp mirror watch” running on both servers.",
+          "btnAaTunnelOn": "Turn on the tunnel for both servers",
+          "btnAaTunnelOff": "Turn off the tunnel for both servers",
+          "aaTunOn": "Tunnel for both servers on",
+          "aaTunOff": "Tunnel for both servers off",
+          "aaTunCopy": "This server runs the other server's tunnel",
+          "aaTunNoCf": "Cloudflare is not configured on this server.",
+          "aaTunHere": "connector here",
+          "aaTunRunning": "in the tunnel",
+          "aaTunStopped": "out of the tunnel",
+          "aaTunAbsent": "not started",
+          "aaTunHosts": "Addresses in the tunnel",
+          "aaTunSick": "unhealthy",
           "aaEdge": "Without a cloud: on a server with a public IP (usually the VPS), start the self-hosted entry from the terminal with the command below. It opens ports 80 and 443, gets HTTPS by itself and checks every 5 seconds whether the app answers on each server. Then add the site here and point its DNS (A record) at that server's public IP.",
           "lblAaHost": "Site address",
           "btnAaSite": "Add site to the self-hosted entry",
@@ -3775,6 +3809,28 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (keep && (activeData.candidates || []).some(c => c.app === keep)) sel.value = keep;
       renderActiveCheck();
       renderEdge();
+      renderTunnel();
+    }
+    function renderTunnel() {
+      const tu = (activeData && activeData.tunnel) || {};
+      const box = document.getElementById('aaTunnelBox');
+      const conn = tu.connector && tu.connector !== 'none'
+        ? ' · ' + esc(t('aaTunHere')) + ': ' + badge(tu.connector === 'running' ? 'success' : tu.connector === 'stopped' ? 'warning' : '', t(tu.connector === 'running' ? 'aaTunRunning' : tu.connector === 'stopped' ? 'aaTunStopped' : 'aaTunAbsent'))
+        : '';
+      const sick = tu.watch && (tu.watch.apps || []).filter(a => !a.healthy).map(a => a.app);
+      let html = '<div>' + (tu.on ? badge('success', t('aaTunOn')) : tu.copyOf ? badge('success', t('aaTunCopy')) : esc(tu.configured ? t('aaTunOff') : t('aaTunNoCf'))) + conn +
+        (sick && sick.length ? ' · ' + badge('danger', t('aaTunSick') + ': ' + sick.join(', ')) : '') + '</div>';
+      if (tu.on && (tu.hostnames || []).length) html += '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aaTunHosts')) + ': ' + esc(tu.hostnames.join(', ')) + '</div>';
+      if (tu.configured && !tu.copyOf) {
+        html += '<div style="margin-top:8px;">' + (tu.on
+          ? '<button class="secondary" onclick="activeTunnel(false)">' + esc(t('btnAaTunnelOff')) + '</button>'
+          : '<button onclick="activeTunnel(true)">' + esc(t('btnAaTunnelOn')) + '</button>') + '</div>';
+      }
+      box.innerHTML = card(html);
+    }
+    async function activeTunnel(on) {
+      const r = await postJson('/api/active/tunnel', { on });
+      if (r) { showToast(t('saved')); loadActive(); }
     }
     function renderActiveCheck() {
       const box = document.getElementById('aaCheckBox');

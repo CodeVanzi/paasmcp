@@ -1134,6 +1134,25 @@ volumes:
       assert.equal(fileCalls.length, 5, "a failed copy is retried on the next round");
       assert.deepEqual(await active.syncActiveFiles({ files: async () => assert.fail("no time left"), now: t0 + 9e9, budgetMs: 0 }), [], "no budget, no copy");
 
+      // The origin's tunnel for apps on both servers: its connector runs here too, and goes away with it.
+      const tunnelMod = await import("./activetunnel.js");
+      body = active.encodeManifest({ ...manifest, tunnel: { token: "bad token; rm -rf /" } });
+      assert.match((await sync()).find((r) => r.peer === "server-a")!.errors.map((e) => e.error).join(" "), /unexpected tunnel token format/);
+      body = active.encodeManifest({ ...manifest, tunnel: { token: "eyJhIjoiYWNjMSJ9TOKEN0123456789" } });
+      res = (await sync()).find((r) => r.peer === "server-a")!;
+      assert.equal(res.tunnel, "started", JSON.stringify(res));
+      assert.equal(fs.readFileSync(path.join(tunnelMod.TUNNEL_DIR, ".env"), "utf-8"), "TUNNEL_TOKEN=eyJhIjoiYWNjMSJ9TOKEN0123456789\n");
+      assert.equal(fs.statSync(path.join(tunnelMod.TUNNEL_DIR, ".env")).mode & 0o777, 0o600, "the token file is private");
+      assert.match(fs.readFileSync(path.join(tunnelMod.TUNNEL_DIR, "compose.yaml"), "utf-8"), /image: cloudflare\/cloudflared:2025\.8\.1/);
+      assert.equal((await sync()).find((r) => r.peer === "server-a")!.tunnel, undefined, "unchanged token: nothing restarts");
+      body = active.encodeManifest({ ...manifest, tunnel: { token: "eyJhIjoiYWNjMSJ9TOKEN0123456789", hostnames: ["shop.example.com", "bad host"] } });
+      assert.equal((await sync()).find((r) => r.peer === "server-a")!.tunnel, undefined, "new hostnames only: nothing restarts");
+      assert.deepEqual(config.loadState().activeTunnelCopy?.hostnames, ["shop.example.com"], "kept for a failover (no DNS change needed for them)");
+      body = active.encodeManifest(manifest);
+      assert.equal((await sync()).find((r) => r.peer === "server-a")!.tunnel, "removed");
+      assert.equal(fs.existsSync(tunnelMod.TUNNEL_DIR), false);
+      assert.equal(config.loadState().activeTunnelCopy, undefined);
+
       // The origin stops running it on both: the peer stops its copy.
       body = active.encodeManifest({ ...manifest, apps: {} });
       res = (await sync()).find((r) => r.peer === "server-a")!;
@@ -1267,6 +1286,182 @@ volumes:
       await assert.rejects(fsync.syncBucket(src, dst, "mirror"), /S3 at 127\.0\.0\.1:\d+ did not answer/);
     } finally {
       srv.close();
+    }
+  });
+
+  await t.test("29. Tunnel for apps on both servers: own tunnel, DNS moves once the copy answers, health watch", async () => {
+    const tun = await import("./activetunnel.js");
+    const active = await import("./active.js");
+    const http = await import("node:http");
+    const saved = JSON.stringify(config.loadState());
+    const MAIN = "11111111-1111-4111-8111-111111111111";
+    const SECOND = "22222222-2222-4222-8222-222222222222";
+    const TOKEN = "eyJhIjoiYWNjMSIsInQiOiIyMjIyIn0SECRET";
+    const calls: string[] = [];
+    const dns: Record<string, { id: string; type: string; content: string }> = {
+      "shop.loja.dev": { id: "r1", type: "CNAME", content: `${MAIN}.cfargotunnel.com` },
+      "blog.loja.dev": { id: "r2", type: "CNAME", content: `${MAIN}.cfargotunnel.com` },
+    };
+    let ingress: unknown[] = [];
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const u = new URL(req.url || "/", "http://x");
+        const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined;
+        calls.push(`${req.method} ${u.pathname}`);
+        if (req.headers.authorization !== "Bearer cf-test-token") return res.writeHead(403).end(JSON.stringify({ success: false, errors: [{ code: 10000, message: "Authentication error" }] }));
+        const ok = (result: unknown) => res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ success: true, result }));
+        const p = u.pathname;
+        if (req.method === "GET" && p === "/accounts/acc1/cfd_tunnel") return ok([]);
+        if (req.method === "POST" && p === "/accounts/acc1/cfd_tunnel") {
+          assert.deepEqual(body, { name: "paasmcp-active-server-a", config_src: "cloudflare" });
+          return ok({ id: SECOND, name: body.name });
+        }
+        if (req.method === "GET" && p === `/accounts/acc1/cfd_tunnel/${SECOND}/token`) return ok(TOKEN);
+        if (req.method === "GET" && p === `/accounts/acc1/cfd_tunnel/${SECOND}`) return ok({ status: "healthy", connections: [{ id: "c1" }] });
+        if (req.method === "PUT" && p === `/accounts/acc1/cfd_tunnel/${SECOND}/configurations`) {
+          ingress = body.config.ingress;
+          return ok({});
+        }
+        if (req.method === "GET" && p === "/zones") return ok([{ id: "z1" }]);
+        if (req.method === "GET" && p === "/zones/z1/dns_records") {
+          const r = dns[u.searchParams.get("name") || ""];
+          return ok(r ? [r] : []);
+        }
+        if (req.method === "PUT" && p.startsWith("/zones/z1/dns_records/")) {
+          const host = Object.keys(dns).find((h) => dns[h].id === p.split("/").pop());
+          assert.ok(host && body.proxied === true && body.type === "CNAME");
+          dns[host!] = { ...dns[host!], content: body.content };
+          return ok({});
+        }
+        res.writeHead(404).end(JSON.stringify({ success: false, errors: [{ message: `no route ${req.method} ${p}` }] }));
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_CF_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const st = config.loadState();
+      st.federation = { ...(st.federation || {}), nodeId: "node-a", nodeName: "server-a" } as typeof st.federation;
+      st.cloudflare = { ...st.cloudflare, accountId: "acc1", tunnelId: MAIN, baseDomain: "loja.dev" };
+      st.mirror = { epoch: 0, bindIp: "100.64.0.1", offers: { "server-b": { peerCidr: "100.64.0.2/32", slot: "s", offeredAt: "x" } }, replicas: {} };
+      delete st.activeTunnel;
+      delete st.activeTunnelCopy;
+      const base = { repoUrl: "acme/x", branch: "main", internalPort: 3000, appDir: "/x", runtimeType: "node", databases: [], createdAt: "x", updatedAt: "x" };
+      st.apps = {
+        shop: { ...base, name: "shop", localPort: 4100, containerName: "paasmcp-shop", healthcheckPath: "/healthz", activeActive: true, lastCommitSha: "a".repeat(40),
+          domains: [{ hostname: "shop.loja.dev", mode: "public", url: "https://shop.loja.dev" }, { hostname: "x.ts.net:8460", mode: "tailscale", url: "https://x.ts.net:8460" }] },
+        blog: { ...base, name: "blog", localPort: 4101, containerName: "paasmcp-blog", domains: [{ hostname: "blog.loja.dev", mode: "public", url: "https://blog.loja.dev" }] },
+      };
+      config.saveState(st);
+      vault.setSecretEntries("system", { CF_API_TOKEN: "cf-test-token" });
+      assert.deepEqual(tun.desiredRoutes(config.loadState()), [{ hostname: "shop.loja.dev", app: "shop", service: "http://paasmcp-shop:3000" }], "only active apps' public addresses");
+      assert.equal(guard.assessRisk("active.tunnel", {})?.level, "confirm");
+
+      // On: tunnel created, connector here, token in the manifest; the copy on B does not answer yet, so no DNS moves.
+      const probed: string[] = [];
+      let bServes = false;
+      const probe = async (u: string) => (probed.push(u), bServes);
+      const on = await tun.enableActiveTunnel({ waitMs: 200, probe });
+      assert.equal(on.tunnelId, SECOND);
+      assert.deepEqual(on.waiting, ["shop.loja.dev"]);
+      assert.deepEqual(probed, ["http://100.64.0.2:4100/healthz"], "B's copy is probed on its Tailscale IP");
+      assert.deepEqual(ingress, [{ service: "http_status:404" }]);
+      assert.equal(dns["shop.loja.dev"].content, `${MAIN}.cfargotunnel.com`, "no DNS change before B's copy answers");
+      assert.equal(vault.getSecrets("system").ACTIVE_TUNNEL_TOKEN, TOKEN);
+      assert.equal(active.buildActiveManifest(config.loadState()).tunnel?.token, TOKEN, "B gets the token through the encrypted channel");
+      assert.equal(fs.statSync(path.join(tun.TUNNEL_DIR, ".env")).mode & 0o777, 0o600);
+      assert.throws(() => tun.applyPeerTunnel("node-b", TOKEN), /runs its own tunnel/);
+
+      // B's copy answers: the ingress is written, then the DNS of that address moves. The other app stays.
+      bServes = true;
+      const before = calls.length;
+      let r = await tun.routeActiveTunnel({ probe });
+      assert.deepEqual(r.routed, ["shop.loja.dev"]);
+      assert.deepEqual(ingress, [{ hostname: "shop.loja.dev", service: "http://paasmcp-shop:3000", originRequest: {} }, { service: "http_status:404" }]);
+      assert.equal(dns["shop.loja.dev"].content, `${SECOND}.cfargotunnel.com`);
+      assert.equal(dns["blog.loja.dev"].content, `${MAIN}.cfargotunnel.com`, "apps only here stay on the main tunnel");
+      assert.deepEqual(active.buildActiveManifest(config.loadState()).tunnel?.hostnames, ["shop.loja.dev"], "B learns which addresses the tunnel serves");
+      const order = calls.slice(before);
+      assert.ok(order.indexOf(`PUT /accounts/acc1/cfd_tunnel/${SECOND}/configurations`) < order.findIndex((c) => c.startsWith("PUT /zones/")), "ingress before DNS");
+      const quiet = calls.length;
+      bServes = false;
+      r = await tun.routeActiveTunnel({ probe });
+      assert.equal(calls.length, quiet, "nothing changed: no Cloudflare call, and a routed address is not pulled for a sick copy");
+      assert.deepEqual(r.routed, ["shop.loja.dev"]);
+
+      // The app stops running on both: its address goes back to the main tunnel.
+      const st2 = config.loadState();
+      st2.apps.shop.activeActive = undefined;
+      config.saveState(st2);
+      r = await tun.routeActiveTunnel({ probe });
+      assert.deepEqual(r.movedBack, ["shop.loja.dev"]);
+      assert.equal(dns["shop.loja.dev"].content, `${MAIN}.cfargotunnel.com`);
+      assert.deepEqual(ingress, [{ service: "http_status:404" }]);
+
+      // Health watch: a copy leaves after two bad rounds and comes back after two good ones; the origin stays unless fenced.
+      assert.equal(tun.tunnelDecision({ running: true, mayLeave: true, mem: { bad: 1, good: 0 } }), "none");
+      assert.equal(tun.tunnelDecision({ running: true, mayLeave: true, mem: { bad: 2, good: 0 } }), "leave");
+      assert.equal(tun.tunnelDecision({ running: true, mayLeave: false, mem: { bad: 9, good: 0 } }), "none");
+      assert.equal(tun.tunnelDecision({ running: false, mayLeave: true, mem: { bad: 0, good: 2 } }), "return");
+      const st3 = config.loadState();
+      st3.apps.shop.activeActive = true;
+      st3.apps.shop.originNodeId = "node-z";
+      config.saveState(st3);
+      let running = true;
+      const docker = { running: () => running, stop: () => void (running = false), start: () => void (running = true) };
+      const mem = { bad: 0, good: 0 };
+      let healthy = false;
+      const tick = () => tun.tunnelWatchTick({ probe: async () => healthy, docker, mem });
+      assert.equal((await tick())?.action, "none");
+      assert.equal((await tick())?.action, "none", "the origin (it runs the tunnel) never steps out");
+      const st4 = config.loadState();
+      const keep = st4.activeTunnel;
+      delete st4.activeTunnel;
+      config.saveState(st4);
+      assert.equal((await tick())?.action, "leave", "a copy steps out after two bad rounds");
+      assert.equal(running, false);
+      healthy = true;
+      assert.equal((await tick())?.action, "none");
+      assert.equal((await tick())?.action, "return");
+      assert.equal(running, true);
+      assert.equal((tun.activeTunnelStatus().watch as { action: string }).action, "return");
+      const st5 = config.loadState();
+      st5.activeTunnel = keep;
+      st5.mirror!.fenced = { byNodeId: "node-b", epoch: 1, at: "x" };
+      st5.apps.shop.originNodeId = undefined;
+      config.saveState(st5);
+      healthy = true;
+      assert.equal((await tick())?.action, "leave", "a fenced server steps out at once, healthy or not");
+      assert.equal((await tick())?.action, "none", "and stays out while fenced");
+      const st6 = config.loadState();
+      st6.mirror!.fenced = undefined;
+      config.saveState(st6);
+
+      // Off: addresses back on the main tunnel, token and connector gone, B told through the manifest.
+      const st7 = config.loadState();
+      st7.apps.shop.activeActive = true;
+      config.saveState(st7);
+      bServes = true;
+      await tun.routeActiveTunnel({ probe });
+      assert.equal(dns["shop.loja.dev"].content, `${SECOND}.cfargotunnel.com`);
+      const off = await tun.disableActiveTunnel();
+      assert.deepEqual(off.movedBack, ["shop.loja.dev"]);
+      assert.equal(dns["shop.loja.dev"].content, `${MAIN}.cfargotunnel.com`);
+      assert.equal(config.loadState().activeTunnel, undefined);
+      assert.equal(vault.getSecrets("system").ACTIVE_TUNNEL_TOKEN, undefined);
+      assert.equal(fs.existsSync(tun.TUNNEL_DIR), false);
+      assert.equal(active.buildActiveManifest(config.loadState()).tunnel, undefined);
+
+      // Cloudflare errors surface with the route, not the token.
+      vault.setSecretEntries("system", { CF_API_TOKEN: "wrong" });
+      await assert.rejects(tun.enableActiveTunnel({ waitMs: 50, probe }), (err: Error) => /Cloudflare GET \/accounts\/acc1\/cfd_tunnel/.test(err.message) && !err.message.includes("wrong"));
+    } finally {
+      srv.close();
+      srv.closeAllConnections();
+      delete process.env.PAASMCP_CF_API_URL;
+      vault.deleteSecretKey("system", "CF_API_TOKEN");
+      fs.writeFileSync(config.STATE_FILE_PATH, saved);
     }
   });
 

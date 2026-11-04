@@ -60,6 +60,7 @@ import {
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { levelAllows, TokenLevel } from "./tokens.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
+import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
 import {
   deleteSecretKey,
   importDotEnvFile,
@@ -378,11 +379,11 @@ async function listTools() {
       {
         name: "paas_active",
         description:
-          "Active-active: an app runs on both mirrored servers at once and both take requests (writes still go to this server's Postgres; the other server reaches it, Redis and S3 over Tailscale). 'status' lists active apps, the commit each server runs and sync errors. 'check' says what is missing before turning it on (mirror, Tailscale IP, health check path, local volumes). 'on'/'off' (needs a person's confirmation) marks the app, redeploys the same version and tells the other server through the mirror's control channel. Entry: Cloudflare Tunnel on both servers, or the self-hosted edge (CLI 'paasmcp edge', needs a person).",
+          "Active-active: an app runs on both mirrored servers at once and both take requests (writes still go to this server's Postgres; the other server reaches it, Redis and S3 over Tailscale). 'status' lists active apps, the commit each server runs and sync errors. 'check' says what is missing before turning it on (mirror, Tailscale IP, health check path, local volumes). 'on'/'off' (needs a person's confirmation) marks the app, redeploys the same version and tells the other server through the mirror's control channel. Entry: 'tunnel_on' (needs a person's confirmation) creates a Cloudflare Tunnel only for the apps on both servers, runs it on both and moves their DNS to it, each address once the other server's copy answers; 'tunnel_status' / 'tunnel_off'. Without Cloudflare: the self-hosted edge (CLI 'paasmcp edge', needs a person).",
         inputSchema: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["status", "check", "on", "off"] },
+            action: { type: "string", enum: ["status", "check", "on", "off", "tunnel_status", "tunnel_on", "tunnel_off"] },
             appName: { type: "string", description: "Application slug (required for check/on/off)." },
           },
           required: ["action"],
@@ -934,6 +935,12 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
       case "paas_active": {
         const action = String(args.action);
         if (action === "status") return { content: [{ type: "text", text: JSON.stringify(activeStatus(), null, 2) }] };
+        if (action === "tunnel_status") return { content: [{ type: "text", text: JSON.stringify(activeTunnelStatus(), null, 2) }] };
+        if (action === "tunnel_on") {
+          authorize("active.tunnel", {});
+          return { content: [{ type: "text", text: JSON.stringify(await enableActiveTunnel(), null, 2) }] };
+        }
+        if (action === "tunnel_off") return { content: [{ type: "text", text: JSON.stringify(await disableActiveTunnel(), null, 2) }] };
         if (!args.appName) throw new Error("'appName' is required.");
         const slug = sanitizeSlug(String(args.appName));
         if (action === "check") return { content: [{ type: "text", text: JSON.stringify(activeReadiness(slug), null, 2) }] };
