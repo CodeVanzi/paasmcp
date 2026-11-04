@@ -1639,5 +1639,101 @@ volumes:
     }
   });
 
+  await t.test("32. Origin gone for good: the server that took over offers its copy to a third server, which follows it and can take over in turn", async () => {
+    const arbiter = await import("./arbiter.js");
+    const mirror = await import("./mirror.js");
+    const active = await import("./active.js");
+    const me = config.loadState().federation?.nodeId || "primary";
+    const key = Buffer.from(vault.getSecrets("system").FEDERATION_CLUSTER_KEY, "hex");
+    const token = (o: Record<string, unknown>) =>
+      "pmirror_" + vault.encryptBinaryPayload(Buffer.from(JSON.stringify({ v: 1, port: 5444, password: "p", epoch: 7, expiresAt: Date.now() + 60_000, ...o })), key).toString("base64url");
+    const viaB = { fromNodeId: "node-gone-b", fromName: "gone-b", host: "100.64.0.42", slot: "mirror_here", dataOf: { nodeId: "node-gone-a", name: "gone-a" } };
+
+    // The offer side: a promoted copy offered to a third server is kept apart from this server's own offers.
+    const st = config.loadState();
+    st.mirror!.replicas["gone-x"] = { peerName: "gone-x", peerNodeId: "node-gone-x", peerHost: "h", slot: "s", container: "paasmcp-mirror-gone-x", localPort: 5470, dataDir: "/nonexistent", acceptedAt: "x", promotedAt: "y", promotedEpoch: 4 };
+    config.saveState(st);
+    const sent = await mirror.offerMirror({ peerName: "gone-c", peerCidr: "100.64.0.43", advertiseHost: "100.64.0.41", fromCopyOf: "gone-x" });
+    const decoded = JSON.parse(vault.decryptBinaryPayload(Buffer.from(sent.token.slice(8), "base64url"), key).toString("utf-8"));
+    assert.deepEqual(decoded.dataOf, { nodeId: "node-gone-x", name: "gone-x" });
+    assert.equal(decoded.port, 5470, "the copy's port, not this server's Postgres");
+    const offer = config.loadState().mirror!.offers["gone-c:gone-x"];
+    assert.deepEqual([offer.peer, offer.dataOf, offer.source], ["gone-c", "gone-x", "paasmcp-mirror-gone-x"]);
+    assert.equal(config.ownOffers(config.loadState()).some(([k]) => k === "gone-c:gone-x"), false, "never a backend or tunnel peer for this server's own apps");
+    assert.equal(active.activeReadiness("nope").peers.includes("gone-c"), false);
+    const st0 = config.loadState();
+    st0.mirror!.replicas["gone-x"].supersededBy = { nodeId: "node-z", epoch: 9, at: "t" };
+    config.saveState(st0);
+    await assert.rejects(mirror.offerMirror({ peerName: "gone-c", peerCidr: "100.64.0.43", advertiseHost: "100.64.0.41", fromCopyOf: "gone-x" }), /took the data of 'gone-x' over from this one/);
+
+    // The accept side: the copy is of A's data, served by B.
+    assert.throws(() => mirror.acceptMirror(token(viaB), { rejoin: true }), /--rejoin takes a token made for this server's own data/);
+    assert.throws(() => mirror.acceptMirror(token({ ...viaB, dataOf: { nodeId: me, name: "self" } })), /this server's own data/);
+    const rec = mirror.acceptMirror(token(viaB)).replica;
+    assert.deepEqual([rec.peerName, rec.peerNodeId, rec.peerHost, rec.servedByNodeId, rec.servedByName], ["gone-a", "node-gone-a", "100.64.0.42", "node-gone-b", "gone-b"]);
+    assert.equal(active.liveCopyOf(config.loadState(), "node-gone-a"), undefined, "A's apps are not copied here: they run only on B");
+    const sync = await active.syncActivePeers({ read: () => "x", deploy: async () => assert.fail("no deploy") });
+    assert.match(String(sync.find((s) => s.peer === "gone-a")?.detail), /follows gone-b, which took over/);
+    assert.equal((mirror.mirrorStatus().receiving as { peer: string; servedBy?: { name: string } }[]).find((r) => r.peer === "gone-a")?.servedBy?.name, "gone-b");
+
+    const stateFile = path.join(tempRoot, "arb-gone.json");
+    const srv = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", key: arbiter.deriveArbiterKey(), stateFile });
+    await new Promise((r) => srv.once("listening", r));
+    const url = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const age = (node: string) => {
+      const f = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+      for (const c of Object.values(f.clusters) as { nodes: Record<string, { lastSeen: number }> }[]) if (c.nodes[node]) c.nodes[node].lastSeen -= 120_000;
+      fs.writeFileSync(stateFile, JSON.stringify(f));
+    };
+    let streaming = true;
+    const tick = () => mirror.watchTick({ streaming: () => streaming });
+    try {
+      mirror.setAutoFailover("gone-a", true, url);
+      // B took A over (A never answers again) and is alive: this copy follows it, no takeover.
+      assert.equal((await arbiter.askArbiter(url, { op: "claim", node: "node-gone-b", epoch: 7, dataOf: "node-gone-a" })).granted, true);
+      const t1 = await tick();
+      assert.deepEqual(Object.keys(t1), ["epoch"], "B is the home this copy follows: nothing to do");
+      assert.ok(config.loadState().mirror!.replicas["gone-a"].streamedAt);
+      // B dies too: this server takes A's data over from its copy.
+      age("node-gone-b");
+      streaming = false;
+      const t2 = await tick();
+      assert.equal((t2["promoted:gone-a"] as { peer: string }).peer, "gone-a");
+
+      // The other side of that: a server that had taken some data over and lost it to another one stops its apps.
+      const st2 = config.loadState();
+      st2.mirror!.replicas["gone-l"] = { peerName: "gone-l", peerNodeId: "node-gone-l", peerHost: "h", slot: "s", container: "paasmcp-mirror-gone-l", localPort: 5471, dataDir: path.join(config.PAAS_DATA_DIR, "mirror", "gone-l", "data"), acceptedAt: "x", promotedAt: "y", promotedEpoch: 8 };
+      st2.apps["gone-l-app"] = { ...Object.values(st2.apps)[0], name: "gone-l-app", originNodeId: "node-gone-l", activeActive: undefined, domains: [], repoUrl: "o/r", trashedAt: undefined };
+      config.saveState(st2);
+      assert.equal((await arbiter.askArbiter(url, { op: "claim", node: "node-gone-m", epoch: 20, dataOf: "node-gone-l" })).granted, true);
+      // An older arbiter entry (a past cycle, or a manual promote here after it) changes nothing.
+      const st3 = config.loadState();
+      st3.mirror!.replicas["gone-p"] = { ...st3.mirror!.replicas["gone-l"], peerName: "gone-p", peerNodeId: "node-gone-p", container: "paasmcp-mirror-gone-p", promotedEpoch: 30 };
+      config.saveState(st3);
+      assert.equal((await arbiter.askArbiter(url, { op: "claim", node: "node-gone-q", epoch: 5, dataOf: "node-gone-p" })).granted, true);
+      const t3 = await tick();
+      assert.deepEqual(t3["lost:gone-l"], { by: "node-gone-m", epoch: 20, stopped: ["gone-l-app"] });
+      assert.equal(t3["lost:gone-p"], undefined, "a takeover older than ours is not a loss");
+      assert.equal(Object.keys(await tick()).some((k) => k.startsWith("lost")), false, "once");
+      await assert.rejects(() => deployer.deployApp({ appName: "gone-l-app", repoSource: "/tmp" }), /no longer run here/);
+      // It can follow the new home: its data folder is moved aside, never deleted.
+      const dir = config.loadState().mirror!.replicas["gone-l"].dataDir;
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "PG_VERSION"), "16");
+      const again = mirror.acceptMirror(token({ fromNodeId: "node-gone-m", fromName: "gone-m", host: "100.64.0.44", slot: "s2", dataOf: { nodeId: "node-gone-l", name: "gone-l" } }));
+      assert.match(String(again.movedAside), /\.taken-over-elsewhere-/);
+      assert.equal(again.replica.servedByNodeId, "node-gone-m");
+    } finally {
+      srv.close();
+      const s = config.loadState();
+      for (const k of ["gone-a", "gone-x", "gone-l", "gone-p"]) delete s.mirror!.replicas[k];
+      delete s.mirror!.offers["gone-c:gone-x"];
+      delete s.apps["gone-l-app"];
+      s.mirror!.auto = (s.mirror!.auto || []).filter((p) => p !== "gone-a");
+      delete s.mirror!.arbiterUrl;
+      config.saveState(s);
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

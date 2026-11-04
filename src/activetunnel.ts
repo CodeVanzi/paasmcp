@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, PaaSState, sanitizeSlug, saveState, writeFileAtomic } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic } from "./config.js";
 import { audit } from "./guard.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
 
@@ -103,7 +103,7 @@ const IPV4 = /^(\d{1,3}\.){3}\d{1,3}$/;
 
 /** True when the app answers on every peer's Tailscale IP (its copy there is deployed and healthy). */
 async function peersServe(state: PaaSState, app: PaaSState["apps"][string], probe: (url: string) => Promise<boolean>): Promise<boolean> {
-  const ips = Object.values(state.mirror?.offers || {}).map((o) => o.peerCidr.replace(/\/32$/, "")).filter((ip) => IPV4.test(ip));
+  const ips = ownOffers(state).map(([, o]) => o.peerCidr.replace(/\/32$/, "")).filter((ip) => IPV4.test(ip));
   if (!ips.length) return false;
   const healthPath = app.healthcheckDisabled ? "/" : app.healthcheckPath || "/";
   const answers = await Promise.all(ips.map((ip) => probe(`http://${ip}:${app.localPort}${healthPath}`)));
@@ -413,7 +413,8 @@ export async function tunnelWatchTick(
   // The origin keeps serving unless it is fenced: the two servers never step out together. A copy
   // whose origin's data moved to another server (several copies) steps out at once, like a fenced one.
   const from = state.activeTunnelCopy?.fromNodeId;
-  const copyBehind = Boolean(from) && Object.values(state.mirror?.replicas || {}).some((r) => r.peerNodeId === from && r.supersededBy && !r.promotedAt);
+  // A copy that follows the server that took the origin over runs none of the origin's apps either.
+  const copyBehind = Boolean(from) && Object.values(state.mirror?.replicas || {}).some((r) => r.peerNodeId === from && !r.handedBackAt && (r.supersededBy || (r.servedByNodeId && !r.promotedAt)));
   const stepOut = Boolean(state.mirror?.fenced) || copyBehind;
   const mayLeave = !state.activeTunnel || stepOut;
   const action = running === undefined ? "none" : tunnelDecision({ running, mayLeave, mem, fenced: stepOut });

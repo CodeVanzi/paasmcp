@@ -30,7 +30,8 @@ import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, setSecretEntrie
 // Several servers (star): one server can offer its data to any number of others, each with its own
 // replication slot. When it fails, the arbiter lets exactly one copy take over; every other copy of
 // it is "superseded" (it would miss the writes made from then on), never takes over, and is rebuilt
-// from a new offer once the data has a home again.
+// from a new offer once the data has a home again: the origin after failback, or, when the origin is
+// gone for good, the server that took over (`offer <peer> --from-copy-of <origin>` there).
 
 // Copies run the same pinned Postgres image as the primary (see updater.ts).
 const PG_IMAGE_NOW = () => imageFor("postgres");
@@ -51,6 +52,8 @@ interface MirrorOffer {
   s3?: { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string };
   /** Sender's epoch, so a rejoining server never goes back in time. */
   epoch?: number;
+  /** A promoted copy offered to a third server: the server whose data it is (gone; the sender serves it). */
+  dataOf?: { nodeId: string; name: string };
   expiresAt: number;
 }
 
@@ -160,13 +163,21 @@ export async function offerMirror(opts: {
   /** Port the peer connects to (default: 5432, or the copy's published port). Labs on one Docker host use 5432 + the container name. */
   advertisePort?: number;
   withBackups?: boolean;
-  /** Failback: offer the promoted copy of this peer (it is now where the data lives). */
+  /**
+   * Offer the promoted copy of that server's data (it lives here since a takeover): to that server
+   * itself for a failback, or to a third server when the origin is gone for good.
+   */
   fromCopyOf?: string;
 }): Promise<{ token: string; slot: string; host: string; backupsBucket?: string; expiresAt: string }> {
   const key = clusterKey();
   const peer = sanitizeSlug(opts.peerName);
   const copy = opts.fromCopyOf ? mirrorState().replicas[sanitizeSlug(opts.fromCopyOf)] : undefined;
   if (opts.fromCopyOf && !copy?.promotedAt) throw new Error(`There is no promoted copy of '${opts.fromCopyOf}' here to offer.`);
+  // To a third server: this server must still be the data's home (not handed back).
+  const toThird = copy && copy.peerName !== peer ? copy : undefined;
+  if (toThird?.supersededBy) throw new Error(`Server ${toThird.supersededBy.nodeId} took the data of '${toThird.peerName}' over from this one at ${toThird.supersededBy.at}: offer it from there.`);
+  if (toThird?.handedBackAt) throw new Error(`The data of '${toThird.peerName}' was handed back at ${toThird.handedBackAt}: offer it from there instead.`);
+  const offerKey = toThird ? `${peer}:${toThird.peerName}` : peer;
   const source = copy ? copy.container : PRIMARY;
   const sourcePort = opts.advertisePort || (copy ? copy.localPort : 5432);
   if (!/^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(opts.peerCidr)) throw new Error(`Invalid --peer-ip '${opts.peerCidr}' (an IP or CIDR).`);
@@ -185,7 +196,7 @@ export async function offerMirror(opts: {
   const rebind = bindIp && mirrorState().bindIp !== bindIp;
   saveMirror((m) => {
     if (bindIp) m.bindIp = bindIp;
-    m.offers[peer] = { peerCidr, slot, offeredAt: new Date().toISOString(), source };
+    m.offers[offerKey] = { peerCidr, slot, offeredAt: new Date().toISOString(), source, ...(toThird ? { peer, dataOf: toThird.peerName } : {}) };
   });
 
   if (!OFFLINE()) {
@@ -220,6 +231,7 @@ export async function offerMirror(opts: {
     password,
     s3,
     epoch: mirrorState().epoch,
+    ...(toThird ? { dataOf: { nodeId: toThird.peerNodeId, name: toThird.peerName } } : {}),
     expiresAt: Date.now() + TOKEN_TTL_MS,
   };
   const token = TOKEN_PREFIX + encryptBinaryPayload(Buffer.from(JSON.stringify(offer)), key).toString("base64url");
@@ -239,8 +251,17 @@ export function acceptMirror(
     throw new Error("Mirror token could not be decrypted: wrong cluster (pair the servers first) or a damaged copy.");
   }
   if (Date.now() > offer.expiresAt) throw new Error("Mirror token expired (1 hour). Ask for a new one with 'paasmcp mirror offer'.");
+  // A copy of a third server's data, served by the sender since it took that server over.
+  const dataOf = offer.dataOf;
+  if (dataOf) {
+    if (typeof dataOf.nodeId !== "string" || !/^[a-zA-Z0-9_.:-]{1,128}$/.test(dataOf.nodeId) || typeof dataOf.name !== "string") throw new Error("Mirror token carries an invalid origin.");
+    if (opts.rejoin) throw new Error("This token copies another server's data; --rejoin takes a token made for this server's own data.");
+    if (dataOf.nodeId === (loadState().federation?.nodeId || "primary")) {
+      throw new Error("That is this server's own data: ask for a failback token instead ('mirror offer <this server> --from-copy-of <this server>') and accept it with --rejoin.");
+    }
+  }
 
-  const peer = sanitizeSlug(offer.fromName);
+  const peer = sanitizeSlug(dataOf ? dataOf.name : offer.fromName);
   const existing = mirrorState();
   const previous = existing.replicas[peer];
   let movedAside: string | undefined;
@@ -263,7 +284,12 @@ export function acceptMirror(
     if (fs.existsSync(dataDir) && fs.readdirSync(dataDir).length > 0) {
       // Only a copy that was promoted and then handed back, or that another server's takeover left
       // behind, is stale; any other copy may be the last one.
-      const stale = previous?.promotedAt && previous.handedBackAt ? "stale-after-handback" : previous?.supersededBy && !previous.promotedAt ? "superseded" : undefined;
+      // (A takeover that another server took over in turn may hold this server's last writes: kept aside.)
+      const stale = previous?.promotedAt && previous.handedBackAt
+        ? "stale-after-handback"
+        : previous?.supersededBy
+          ? previous.promotedAt ? "taken-over-elsewhere" : "superseded"
+          : undefined;
       if (!stale) {
         throw new Error(`This server already holds a copy of '${peer}' in ${dataDir}. To rebuild it, stop ${container} and move that folder away first.`);
       }
@@ -295,8 +321,9 @@ export function acceptMirror(
 
   const replica: MirrorReplicaRecord = {
     peerName: peer,
-    peerNodeId: offer.fromNodeId,
+    peerNodeId: dataOf ? dataOf.nodeId : offer.fromNodeId,
     peerHost: offer.host,
+    ...(dataOf ? { servedByNodeId: offer.fromNodeId, servedByName: sanitizeSlug(offer.fromName) } : {}),
     slot: offer.slot,
     container,
     localPort: opts.rejoin ? 5432 : localPort,
@@ -330,14 +357,15 @@ export function mirrorStatus(): Record<string, unknown> {
       return { error: err instanceof Error ? err.message.split("\n")[0] : String(err) };
     }
   };
-  out.sending = Object.entries(m.offers).map(([peer, o]) => ({
-    peer,
+  out.sending = Object.entries(m.offers).map(([key, o]) => ({
+    peer: o.peer || key,
+    ...(o.dataOf ? { dataOf: o.dataOf } : {}),
     slot: o.slot,
     ...(OFFLINE()
       ? {}
       : safe(() => {
           const [active, retained, walStatus] = sql(
-            PRIMARY,
+            o.source || PRIMARY,
             `SELECT active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)), wal_status FROM pg_replication_slots WHERE slot_name='${o.slot}'`
           ).split("|");
           // wal_status 'lost' = the peer was away longer than the 10GB cap and needs a fresh copy.
@@ -348,7 +376,8 @@ export function mirrorStatus(): Record<string, unknown> {
     peer: r.peerName,
     container: r.container,
     promotedAt: r.promotedAt,
-    ...(r.supersededBy && !r.promotedAt ? { supersededBy: { ...r.supersededBy, name: serverName(r.supersededBy.nodeId) } } : {}),
+    ...(r.supersededBy && !r.handedBackAt ? { supersededBy: { ...r.supersededBy, name: serverName(r.supersededBy.nodeId) } } : {}),
+    ...(r.servedByNodeId ? { servedBy: { nodeId: r.servedByNodeId, name: r.servedByName || serverName(r.servedByNodeId) } } : {}),
     ...(OFFLINE() || r.promotedAt
       ? {}
       : safe(() => {
@@ -424,7 +453,8 @@ export async function promoteMirror(peerName: string, opts: { epoch?: number; st
       // DNS switch: re-exposing points the hostname at this server's tunnel. Hostnames served by the
       // origin's tunnel for apps on both servers already reach this server (it runs that connector).
       const base = state.cloudflare.baseDomain;
-      const viaTunnel = state.activeTunnelCopy?.fromNodeId === rec.peerNodeId ? new Set(state.activeTunnelCopy.hostnames || []) : new Set<string>();
+      // (A copy that followed the server that took over ran no copies of these apps, nor that connector.)
+      const viaTunnel = state.activeTunnelCopy?.fromNodeId === rec.peerNodeId && !rec.servedByNodeId ? new Set(state.activeTunnelCopy.hostnames || []) : new Set<string>();
       for (const d of app.domains.filter((x) => (x.mode === "public" || x.mode === "zero-trust") && !(app.activeActive && viaTunnel.has(x.hostname)))) {
         if (!OFFLINE()) {
           await exposeApplication({ appName: app.name, mode: d.mode as "public" | "zero-trust", subdomain: d.hostname.replace(`.${base}`, "") });
@@ -654,12 +684,39 @@ export async function watchTick(opts: { streaming?: (rec: MirrorReplicaRecord) =
     out.fenced = { by: myOwner.owner, epoch: myOwner.epoch, stopped };
   }
 
+  // Several servers: this server serves another server's data since a takeover, and the arbiter now
+  // names a newer home for it (this server was lost for over a minute and a copy that followed it took
+  // over). Its apps for that data stop here at once, like a fenced server's own apps.
+  for (const rec of Object.values(m.replicas)) {
+    if (!rec.promotedAt || rec.handedBackAt || rec.failback || rec.supersededBy) continue;
+    const owner = beat.owners[rec.peerNodeId];
+    // Only a takeover newer than ours counts: an older entry (a past cycle, or before a manual promote
+    // here) must never stop the apps this server serves now.
+    if (!owner || owner.owner === me || owner.epoch <= (rec.promotedEpoch || 0)) continue;
+    const stopped: string[] = [];
+    for (const app of Object.values(loadState().apps).filter((a) => a.originNodeId === rec.peerNodeId && !a.trashedAt)) {
+      try {
+        if (!OFFLINE()) manageAppLifecycle(app.name, "stop");
+        stopped.push(app.name);
+      } catch {
+        // keep stopping the others
+      }
+    }
+    saveMirror((mm) => {
+      if (mm.replicas[rec.peerName]) mm.replicas[rec.peerName].supersededBy = { nodeId: owner.owner, epoch: owner.epoch, at: new Date().toISOString() };
+    });
+    audit({ event: "mirror.data-moved-away", peer: rec.peerName, by: owner.owner, epoch: owner.epoch, stopped });
+    out[`lost:${rec.peerName}`] = { by: owner.owner, epoch: owner.epoch, stopped };
+  }
+
   // Several copies of one server: once the arbiter records another server as the home of the data a
   // copy here follows, that copy misses every write from then on. It steps aside for good.
   for (const rec of Object.values(m.replicas)) {
     if (rec.promotedAt || rec.failback || rec.supersededBy) continue;
     const owner = beat.owners[rec.peerNodeId];
-    if (owner && owner.owner !== rec.peerNodeId && owner.owner !== me) {
+    // The server this copy streams from: the origin, or the server that took it over.
+    const home = rec.servedByNodeId || rec.peerNodeId;
+    if (owner && owner.owner !== home && owner.owner !== me) {
       out[`superseded:${rec.peerName}`] = supersedeCopy(rec.peerName, { nodeId: owner.owner, epoch: owner.epoch });
     }
   }
@@ -676,7 +733,7 @@ export async function watchTick(opts: { streaming?: (rec: MirrorReplicaRecord) =
     const now = mirrorState();
     const rec = now.replicas[peer];
     if (!rec || rec.promotedAt || rec.failback || rec.supersededBy || now.fenced) continue;
-    const alive = beat.now - (beat.nodes[rec.peerNodeId]?.lastSeen || 0) <= 60_000;
+    const alive = beat.now - (beat.nodes[rec.servedByNodeId || rec.peerNodeId]?.lastSeen || 0) <= 60_000;
     const fresh = Boolean(rec.streamedAt) && Date.now() - Date.parse(rec.streamedAt!) < STREAMED_REFRESH_MS;
     if (alive && fresh) continue;
     const streaming = isStreaming(rec);
