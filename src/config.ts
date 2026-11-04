@@ -65,6 +65,52 @@ export interface AppRecord {
     /** Last refresh of this server's copy of the app's bucket. */
     files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string; pending?: boolean };
   };
+  /** Automatic scaling (scale.ts). Phase 1 only measures and rehearses: nothing is started or stopped. */
+  scale?: {
+    rule?: Partial<ScaleRule>;
+    capacity?: CapacityResult;
+  };
+}
+
+/** When the decision rule would add or remove a copy (scale.ts). Numbers are starting points to calibrate. */
+export interface ScaleRule {
+  /** Copies never go below this (the origin always keeps one). */
+  min: number;
+  max: number;
+  /** CPU per copy, in % of the app's CPU limit (or of one core when it has none). */
+  targetCpu: number;
+  /** Rounds in a row above the target before adding a copy. */
+  upRounds: number;
+  /** Seconds below half the target before removing a copy. */
+  downAfterSeconds: number;
+  /** Seconds to wait after an action before the next one. */
+  cooldownSeconds: number;
+}
+
+/** Result of `paasmcp scale test` (loadtest.ts). */
+export interface CapacityResult {
+  at: string;
+  path: string;
+  /** Best requests per second with at most 1% errors, for one copy. */
+  rps: number;
+  concurrency: number;
+  p95Ms: number;
+  /** App CPU at that point, in % of its limit (or of one core). */
+  cpu: number | null;
+  bottleneck: "app_cpu" | "database" | "client" | "errors" | "latency" | "none" | "unknown";
+  suggestedTargetRps: number;
+  steps: {
+    concurrency: number;
+    seconds: number;
+    requests: number;
+    errors: number;
+    rps: number;
+    p50Ms: number;
+    p95Ms: number;
+    appCpu: number | null;
+    dbCpu: number | null;
+    clientCpu: number;
+  }[];
 }
 
 export interface DatabaseRecord {
@@ -218,6 +264,13 @@ export interface PaaSState {
   /** Images moved by 'paasmcp update apply' (see updater.ts PINNED). */
   versions?: Partial<Record<"postgres" | "redis" | "garage", string>>;
   federation?: FederationConfig;
+  /** Measuring for automatic scaling (scale.ts). */
+  scale?: {
+    /** Language of the decision diary in the CLI, the MCP tool and the log (the dashboard follows its own switch). */
+    language?: "pt" | "en";
+    /** Set by `paasmcp scale install-timer`. */
+    timer?: { seconds: number; installedAt: string };
+  };
 }
 
 export const HOMELAB_ROOT = process.env.PAASMCP_ROOT || "/opt/homelab";

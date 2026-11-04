@@ -252,6 +252,43 @@ back on failure. Major upgrades are refused: they need a migration.
 compares `git ls-remote` with the last deployed commit and redeploys when it changed. Nothing stays in
 memory and nothing needs to be reachable from the internet.
 
+## 10a. Measuring for automatic scaling, phase 1 (`src/scale.ts`, `src/loadtest.ts`)
+
+Phase 1 of the automatic scaling plan only measures and rehearses; it never starts or stops a copy.
+
+- **Round:** `paasmcp scale tick`, run by a systemd oneshot timer (`scale install-timer [--seconds 15]`,
+  `AccuracySec=1s`, `Nice=10`), so nothing stays in memory between rounds. One `docker stats --no-stream`
+  call for all containers, then a GET of each running app's health path on `127.0.0.1:<port>` (3 s
+  timeout, `ok` = status < 500, apps with the health check off are not probed). The round only reads
+  `state.json` and skips the state lock, so a long deploy never pauses it; a lock file in `scale/`
+  (stale after 120 s) stops two rounds from overlapping.
+- **Files** (`paasmcp/scale/`, dir 0700, files 0600): `<app>.json` (last 10 minutes of samples, network
+  counters, rehearsal state; rewritten each round, a few KB), `<app>.history.ndjson` (one averaged point
+  per finished minute, appended once a minute and trimmed to 24 h), `diary.ndjson` (7 days, at most
+  2000 entries). A sample is `{t, cpu (% of one core), mem (MiB), rx, tx (bytes/s from the counter delta;
+  null after a container restart), lat (ms), ok}`. `paas_app_lifecycle purge` deletes an app's files.
+- **Rehearsal** (`rehearse`, pure): CPU per copy = measured CPU / app CPU limit (one core if none) /
+  copies the rehearsal is running. Above `targetCpu` (default 70) for `upRounds` (3) rounds in a row →
+  "would add a copy" (up to `max`, default 3); below half the target for `downAfterSeconds` (600) →
+  "would remove one" (down to `min`, default 1); `cooldownSeconds` (120) between steps; a gap in the data
+  longer than max(90 s, 3 rounds) resets the streaks; three unanswered probes stop decisions until the
+  app answers again. The rule lives in `app.scale.rule` (`scale rule`, dashboard, `paas_scale rule`).
+- **Decision diary:** entries are a code plus numbers (`would_up`, `would_down`, `at_max`, `no_answer`,
+  `answered_again`, `rule_changed`, `capacity`); `renderDiary` writes the sentence in `pt` or `en` when
+  read, so changing `state.scale.language` (`scale language pt|en`) rewrites the whole history. Only
+  numbers, slugs and validated paths go in, and the MCP tool marks it as data.
+- **Capacity test** (`scale test <app>`, guard `scale.test`, confirm): GET only, only the app's own
+  loopback port, path validated (no scheme, no `//`, at most 200 characters), concurrency doubles from 1
+  up to `--max-concurrency` (default 32, at most 64), 2 to 30 s per step. It stops at more than 5% errors,
+  a p95 over 2 s, or two steps without 10% more requests per second. While each step runs it reads the
+  app's and `paasmcp-postgres`'s CPU and its own CPU, and classifies what choked: `app_cpu` (≥ 85% of the
+  limit), `database` (Postgres ≥ 80% of one core), `client` (the test itself ≥ 90% of one core), `errors`,
+  `latency`, `none` or `unknown`. The result (`app.scale.capacity`) suggests 70% of the best rate as a
+  per-copy target. The client runs on the same server, so the numbers are a lower bound.
+- **Not measured yet:** requests per second per app in live traffic. Cloudflare Tunnel and the Caddy edge
+  (2.8) do not split their counters by site, so phase 1 decides on CPU and uses the capacity test for
+  requests per second; a per-app counter comes when the balancer of phase 3 sits in the traffic path.
+
 ## 11. Environment variables
 
 | Variable | Default | Purpose |
@@ -273,6 +310,10 @@ memory and nothing needs to be reachable from the internet.
 ## 12. Test labs
 
 - `npm test`: unit tests, no Docker.
+- `scripts/scale-lab.sh`: scale phase 1 with real Docker: a 0.5-core app is measured idle, under 50 s of
+  steady load and after it. CPU must reach the limit under load (and not read far above it), traffic and a
+  slower answer must show, the rehearsal must climb and come back to one copy without flapping, the
+  history must get one point per minute, files must be 0600, and the capacity test must blame the app's CPU.
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,

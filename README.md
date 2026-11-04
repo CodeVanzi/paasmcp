@@ -26,6 +26,7 @@ Traditional self-hosted PaaS dashboards are great for manual clicking, but they:
 - **1-Second Image Rollback & `paas_doctor` Diagnostics:** Automatically tags the previous working image (`paasmcp/<app>:previous`) before every deploy for instant 1-second rollback, and inspects containers for `OOMKilled`, crash-loops, and live CPU/RAM metrics (`docker stats`).
 - **Two-Server Mirror:** Pair a second server (`paasmcp-join://`, `HMAC-SHA256` + SSH fingerprint), then `paasmcp mirror offer/accept`: each server keeps a live read-only copy of the other's Postgres (physical streaming over Tailscale, a replication slot keeps up to 10 GB of changes while the peer is away) and receives the other's backups in its Garage. `paas_mirror status` shows streaming / caught up / seconds behind; `promote` is a manual failover with a strong confirmation that raises an epoch number, redeploys the peer's apps and points their DNS here. Automatic failover needs an arbiter (`paasmcp arbiter install-service` on a small third device, which can serve several clusters with `arbiter add-key`; forbidden without one; the dashboard walks through it step by step and `paasmcp arbiter check` / its "Test" button shows whether the arbiter answers and hears both servers): `mirror watch` heartbeats, takes over only when both it and the arbiter lost the peer and the copy stopped streaming, and **fences** a server whose data moved (its apps stop, deploys are refused). Guided failback: `offer --from-copy-of`, `accept --rejoin` (old data moved aside, never deleted), `handback` (waits for zero lag), `promote`. One server can also send copies to several others (star): on failure exactly one copy takes over and the others step aside until rebuilt (`mirror retire` for a manual failover). The full outage → failover → failback cycle runs in `scripts/mirror-lab.sh` and, with three servers and a real arbiter, in `scripts/star-lab.sh` (real Postgres containers).
 - **Active-active (app on both servers):** `paasmcp active on <app>` (confirmation) runs a mirrored app on both servers at once. Writes still go to the origin's Postgres; the peer reaches it, Redis and S3 over Tailscale, and builds the **exact commit** the origin runs, received through an encrypted manifest that travels inside the existing Postgres stream (no new port or daemon). Entry: `paasmcp active tunnel on` (a Cloudflare Tunnel just for those apps, run on both servers; a sick copy steps out of it by itself), or the self-hosted **edge** (`paasmcp edge install` / `edge add <app> <hostname>`): a Caddy with Let's Encrypt, round robin and health checks every 5 s, no cloud needed. Uploaded files in the app's S3 bucket are copied to the peer every minute with the same key, and come back on handback. Tested in `scripts/active-lab.sh` and `scripts/files-lab.sh`.
+- **Measuring for automatic scaling (phase 1: measure and rehearse, never act):** `sudo paasmcp scale install-timer` runs a systemd oneshot timer every 15 s (nothing stays in memory between rounds). Each round reads every running app's CPU, memory and network traffic (`docker stats`) and times an answer of its health path, keeping the last 10 minutes at full detail and one point per minute for 24 hours under `paasmcp/scale/`. A **rehearsal** runs the scaling rule on those numbers (add a copy when CPU per copy stays above the target for 3 rounds, remove one after 10 minutes below half of it, 2 minutes between steps) and writes what it *would* do, with the reason, to a **decision diary** shown in Portuguese or English (`paasmcp scale diary`, `scale language pt|en`). `paasmcp scale test <app>` (confirmation) is a **capacity test**: it doubles parallel GET requests on the app's own loopback port until it chokes and says how many requests per second one copy handles and whether the app's CPU or the database gave out. Dashboard: 24 h charts, the rehearsal line, the rule and the diary on the Apps tab. Tested in `scripts/scale-lab.sh`.
 - **Built-in Workspace Web UI (`paasmcp-dashboard`):** Optional ultra-lightweight dark/light web workspace (protected by constant-time `DASHBOARD_TOKEN`, login rate-limiting, CSP headers, and Cloudflare Zero Trust Access) with built-in **GitHub Push Webhook (`X-Hub-Signature-256`)** auto-deploy receiver.
 
 ---
@@ -94,7 +95,7 @@ Limit: this protects against an agent acting **through MCP**. An agent with a sh
 
 ---
 
-## 🔌 MCP Server Configuration (16 Tools)
+## 🔌 MCP Server Configuration (22 Tools)
 
 ### Remote clients (MCP over HTTP)
 
@@ -167,6 +168,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), `destroy` (to the 30-day trash), `restore` (from the trash) or `purge`. |
 | `paas_doctor` | Diagnoses `OOMKilled` events, crash-loops, non-zero exit codes, and recent error logs across all containers. |
 | `paas_mirror` | Mirror status per peer (streaming, caught up, seconds behind, WAL kept, epoch) and manual `promote` (strong confirmation). Pairing is CLI-only. |
+| `paas_scale` | Read-only (any token): `status` (last CPU / memory / traffic / response time per app, copies the rehearsal would run, rule, last capacity test), `history` (24 h, one point per bucket) and `diary` (each rehearsal decision with its reason, in `pt` or `en`). `rule` (deploy token) changes an app's rehearsal rule. The capacity test is CLI-only. |
 | `paas_node_federation` | Generates signed `paasmcp-join://` tokens, pairs secondary servers, and exports/imports encrypted Vault & State sync bundles. |
 
 ---
@@ -218,6 +220,13 @@ paasmcp storage provision my-saas
 sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
 paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
 paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it
+
+# Measure every app for 24 h and rehearse scaling decisions (phase 1: it never starts or stops copies)
+sudo paasmcp scale install-timer             # one round every 15 s, nothing running in between
+paasmcp scale status                         # last numbers and how many copies the rehearsal would run
+paasmcp scale diary my-saas --lang en        # why: each decision with its reason (pt or en)
+paasmcp scale rule my-saas --max 4 --target-cpu 60
+sudo paasmcp scale test my-saas --path /     # capacity test: requests/s one copy handles and what chokes
 
 # Run health diagnostics or 1-second rollback
 paasmcp doctor

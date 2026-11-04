@@ -21,6 +21,7 @@ import { ensureDockerNetwork, provisionDatabase } from "./database.js";
 import { cloneOrUpdateRepo, DetectedBuildPlan, detectOrGenerateDockerfile } from "./github.js";
 import { getSecrets, setSecretEntries, writeRuntimeEnvFile } from "./vault.js";
 import { activeComposeExtras, publishActiveState } from "./active.js";
+import { forgetScaleData } from "./scale.js";
 
 export interface DeployOptions {
   appName: string;
@@ -732,6 +733,7 @@ export function manageAppLifecycle(
       }
       delete state.apps[slug];
       saveState(state);
+      forgetScaleData(slug);
       syncHomepageDashboard();
       return `App '${slug}' was permanently deleted (containers, volumes, images and files).`;
     }

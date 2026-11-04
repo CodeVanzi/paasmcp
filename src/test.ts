@@ -1735,5 +1735,250 @@ volumes:
     }
   });
 
+  await t.test("33. Scale phase 1: 24 h of measurements, rehearsal without flapping, diary in pt/en, capacity test on loopback only", async () => {
+    const scale = await import("./scale.js");
+    const loadtest = await import("./loadtest.js");
+    const guard = await import("./guard.js");
+    const mcp = await import("./mcp-server.js");
+    const http = await import("node:http");
+
+    // docker stats parsing (binary sizes for memory, decimal for network)
+    assert.equal(scale.parseDockerSize("1.5KiB"), 1536);
+    assert.equal(scale.parseDockerSize("2kB"), 2000);
+    assert.equal(scale.parseDockerSize("0B"), 0);
+    assert.equal(scale.parseDockerSize("abc"), null);
+    const parsed = scale.parseDockerStats(
+      '{"Name":"paasmcp-a","CPUPerc":"12.50%","MemUsage":"64MiB / 1GiB","NetIO":"1kB / 2MB"}\nnot json\n{"Name":"x","CPUPerc":"--","MemUsage":"","NetIO":""}\n'
+    );
+    assert.deepEqual(parsed["paasmcp-a"], { cpu: 12.5, mem: 64, rxTotal: 1000, txTotal: 2_000_000 });
+    assert.equal(parsed.x.cpu, null);
+
+    // Rule validation
+    assert.throws(() => scale.validateRule({ targetCpu: 200 }), /targetCpu/);
+    assert.throws(() => scale.validateRule({ min: 0 }), /min/);
+    assert.throws(() => scale.validateRule({ max: "3;rm" }), /max/);
+    assert.throws(() => scale.validateRule({ evil: 1 }), /Unknown/);
+    assert.deepEqual(scale.validateRule({ min: "1", max: 4 }), { min: 1, max: 4 });
+
+    // Rehearsal: load climbs to 1.5 cores on a 1-core app, stays, then drops. It must settle, not flap.
+    const rule = { ...scale.DEFAULT_RULE, max: 4, downAfterSeconds: 120, cooldownSeconds: 60 };
+    let st = scale.freshRehearsal(rule);
+    const events: { t: number; kind: string; to?: number }[] = [];
+    const run = (from: number, to: number, cpu: (t: number) => number) => {
+      for (let t = from; t < to; t += 15_000) {
+        const r = scale.rehearse(rule, st, { t, cpu: cpu(t), ok: true, lat: 20 }, { cpuRefCores: 1, gapMs: 90_000 });
+        st = r.state;
+        if (r.event) events.push({ t, kind: r.event.kind, to: Number(r.event.p.to) || undefined });
+      }
+    };
+    run(0, 120_000, () => 20);
+    assert.equal(events.length, 0, "quiet load: nothing to do");
+    // a little noise around 150% so the per-copy CPU crosses nothing at 3 copies (50%)
+    run(120_000, 1_200_000, (t) => 150 + ((t / 15_000) % 3) * 5);
+    assert.deepEqual(events.map((e) => e.kind), ["would_up", "would_up"]);
+    assert.equal(st.copies, 3);
+    assert.ok(events[1].t - events[0].t >= 60_000, "waits the cooldown between steps");
+    run(1_200_000, 2_400_000, () => 10);
+    const kinds = events.map((e) => e.kind);
+    assert.deepEqual(kinds, ["would_up", "would_up", "would_down", "would_down"]);
+    assert.equal(st.copies, 1, "back to the minimum, never below");
+    // Waves faster than the rule: up for 30 s, down for 30 s. The 3-round streak never forms.
+    const before = events.length;
+    run(2_400_000, 3_600_000, (t) => (Math.floor(t / 30_000) % 2 ? 300 : 5));
+    assert.equal(events.length, before, "short waves do not move it");
+    // A gap in the data breaks a streak.
+    st = scale.freshRehearsal(rule);
+    st = scale.rehearse(rule, st, { t: 0, cpu: 300, ok: true, lat: 1 }, { cpuRefCores: 1, gapMs: 90_000 }).state;
+    st = scale.rehearse(rule, st, { t: 15_000, cpu: 300, ok: true, lat: 1 }, { cpuRefCores: 1, gapMs: 90_000 }).state;
+    const afterGap = scale.rehearse(rule, st, { t: 600_000, cpu: 300, ok: true, lat: 1 }, { cpuRefCores: 1, gapMs: 90_000 });
+    assert.equal(afterGap.event, undefined);
+    assert.equal(afterGap.state.aboveStreak, 1);
+    // CPU is read against the app's limit: 0.5 core limit, 45% of one core = 90% of the limit.
+    let half = scale.freshRehearsal(rule);
+    let ev: string | undefined;
+    for (let t = 0; t < 60_000; t += 15_000) {
+      const r = scale.rehearse(rule, half, { t, cpu: 45, ok: true, lat: 1 }, { cpuRefCores: 0.5, gapMs: 90_000 });
+      half = r.state;
+      ev ||= r.event?.kind;
+    }
+    assert.equal(ev, "would_up");
+    // At the maximum: noted once.
+    let maxed: typeof st = { ...scale.freshRehearsal(rule), copies: 4 };
+    const maxEvents: string[] = [];
+    for (let t = 0; t < 300_000; t += 15_000) {
+      const r = scale.rehearse(rule, maxed, { t, cpu: 400, ok: true, lat: 1 }, { cpuRefCores: 1, gapMs: 90_000 });
+      maxed = r.state;
+      if (r.event) maxEvents.push(r.event.kind);
+    }
+    assert.deepEqual(maxEvents, ["at_max"]);
+    // No answer three times: noted once, nothing decided; then it answers again.
+    let sick = scale.freshRehearsal(rule);
+    const sickEvents: string[] = [];
+    for (let t = 0; t < 90_000; t += 15_000) {
+      const r = scale.rehearse(rule, sick, { t, cpu: 500, ok: false, lat: null }, { cpuRefCores: 1, gapMs: 90_000, path: "/health" });
+      sick = r.state;
+      if (r.event) sickEvents.push(r.event.kind);
+    }
+    const back = scale.rehearse(rule, sick, { t: 90_000, cpu: 5, ok: true, lat: 33 }, { cpuRefCores: 1, gapMs: 90_000 });
+    assert.deepEqual([...sickEvents, back.event?.kind], ["no_answer", "answered_again"]);
+    assert.equal(sick.copies, 1);
+
+    // Diary sentences exist in both languages for every kind, with no holes.
+    for (const kind of ["would_up", "would_down", "at_max", "no_answer", "answered_again", "rule_changed", "capacity"] as const) {
+      for (const lang of ["pt", "en"] as const) {
+        const text = scale.renderDiary({ t: "2026-11-04T00:00:00Z", app: "x", kind, p: { from: 1, to: 2, cpu: 90, target: 70, rounds: 3, seconds: 30, below: 35, minutes: 10, max: 3, path: "/", ms: 12, min: 1, rps: 250, p95: 40, bottleneck: "app_cpu" } }, lang);
+        assert.ok(text.length > 10 && !/undefined|NaN|\{/.test(text), `${kind}/${lang}: ${text}`);
+      }
+    }
+    assert.match(scale.renderDiary({ t: "", app: "x", kind: "would_up", p: { from: 1, to: 2, cpu: 92, target: 70, rounds: 3, seconds: 30 } }, "pt"), /subiria de 1 para 2 cópias/);
+    assert.match(scale.renderDiary({ t: "", app: "x", kind: "would_up", p: { from: 1, to: 2, cpu: 92, target: 70, rounds: 3, seconds: 30 } }, "en"), /would go from 1 to 2 copies/);
+
+    // A measuring round with fake docker stats and probes: minute history, traffic rates, diary, files 0600.
+    const st0 = config.loadState();
+    const mk = (name: string, port: number, extra: Record<string, unknown> = {}) => ({
+      name, branch: "main", localPort: port, internalPort: 3000, containerName: `paasmcp-${name}`, appDir: `/tmp/${name}`,
+      runtimeType: "node", databases: [], domains: [], createdAt: "", updatedAt: "", ...extra,
+    });
+    st0.apps["scale-a"] = mk("scale-a", 4801, { cpuLimit: "0.5", healthcheckPath: "/health" }) as never;
+    st0.apps["scale-b"] = mk("scale-b", 4802, { healthcheckDisabled: true }) as never;
+    st0.apps["scale-off"] = mk("scale-off", 4803) as never;
+    config.saveState(st0);
+    scale.setScaleRule("scale-a", { cooldownSeconds: 0 }, "test");
+    const probed: string[] = [];
+    let rxTotal = 0;
+    const logs: string[] = [];
+    const base = Date.UTC(2026, 10, 4, 12, 0, 0);
+    for (let i = 0; i < 16; i++) {
+      rxTotal += 15 * 1000; // 1000 B/s
+      const r = await scale.scaleTick({
+        now: base + i * 15_000,
+        stats: async () => ({
+          "paasmcp-scale-a": { cpu: 49, mem: 100, rxTotal, txTotal: rxTotal * 2 },
+          "paasmcp-scale-b": { cpu: 1, mem: 10, rxTotal: 0, txTotal: 0 },
+        }),
+        probe: async (u) => { probed.push(u); return { ok: true, ms: 25 }; },
+        log: (l) => logs.push(l),
+      });
+      assert.equal(r.apps["scale-off"], undefined, "a stopped app gets no sample");
+      if (i === 0) assert.equal(r.apps["scale-a"].copies, 1);
+    }
+    assert.ok(probed.every((u) => u === "http://127.0.0.1:4801/health"), "only the app's loopback health path is probed");
+    const hist = scale.scaleHistory("scale-a", { bucketMinutes: 1, now: base + 16 * 15_000 });
+    assert.equal(hist.points.length, 3, "three finished minutes");
+    assert.equal(hist.points[0].n, 4);
+    assert.equal(hist.points[1].cpu, 49);
+    assert.equal(hist.points[1].rx, 1000);
+    assert.equal(hist.points[1].tx, 2000);
+    assert.equal(hist.points[1].lat, 25);
+    assert.equal(scale.scaleHistory("scale-b", { now: base + 16 * 15_000 }).points[0].lat, null, "health check off: not probed");
+    // 49% of one core on a 0.5-core app is 98% of its limit: two copies (49% each) are enough.
+    const stat = scale.scaleStatus({ app: "scale-a", now: base + 16 * 15_000 }).apps[0];
+    assert.equal(stat.cpuOfLimit, 98);
+    assert.equal(stat.rehearsalCopies, 2);
+    assert.ok(logs.some((l) => l.startsWith("[scale-a] Ensaio: subiria de 1 para 2")), logs.join("\n"));
+    const diaryEn = scale.scaleDiary({ app: "scale-a", lang: "en" });
+    assert.ok(diaryEn.some((e) => /would go from 1 to 2 copies\. CPU per copy was 98% \(target 70%\)/.test(e.text)), JSON.stringify(diaryEn));
+    assert.equal(diaryEn.filter((e) => e.kind === "would_up").length, 1, "settles at two copies");
+    assert.ok(diaryEn.some((e) => e.kind === "rule_changed"));
+    for (const f of ["scale-a.json", "scale-a.history.ndjson", "diary.ndjson"]) {
+      assert.equal(fs.statSync(path.join(scale.SCALE_DIR, f)).mode & 0o777, 0o600, f);
+    }
+    assert.equal(fs.statSync(scale.SCALE_DIR).mode & 0o777, 0o700);
+    assert.equal(fs.existsSync(path.join(scale.SCALE_DIR, ".tick.lock")), false, "lock released");
+    // A restarted container (counters went down) gives no traffic rate instead of a negative one.
+    const restarted = await scale.scaleTick({
+      now: base + 17 * 15_000,
+      stats: async () => ({ "paasmcp-scale-a": { cpu: 1, mem: 100, rxTotal: 10, txTotal: 10 } }),
+      probe: async () => ({ ok: true, ms: 5 }),
+      log: () => undefined,
+    });
+    assert.ok(restarted.apps["scale-a"]);
+    const recent = scale.scaleHistory("scale-a", { now: base + 17 * 15_000 }).recent;
+    assert.equal(recent[recent.length - 1].rx, null);
+    // Garbage in the diary file is skipped, never shown.
+    fs.appendFileSync(path.join(scale.SCALE_DIR, "diary.ndjson"), 'not json\n{"t":"x","app":"a","kind":"evil","p":{}}\n');
+    assert.ok(scale.readDiary().every((e) => e.kind !== ("evil" as never)));
+
+    // Downsampling keeps weighted averages and the worst values.
+    const ds = scale.downsample(
+      [
+        { t: 0, n: 1, cpu: 10, cpuMax: 10, mem: 1, rx: 0, tx: 0, lat: 10, latMax: 10, fail: 0 },
+        { t: 60_000, n: 3, cpu: 50, cpuMax: 90, mem: 1, rx: 0, tx: 0, lat: null, latMax: null, fail: 2 },
+      ],
+      5
+    );
+    assert.equal(ds.length, 1);
+    assert.equal(ds[0].cpu, 40);
+    assert.equal(ds[0].cpuMax, 90);
+    assert.equal(ds[0].lat, 10);
+    assert.equal(ds[0].fail, 2);
+
+    // MCP: read tokens see the numbers and the diary; changing the rule needs a deploy token.
+    const mcpStatus = await mcp.handleToolCall("paas_scale", { action: "status", appName: "scale-a", language: "en" }, "read");
+    assert.equal("isError" in mcpStatus, false);
+    assert.match(mcpStatus.content[0].text, /"rehearsalCopies": 2/);
+    const mcpDiary = await mcp.handleToolCall("paas_scale", { action: "diary", appName: "scale-a", language: "pt" }, "read");
+    assert.match(mcpDiary.content[0].text, /subiria/);
+    const readRule = await mcp.handleToolCall("paas_scale", { action: "rule", appName: "scale-a", max: 5 }, "read");
+    assert.equal("isError" in readRule && readRule.isError, true);
+    const deployRule = await mcp.handleToolCall("paas_scale", { action: "rule", appName: "scale-a", max: 5 }, "deploy");
+    assert.match(deployRule.content[0].text, /"max": 5/);
+    const badRule = await mcp.handleToolCall("paas_scale", { action: "rule", appName: "scale-a", targetCpu: 5 }, "deploy");
+    assert.equal("isError" in badRule && badRule.isError, true);
+
+    // Diary language setting
+    assert.throws(() => scale.setDiaryLanguage("fr"));
+    scale.setDiaryLanguage("en");
+    assert.equal(scale.diaryLanguage(), "en");
+    scale.setDiaryLanguage("pt");
+
+    // Capacity test: guard asks a person; only GET on the app's own loopback port; bad paths refused.
+    assert.equal(guard.assessRisk("scale.test", { appName: "scale-a", path: "/", maxConcurrency: 8 })?.level, "confirm");
+    for (const bad of ["//evil.example.com/", "http://evil.example.com/", "/a b", "x", "/" + "a".repeat(250)]) {
+      assert.throws(() => loadtest.validateTestPath(bad), /Invalid path/, bad);
+    }
+    assert.equal(loadtest.validateTestPath("/api/health?x=1"), "/api/health?x=1");
+    assert.equal(loadtest.classifyBottleneck({ appCpuOfLimit: 95, dbCpu: 10, clientCpu: 20, saturated: true }), "app_cpu");
+    assert.equal(loadtest.classifyBottleneck({ appCpuOfLimit: 30, dbCpu: 120, clientCpu: 20, saturated: true }), "database");
+    assert.equal(loadtest.classifyBottleneck({ appCpuOfLimit: 30, dbCpu: 10, clientCpu: 99, saturated: true }), "client");
+    assert.equal(loadtest.classifyBottleneck({ appCpuOfLimit: null, dbCpu: null, clientCpu: 5, stoppedBy: "errors", saturated: true }), "errors");
+    assert.equal(loadtest.classifyBottleneck({ appCpuOfLimit: null, dbCpu: null, clientCpu: 5, saturated: false }), "none");
+    await assert.rejects(() => loadtest.capacityTest("scale-a", { maxConcurrency: 500 }), /Parallel requests/);
+    await assert.rejects(() => loadtest.capacityTest("scale-a", { stepSeconds: 1 }), /Step seconds/);
+
+    const seen: { method?: string; url?: string }[] = [];
+    const srv = http.createServer((req, res) => {
+      seen.push({ method: req.method, url: req.url });
+      res.end("ok");
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    try {
+      const port = (srv.address() as { port: number }).port;
+      const st1 = config.loadState();
+      st1.apps["scale-a"].localPort = port;
+      config.saveState(st1);
+      const steps: number[] = [];
+      const cap = await loadtest.capacityTest("scale-a", { stepSeconds: 2, maxConcurrency: 2, onStep: (s) => steps.push(s.concurrency) });
+      assert.deepEqual(steps, [1, 2]);
+      assert.ok(cap.rps > 0 && cap.steps.every((s) => s.errors === 0));
+      assert.equal(cap.path, "/health");
+      assert.equal(cap.suggestedTargetRps, Math.floor(cap.rps * 0.7));
+      assert.ok(seen.length > 0 && seen.every((r) => r.method === "GET" && r.url === "/health"));
+      loadtest.saveCapacity("scale-a", cap, "test");
+      assert.equal(config.loadState().apps["scale-a"].scale?.capacity?.rps, cap.rps);
+      assert.ok(scale.readDiary({ app: "scale-a" }).some((e) => e.kind === "capacity"));
+    } finally {
+      srv.close();
+    }
+
+    // Purging an app forgets its measurements.
+    scale.forgetScaleData("scale-a");
+    assert.equal(fs.existsSync(path.join(scale.SCALE_DIR, "scale-a.json")), false);
+    assert.equal(fs.existsSync(path.join(scale.SCALE_DIR, "scale-a.history.ndjson")), false);
+    const st2 = config.loadState();
+    for (const k of ["scale-a", "scale-b", "scale-off"]) delete st2.apps[k];
+    config.saveState(st2);
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

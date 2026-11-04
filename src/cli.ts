@@ -14,6 +14,10 @@ import {
   resolveArbiterHost, startArbiterServer,
 } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
+import {
+  DiaryLang, installScaleTimer, scaleDiary, scaleHistory, scaleStatus, scaleTick, setDiaryLanguage, setScaleRule, uninstallScaleTimer,
+} from "./scale.js";
+import { capacityTest, saveCapacity, validateTestPath } from "./loadtest.js";
 import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActiveFiles, syncActivePeers } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel, routeActiveTunnel, tunnelWatchTick } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, installEdge, refreshEdge, removeEdgeSite, uninstallEdge } from "./edge.js";
@@ -533,6 +537,60 @@ async function runCli() {
       break;
     }
 
+    case "scale": {
+      const [sub, arg1] = rest;
+      const langFlag = getFlagValue(rest, "--lang");
+      if (langFlag && langFlag !== "pt" && langFlag !== "en") throw new Error("--lang must be pt or en.");
+      const lang = langFlag as DiaryLang | undefined;
+      if (sub === "tick") {
+        const r = await scaleTick({ log: (l) => console.log(l) });
+        if (!rest.includes("--quiet")) console.log(JSON.stringify(r, null, 2));
+        else if (r.skipped) console.error(r.skipped);
+      } else if (!sub || sub === "status") {
+        console.log(JSON.stringify(scaleStatus({ app: arg1 && !arg1.startsWith("--") ? arg1 : undefined, lang }), null, 2));
+      } else if (sub === "history" && arg1) {
+        console.log(JSON.stringify(scaleHistory(arg1, { bucketMinutes: Number(getFlagValue(rest, "--bucket") || 5) }), null, 2));
+      } else if (sub === "diary") {
+        const app = arg1 && !arg1.startsWith("--") ? arg1 : undefined;
+        for (const e of scaleDiary({ app, lang, limit: Number(getFlagValue(rest, "--limit") || 50) })) {
+          console.log(`${e.t.slice(0, 19).replace("T", " ")}  [${e.app}] ${e.text}`);
+        }
+      } else if (sub === "rule" && arg1) {
+        const input: Record<string, unknown> = {};
+        for (const [flag, key] of [["--min", "min"], ["--max", "max"], ["--target-cpu", "targetCpu"], ["--up-rounds", "upRounds"], ["--down-after", "downAfterSeconds"], ["--cooldown", "cooldownSeconds"]]) {
+          const v = getFlagValue(rest, flag);
+          if (v !== undefined) input[key] = v;
+        }
+        console.log(JSON.stringify(setScaleRule(arg1, input, `cli:${process.env.USER || "unknown"}`), null, 2));
+      } else if (sub === "language" && arg1) {
+        console.log(JSON.stringify(setDiaryLanguage(arg1), null, 2));
+      } else if (sub === "test" && arg1) {
+        const slug = sanitizeSlug(arg1);
+        const app = loadState().apps[slug];
+        if (!app) throw new Error(`App '${slug}' not found.`);
+        const testPath = validateTestPath(getFlagValue(rest, "--path") || app.healthcheckPath || "/");
+        const maxConcurrency = Number(getFlagValue(rest, "--max-concurrency") || 32);
+        await confirmInCli("scale.test", { appName: slug, path: testPath, maxConcurrency }, rest);
+        const result = await capacityTest(slug, {
+          path: testPath,
+          maxConcurrency,
+          stepSeconds: Number(getFlagValue(rest, "--step-seconds") || 5),
+          onStep: (st) => console.error(`${String(st.concurrency).padStart(3)} parallel: ${st.rps} req/s, p95 ${st.p95Ms} ms, errors ${st.errors}, app CPU ${st.appCpu ?? "?"}%, db CPU ${st.dbCpu ?? "?"}%`),
+        });
+        await withStateLock(() => saveCapacity(slug, result, `cli:${process.env.USER || "unknown"}`));
+        console.log(JSON.stringify(result, null, 2));
+      } else if (sub === "install-timer") {
+        console.log(JSON.stringify(installScaleTimer(Number(getFlagValue(rest, "--seconds") || 15)), null, 2));
+      } else if (sub === "uninstall-timer") {
+        console.log(JSON.stringify(uninstallScaleTimer(), null, 2));
+      } else {
+        throw new Error(
+          "Usage: paasmcp scale [status [app]]|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--up-rounds n] [--down-after s] [--cooldown s]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
+        );
+      }
+      break;
+    }
+
     case "update": {
       const [sub, comp, image] = rest;
       if (!sub || sub === "check") {
@@ -828,6 +886,8 @@ Commands:
   paasmcp active tunnel <status|on|off>             Cloudflare Tunnel just for those apps, on both servers
   paasmcp edge <status|install|add|remove|reload|uninstall>  Self-hosted entry (Caddy) splitting requests between both servers
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
+  paasmcp scale <status|tick|history|diary|rule|language|test|install-timer|uninstall-timer>
+                                                    Measure apps for 24 h and rehearse scaling decisions (never acts yet)
   paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
   paasmcp email <set|status|provision <app>|test <to>>  One relay (Brevo, SES...) for every app's email
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
@@ -882,7 +942,14 @@ async function runActiveSyncWithFiles() {
 const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", "mcp", "token", undefined]);
 const command = process.argv[2];
 // Long-running loops take the lock per round instead of holding it.
-const lockFree = LOCK_FREE_COMMANDS.has(command) || command === "arbiter" || (command === "mirror" && process.argv[3] === "watch");
+// Scale rounds only read state.json (they keep their own files), so a long deploy never pauses the
+// measuring; the capacity test takes the lock only to save its result.
+const SCALE_LOCK_FREE = new Set(["tick", "status", "history", "diary", "test", undefined]);
+const lockFree =
+  LOCK_FREE_COMMANDS.has(command) ||
+  command === "arbiter" ||
+  (command === "mirror" && process.argv[3] === "watch") ||
+  (command === "scale" && SCALE_LOCK_FREE.has(process.argv[3]));
 (lockFree ? runCli() : withStateLock(runCli)).catch((err) => {
   console.error("Error:", err instanceof Error ? err.message : String(err));
   process.exit(1);

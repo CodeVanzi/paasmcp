@@ -2,6 +2,7 @@ import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
+import { DiaryLang, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
@@ -526,6 +527,29 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/tokens" && req.method === "DELETE") {
           const body = await readJsonBody(req);
           return reply({ revoked: revokeToken(String(body.id || "")) });
+        }
+
+        if (pathname === "/api/scale" && req.method === "GET") {
+          const lang: DiaryLang = url.searchParams.get("lang") === "en" ? "en" : "pt";
+          const status = scaleStatus({ lang });
+          const wanted = url.searchParams.get("app");
+          const app = status.apps.find((a) => a.app === wanted)?.app ?? status.apps[0]?.app;
+          return reply({
+            ...status,
+            app: app || null,
+            history: app ? scaleHistory(app, { bucketMinutes: 5 }) : null,
+            diary: app ? scaleDiary({ app, lang, limit: 30 }) : [],
+          });
+        }
+        if (pathname === "/api/scale/rule" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const input: Record<string, unknown> = {};
+          for (const k of ["min", "max", "targetCpu", "downAfterSeconds", "cooldownSeconds"]) if (body[k] !== undefined) input[k] = body[k];
+          return reply(setScaleRule(String(body.appName || ""), input, actor));
+        }
+        if (pathname === "/api/scale/language" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(setDiaryLanguage(String(body.language || "")));
         }
 
         if (pathname === "/api/poll" && req.method === "POST") {
@@ -1375,6 +1399,41 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <strong id="guideAppsLoopbackTitle">🔒 Isolamento Loopback</strong>
                   <span id="guideAppsLoopbackDesc">Containers escutam exclusivamente em 127.0.0.1:4000-4998, sem portas expostas no firewall ou roteador.</span>
                 </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" id="scaleCard">
+            <div class="card-header">
+              <h2 data-i18n="scaleTitle"></h2>
+              <p class="card-desc" data-i18n="scaleDesc"></p>
+            </div>
+            <div id="scaleTimerNote"></div>
+            <div class="form-grid" style="grid-template-columns:minmax(0,280px);">
+              <div><label class="field-label" for="scaleApp" data-i18n="lblScaleApp"></label><select id="scaleApp" onchange="loadScale()"></select></div>
+            </div>
+            <div id="scaleNow"></div>
+            <div id="scaleCharts" style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px;"></div>
+            <div id="scaleBody">
+              <h3 data-i18n="scaleRuleTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleRuleDesc"></p>
+              <div class="form-grid">
+                <div><label class="field-label" for="scaleMin" data-i18n="lblScaleMin"></label><input id="scaleMin" type="number" min="1" max="20" /></div>
+                <div><label class="field-label" for="scaleMax" data-i18n="lblScaleMax"></label><input id="scaleMax" type="number" min="1" max="20" /></div>
+                <div><label class="field-label" for="scaleTarget" data-i18n="lblScaleTarget"></label><input id="scaleTarget" type="number" min="10" max="95" /></div>
+                <div><label class="field-label" for="scaleDown" data-i18n="lblScaleDown"></label><input id="scaleDown" type="number" min="1" max="1440" /></div>
+                <div><label class="field-label" for="scaleCooldown" data-i18n="lblScaleCooldown"></label><input id="scaleCooldown" type="number" min="0" max="3600" /></div>
+              </div>
+              <button onclick="saveScaleRule()" data-i18n="btnSave"></button>
+              <h3 data-i18n="scaleCapTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleCapDesc"></p>
+              <div id="scaleCapacity"></div>
+              <h3 data-i18n="scaleDiaryTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleDiaryDesc"></p>
+              <div id="scaleDiary"></div>
+              <div class="form-grid" style="grid-template-columns:minmax(0,320px);margin-top:8px;">
+                <div><label class="field-label" for="scaleLang" data-i18n="lblScaleLang"></label>
+                  <select id="scaleLang" onchange="saveScaleLang()"><option value="pt">Português</option><option value="en">English</option></select></div>
               </div>
             </div>
           </div>
@@ -3191,6 +3250,111 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "promptEx3Desc": "“Why did the app <code>blog</code> stop? Run diagnostics and tell me what to do.”"
     });
 
+    Object.assign(I18N.pt, {
+          "scaleTitle": "📈 Uso nas últimas 24 h e ensaio da escala",
+          "scaleDesc": "O PaaSMCP mede a CPU, a memória, o tráfego e o tempo de resposta de cada app e guarda 24 horas. Com esses números, o <strong>ensaio</strong> aplica a regra da escala automática e anota o que faria, sem subir nem desligar nada. Serve para ver quais apps ganhariam com mais cópias e para calibrar a regra antes de ela agir de verdade.",
+          "scaleNoTimer": "A medição ainda não está ligada. No servidor, rode <code>sudo paasmcp scale install-timer</code>. Ela mede a cada 15 s e não deixa nenhum programa rodando entre uma medição e outra.",
+          "scaleTimerOn": "Medindo a cada {n} s.",
+          "scaleNoApps": "Nenhum app para medir ainda.",
+          "lblScaleApp": "App",
+          "scaleNoData": "Ainda sem medições deste app.",
+          "scaleStale": "Sem medição recente: o app está parado ou a medição foi desligada.",
+          "scaleOfLimit": "do limite de {n} CPU",
+          "scaleOfCore": "de um núcleo, porque o app não tem limite de CPU",
+          "scaleMem": "memória",
+          "scaleLat": "resposta",
+          "scaleNoAnswer": "não respondeu",
+          "scaleNet": "tráfego",
+          "scaleNowLbl": "agora",
+          "scale24hAgo": "24 h atrás",
+          "scaleMax": "máx.",
+          "scaleLast": "última",
+          "scaleTargetLegend": "tracejado: alvo por cópia",
+          "scaleWould1": "O ensaio rodaria 1 cópia agora",
+          "scaleWouldN": "O ensaio rodaria {n} cópias agora",
+          "scaleChartCpu": "CPU em %",
+          "scaleChartLat": "Tempo de resposta (ms)",
+          "scaleChartNet": "Tráfego (kB/s)",
+          "scaleChartMem": "Memória (MB)",
+          "scaleRuleTitle": "Regra do ensaio",
+          "scaleRuleDesc": "O ensaio divide a CPU do app pelas cópias que ele teria. Sobe uma cópia quando a CPU por cópia passa do alvo em 3 medições seguidas, e desce uma quando ela fica abaixo da metade do alvo pelo tempo escolhido. Depois de cada passo, espera antes do próximo, para não ficar subindo e descendo.",
+          "lblScaleMin": "Mínimo de cópias",
+          "lblScaleMax": "Máximo de cópias",
+          "lblScaleTarget": "Alvo de CPU por cópia (%)",
+          "lblScaleDown": "Descer depois de (min)",
+          "lblScaleCooldown": "Espera entre passos (s)",
+          "scaleRuleSaved": "Regra salva. O ensaio passa a usar a regra nova na próxima medição.",
+          "scaleCapTitle": "Teste de capacidade",
+          "scaleCapDesc": "Descobre quantas visitas por segundo uma cópia aguenta e o que trava primeiro (a CPU do app ou o banco). Como põe carga de verdade no app, ele roda pelo terminal do servidor e pede confirmação.",
+          "scaleCapNone": "Este app ainda não foi testado.",
+          "scaleCapResult": "Em {date}, uma cópia aguentou <strong>{rps} visitas/s</strong> em <code>{path}</code>, com {c} pedidos ao mesmo tempo (p95 de {p95} ms). O que travou: {bn}.",
+          "scaleCapSuggest": "Até uns {s} visitas/s por cópia, sobra folga (70% do medido).",
+          "scaleBn_app_cpu": "a CPU do app",
+          "scaleBn_database": "o banco de dados",
+          "scaleBn_client": "o próprio teste, porque o servidor não conseguiu gerar mais carga",
+          "scaleBn_errors": "o app começou a dar erro",
+          "scaleBn_latency": "o tempo de resposta passou de 2 s",
+          "scaleBn_none": "nada, até a carga máxima testada",
+          "scaleBn_unknown": "não identificado (talvez disco, rede ou um limite do próprio app)",
+          "scaleDiaryTitle": "Diário do decisor",
+          "scaleDiaryDesc": "Cada decisão do ensaio com o motivo. A IA lê o mesmo diário pelo MCP para responder, por exemplo, “por que o app teria 3 cópias agora?”.",
+          "scaleDiaryNone": "Nada anotado ainda.",
+          "lblScaleLang": "Idioma do diário no terminal, no log e na IA",
+          "scaleLangSaved": "Idioma do diário salvo."
+    });
+    Object.assign(I18N.en, {
+          "scaleTitle": "📈 Last 24 h of use and the scaling rehearsal",
+          "scaleDesc": "PaaSMCP measures each app's CPU, memory, traffic and response time and keeps 24 hours. On those numbers, the <strong>rehearsal</strong> runs the automatic scaling rule and writes down what it would do, without starting or stopping anything. Use it to see which apps would gain from more copies and to tune the rule before it acts for real.",
+          "scaleNoTimer": "Measuring is not on yet. On the server, run <code>sudo paasmcp scale install-timer</code>. It measures every 15 s and leaves no program running between rounds.",
+          "scaleTimerOn": "Measuring every {n} s.",
+          "scaleNoApps": "No app to measure yet.",
+          "lblScaleApp": "App",
+          "scaleNoData": "No measurements for this app yet.",
+          "scaleStale": "No recent measurement: the app is stopped or measuring was turned off.",
+          "scaleOfLimit": "of its {n} CPU limit",
+          "scaleOfCore": "of one core, since the app has no CPU limit",
+          "scaleMem": "memory",
+          "scaleLat": "response",
+          "scaleNoAnswer": "no answer",
+          "scaleNet": "traffic",
+          "scaleNowLbl": "now",
+          "scale24hAgo": "24 h ago",
+          "scaleMax": "max",
+          "scaleLast": "last",
+          "scaleTargetLegend": "dashed: target per copy",
+          "scaleWould1": "The rehearsal would run 1 copy now",
+          "scaleWouldN": "The rehearsal would run {n} copies now",
+          "scaleChartCpu": "CPU in %",
+          "scaleChartLat": "Response time (ms)",
+          "scaleChartNet": "Traffic (kB/s)",
+          "scaleChartMem": "Memory (MB)",
+          "scaleRuleTitle": "Rehearsal rule",
+          "scaleRuleDesc": "The rehearsal spreads the app's CPU over the copies it would have. It adds a copy when CPU per copy is above the target for 3 measurements in a row, and removes one when it stays below half the target for the time you choose. After each step it waits before the next, so it does not keep going up and down.",
+          "lblScaleMin": "Fewest copies",
+          "lblScaleMax": "Most copies",
+          "lblScaleTarget": "CPU target per copy (%)",
+          "lblScaleDown": "Remove after (min)",
+          "lblScaleCooldown": "Wait between steps (s)",
+          "scaleRuleSaved": "Rule saved. The rehearsal uses it from the next measurement.",
+          "scaleCapTitle": "Capacity test",
+          "scaleCapDesc": "Finds how many requests per second one copy handles and what chokes first (the app's CPU or the database). Since it puts real load on the app, it runs from the server's terminal and asks for confirmation.",
+          "scaleCapNone": "This app has not been tested yet.",
+          "scaleCapResult": "On {date}, one copy handled <strong>{rps} requests/s</strong> on <code>{path}</code> with {c} requests at once (p95 {p95} ms). What choked: {bn}.",
+          "scaleCapSuggest": "Up to about {s} requests/s per copy there is room to spare (70% of the measured value).",
+          "scaleBn_app_cpu": "the app's CPU",
+          "scaleBn_database": "the database",
+          "scaleBn_client": "the test itself, since the server could not generate more load",
+          "scaleBn_errors": "the app started returning errors",
+          "scaleBn_latency": "response time went over 2 s",
+          "scaleBn_none": "nothing, up to the highest load tested",
+          "scaleBn_unknown": "not identified (maybe disk, network or a limit inside the app)",
+          "scaleDiaryTitle": "Decision diary",
+          "scaleDiaryDesc": "Each rehearsal decision with its reason. The AI reads the same diary over MCP to answer, for example, “why would the app have 3 copies now?”.",
+          "scaleDiaryNone": "Nothing written yet.",
+          "lblScaleLang": "Diary language in the terminal, the log and the AI",
+          "scaleLangSaved": "Diary language saved."
+    });
+
     function t(key) {
       const dict = I18N[currentLang] || I18N.pt;
       return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
@@ -3274,6 +3438,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') loadStorage();
+      if (tabName === 'overview') loadScale();
     }
 
     function toggleTheme() {
@@ -3286,6 +3451,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       currentLang = currentLang === 'pt' ? 'en' : 'pt';
       localStorage.setItem('paasmcp_lang', currentLang);
       applyPreferences();
+      if (scaleData) loadScale();
     }
 
     function applyPreferences() {
@@ -3904,6 +4070,135 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         const r = await postJson('/api/backups/sync', {});
         if (r) showToast(t('offsiteDone') + ' ' + r.uploaded.length + (r.failed.length ? ' · ' + t('offsiteFailed') + ' ' + r.failed.length : ''));
       } finally { btn.disabled = false; }
+    }
+
+    // ---- Scale: 24 h of measurements and the decision rehearsal ----
+    let scaleData = null;
+    async function loadScale() {
+      const sel = document.getElementById('scaleApp');
+      const app = sel ? sel.value : '';
+      const res = await fetch('/api/scale?lang=' + currentLang + (app ? '&app=' + encodeURIComponent(app) : ''));
+      if (!res.ok) return;
+      scaleData = await res.json();
+      renderScale();
+    }
+    function fmtDate(iso) {
+      return new Date(iso).toLocaleString(currentLang === 'en' ? 'en-US' : 'pt-BR', { dateStyle: 'short', timeStyle: 'short' });
+    }
+    function fmtNum(n, digits) {
+      return Number(n).toLocaleString(currentLang === 'en' ? 'en-US' : 'pt-BR', { maximumFractionDigits: digits ?? 0 });
+    }
+    function fmtRate(bytes) {
+      if (bytes === null || bytes === undefined) return '-';
+      if (bytes >= 1048576) return fmtNum(bytes / 1048576, 1) + ' MB/s';
+      return fmtNum(bytes / 1024, 1) + ' kB/s';
+    }
+    // Small line chart (inline SVG, no library): last 24 h, gaps where nothing was measured.
+    function scaleChart(title, points, valueOf, opts) {
+      const W = 300, H = 90, now = Date.now(), from = now - 24 * 3600 * 1000;
+      const vals = points.map(p => ({ t: p.t, v: valueOf(p) })).filter(p => p.v !== null && p.v !== undefined && isFinite(p.v));
+      const top = Math.max(1, ...vals.map(p => p.v), opts.target ? opts.target * 1.25 : 0);
+      const x = t => ((t - from) / (now - from)) * W;
+      const y = v => H - (v / top) * (H - 6);
+      const segs = [];
+      let cur = [];
+      vals.forEach((p, i) => {
+        if (i && p.t - vals[i - 1].t > 12 * 60 * 1000) { segs.push(cur); cur = []; }
+        cur.push(x(p.t).toFixed(1) + ',' + y(p.v).toFixed(1));
+      });
+      segs.push(cur);
+      const lines = segs.filter(sg => sg.length).map(sg => sg.length === 1
+        ? '<circle cx="' + sg[0].split(',')[0] + '" cy="' + sg[0].split(',')[1] + '" r="1.8" style="fill:var(--accent)"/>'
+        : '<polyline points="' + sg.join(' ') + '" style="fill:none;stroke:var(--accent);stroke-width:1.6"/>').join('');
+      const target = opts.target ? '<line x1="0" x2="' + W + '" y1="' + y(opts.target).toFixed(1) + '" y2="' + y(opts.target).toFixed(1) + '" style="stroke:var(--warning);stroke-width:1;stroke-dasharray:4 3"/>' : '';
+      const last = vals.length ? vals[vals.length - 1].v : null;
+      return '<div class="arch-box" style="padding:10px 12px;">'
+        + '<div style="display:flex;justify-content:space-between;font-size:12px;gap:8px;"><strong>' + esc(title) + '</strong><span style="color:var(--muted)">' + esc(t('scaleMax')) + ' ' + esc(fmtNum(Math.max(0, ...vals.map(p => p.v)), 1)) + (last !== null ? ' · ' + esc(t('scaleLast')) + ' ' + esc(fmtNum(last, 1)) : '') + '</span></div>'
+        + '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:100%;height:90px;display:block;margin-top:6px;border-bottom:1px solid var(--border)" role="img" aria-label="' + esc(title) + '">' + target + lines + '</svg>'
+        + '<div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted);margin-top:3px;"><span>' + esc(t('scale24hAgo')) + '</span>' + (opts.target ? '<span>' + esc(t('scaleTargetLegend')) + '</span>' : '') + '<span>' + esc(t('scaleNowLbl')) + '</span></div>'
+        + '</div>';
+    }
+    function renderScale() {
+      const d = scaleData;
+      if (!d) return;
+      const note = document.getElementById('scaleTimerNote');
+      note.innerHTML = d.timer
+        ? '<p class="card-desc">' + esc(t('scaleTimerOn').replace('{n}', d.timer.seconds)) + '</p>'
+        : '<div class="arch-box" style="border-color:var(--warning);margin-bottom:10px;font-size:13px;">' + t('scaleNoTimer') + '</div>';
+      const sel = document.getElementById('scaleApp');
+      sel.innerHTML = d.apps.map(a => '<option value="' + esc(a.app) + '"' + (a.app === d.app ? ' selected' : '') + '>' + esc(a.app) + '</option>').join('');
+      document.getElementById('scaleLang').value = d.language;
+      const a = d.apps.find(x => x.app === d.app);
+      const body = document.getElementById('scaleBody');
+      if (!a) {
+        document.getElementById('scaleNow').innerHTML = '<p class="card-desc">' + esc(t('scaleNoApps')) + '</p>';
+        document.getElementById('scaleCharts').innerHTML = '';
+        body.style.display = 'none';
+        return;
+      }
+      body.style.display = '';
+      const ref = a.cpuReferenceCores;
+      const cpuUnit = a.cpuLimited ? t('scaleOfLimit').replace('{n}', fmtNum(ref, 2)) : t('scaleOfCore');
+      let now = '';
+      if (!a.last) now = esc(t('scaleNoData'));
+      else {
+        const l = a.last;
+        now = '<strong>' + esc(t('scaleNowLbl')) + ':</strong> CPU ' + esc(a.cpuOfLimit ?? '-') + '% ' + esc(cpuUnit)
+          + ' · ' + esc(t('scaleMem')) + ' ' + esc(l.mem === null ? '-' : fmtNum(l.mem) + ' MB')
+          + ' · ' + esc(t('scaleLat')) + ' ' + esc(l.lat === null ? (l.ok === false ? t('scaleNoAnswer') : '-') : fmtNum(l.lat) + ' ms')
+          + ' · ' + esc(t('scaleNet')) + ' ' + esc(l.rx === null ? '-' : fmtRate((l.rx || 0) + (l.tx || 0)));
+        if (!a.measuring) now += '<div style="color:var(--warning);margin-top:4px;">' + esc(t('scaleStale')) + '</div>';
+      }
+      const copies = a.rehearsalCopies;
+      now += '<div style="margin-top:6px;"><span class="badge' + (copies > a.rule.min ? ' warning' : '') + '">' + esc((copies === 1 ? t('scaleWould1') : t('scaleWouldN')).replace('{n}', copies)) + '</span></div>';
+      if (a.lastEvent) now += '<div style="margin-top:6px;font-size:12.5px;color:var(--muted);">' + esc(fmtDate(a.lastEvent.t)) + ' · ' + esc(a.lastEvent.text) + '</div>';
+      document.getElementById('scaleNow').innerHTML = card(now);
+
+      const pts = (d.history && d.history.points) || [];
+      document.getElementById('scaleCharts').innerHTML =
+        scaleChart(t('scaleChartCpu') + ' ' + cpuUnit, pts, p => p.cpu === null ? null : p.cpu / ref, { target: a.rule.targetCpu })
+        + scaleChart(t('scaleChartLat'), pts, p => p.lat, {})
+        + scaleChart(t('scaleChartNet'), pts, p => p.rx === null ? null : ((p.rx || 0) + (p.tx || 0)) / 1024, {})
+        + scaleChart(t('scaleChartMem'), pts, p => p.mem, {});
+
+      document.getElementById('scaleMin').value = a.rule.min;
+      document.getElementById('scaleMax').value = a.rule.max;
+      document.getElementById('scaleTarget').value = a.rule.targetCpu;
+      document.getElementById('scaleDown').value = Math.round(a.rule.downAfterSeconds / 60);
+      document.getElementById('scaleCooldown').value = a.rule.cooldownSeconds;
+
+      const cmd = '<code>sudo paasmcp scale test ' + esc(a.app) + '</code>';
+      const c = a.capacity;
+      document.getElementById('scaleCapacity').innerHTML = card(
+        (c
+          ? t('scaleCapResult').replace('{date}', esc(fmtDate(c.at))).replace('{rps}', esc(fmtNum(c.rps))).replace('{path}', esc(c.path))
+              .replace('{c}', esc(c.concurrency)).replace('{p95}', esc(c.p95Ms)).replace('{bn}', esc(t('scaleBn_' + c.bottleneck)))
+            + '<div style="margin-top:4px;color:var(--muted);font-size:12.5px;">' + esc(t('scaleCapSuggest').replace('{s}', fmtNum(c.suggestedTargetRps))) + '</div>'
+          : esc(t('scaleCapNone')))
+        + '<div style="margin-top:6px;">' + cmd + '</div>');
+
+      const diary = (d.diary || []).slice().reverse();
+      document.getElementById('scaleDiary').innerHTML = diary.length
+        ? diary.map(e => '<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12.5px;"><span style="color:var(--muted)">' + esc(fmtDate(e.t)) + '</span> · ' + esc(e.text) + '</div>').join('')
+        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('scaleDiaryNone')) + '</span>';
+    }
+    async function saveScaleRule() {
+      const a = scaleData && scaleData.app;
+      if (!a) return;
+      const num = id => document.getElementById(id).value;
+      const r = await postJson('/api/scale/rule', {
+        appName: a,
+        min: num('scaleMin'),
+        max: num('scaleMax'),
+        targetCpu: num('scaleTarget'),
+        downAfterSeconds: String(Math.round(Number(num('scaleDown')) * 60)),
+        cooldownSeconds: num('scaleCooldown'),
+      });
+      if (r) { showToast(t('scaleRuleSaved')); loadScale(); }
+    }
+    async function saveScaleLang() {
+      const r = await postJson('/api/scale/language', { language: document.getElementById('scaleLang').value });
+      if (r) showToast(t('scaleLangSaved'));
     }
 
     // ---- Connect AI ----
