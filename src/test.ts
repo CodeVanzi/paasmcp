@@ -952,5 +952,180 @@ volumes:
     );
   });
 
+  await t.test("27. Active-active: readiness, encrypted control channel, peer sync, shared services, edge", async () => {
+    const active = await import("./active.js");
+    const edge = await import("./edge.js");
+    const mirror = await import("./mirror.js");
+    const mcp = await import("./mcp-server.js");
+    const saved = JSON.stringify(config.loadState());
+    const sha1 = "a".repeat(40);
+    const sha2 = "b".repeat(40);
+    try {
+      // --- Origin side (server A) ---
+      const appDir = fs.mkdtempSync(path.join(tempRoot, "shop-"));
+      fs.writeFileSync(path.join(appDir, "compose.yaml"), YAML.stringify({ services: { app: {} }, volumes: { uploads: {} } }));
+      const st = config.loadState();
+      st.mirror = { epoch: 0, bindIp: "100.64.0.1", offers: { "server-b": { peerCidr: "100.64.0.2/32", slot: "s", offeredAt: "x" } }, replicas: {} };
+      st.apps.shop = {
+        name: "shop", repoUrl: "acme/shop", branch: "main", localPort: 4100, internalPort: 3000, containerName: "paasmcp-shop",
+        appDir, runtimeType: "node", databases: [], domains: [], createdAt: "x", updatedAt: "x", lastCommit: "aaaaaaa",
+        healthcheckPath: "/healthz",
+      };
+      config.saveState(st);
+      vault.saveSecrets("shop", {
+        DATABASE_URL: "postgresql://u:p@paasmcp-postgres:5432/db_shop",
+        REDIS_URL: "redis://:apass@paasmcp-redis:6379/2",
+        S3_ENDPOINT: "http://paasmcp-garage:3900",
+      });
+
+      let ready = active.activeReadiness("shop");
+      assert.equal(ready.ok, false);
+      assert.match(ready.problems.join(" "), /exact commit/);
+      const st1 = config.loadState();
+      st1.apps.shop.lastCommitSha = sha1;
+      config.saveState(st1);
+      ready = active.activeReadiness("shop");
+      assert.equal(ready.ok, true, ready.problems.join(" "));
+      assert.match(ready.warnings.join(" "), /local volumes \(uploads\)/);
+      assert.deepEqual(ready.peers, ["server-b"]);
+
+      // Turning it on needs a person (confirm); the edge needs the name typed (strong).
+      assert.equal(guard.assessRisk("app.active", { appName: "shop" })?.level, "confirm");
+      assert.equal(guard.assessRisk("edge.install", {})?.level, "strong");
+      const asked = JSON.parse((await mcp.handleToolCall("paas_active", { action: "on", appName: "shop" }, "destroy")).content[0].text);
+      assert.equal(asked.confirmationRequired, true);
+      await active.setActiveActive("shop", true);
+      assert.equal(config.loadState().apps.shop.activeActive, true);
+
+      const origin = active.activeComposeExtras(config.loadState(), config.loadState().apps.shop, 3000, vault.getSecrets("shop"));
+      assert.deepEqual(origin.extraPorts, ["100.64.0.1:4100:3000"]);
+      assert.deepEqual(origin.extraHosts, [], "the origin uses its own services");
+      assert.equal(origin.extraEnv.DATABASE_REPLICA_URL, "postgresql://u:p@paasmcp-postgres:5432/db_shop");
+
+      const written: string[] = [];
+      assert.equal(active.publishActiveState((b) => written.push(b)).published, true);
+      assert.equal(active.publishActiveState((b) => written.push(b)).reason, "unchanged", "identical manifests are not rewritten");
+      assert.equal(written.length, 1);
+      assert.match(written[0], /^[A-Za-z0-9+/=]+$/);
+      assert.ok(!Buffer.from(written[0], "base64").toString("latin1").includes("apass"), "secrets travel encrypted");
+      const decoded = active.decodeManifest(written[0]);
+      assert.equal(decoded.apps.shop.commit, sha1);
+      assert.equal(decoded.apps.shop.record.appDir, undefined, "local paths stay local");
+      const tampered = Buffer.from(written[0], "base64");
+      tampered[tampered.length - 1] ^= 1;
+      assert.throws(() => active.decodeManifest(tampered.toString("base64")), /could not be decrypted/);
+
+      // --- Peer side (server B), simulated in the same state ---
+      const manifest = { ...decoded, nodeId: "node-a" };
+      let body = active.encodeManifest(manifest);
+      const st2 = config.loadState();
+      st2.mirror!.replicas["server-a"] = {
+        peerName: "server-a", peerNodeId: "node-a", peerHost: "100.64.0.1", slot: "s", container: "paasmcp-mirror-server-a",
+        localPort: 5433, dataDir: "/x", acceptedAt: "x",
+      };
+      config.saveState(st2);
+      const deployed: { app: string; commit?: string }[] = [];
+      const stopped: string[] = [];
+      const sync = () =>
+        active.syncActivePeers({
+          read: () => body,
+          deploy: async (app, commit) => void deployed.push({ app: app.name, commit }),
+          stop: (a) => void stopped.push(a),
+        });
+
+      let res = (await sync()).find((r) => r.peer === "server-a")!;
+      assert.match(res.errors[0]?.error || "", /already lives on this server/, "a local app with the same name is never overwritten");
+      const st3 = config.loadState();
+      delete st3.apps.shop;
+      st3.apps.other = { ...st1.apps.shop, name: "other", localPort: 4100, activeActive: undefined, lastCommitSha: undefined };
+      config.saveState(st3);
+      res = (await sync()).find((r) => r.peer === "server-a")!;
+      assert.match(res.errors[0]?.error || "", /port 4100 is taken/);
+      const st4 = config.loadState();
+      delete st4.apps.other;
+      config.saveState(st4);
+
+      res = (await sync()).find((r) => r.peer === "server-a")!;
+      assert.equal(res.status, "applied", JSON.stringify(res));
+      assert.deepEqual(deployed, [{ app: "shop", commit: sha1 }], "the peer builds the origin's exact commit");
+      const peerApp = config.loadState().apps.shop;
+      assert.equal(peerApp.originNodeId, "node-a");
+      assert.equal(peerApp.localPort, 4100, "same port on both servers");
+      assert.equal(peerApp.activeSync?.commit, sha1);
+      assert.equal(vault.getSecrets("shop").REDIS_URL, "redis://:apass@paasmcp-redis:6379/2");
+      assert.equal((await sync()).find((r) => r.peer === "server-a")!.status, "unchanged");
+      assert.equal(deployed.length, 1);
+
+      const peerExtras = active.activeComposeExtras(config.loadState(), peerApp, 3000, vault.getSecrets("shop"));
+      assert.deepEqual(peerExtras.extraHosts, ["paasmcp-postgres:100.64.0.1", "paasmcp-redis:100.64.0.1", "paasmcp-garage:100.64.0.1"]);
+      assert.equal(peerExtras.extraEnv.DATABASE_REPLICA_URL, "postgresql://u:p@paasmcp-mirror-server-a:5432/db_shop", "reads can use the local copy");
+
+      // A new commit or a changed secret redeploys; bad input is refused.
+      manifest.apps.shop = { ...manifest.apps.shop, commit: sha2, configHash: "changed" };
+      body = active.encodeManifest(manifest);
+      await sync();
+      assert.deepEqual(deployed.at(-1), { app: "shop", commit: sha2 });
+      body = active.encodeManifest({ ...manifest, apps: { shop: { ...manifest.apps.shop, record: { ...manifest.apps.shop.record, localPort: "4100; rm -rf /" as unknown as number } } } });
+      assert.match((await sync()).find((r) => r.peer === "server-a")!.errors[0].error, /invalid port/);
+      body = active.encodeManifest({ ...manifest, apps: { shop: { ...manifest.apps.shop, secrets: { "BAD-KEY": "x" } } } });
+      assert.match((await sync()).find((r) => r.peer === "server-a")!.errors[0].error, /Invalid environment variable key/);
+      body = active.encodeManifest({ ...manifest, nodeId: "intruder" });
+      assert.match((await sync()).find((r) => r.peer === "server-a")!.detail || "", /not 'node-a'/);
+      body = active.encodeManifest(manifest);
+      await sync();
+
+      // Edge: both copies behind one Caddy, with the app's health path.
+      const st5 = config.loadState();
+      st5.edge = { sites: {} };
+      config.saveState(st5);
+      assert.throws(() => edge.addEdgeSite("shop", "evil.com {\n}"), /Invalid hostname/);
+      assert.deepEqual(edge.addEdgeSite("shop", "Shop.Example.com").backends, [
+        { address: "127.0.0.1:4100", where: "here" },
+        { address: "100.64.0.1:4100", where: "server-a" },
+      ]);
+      await assert.rejects(edge.installEdge({ email: "no email" }), /Invalid email/);
+      await edge.installEdge({ email: "ops@example.com" });
+      const caddyfile = fs.readFileSync(path.join(edge.EDGE_DIR, "conf", "Caddyfile"), "utf-8");
+      assert.match(caddyfile, /email ops@example\.com/);
+      assert.match(caddyfile, /shop\.example\.com \{\n\treverse_proxy 127\.0\.0\.1:4100 100\.64\.0\.1:4100 \{/);
+      assert.match(caddyfile, /health_uri \/healthz/);
+      assert.match(fs.readFileSync(path.join(edge.EDGE_DIR, "compose.yaml"), "utf-8"), /image: caddy:2\.8\.4-alpine/);
+      assert.equal(active.activeStatus().apps.find((a) => a.app === "shop")?.entries.edge[0], "shop.example.com");
+
+      // The origin stops running it on both: the peer stops its copy.
+      body = active.encodeManifest({ ...manifest, apps: {} });
+      res = (await sync()).find((r) => r.peer === "server-a")!;
+      assert.deepEqual(res.stopped, ["shop"]);
+      assert.equal(config.loadState().apps.shop.activeActive, undefined);
+
+      // Failover: the peer's app moves to the local copy and to this server's Redis password.
+      const st6 = config.loadState();
+      st6.apps.shop.activeActive = true;
+      st6.apps.shop.activeSync = { commit: sha2 };
+      config.saveState(st6);
+      vault.setSecretEntries("system", { REDIS_ROOT_PASSWORD: "bpass" });
+      await mirror.promoteMirror("server-a");
+      assert.equal(vault.getSecrets("shop").REDIS_URL, "redis://:bpass@paasmcp-redis:6379/2");
+      assert.equal(vault.getSecrets("shop").DATABASE_URL, "postgresql://u:p@paasmcp-mirror-server-a:5432/db_shop");
+      const after = active.activeComposeExtras(config.loadState(), config.loadState().apps.shop, 3000, vault.getSecrets("shop"));
+      assert.deepEqual(after.extraHosts, [], "after promotion everything is local");
+      assert.equal((await sync()).find((r) => r.peer === "server-a")!.status, "skipped");
+
+      // Pass-through compose gets the same extras.
+      const composeDir = fs.mkdtempSync(path.join(tempRoot, "aa-"));
+      fs.writeFileSync(path.join(composeDir, "docker-compose.yml"), YAML.stringify({ services: { web: { build: "." }, worker: { build: "." } } }));
+      const out = YAML.parse(deployer.generateSanitizedComposeFromRepo({
+        repoComposePath: path.join(composeDir, "docker-compose.yml"), slug: "aa", containerName: "paasmcp-aa", localPort: 4101,
+        internalPort: 3000, primaryServiceName: "web", extraHosts: ["paasmcp-postgres:100.64.0.1"], extraPorts: ["100.64.0.2:4101:3000"],
+      }).yaml);
+      assert.deepEqual(out.services.web.ports, ["127.0.0.1:4101:3000", "100.64.0.2:4101:3000"]);
+      assert.deepEqual(out.services.worker.extra_hosts, ["paasmcp-postgres:100.64.0.1"]);
+      assert.equal(out.services.worker.ports, undefined);
+      assert.throws(() => github.cloneOrUpdateRepo("acme/x", path.join(tempRoot, "nope"), "main", "abc; rm"), /full 40-character SHA/);
+    } finally {
+      fs.writeFileSync(config.STATE_FILE_PATH, saved);
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

@@ -59,6 +59,8 @@ import {
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { levelAllows, TokenLevel } from "./tokens.js";
+import { activeReadiness, activeStatus, publishActiveState, setActiveActive } from "./active.js";
+import { refreshEdge } from "./edge.js";
 import {
   deleteSecretKey,
   importDotEnvFile,
@@ -128,6 +130,7 @@ const TOOLS_WITH_APPROVAL = new Set([
   "paas_secret_delete",
   "paas_db_backup",
   "paas_mirror",
+  "paas_active",
   "paas_update",
   "paas_app_deploy",
   "paas_app_expose",
@@ -369,6 +372,19 @@ async function listTools() {
           properties: {
             action: { type: "string", enum: ["status", "promote"] },
             peer: { type: "string", description: "Peer server name (required for promote)." },
+          },
+          required: ["action"],
+        },
+      },
+      {
+        name: "paas_active",
+        description:
+          "Active-active: an app runs on both mirrored servers at once and both take requests (writes still go to this server's Postgres; the other server reaches it, Redis and S3 over Tailscale). 'status' lists active apps, the commit each server runs and sync errors. 'check' says what is missing before turning it on (mirror, Tailscale IP, health check path, local volumes). 'on'/'off' (needs a person's confirmation) marks the app, redeploys the same version and tells the other server through the mirror's control channel. Entry: Cloudflare Tunnel on both servers, or the self-hosted edge (CLI 'paasmcp edge', needs a person).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["status", "check", "on", "off"] },
+            appName: { type: "string", description: "Application slug (required for check/on/off)." },
           },
           required: ["action"],
         },
@@ -914,6 +930,30 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           return { content: [{ type: "text", text: JSON.stringify(await promoteMirror(String(args.peer)), null, 2) }] };
         }
         return { content: [{ type: "text", text: JSON.stringify(mirrorStatus(), null, 2) }] };
+      }
+
+      case "paas_active": {
+        const action = String(args.action);
+        if (action === "status") return { content: [{ type: "text", text: JSON.stringify(activeStatus(), null, 2) }] };
+        if (!args.appName) throw new Error("'appName' is required.");
+        const slug = sanitizeSlug(String(args.appName));
+        if (action === "check") return { content: [{ type: "text", text: JSON.stringify(activeReadiness(slug), null, 2) }] };
+        if (action !== "on" && action !== "off") throw new Error("action must be status, check, on or off.");
+        if (action === "on") {
+          const ready = activeReadiness(slug);
+          if (!ready.ok) throw new Error(`App '${slug}' cannot run on both servers yet:\n- ${ready.problems.join("\n- ")}`);
+          authorize("app.active", { appName: slug });
+        }
+        const r = await setActiveActive(slug, action === "on");
+        const app = loadState().apps[slug];
+        const redeploy = app.repoUrl
+          ? await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha })
+          : undefined;
+        const published = publishActiveState();
+        refreshEdge();
+        return {
+          content: [{ type: "text", text: JSON.stringify({ ...r, redeployed: redeploy?.commitHash, warning: redeploy?.warning, published }, null, 2) }],
+        };
       }
 
       case "paas_email_provision": {

@@ -117,6 +117,9 @@ export function ensureSharedRedisCluster(): { redisPass: string } {
     setSecretEntries("system", { REDIS_ROOT_PASSWORD: redisPass });
   }
 
+  // Published on the Tailscale IP when a mirror peer exists: active-active apps on the peer keep
+  // sessions and carts in this Redis (password required; Tailscale encrypts the link).
+  const mirrorBind = loadState().mirror?.bindIp;
   const composeFile = path.join(PAAS_REDIS_DIR, "compose.yaml");
   const composeContent = `services:
   redis:
@@ -125,7 +128,7 @@ export function ensureSharedRedisCluster(): { redisPass: string } {
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--requirepass", "${redisPass}"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:6379:6379"${mirrorBind ? `\n      - "${mirrorBind}:6379:6379"` : ""}
     volumes:
       - ./data:/data
     networks:

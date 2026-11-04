@@ -49,6 +49,15 @@ export interface AppRecord {
   healthcheckTimeoutSeconds?: number;
   /** true = deploy without candidate/healthcheck (apps that do not speak HTTP). */
   healthcheckDisabled?: boolean;
+  /** Full commit SHA of the running version (lastCommit is the short form). */
+  lastCommitSha?: string;
+  /**
+   * Active-active (active.ts): the app also runs on the mirror peer and both take requests. On the
+   * origin server it is set by `paasmcp active on`; on the peer it arrives through the control channel.
+   */
+  activeActive?: boolean;
+  /** Peer side: what was last deployed from the origin's control channel, and the last error. */
+  activeSync?: { commit?: string; configHash?: string; at?: string; error?: string };
 }
 
 export interface DatabaseRecord {
@@ -117,6 +126,17 @@ export interface MirrorConfig {
   auto?: string[];
   /** Set when the arbiter says another server now serves this server's data: own apps stay stopped. */
   fenced?: { byNodeId: string; epoch: number; at: string };
+  /** Active-active, origin side: hash of the last manifest written to paasmcp_meta (skip identical writes). */
+  activePublishedHash?: string;
+  activePublishedAt?: string;
+}
+
+/** Self-hosted entry (edge.ts): a Caddy on this server that splits requests between both servers. */
+export interface EdgeConfig {
+  /** ACME account email for Let's Encrypt. */
+  email?: string;
+  sites: Record<string, { app: string; addedAt: string }>;
+  installedAt?: string;
 }
 
 export interface FederationPeerRecord {
@@ -156,6 +176,7 @@ export interface PaaSState {
   backups?: Record<string, BackupRecord>;
   storage?: Record<string, StorageRecord>;
   mirror?: MirrorConfig;
+  edge?: EdgeConfig;
   /** Images moved by 'paasmcp update apply' (see updater.ts PINNED). */
   versions?: Partial<Record<"postgres" | "redis" | "garage", string>>;
   federation?: FederationConfig;
