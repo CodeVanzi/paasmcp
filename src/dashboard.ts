@@ -2682,6 +2682,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaEdgeOn": "Entrada própria ligada",
           "aaEdgeStopped": "Entrada própria instalada, mas parada",
           "aaHere": "este servidor",
+          "aaFiles": "arquivos copiados às {time}",
+          "aaFilesErr": "cópia dos arquivos falhou",
+          "aaFilesPending": "o resto continua na próxima rodada",
+          "aaFilesBig": "{n} arquivo(s) acima de 512 MB não copiados",
           "aaRemove": "Remover",
           "aaDns": "Site adicionado. Agora crie no DNS um registro A de {host} para o IP público deste servidor.",
           "aaP_trashed": "O app está na lixeira.",
@@ -2694,7 +2698,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaP_noHealthcheck": "O app não tem verificação de saúde por HTTP, e a entrada precisa dela para parar de mandar visitas a um servidor que caiu.",
           "aaW_rootHealthPath": "Use um caminho de verificação de saúde que consulte o banco (por exemplo /healthz). Com “/”, um servidor que perdeu o banco continua recebendo visitas.",
           "aaW_zeroTrustBypass": "O app está atrás do login da Cloudflare (Zero Trust). Rodando nos dois, a porta dele também fica no IP do Tailscale, onde qualquer aparelho da sua Tailnet chega sem esse login. Mantenha o login do próprio app, ou limite a Tailnet com ACLs.",
-          "aaW_localVolumes": "O app grava arquivos em volumes locais ({v}): esses arquivos ficariam diferentes em cada servidor. Guarde os envios no armazenamento S3 (tela Armazenamento).",
+          "aaW_localVolumes": "O app grava arquivos em volumes locais ({v}): esses arquivos ficariam diferentes em cada servidor. Guarde os envios no armazenamento S3 (tela Armazenamento), que é copiado para o outro servidor.",
           "mirrorAuto": "Troca automática",
           "mirrorArbiter": "Juiz",
           "mirrorSendingTo": "Mandando cópia para",
@@ -2956,6 +2960,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "aaEdgeOn": "Self-hosted entry on",
           "aaEdgeStopped": "Self-hosted entry installed but stopped",
           "aaHere": "this server",
+          "aaFiles": "files copied at {time}",
+          "aaFilesErr": "file copy failed",
+          "aaFilesPending": "the rest continues on the next round",
+          "aaFilesBig": "{n} file(s) over 512 MB not copied",
           "aaRemove": "Remove",
           "aaDns": "Site added. Now create a DNS A record for {host} pointing at this server's public IP.",
           "mirrorAuto": "Automatic takeover",
@@ -3756,7 +3764,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         ? activeData.apps.map(a => card('<strong>' + esc(a.app) + '</strong> ' +
             (a.error ? badge('danger', a.error) : badge('success', a.role === 'origin' ? t('aaOrigin') : t('aaCopy').replace('{peer}', (activeData.peers || [])[0] || '?'))) +
             '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aaRunning')) + ': ' + esc(a.commit || '?') +
-            (a.wanted ? ' · ' + esc(t('aaWanted')) + ': ' + esc(a.wanted) : '') + '</div>')).join('')
+            (a.wanted ? ' · ' + esc(t('aaWanted')) + ': ' + esc(a.wanted) : '') +
+            (a.files ? ' · ' + (a.files.error ? badge('danger', t('aaFilesErr') + ': ' + a.files.error) : esc(t('aaFiles').replace('{time}', new Date(a.files.at).toLocaleTimeString()))) : '') +
+            (a.files && a.files.pending && !a.files.error ? ' · ' + esc(t('aaFilesPending')) : '') +
+            (a.files && a.files.tooLarge ? ' · ' + badge('warning', t('aaFilesBig').replace('{n}', String(a.files.tooLarge))) : '') + '</div>')).join('')
         : card(esc(t('aaNone')));
       const sel = document.getElementById('aaApp');
       const keep = sel.value;

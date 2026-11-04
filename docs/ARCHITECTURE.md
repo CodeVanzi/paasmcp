@@ -149,6 +149,16 @@ There is still **one writer**: the origin's Postgres.
 - **Failover:** `promoteMirror` redeploys the app without `extra_hosts` (the copy is local now), points
   `DATABASE_URL` at the promoted copy and `REDIS_URL` / `LOCAL_REDIS_URL` at this server's Redis (sessions
   start empty), keeping the commit it already ran.
+- **Uploaded files** (`src/filesync.ts`): for each active app with S3 secrets, the peer creates the same bucket
+  on its own Garage and imports the **same access key** (admin API, `ensureBucketWithImportedKey`), so the app's
+  `S3_*` variables keep working there after a failover. `syncActiveFiles` runs in the background of `mirror watch`,
+  outside the state lock, so a slow or unreachable origin never delays a failover check or a deploy (`active sync`
+  and `poll run` call it directly, with a 5-minute budget). It stops between objects as soon as this server takes
+  over. At most once a minute (sooner after an error or an unfinished run) it lists both buckets with the app's key (SigV4) and copies new or changed objects from the origin's
+  S3 API on its Tailscale IP, deleting what the origin deleted. Objects go through memory one at a time; above
+  512 MB they are skipped and counted in the status. An empty origin bucket next to a non-empty copy is refused
+  (nothing deleted). `mirror handback` first copies back, without deleting, what was uploaded on the peer while
+  it served the data, and hands nothing back if that fails. No admin token leaves its server.
 - **Entry, option 1 — Cloudflare Tunnel:** run `cloudflared` with the same tunnel token on both servers. The
   tunnel's ingress points at `http://paasmcp-<app>:<port>`, which exists on both. Cloudflare does not health
   check origins: if the link between the servers breaks while both stay up, the peer's share of requests fails.
@@ -196,6 +206,8 @@ memory and nothing needs to be reachable from the internet.
 | `PAASMCP_BASE_DOMAIN` | `example.com` | Domain used for app hostnames. |
 | `PAASMCP_CF_ACCOUNT_ID`, `PAASMCP_CF_TUNNEL_ID` | — | Cloudflare account and tunnel. |
 | `PAASMCP_GARAGE_ADMIN_URL` | `http://127.0.0.1:3903` | Garage admin API. |
+| `PAASMCP_GARAGE_S3_URL` | `http://127.0.0.1:3900` | This server's Garage S3 API, used by the file copy (the labs change it). |
+| `PAASMCP_PEER_S3_URL` | `http://<peer Tailscale IP>:3900` | The origin's Garage S3 API as seen from the peer (labs only). |
 | `PAASMCP_GARAGE_CAPACITY_GB` | `100` | Capacity declared for this server's Garage node. |
 | `PAASMCP_ARBITER_KEY` | — | Key for `paasmcp arbiter serve` (from `paasmcp arbiter key`), instead of `--key`. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
@@ -214,3 +226,6 @@ memory and nothing needs to be reachable from the internet.
   receives it, B builds A's exact commit (and ignores a newer unpublished one), B's app reads and writes A's
   database through the shared-service names and reads its local copy, the Caddy edge serves B and skips A's
   dead backend, and after A dies B is promoted and keeps serving from its copy.
+- `scripts/files-lab.sh`: two real Garage nodes (ports 3900/3903 and 3910/3913). B creates the same bucket and
+  key, copies A's files and later A's deletions, serves them with the app's key while A is down, sends the
+  upload made during the outage back to A, and keeps its copy when A's bucket comes back empty.

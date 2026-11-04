@@ -16,6 +16,8 @@ import {
 import { ensureDockerNetwork, ensureSharedPostgresCluster, ensureSharedRedisCluster } from "./database.js";
 import { deployApp, manageAppLifecycle } from "./deployer.js";
 import { askArbiter } from "./arbiter.js";
+import { bucketTargets } from "./active.js";
+import { syncBucket } from "./filesync.js";
 import { audit } from "./guard.js";
 import { exposeApplication } from "./exposure.js";
 import { createBucketWithKey } from "./storage.js";
@@ -403,7 +405,10 @@ export async function promoteMirror(peerName: string, opts: { epoch?: number } =
  * rejoined copy has every change, and hand the data back (arbiter too, when configured).
  * Next: on the peer, `paasmcp mirror promote <this server>`.
  */
-export async function handbackMirror(peerName: string, waitMs = 120_000): Promise<{ peer: string; epoch: number; stoppedApps: string[] }> {
+export async function handbackMirror(
+  peerName: string,
+  waitMs = 120_000
+): Promise<{ peer: string; epoch: number; stoppedApps: string[]; filesBack: { app: string; copied: number }[] }> {
   const peer = sanitizeSlug(peerName);
   const m0 = mirrorState();
   const rec = m0.replicas[peer];
@@ -428,6 +433,24 @@ export async function handbackMirror(peerName: string, waitMs = 120_000): Promis
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
+  // Files uploaded here while this server served the peer's apps go back first (only additions and
+  // newer versions: nothing on the peer is deleted). A failure keeps the data here and the apps running.
+  const filesBack: { app: string; copied: number }[] = [];
+  if (!OFFLINE()) {
+    for (const app of stoppedApps) {
+      const env = getSecrets(app);
+      if (!loadState().apps[app]?.activeActive || !env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
+      try {
+        const t = bucketTargets(rec, env);
+        const r = await syncBucket(t.local, t.origin, "additive");
+        if (r.errors.length) throw new Error(r.errors[0]);
+        filesBack.push({ app, copied: r.copied });
+      } catch (err) {
+        for (const a of stoppedApps) manageAppLifecycle(a, "start");
+        throw new Error(`Could not copy ${app}'s uploaded files back to '${peer}' (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); apps restarted here, nothing handed back.`);
+      }
+    }
+  }
   const m = saveMirror((mm) => {
     mm.epoch += 1;
     mm.replicas[peer].handedBackAt = new Date().toISOString();
@@ -437,8 +460,8 @@ export async function handbackMirror(peerName: string, waitMs = 120_000): Promis
     const r = await askArbiter(m.arbiterUrl, { op: "handover", node: me, epoch: m.epoch, dataOf: rec.peerNodeId, to: rec.peerNodeId });
     if (!r.granted) throw new Error("The arbiter refused the handover (this server is not the recorded owner). Apps here stay stopped; check 'paasmcp mirror status'.");
   }
-  audit({ event: "mirror.handback", peer, epoch: m.epoch });
-  return { peer, epoch: m.epoch, stoppedApps };
+  audit({ event: "mirror.handback", peer, epoch: m.epoch, filesBack });
+  return { peer, epoch: m.epoch, stoppedApps, filesBack };
 }
 
 const ARBITER_URL_RE = /^https?:\/\/[a-zA-Z0-9.:[\]-]+(\/.*)?$/;

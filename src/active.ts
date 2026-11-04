@@ -18,6 +18,8 @@ import {
 } from "./config.js";
 import { deployApp, manageAppLifecycle, validateHealthcheckPath, validateHealthcheckTimeout } from "./deployer.js";
 import { audit } from "./guard.js";
+import { FileSyncResult, syncBucket } from "./filesync.js";
+import { ensureBucketWithImportedKey, ensureGarage, localS3Url, PAAS_GARAGE_DIR } from "./storage.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, saveSecrets } from "./vault.js";
 
 // Active-active: an app marked here also runs on the mirror peer, and both servers take requests.
@@ -271,7 +273,7 @@ export function activeReadiness(appName: string, state = loadState()): ActiveRea
   }
   const vols = localVolumes(app);
   if (vols.length) {
-    warn("localVolumes", `The app writes to local volumes (${vols.join(", ")}): files there will differ between the servers. Store uploads in S3 (paas_storage_provision) instead.`, vols.join(", "));
+    warn("localVolumes", `The app writes to local volumes (${vols.join(", ")}): files there will differ between the servers. Store uploads in S3 (paas_storage_provision) instead: buckets are copied to the peer.`, vols.join(", "));
   }
   return { app: slug, ok: problems.length === 0, problems, warnings, problemCodes, warningCodes, peers };
 }
@@ -282,6 +284,14 @@ export function redisNeedsRebind(state = loadState()): boolean {
   const file = path.join(PAAS_REDIS_DIR, "compose.yaml");
   if (!bind || !fs.existsSync(file)) return false;
   return !fs.readFileSync(file, "utf-8").includes(`${bind}:6379:6379`);
+}
+
+/** True when the app has a bucket and Garage's S3 API is not published on the mirror's Tailscale IP yet. */
+export function garageNeedsRebind(state: PaaSState, env: Record<string, string>): boolean {
+  const bind = state.mirror?.bindIp;
+  const file = path.join(PAAS_GARAGE_DIR, "compose.yaml");
+  if (!bind || !env.S3_BUCKET || !fs.existsSync(file)) return false;
+  return !fs.readFileSync(file, "utf-8").includes(`${bind}:3900:3900`);
 }
 
 /** Origin side: turns the mode on/off for an app. The caller redeploys the app afterwards. */
@@ -301,6 +311,8 @@ export async function setActiveActive(appName: string, on: boolean): Promise<{ a
       ensureSharedRedisCluster();
       redisRebound = true;
     }
+    // The peer copies the app's bucket from this server's S3 API on the Tailscale IP.
+    if (!OFFLINE() && garageNeedsRebind(state, getSecrets(slug))) await ensureGarage();
   } else if (state.apps[slug].originNodeId) {
     throw new Error("This app came from the other server: turn the mode off there.");
   }
@@ -329,6 +341,86 @@ export async function switchActiveActive(appName: string, on: boolean): Promise<
   const { refreshEdge } = await import("./edge.js");
   refreshEdge();
   return { ...r, redeployed, warning, published };
+}
+
+/** How often the peer refreshes its copy of each app bucket (it lists both sides each time). */
+export const FILES_EVERY_MS = 60_000;
+
+type FilesFn = (rec: MirrorReplicaRecord, app: string, env: Record<string, string>, keepGoing: () => boolean) => Promise<FileSyncResult>;
+
+/** The origin's S3 API as seen from here: its Tailscale IP, port 3900 (labs override it). */
+export const peerS3Url = (rec: MirrorReplicaRecord) => process.env.PAASMCP_PEER_S3_URL || `http://${rec.peerHost}:3900`;
+
+/** The app's bucket on both sides, with the app's own key (the same key exists on both Garage nodes). */
+export function bucketTargets(rec: MirrorReplicaRecord, env: Record<string, string>) {
+  const base = { bucket: env.S3_BUCKET, accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY, region: env.S3_REGION || undefined };
+  return { origin: { ...base, endpoint: peerS3Url(rec) }, local: { ...base, endpoint: localS3Url() } };
+}
+
+const defaultFiles: FilesFn = async (rec, app, env, keepGoing) => {
+  await ensureBucketWithImportedKey(env.S3_BUCKET, env.S3_ACCESS_KEY_ID, env.S3_SECRET_ACCESS_KEY, `paasmcp-${app}`);
+  const t = bucketTargets(rec, env);
+  return syncBucket(t.origin, t.local, "mirror", keepGoing);
+};
+
+export interface ActiveFilesResult {
+  peer: string;
+  app: string;
+  copied: number;
+  removed: number;
+  partial?: boolean;
+  error?: string;
+}
+
+/** True while this server still follows that peer (not promoted, no failback): copying may go on. */
+const stillFollowing = (peerName: string) => {
+  const r = loadState().mirror?.replicas[peerName];
+  return !!r && !r.promotedAt && !r.failback;
+};
+
+/**
+ * Peer side: refreshes this server's copy of each active app's bucket, at most every FILES_EVERY_MS
+ * (sooner after an error or an unfinished run). Meant to run OUTSIDE the state lock (`mirror watch`
+ * starts it in the background so failover checks never wait for a copy): `lock` wraps the short
+ * state writes, and `budgetMs` bounds one run; whatever is left continues on the next one.
+ */
+export async function syncActiveFiles(
+  opts: { files?: FilesFn; now?: number; budgetMs?: number; lock?: (fn: () => void) => Promise<void> | void } = {}
+): Promise<ActiveFilesResult[]> {
+  const files = opts.files || (OFFLINE() ? undefined : defaultFiles);
+  if (!files) return [];
+  const now = opts.now ?? Date.now();
+  const deadline = Date.now() + (opts.budgetMs ?? 10 * 60 * 1000);
+  const lock = opts.lock || ((fn: () => void) => fn());
+  const out: ActiveFilesResult[] = [];
+  const state = loadState();
+  for (const rec of Object.values(state.mirror?.replicas || {})) {
+    for (const app of Object.values(state.apps)) {
+      if (!stillFollowing(rec.peerName)) break;
+      if (app.originNodeId !== rec.peerNodeId || !app.activeActive || app.trashedAt) continue;
+      const env = getSecrets(app.name);
+      if (!env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
+      const last = app.activeSync?.files;
+      if (last?.at && !last.error && !last.pending && now - Date.parse(last.at) < FILES_EVERY_MS) continue;
+      if (Date.now() >= deadline) break;
+      const keepGoing = () => Date.now() < deadline && stillFollowing(rec.peerName);
+      let record: NonNullable<NonNullable<AppRecord["activeSync"]>["files"]>;
+      try {
+        const r = await files(rec, app.name, env, keepGoing);
+        const error = r.errors.length ? r.errors.slice(0, 3).join("; ") : undefined;
+        record = { at: new Date(now).toISOString(), copied: r.copied, removed: r.removed, tooLarge: r.tooLarge.length || undefined, error, pending: r.partial || undefined };
+        if (r.copied || r.removed || error || r.partial) {
+          out.push({ peer: rec.peerName, app: app.name, copied: r.copied, removed: r.removed, ...(r.partial ? { partial: true } : {}), ...(error ? { error } : {}) });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message.split("\n")[0] : String(err);
+        record = { at: new Date(now).toISOString(), error: msg };
+        out.push({ peer: rec.peerName, app: app.name, copied: 0, removed: 0, error: msg });
+      }
+      await lock(() => patchApp(app.name, (a) => (a.activeSync = { ...(a.activeSync || {}), files: record })));
+    }
+  }
+  return out;
 }
 
 type DeployFn = (app: AppRecord, commit: string | undefined) => Promise<unknown>;
@@ -399,7 +491,11 @@ export interface ActiveSyncResult {
  * exact commit the origin runs when the commit or the settings changed.
  */
 export async function syncActivePeers(
-  opts: { read?: (rec: MirrorReplicaRecord) => string | undefined; deploy?: DeployFn; stop?: (app: string) => Promise<void> | void } = {}
+  opts: {
+    read?: (rec: MirrorReplicaRecord) => string | undefined;
+    deploy?: DeployFn;
+    stop?: (app: string) => Promise<void> | void;
+  } = {}
 ): Promise<ActiveSyncResult[]> {
   const read = opts.read || readMetaFromCopy;
   const deploy = opts.deploy || defaultDeploy;
@@ -488,6 +584,7 @@ export async function syncActivePeers(
         out.errors.push({ app: slug, error: err instanceof Error ? err.message : String(err) });
       }
     }
+
     out.status = out.errors.length ? "error" : out.deployed.length || out.stopped.length ? "applied" : "unchanged";
   }
   return results;
@@ -502,6 +599,8 @@ export interface ActiveAppStatus {
   wanted?: string;
   syncedAt?: string;
   error?: string;
+  /** Copy side: last refresh of the local copy of the app's bucket. */
+  files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string; pending?: boolean };
   entries: { tunnel: string[]; edge: string[] };
 }
 
@@ -512,7 +611,9 @@ export function activeStatus(state = loadState()): { apps: ActiveAppStatus[]; pu
       app: a.name,
       role: a.originNodeId ? "copy" : "origin",
       commit: a.lastCommit,
-      ...(a.originNodeId ? { wanted: a.activeSync?.commit?.slice(0, 7), syncedAt: a.activeSync?.at, error: a.activeSync?.error } : {}),
+      ...(a.originNodeId
+        ? { wanted: a.activeSync?.commit?.slice(0, 7), syncedAt: a.activeSync?.at, error: a.activeSync?.error, files: a.activeSync?.files }
+        : {}),
       entries: {
         tunnel: a.domains.filter((d) => d.mode === "public" || d.mode === "zero-trust").map((d) => d.hostname),
         edge: Object.entries(state.edge?.sites || {}).filter(([, s]) => s.app === a.name).map(([h]) => h),

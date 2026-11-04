@@ -11,7 +11,7 @@ import {
 } from "./config.js";
 import { deriveArbiterKey, installArbiterService, resolveArbiterHost, startArbiterServer } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
-import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActivePeers } from "./active.js";
+import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActiveFiles, syncActivePeers } from "./active.js";
 import { addEdgeSite, edgeStatus, installEdge, refreshEdge, removeEdgeSite, uninstallEdge } from "./edge.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
@@ -345,6 +345,9 @@ async function runCli() {
         if (arg1 === "on") await confirmInCli("mirror.auto", { peer: rest[2], arbiterUrl }, rest);
         console.log(JSON.stringify(setAutoFailover(rest[2], arg1 === "on", arbiterUrl), null, 2));
       } else if (sub === "watch") {
+        // Bucket copies run in the background, one at a time, outside the state lock: a slow or
+        // unreachable origin never delays the next failover check or a deploy.
+        let filesRun: Promise<void> | undefined;
         for (;;) {
           try {
             const r = await withStateLock(() => watchTick());
@@ -359,7 +362,16 @@ async function runCli() {
           } catch (err) {
             console.error(new Date().toISOString(), "active sync:", err instanceof Error ? err.message : String(err));
           }
-          if (rest.includes("--once")) break;
+          filesRun ??= syncActiveFiles({ lock: (fn) => withStateLock(fn) })
+            .then((files) => {
+              if (files.length) console.log(new Date().toISOString(), JSON.stringify({ activeFiles: files }));
+            })
+            .catch((err) => console.error(new Date().toISOString(), "active files:", err instanceof Error ? err.message : String(err)))
+            .finally(() => (filesRun = undefined));
+          if (rest.includes("--once")) {
+            await filesRun;
+            break;
+          }
           await new Promise((r) => setTimeout(r, 15_000));
         }
       } else if (sub === "install-watch") {
@@ -395,7 +407,7 @@ async function runCli() {
       } else if (sub === "check" && arg1) {
         console.log(JSON.stringify(activeReadiness(arg1), null, 2));
       } else if (sub === "sync") {
-        console.log(JSON.stringify(await runActiveSync(), null, 2));
+        console.log(JSON.stringify(await runActiveSyncWithFiles(), null, 2));
       } else if (sub === "publish") {
         console.log(JSON.stringify(publishActiveState(), null, 2));
       } else if (!sub || sub === "status") {
@@ -466,7 +478,7 @@ async function runCli() {
         const polled = await pollRepos();
         let activeSync: unknown;
         try {
-          activeSync = await runActiveSync();
+          activeSync = await runActiveSyncWithFiles();
         } catch (err) {
           activeSync = { error: err instanceof Error ? err.message : String(err) };
         }
@@ -802,6 +814,18 @@ async function runActiveSync() {
   const r = await syncActivePeers();
   if (r.some((p) => p.deployed.length || p.stopped.length)) refreshEdge();
   return r;
+}
+
+/** One-shot commands already hold the state lock: copy buckets right after, within a time budget. */
+async function runActiveSyncWithFiles() {
+  const peers = await runActiveSync();
+  let files: unknown;
+  try {
+    files = await syncActiveFiles({ budgetMs: 5 * 60 * 1000 });
+  } catch (err) {
+    files = { error: err instanceof Error ? err.message : String(err) };
+  }
+  return { peers, files };
 }
 
 // Read-only commands and the long-running dashboard server skip the state lock.
