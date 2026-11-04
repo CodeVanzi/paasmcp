@@ -3,7 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { liveCopyOf } from "./active.js";
-import { EdgeConfig, HOMELAB_ROOT, loadState, PaaSState, sanitizeSlug, saveState, writeFileAtomic } from "./config.js";
+import { EdgeConfig, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic } from "./config.js";
 import { audit } from "./guard.js";
 
 // Self-hosted entry, the alternative to Cloudflare Tunnel: a Caddy container on a server with a
@@ -41,7 +41,7 @@ export function edgeBackends(state: PaaSState, appName: string): EdgeBackend[] {
   const out: EdgeBackend[] = [{ address: `127.0.0.1:${app.localPort}`, where: "here" }];
   if (!app.activeActive) return out;
   if (!app.originNodeId) {
-    for (const [peer, offer] of Object.entries(state.mirror?.offers || {})) {
+    for (const [peer, offer] of ownOffers(state)) {
       const ip = offer.peerCidr.replace(/\/32$/, "");
       if (IPV4.test(ip)) out.push({ address: `${ip}:${app.localPort}`, where: peer });
     }

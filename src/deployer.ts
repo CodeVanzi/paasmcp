@@ -404,6 +404,13 @@ export async function deployApp(opts: DeployOptions): Promise<{
   if (state.mirror?.fenced && !state.apps[slug]?.originNodeId) {
     throw new Error(`This server is fenced: since epoch ${state.mirror.fenced.epoch} another server serves its data. Follow the failback steps ('paasmcp mirror status').`);
   }
+  // Several servers: this server served another server's data after a takeover, and a later takeover
+  // moved that data elsewhere. Its apps must not start here again.
+  const origin = state.apps[slug]?.originNodeId;
+  const lost = origin ? Object.values(state.mirror?.replicas || {}).find((r) => r.peerNodeId === origin && r.promotedAt && r.supersededBy && !r.handedBackAt) : undefined;
+  if (lost) {
+    throw new Error(`Another server (${lost.supersededBy!.nodeId}) took over the data of '${lost.peerName}' at ${lost.supersededBy!.at}: its apps no longer run here ('paasmcp mirror status').`);
+  }
   if (state.apps[slug]?.trashedAt) {
     throw new Error(`App '${slug}' is in the trash. Restore it (action 'restore') or purge it before deploying again.`);
   }

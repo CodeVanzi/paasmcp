@@ -112,6 +112,17 @@ PaaSMCP enables optional multi-server redundancy without the RAM overhead of Kub
    app copies stop, it leaves the tunnel, it never takes over, and `mirror promote` refuses it without
    `--stale`. It stays on disk, read-only; once the origin is home again (failback), a new offer
    rebuilds it and the old folder is moved aside (`.superseded-<time>`), never deleted.
+   **Origin gone for good:** the server that took over offers its promoted copy to the others
+   (`mirror offer <peer> --peer-ip <ip> --from-copy-of <origin>` there). The token names the data's
+   origin (`dataOf`), so the copy is still recorded as the origin's data, with `servedByNodeId` = the
+   server it streams from. Its liveness (not the dead origin's) decides an automatic takeover, so the
+   data can move on again if that server fails too. The origin's apps run only on the server that holds
+   the data meanwhile (no active-active from a promoted copy). Such offers are keyed `<peer>:<origin>`
+   and never count as this server's own peers (`ownOffers`: edge backends, tunnel, readiness).
+   A server that had taken some data over and lost it to a later takeover (it was away for over a
+   minute; only an arbiter entry with a higher epoch than its own takeover counts) stops those apps at
+   its next watch round, refuses to deploy them, and can follow the new home the same way (its folder
+   is moved aside as `.taken-over-elsewhere-<time>`).
 7. **Trust for an automatic takeover:** `mirror watch` records when it last saw a copy streaming
    (`streamedAt`, refreshed every 4 minutes while the origin is alive). A copy last seen streaming over
    15 minutes before the origin vanished (or never) does not take over on its own; the watch says so once.
@@ -272,7 +283,8 @@ memory and nothing needs to be reachable from the internet.
 - `scripts/star-lab.sh`: three simulated servers in a star plus a real arbiter (ports 5432/5433/5443/4197). A
   offers to B and C and both follow; A dies, the first copy to ask takes over and the other steps aside and
   refuses to be promoted; A comes back fenced, failback; the copy left behind is rebuilt from a new offer and
-  has every row.
+  has every row. With `gone`, A never comes back: B follows C, C dies, B takes over with every row, and C
+  stops A's apps when it returns.
 - `scripts/active-lab.sh`: active-active on one Docker host. A publishes through `paasmcp_meta`, B's copy
   receives it, B builds A's exact commit (and ignores a newer unpublished one), B's app reads and writes A's
   database through the shared-service names and reads its local copy, the Caddy edge serves B and skips A's

@@ -2746,7 +2746,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorBehind": "Ficou para trás",
           "mirrorBehindBy": "O servidor {who} assumiu esses dados.",
           "mirrorBehindManual": "Você marcou que outro servidor assumiu esses dados.",
-          "mirrorBehindDesc": "Esta cópia não recebe mais nada e nunca assume sozinha. Quando {peer} voltar a ser a casa dos dados, peça uma nova oferta lá para refazê-la (a cópia antiga fica guardada no disco).",
+          "mirrorBehindDesc": "Esta cópia não recebe mais nada e nunca assume sozinha. Para refazê-la, peça uma nova oferta a quem guarda os dados agora: {peer}, se voltar, ou o servidor que assumiu, com --from-copy-of {peer} (a cópia antiga fica guardada no disco).",
+          "mirrorLostDesc": "Este servidor tinha assumido os dados de {peer}, ficou fora por mais de um minuto e outro assumiu no lugar. Os apps de {peer} pararam aqui e não sobem mais. Para voltar a ter uma cópia, peça uma nova oferta a quem assumiu, com --from-copy-of {peer} (os dados daqui ficam guardados no disco).",
+          "mirrorVia": "pelo servidor {who}",
           "mirrorPromotedDesc": "Os apps dele estão rodando aqui. Quando ele voltar, siga a devolução abaixo.",
           "btnPromote": "Assumir os apps",
           "btnHandback": "Devolver os apps",
@@ -3033,7 +3035,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "mirrorBehind": "Behind",
           "mirrorBehindBy": "Server {who} took over this data.",
           "mirrorBehindManual": "You marked that another server took over this data.",
-          "mirrorBehindDesc": "This copy receives nothing more and never takes over on its own. Once {peer} is the data's home again, ask for a new offer there to rebuild it (the old copy stays on disk).",
+          "mirrorBehindDesc": "This copy receives nothing more and never takes over on its own. To rebuild it, ask for a new offer from whoever holds the data now: {peer}, if it comes back, or the server that took over, with --from-copy-of {peer} (the old copy stays on disk).",
+          "mirrorLostDesc": "This server had taken over the data of {peer}, was away for over a minute, and another one took over instead. The apps of {peer} stopped here and won't start again. To hold a copy again, ask the server that took over for a new offer, with --from-copy-of {peer} (the data here stays on disk).",
+          "mirrorVia": "through server {who}",
           "mirrorPromotedDesc": "Its apps run here. When it comes back, follow the hand-back steps below.",
           "btnPromote": "Take over the apps",
           "btnHandback": "Hand the apps back",
@@ -3693,11 +3697,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           (o.walStatus === 'lost' ? '<div style="margin-top:6px;">' + esc(t('mirrorLost')) + '</div>' : ''));
       });
       (m.receiving || []).forEach(r => {
+        const via = r.servedBy ? ' (' + t('mirrorVia').replace('{who}', r.servedBy.name || r.servedBy.nodeId) + ')' : '';
         if (r.supersededBy) {
-          // Another server took over this peer's data: this copy only waits to be rebuilt.
+          // Another server took over this peer's data: this copy only waits to be rebuilt (or, if this
+          // server had taken it over before, its apps for it stopped here).
           const by = r.supersededBy.nodeId === 'manual' ? t('mirrorBehindManual') : t('mirrorBehindBy').replace('{who}', r.supersededBy.name || r.supersededBy.nodeId);
-          html += card('<strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + '</strong> ' + badge('warning', t('mirrorBehind')) +
-            '<div style="color:var(--muted);margin-top:4px;">' + esc(by) + ' ' + esc(t('mirrorBehindDesc').split('{peer}').join(r.peer)) + '</div>');
+          const desc = r.promotedAt ? t('mirrorLostDesc') : t('mirrorBehindDesc');
+          html += card('<strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + esc(via) + '</strong> ' + badge('warning', t('mirrorBehind')) +
+            '<div style="color:var(--muted);margin-top:4px;">' + esc(by) + ' ' + esc(desc.split('{peer}').join(r.peer)) + '</div>');
           return;
         }
         const state = r.error ? badge('danger', r.error)
@@ -3709,7 +3716,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           : '<button class="danger" onclick="mirrorPromote(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnPromote')) + '</button>' +
             // A stopped copy: if another server already took over by hand, this one should step aside.
             (!r.streaming && !r.error ? ' <button class="secondary" onclick="mirrorRetire(&#39;' + esc(r.peer) + '&#39;)">' + esc(t('btnRetire')) + '</button>' : '');
-        html += card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + '</strong> ' + state +
+        html += card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(t('mirrorCopyOf')) + ' ' + esc(r.peer) + esc(via) + '</strong> ' + state +
           '<div style="color:var(--muted);margin-top:4px;">' + esc(r.promotedAt ? t('mirrorPromotedDesc') : t('mirrorPromoteDesc')) + '</div>' +
           (!r.promotedAt && !r.streaming && !r.error ? '<div style="color:var(--muted);margin-top:4px;">' + esc(t('mirrorRetireDesc').split('{peer}').join(r.peer)) + '</div>' : '') +
           '</div><div style="display:flex;gap:6px;flex-wrap:wrap;">' + action + '</div></div>');
@@ -3719,7 +3726,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       // Step 5 only offers peers this server holds a copy of (the ones it could take over).
       const sel = document.getElementById('mAutoPeer');
       const keep = sel.value;
-      const peers = (m.receiving || []).filter(r => !r.promotedAt).map(r => r.peer);
+      const peers = (m.receiving || []).filter(r => !r.promotedAt && !r.supersededBy).map(r => r.peer);
       sel.innerHTML = peers.length
         ? peers.map(p => '<option value="' + esc(p) + '">' + esc(p) + ((m.auto || []).includes(p) ? ' · ' + esc(t('arbAutoTag')) : '') + '</option>').join('')
         : '<option value="">' + esc(t('autoNoCopy')) + '</option>';

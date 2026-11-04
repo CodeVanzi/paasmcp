@@ -7,6 +7,7 @@ import {
   AppRecord,
   loadState,
   MirrorReplicaRecord,
+  ownOffers,
   PaaSState,
   PAAS_APPS_DIR,
   PAAS_REDIS_DIR,
@@ -154,7 +155,7 @@ export function publishActiveState(write: (body: string) => void = writeMeta): {
   const manifest = buildActiveManifest(state);
   const apps = Object.keys(manifest.apps);
   if (m?.fenced) return { published: false, apps, reason: "this server is fenced" };
-  if (!m || Object.keys(m.offers).length === 0) {
+  if (!m || ownOffers(state).length === 0) {
     return { published: false, apps, reason: apps.length ? "no mirror peer receives a copy of this server yet" : "nothing to publish" };
   }
   const hash = sha256(JSON.stringify(manifest));
@@ -186,7 +187,7 @@ export function activeBindIp(state: PaaSState): string | undefined {
 /** The live copy this server keeps of `nodeId`, while that server is still the one serving its data. */
 export function liveCopyOf(state: PaaSState, nodeId?: string): MirrorReplicaRecord | undefined {
   if (!nodeId) return undefined;
-  return Object.values(state.mirror?.replicas || {}).find((r) => r.peerNodeId === nodeId && !r.promotedAt && !r.failback && !r.supersededBy);
+  return Object.values(state.mirror?.replicas || {}).find((r) => r.peerNodeId === nodeId && !r.promotedAt && !r.failback && !r.supersededBy && !r.servedByNodeId);
 }
 
 export interface ActiveComposeExtras {
@@ -258,7 +259,7 @@ export function activeReadiness(appName: string, state = loadState()): ActiveRea
   const problem = (code: string, text: string) => (problemCodes.push(code), problems.push(text));
   const warn = (code: string, text: string, value?: string) => (warningCodes.push({ code, value }), warnings.push(text));
   const m = state.mirror;
-  const peers = Object.keys(m?.offers || {});
+  const peers = ownOffers(state).map(([k, o]) => o.peer || k);
   if (!app) {
     problem("notFound", `App '${slug}' not found.`);
     return { app: slug, ok: false, problems, warnings, problemCodes, warningCodes, peers };
@@ -526,13 +527,15 @@ export async function syncActivePeers(
   for (const rec of Object.values(m?.replicas || {})) {
     const out: ActiveSyncResult = { peer: rec.peerName, status: "unchanged", deployed: [], stopped: [], errors: [] };
     results.push(out);
-    if (rec.promotedAt || rec.failback || rec.supersededBy) {
+    if (rec.promotedAt || rec.failback || rec.supersededBy || rec.servedByNodeId) {
       out.status = "skipped";
       out.detail = rec.promotedAt
         ? "this server serves that peer's data now"
         : rec.failback
           ? "failback in progress"
-          : "another server took over that peer's data: this copy waits to be rebuilt";
+          : rec.supersededBy
+            ? "another server took over that peer's data: this copy waits to be rebuilt"
+            : `this copy follows ${rec.servedByName || rec.servedByNodeId}, which took over that peer's data: its apps run only there`;
       continue;
     }
     const body = OFFLINE() && !opts.read ? undefined : read(rec);

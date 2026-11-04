@@ -1,10 +1,12 @@
 #!/bin/bash
 # Three "servers" on one Docker daemon, in a star: A = origin (paasmcp-postgres, root /tmp/starA),
 # B and C = copies of A (roots /tmp/starB, /tmp/starC), plus an arbiter on 127.0.0.1:4197.
-# A fails: exactly one copy takes over, the other steps aside; then failback, and the copy left
-# behind is rebuilt from a new offer. Needs Docker and a build (npm run build). Uses its own Docker
-# network (paasmcp-lab-net) and ports 127.0.0.1:5432/5433/5443/4197. Refuses to run where PaaSMCP
-# already runs (same container names); removes only what it created.
+# A fails: exactly one copy takes over, the other steps aside. Then, by default, failback, and the copy
+# left behind is rebuilt from a new offer; with the argument "gone", A never comes back: the copy left
+# behind follows the server that took over, which then fails too, and the copy takes over in turn.
+# Needs Docker and a build (npm run build). Uses its own Docker network (paasmcp-lab-net) and ports
+# 127.0.0.1:5432/5433/5443/4197. Refuses to run where PaaSMCP already runs (same container names);
+# removes only what it created.
 set -e
 cd "$(dirname "$0")/.."
 docker info >/dev/null 2>&1 || { echo "Docker is not reachable." >&2; exit 1; }
@@ -90,6 +92,35 @@ echo "  C accepts writes: $(pc "INSERT INTO notas(txt) VALUES ('after-failover')
 pc "INSERT INTO notas(txt) SELECT 'c'||g FROM generate_series(1,9) g;" >/dev/null
 tick B
 runB 'const m=await import("./dist/mirror.js");m.promoteMirror("server-a").then(()=>{console.error("B promoted a copy left behind");process.exit(1)},e=>console.log("  B refuses to promote:",e.message.slice(0,90)))'
+
+if [ "${1:-failback}" = gone ]; then
+  step "A is gone for good: B follows C, the server that took over"
+  TBC=$(runC "const m=await import('./dist/mirror.js');const r=await m.offerMirror({peerName:'server-b',peerCidr:'172.16.0.0/12',advertiseHost:'paasmcp-mirror-server-a-c',advertisePort:5432,fromCopyOf:'server-a'});console.log(r.token)")
+  runB "const m=await import('./dist/mirror.js');const r=m.acceptMirror('$TBC');console.log('  B old copy kept at', r.movedAside, '· follows', r.replica.servedByName)"
+  sleep 4
+  pc "INSERT INTO notas(txt) SELECT 'd'||g FROM generate_series(1,5) g;" >/dev/null; sleep 2
+  C_ROWS=$(pc 'SELECT count(*) FROM notas'); B_ROWS=$(pb 'SELECT count(*) FROM notas')
+  echo "  rows C: $C_ROWS  B copy: $B_ROWS"
+  [ "$C_ROWS" = 165 ] && [ "$B_ROWS" = 165 ] || fail "B should follow C with all 165 rows"
+  tick C; tick B
+
+  step "C dies too: B takes A's data over from its copy of C"
+  docker stop paasmcp-mirror-server-a-c >/dev/null
+  echo "  waiting 65 s for the arbiter to lose C..."; sleep 65
+  tick B
+  [ "$(runB 'const c=await import("./dist/config.js");console.log(c.loadState().mirror.replicas["server-a"].promotedAt?"yes":"no")')" = yes ] || fail "B should have taken over"
+  echo "  B accepts writes: $(pb "INSERT INTO notas(txt) VALUES ('on-b') RETURNING id" | head -1)"
+  B_ROWS=$(pb 'SELECT count(*) FROM notas'); echo "  rows on B: $B_ROWS"
+  [ "$B_ROWS" = 166 ] || fail "B should have 166 rows"
+
+  step "C comes back: another server holds that data now, so A's apps stop on C"
+  docker start paasmcp-mirror-server-a-c >/dev/null; sleep 3
+  OUT=$(runC 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(await m.watchTick()))'); echo "  C watch: $OUT"
+  echo "$OUT" | grep -q '"lost:server-a"' || fail "C should see that B took the data over"
+  runC 'const m=await import("./dist/mirror.js");console.log(JSON.stringify(m.mirrorStatus().receiving))'
+  echo; echo "=== all steps passed (gone)"
+  exit 0
+fi
 
 step "A comes back fenced; failback from C"
 docker start paasmcp-postgres >/dev/null; sleep 3

@@ -125,6 +125,12 @@ export interface MirrorReplicaRecord {
   supersededBy?: { nodeId: string; epoch: number; at: string };
   /** Last time `mirror watch` saw this copy streaming (refreshed every few minutes, not every round). */
   streamedAt?: string;
+  /**
+   * The origin is gone and this copy of its data follows the server that took it over (peerHost is that
+   * server). Its liveness decides an automatic takeover; the origin's apps run only there meanwhile.
+   */
+  servedByNodeId?: string;
+  servedByName?: string;
 }
 
 export interface MirrorConfig {
@@ -132,7 +138,11 @@ export interface MirrorConfig {
   epoch: number;
   /** Tailscale IP where Postgres / Garage S3 are also published for the peer. */
   bindIp?: string;
-  offers: Record<string, { peerCidr: string; slot: string; offeredAt: string; source?: string }>;
+  /**
+   * What this server sends, keyed by peer name. An offer of a promoted copy to a third server (the data
+   * of `dataOf`, served here since a takeover) is keyed "<peer>:<dataOf>" and names its peer in `peer`.
+   */
+  offers: Record<string, { peerCidr: string; slot: string; offeredAt: string; source?: string; peer?: string; dataOf?: string }>;
   replicas: Record<string, MirrorReplicaRecord>;
   /** Third vote for automatic failover (`paasmcp arbiter serve`). */
   arbiterUrl?: string;
@@ -395,6 +405,11 @@ export function allocateAppPort(state: PaaSState, existingAppName?: string): num
     }
   }
   throw new Error("No available ports in range 4000-4998");
+}
+
+/** Offers of this server's own Postgres (not of a promoted copy of another server's data). */
+export function ownOffers(state: Pick<PaaSState, "mirror">): [string, MirrorConfig["offers"][string]][] {
+  return Object.entries(state.mirror?.offers || {}).filter(([, o]) => !o.source || o.source === "paasmcp-postgres");
 }
 
 export function sanitizeSlug(name: string): string {
