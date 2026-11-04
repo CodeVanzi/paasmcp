@@ -139,6 +139,16 @@ export interface MirrorConfig {
 }
 
 /** Self-hosted entry (edge.ts): a Caddy on this server that splits requests between both servers. */
+export interface ActiveTunnelConfig {
+  tunnelId: string;
+  name: string;
+  createdAt: string;
+  /** Hostnames whose DNS points at this tunnel. */
+  routes: Record<string, { app: string; at: string }>;
+  /** Hash of the ingress last sent to Cloudflare (nothing is sent while it stays the same). */
+  ingressHash?: string;
+}
+
 export interface EdgeConfig {
   /** ACME account email for Let's Encrypt. */
   email?: string;
@@ -184,6 +194,10 @@ export interface PaaSState {
   storage?: Record<string, StorageRecord>;
   mirror?: MirrorConfig;
   edge?: EdgeConfig;
+  /** Origin side: the Cloudflare tunnel used only by apps that run on both servers (activetunnel.ts). */
+  activeTunnel?: ActiveTunnelConfig;
+  /** Peer side: this server runs the connector of that origin's tunnel. */
+  activeTunnelCopy?: { fromNodeId: string; tokenHash: string; at: string; hostnames?: string[] };
   /** Images moved by 'paasmcp update apply' (see updater.ts PINNED). */
   versions?: Partial<Record<"postgres" | "redis" | "garage", string>>;
   federation?: FederationConfig;

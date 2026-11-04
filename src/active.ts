@@ -19,6 +19,7 @@ import {
 import { deployApp, manageAppLifecycle, validateHealthcheckPath, validateHealthcheckTimeout } from "./deployer.js";
 import { audit } from "./guard.js";
 import { FileSyncResult, syncBucket } from "./filesync.js";
+import { applyPeerTunnel, routeActiveTunnel, validTunnelToken } from "./activetunnel.js";
 import { ensureBucketWithImportedKey, ensureGarage, localS3Url, PAAS_GARAGE_DIR } from "./storage.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, saveSecrets } from "./vault.js";
 
@@ -53,6 +54,8 @@ export interface ActiveManifest {
   nodeId: string;
   epoch: number;
   apps: Record<string, ActiveManifestApp>;
+  /** Tunnel for apps on both servers (activetunnel.ts), when it is on: its token and the hostnames it serves. */
+  tunnel?: { token: string; hostnames?: string[] };
 }
 
 function clusterKey(): Buffer {
@@ -87,7 +90,11 @@ export function buildActiveManifest(
       configHash: sha256(sortedJson({ ...record, ...Object.fromEntries(Object.entries(secrets).map(([k, v]) => [`env:${k}`, v])) })),
     };
   }
-  return { v: 1, nodeId: state.federation?.nodeId || "primary", epoch: state.mirror?.epoch || 0, apps };
+  const token = state.activeTunnel ? secretsOf("system").ACTIVE_TUNNEL_TOKEN : undefined;
+  return {
+    v: 1, nodeId: state.federation?.nodeId || "primary", epoch: state.mirror?.epoch || 0, apps,
+    ...(token ? { tunnel: { token, hostnames: Object.keys(state.activeTunnel?.routes || {}).sort() } } : {}),
+  };
 }
 
 export const encodeManifest = (m: ActiveManifest, key = clusterKey()) =>
@@ -340,7 +347,17 @@ export async function switchActiveActive(appName: string, on: boolean): Promise<
   const published = publishActiveState();
   const { refreshEdge } = await import("./edge.js");
   refreshEdge();
-  return { ...r, redeployed, warning, published };
+  // Tunnel for apps on both servers: an app that leaves goes back to the main tunnel now; one that
+  // joins moves once its copy on the other server answers (mirror watch / poll retry it).
+  let tunnel: unknown;
+  if (loadState().activeTunnel && !OFFLINE()) {
+    try {
+      tunnel = await routeActiveTunnel();
+    } catch (err) {
+      tunnel = { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  return { ...r, redeployed, warning, published, ...(tunnel ? { tunnel } : {}) };
 }
 
 /** How often the peer refreshes its copy of each app bucket (it lists both sides each time). */
@@ -482,6 +499,8 @@ export interface ActiveSyncResult {
   detail?: string;
   deployed: string[];
   stopped: string[];
+  /** What happened to this server's copy of the origin's tunnel connector. */
+  tunnel?: "started" | "updated" | "removed";
   errors: { app: string; error: string }[];
 }
 
@@ -530,6 +549,17 @@ export async function syncActivePeers(
       out.status = "skipped";
       out.detail = `the manifest is from epoch ${manifest.epoch}, older than this server's`;
       continue;
+    }
+
+    // The origin's tunnel for apps on both servers: its connector runs here too (or goes away).
+    try {
+      const tunnelToken = manifest.tunnel?.token;
+      if (tunnelToken !== undefined && !validTunnelToken(tunnelToken)) throw new Error("unexpected tunnel token format");
+      const hostnames = (Array.isArray(manifest.tunnel?.hostnames) ? manifest.tunnel!.hostnames : []).filter((h): h is string => typeof h === "string" && /^[a-z0-9.-]{1,253}$/.test(h));
+      const t = applyPeerTunnel(rec.peerNodeId, tunnelToken, hostnames);
+      if (t !== "unchanged") out.tunnel = t;
+    } catch (err) {
+      out.errors.push({ app: "tunnel", error: err instanceof Error ? err.message.split("\n")[0] : String(err) });
     }
 
     // Apps the origin no longer runs on both servers stop here.
@@ -585,7 +615,7 @@ export async function syncActivePeers(
       }
     }
 
-    out.status = out.errors.length ? "error" : out.deployed.length || out.stopped.length ? "applied" : "unchanged";
+    out.status = out.errors.length ? "error" : out.deployed.length || out.stopped.length || out.tunnel ? "applied" : "unchanged";
   }
   return results;
 }

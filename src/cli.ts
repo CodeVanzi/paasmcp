@@ -12,6 +12,7 @@ import {
 import { deriveArbiterKey, installArbiterService, resolveArbiterHost, startArbiterServer } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
 import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActiveFiles, syncActivePeers } from "./active.js";
+import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel, routeActiveTunnel, tunnelWatchTick } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, installEdge, refreshEdge, removeEdgeSite, uninstallEdge } from "./edge.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
@@ -368,6 +369,18 @@ async function runCli() {
             })
             .catch((err) => console.error(new Date().toISOString(), "active files:", err instanceof Error ? err.message : String(err)))
             .finally(() => (filesRun = undefined));
+          // Tunnel for apps on both servers: take a sick copy out / back in, and (origin) move the
+          // addresses whose copy now answers. Outside the lock; only short state writes take it.
+          try {
+            const w = await tunnelWatchTick();
+            if (w && w.action !== "none") console.log(new Date().toISOString(), JSON.stringify({ activeTunnel: w }));
+            if (loadState().activeTunnel) {
+              const r = await routeActiveTunnel({ lock: (fn) => withStateLock(fn) });
+              if (r.dnsChanged) console.log(new Date().toISOString(), JSON.stringify({ activeTunnelRoutes: r }));
+            }
+          } catch (err) {
+            console.error(new Date().toISOString(), "active tunnel:", err instanceof Error ? err.message : String(err));
+          }
           if (rest.includes("--once")) {
             await filesRun;
             break;
@@ -402,7 +415,19 @@ async function runCli() {
         console.log(JSON.stringify(await switchActiveActive(slug, sub === "on"), null, 2));
         if (sub === "on") {
           console.error("On the other server, the app starts within ~15 s if 'paasmcp mirror watch' runs there, or at the next 'paasmcp poll' (timer). To do it now: paasmcp active sync");
-          console.error("Entry: with Cloudflare Tunnel, run cloudflared on the other server with this tunnel's token. Without it: paasmcp edge install (on a server with a public IP).");
+          console.error("Entry: with Cloudflare Tunnel, 'paasmcp active tunnel on' (a tunnel just for apps on both servers, run on both). Without Cloudflare: paasmcp edge install (on a server with a public IP).");
+        }
+      } else if (sub === "tunnel") {
+        if (arg1 === "on") {
+          await confirmInCli("active.tunnel", {}, rest);
+          console.log(JSON.stringify(await enableActiveTunnel(), null, 2));
+          console.error("Run 'sudo paasmcp mirror install-watch' on both servers: it moves each address once the other server's copy answers, and takes a sick copy out of the tunnel.");
+        } else if (arg1 === "off") {
+          console.log(JSON.stringify(await disableActiveTunnel(), null, 2));
+        } else if (!arg1 || arg1 === "status") {
+          console.log(JSON.stringify(activeTunnelStatus(), null, 2));
+        } else {
+          throw new Error("Usage: paasmcp active tunnel <status|on|off>");
         }
       } else if (sub === "check" && arg1) {
         console.log(JSON.stringify(activeReadiness(arg1), null, 2));
@@ -413,7 +438,7 @@ async function runCli() {
       } else if (!sub || sub === "status") {
         console.log(JSON.stringify(activeStatus(), null, 2));
       } else {
-        throw new Error("Usage: paasmcp active <status|check <app>|on <app>|off <app>|sync|publish>");
+        throw new Error("Usage: paasmcp active <status|check <app>|on <app>|off <app>|sync|publish|tunnel <status|on|off>>");
       }
       break;
     }
@@ -784,6 +809,7 @@ Commands:
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp arbiter <key|serve|install-service|check> Third vote for automatic failover (run on a small third device)
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
+  paasmcp active tunnel <status|on|off>             Cloudflare Tunnel just for those apps, on both servers
   paasmcp edge <status|install|add|remove|reload|uninstall>  Self-hosted entry (Caddy) splitting requests between both servers
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp update <check|apply <component> [image]>  Pinned Postgres/Redis/Garage; backup, health check, rollback
@@ -819,13 +845,21 @@ async function runActiveSync() {
 /** One-shot commands already hold the state lock: copy buckets right after, within a time budget. */
 async function runActiveSyncWithFiles() {
   const peers = await runActiveSync();
+  let tunnel: unknown;
+  if (loadState().activeTunnel) {
+    try {
+      tunnel = await routeActiveTunnel();
+    } catch (err) {
+      tunnel = { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
   let files: unknown;
   try {
     files = await syncActiveFiles({ budgetMs: 5 * 60 * 1000 });
   } catch (err) {
     files = { error: err instanceof Error ? err.message : String(err) };
   }
-  return { peers, files };
+  return { peers, files, ...(tunnel ? { tunnel } : {}) };
 }
 
 // Read-only commands and the long-running dashboard server skip the state lock.

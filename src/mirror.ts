@@ -385,9 +385,11 @@ export async function promoteMirror(peerName: string, opts: { epoch?: number } =
         const commit = app.activeActive && app.activeSync?.commit ? app.activeSync.commit : undefined;
         if (!OFFLINE()) await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, commit });
       }
-      // DNS switch: re-exposing points the hostname at this server's tunnel.
+      // DNS switch: re-exposing points the hostname at this server's tunnel. Hostnames served by the
+      // origin's tunnel for apps on both servers already reach this server (it runs that connector).
       const base = state.cloudflare.baseDomain;
-      for (const d of app.domains.filter((x) => x.mode === "public" || x.mode === "zero-trust")) {
+      const viaTunnel = state.activeTunnelCopy?.fromNodeId === rec.peerNodeId ? new Set(state.activeTunnelCopy.hostnames || []) : new Set<string>();
+      for (const d of app.domains.filter((x) => (x.mode === "public" || x.mode === "zero-trust") && !(app.activeActive && viaTunnel.has(x.hostname)))) {
         if (!OFFLINE()) {
           await exposeApplication({ appName: app.name, mode: d.mode as "public" | "zero-trust", subdomain: d.hostname.replace(`.${base}`, "") });
         }

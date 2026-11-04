@@ -82,7 +82,10 @@ PaaSMCP enables optional multi-server redundancy without the RAM overhead of Kub
    - **Mode B — `warm-standby` (Encrypted State & Vault Sync):** The primary node exports an AES-256-GCM encrypted + HMAC-signed sync bundle containing all app manifests and Vault scopes (`POST /api/federation/sync`), keeping the standby server ready for immediate promotion.
 
 > Mode B is now implemented as the **mirror** (section 5). The sync bundle is still used to copy app
-> manifests and vault scopes; the data itself travels by Postgres streaming replication.
+> manifests and vault scopes; the data itself travels by Postgres streaming replication. Mode A is now
+> **active-active** (section 5, "Active-active"): sharing the main tunnel turned out to be wrong, because
+> Cloudflare spreads a tunnel's requests over its connectors without looking at the hostname, so apps that
+> run on one server only would fail on the other. Apps on both servers get a tunnel of their own instead.
 
 ---
 
@@ -159,9 +162,29 @@ There is still **one writer**: the origin's Postgres.
   512 MB they are skipped and counted in the status. An empty origin bucket next to a non-empty copy is refused
   (nothing deleted). `mirror handback` first copies back, without deleting, what was uploaded on the peer while
   it served the data, and hands nothing back if that fails. No admin token leaves its server.
-- **Entry, option 1 — Cloudflare Tunnel:** run `cloudflared` with the same tunnel token on both servers. The
-  tunnel's ingress points at `http://paasmcp-<app>:<port>`, which exists on both. Cloudflare does not health
-  check origins: if the link between the servers breaks while both stay up, the peer's share of requests fails.
+- **Entry, option 1 — Cloudflare Tunnel** (`src/activetunnel.ts`; `paasmcp active tunnel on|off|status`, guard
+  `active.tunnel` confirm; MCP `paas_active` `tunnel_*`; button in the dashboard card). Cloudflare spreads a
+  tunnel's requests over all its connectors whatever the hostname, so the main tunnel must not run on the peer
+  (apps that live only on the origin would fail there). Instead:
+  - The origin creates a second tunnel (`paasmcp-active-<node>`, remotely managed) with the same `CF_API_TOKEN`,
+    keeps its token in the vault (`ACTIVE_TUNNEL_TOKEN`) and runs a pinned `cloudflare/cloudflared:2025.8.1`
+    (`paasmcp-tunnel-active`, Docker network only, token in a 0600 `.env`). The token reaches the peer inside the
+    encrypted manifest; the peer runs the same container (`applyPeerTunnel`) and removes it when the origin turns
+    the tunnel off. Nothing is changed in DNS until the origin's connector is connected.
+  - `routeActiveTunnel` writes the tunnel's ingress (the active apps' public and zero-trust hostnames, then a 404
+    catch-all), then moves each hostname's CNAME to the new tunnel **only once the app answers on the peer's
+    Tailscale IP** (its copy may still be building); a routed hostname stays. Hostnames of apps that stop running on
+    both go back to the main tunnel, whose ingress still lists them. It runs after `active on/off`, after exposing
+    an active app, in every round of `mirror watch` and in `poll run`, and calls Cloudflare only when something
+    changed (ingress hash).
+  - **Health watch** (`tunnelWatchTick`, each `mirror watch` round, outside the state lock): probes the health path
+    of this server's active apps on `127.0.0.1`. A copy whose apps fail two rounds in a row (~30 s) stops its
+    connector, so Cloudflare sends everything to the other one; two healthy rounds start it again. The origin keeps
+    its connector unless it is fenced (then it steps out at once), so both never step out together.
+  - The manifest also lists the hostnames the tunnel serves. After a failover the peer leaves their DNS alone
+    (its connector already receives them) and re-exposes only the other hostnames on its own tunnel. Last result in `paasmcp-tunnel-active/watch.json`.
+  - `active tunnel off` moves the hostnames back, empties the ingress, removes the token and the connector here and,
+    through the manifest, on the peer. The tunnel object stays in the Cloudflare account and is reused next time.
 - **Entry, option 2 — self-hosted edge** (`paasmcp edge install|add|remove|status|uninstall`): a pinned Caddy
   (`caddy:2.8.4-alpine`, host network, admin API on a unix socket in its 0700 data folder) on a server with a
   public IP. `edge install` is guard `edge.install` (*strong*: opens 80/443), `edge add <app> <hostname>` is
@@ -207,6 +230,7 @@ memory and nothing needs to be reachable from the internet.
 | `PAASMCP_CF_ACCOUNT_ID`, `PAASMCP_CF_TUNNEL_ID` | — | Cloudflare account and tunnel. |
 | `PAASMCP_GARAGE_ADMIN_URL` | `http://127.0.0.1:3903` | Garage admin API. |
 | `PAASMCP_GARAGE_S3_URL` | `http://127.0.0.1:3900` | This server's Garage S3 API, used by the file copy (the labs change it). |
+| `PAASMCP_CF_API_URL` | `https://api.cloudflare.com/client/v4` | Cloudflare API base used by the tunnel for apps on both servers (tests point it at a fake). |
 | `PAASMCP_PEER_S3_URL` | `http://<peer Tailscale IP>:3900` | The origin's Garage S3 API as seen from the peer (labs only). |
 | `PAASMCP_GARAGE_CAPACITY_GB` | `100` | Capacity declared for this server's Garage node. |
 | `PAASMCP_ARBITER_KEY` | — | Key for `paasmcp arbiter serve` (from `paasmcp arbiter key`), instead of `--key`. |
@@ -225,7 +249,9 @@ memory and nothing needs to be reachable from the internet.
 - `scripts/active-lab.sh`: active-active on one Docker host. A publishes through `paasmcp_meta`, B's copy
   receives it, B builds A's exact commit (and ignores a newer unpublished one), B's app reads and writes A's
   database through the shared-service names and reads its local copy, the Caddy edge serves B and skips A's
-  dead backend, and after A dies B is promoted and keeps serving from its copy.
+  dead backend, B starts A's tunnel connector from the control channel (token in its env file, pinned image),
+  steps out of the tunnel while its copy is sick and back in when it recovers, removes the connector when A turns
+  the tunnel off, and after A dies B is promoted and keeps serving from its copy.
 - `scripts/files-lab.sh`: two real Garage nodes (ports 3900/3903 and 3910/3913). B creates the same bucket and
   key, copies A's files and later A's deletions, serves them with the app's key while A is down, sends the
   upload made during the outage back to A, and keeps its copy when A's bucket comes back empty.
