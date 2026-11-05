@@ -1301,69 +1301,106 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     }
     .grid-stats {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 14px;
-      margin-bottom: 22px;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
     }
     .stat-card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px 18px;
+      border-radius: 8px;
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
-    .stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
-    .stat-value { font-size: 20px; font-weight: 700; margin-top: 6px; letter-spacing: -0.02em; }
-    .stat-meta { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+    .stat-card:hover {
+      border-color: var(--border-strong);
+    }
+    .stat-label { 
+      color: var(--muted); 
+      font-size: 11px; 
+      text-transform: uppercase; 
+      letter-spacing: 0.06em; 
+      font-weight: 600; 
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .stat-value { 
+      font-size: 22px; 
+      font-weight: 700; 
+      margin-top: 8px; 
+      letter-spacing: -0.02em; 
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .stat-meta { 
+      color: var(--muted); 
+      font-size: 12px; 
+      margin-top: 6px; 
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
     .card {
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 20px 22px;
-      margin-bottom: 20px;
+      border-radius: 10px;
+      padding: 22px 24px;
+      margin-bottom: 22px;
       box-shadow: var(--shadow);
     }
-    .card-header { margin-bottom: 14px; }
+    .card-header { margin-bottom: 16px; }
     .card-header h2 {
-      margin: 0 0 4px;
-      font-size: 16px;
+      margin: 0 0 6px;
+      font-size: 17px;
+      font-weight: 650;
+      letter-spacing: -0.01em;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
       flex-wrap: wrap;
     }
-    .card-desc { margin: 0; font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+    .card-desc { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.55; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
     @media (max-width: 980px) { .row { grid-template-columns: 1fr; } }
     .form-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
-      gap: 10px;
-      margin-bottom: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
     }
     .field-label {
       display: block;
-      font-size: 11.5px;
+      font-size: 12px;
       font-weight: 600;
       color: var(--muted);
-      margin-bottom: 5px;
+      margin-bottom: 6px;
     }
     .examples-bar {
       display: flex;
       align-items: center;
       gap: 6px;
       flex-wrap: wrap;
-      margin-bottom: 12px;
-      padding: 8px 10px;
+      margin-bottom: 14px;
+      padding: 10px 12px;
       border-radius: 8px;
       background: var(--bg-subtle);
       border: 1px dashed var(--border);
-      font-size: 11.5px;
+      font-size: 12px;
       color: var(--muted);
     }
-    table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-    th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+    th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; background: var(--bg-subtle); }
+    th:first-child { border-top-left-radius: 8px; }
+    th:last-child { border-top-right-radius: 8px; }
+    tr:last-child td { border-bottom: none; }
+    tbody tr { transition: background 0.12s ease; }
+    tbody tr:hover { background: var(--card-hover); }
     .actions { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
     .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 7px; }
     .status-dot.stopped { background: var(--danger); }
@@ -3963,24 +4000,36 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       document.getElementById('statsGrid').innerHTML = \`
         <div class="stat-card">
-          <div class="stat-label">\${esc(t('statHost'))}</div>
-          <div class="stat-value">🖥️ \${esc(s.hostname)}</div>
-          <div class="stat-meta">\${esc(s.platform)} · \${esc(t('statDisk'))} \${esc(s.rootDisk)}</div>
+          <div class="stat-label">
+            <span>\${esc(t('statHost'))}</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+          </div>
+          <div class="stat-value">\${esc(s.hostname)}</div>
+          <div class="stat-meta"><span>\${esc(s.platform)}</span> · <span>\${esc(t('statDisk'))} \${esc(s.rootDisk)}</span></div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">\${esc(t('statMem'))}</div>
-          <div class="stat-value">⚡ \${esc(s.freeMemGb)} / \${esc(s.totalMemGb)} GB</div>
-          <div class="stat-meta">\${esc(s.cpus)} vCPUs · \${esc(t('statIdle'))}</div>
+          <div class="stat-label">
+            <span>\${esc(t('statMem'))}</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+          </div>
+          <div class="stat-value">\${esc(s.freeMemGb)} / \${esc(s.totalMemGb)} GB</div>
+          <div class="stat-meta"><span>\${esc(s.cpus)} vCPUs</span> · <span class="badge success" style="font-size:10.5px;padding:1px 6px;">\${esc(t('statIdle'))}</span></div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">\${esc(t('statAppsDbs'))}</div>
-          <div class="stat-value">📦 \${esc(s.appsCount)} Apps · \${esc(s.databasesCount)} DBs</div>
-          <div class="stat-meta">🛡️ \${esc(s.backupsCount || 0)} \${esc(t('statSnapshots'))}</div>
+          <div class="stat-label">
+            <span>\${esc(t('statAppsDbs'))}</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+          </div>
+          <div class="stat-value">\${esc(s.appsCount)} Apps · \${esc(s.databasesCount)} DBs</div>
+          <div class="stat-meta"><span class="badge" style="font-size:10.5px;padding:1px 6px;">\${esc(s.backupsCount || 0)} \${esc(t('statSnapshots'))}</span></div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">\${esc(t('statSecurityFed'))}</div>
-          <div class="stat-value">🔒 \${esc(role.toUpperCase())}</div>
-          <div class="stat-meta">SSH: <code>\${esc((s.sshKeyFingerprint || '').slice(0, 22))}...</code></div>
+          <div class="stat-label">
+            <span>\${esc(t('statSecurityFed'))}</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          </div>
+          <div class="stat-value">\${esc(role.toUpperCase())}</div>
+          <div class="stat-meta">SSH: <code>\${esc((s.sshKeyFingerprint || '').slice(0, 18))}...</code></div>
         </div>
       \`;
 
