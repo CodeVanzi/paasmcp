@@ -615,7 +615,7 @@ export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> 
       : /clock skew/.test(msg)
         ? ["clock", "The arbiter answered but its clock is more than 1 minute off from this server. Turn on automatic time (NTP) on both."]
         : /No cluster key/.test(msg)
-          ? ["notPaired", "This server is not paired with the other one yet: pair them in Connections & webhook first."]
+          ? ["notPaired", "This server is not paired with the other one yet: pair them first (“Connect another server” on the Second server screen)."]
           : /HTTP 404/.test(msg)
             ? ["notArbiter", "Something answered at that address, but it is not the arbiter. Check the port (default 4097)."]
             : ["unreachable", `The arbiter did not answer (${msg.split("\n")[0].slice(0, 120)}). Check that it is running on the third device ('systemctl status paasmcp-arbiter'), that the address is its Tailscale IP and that the port is right.`];
