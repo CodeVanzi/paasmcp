@@ -22,8 +22,9 @@ By default, PaaSMCP stores all runtime state under `PAASMCP_ROOT` (`/opt/homelab
 │   ├── backups/
 │   │   └── <id>.enc.bak          # Binary AES-256-GCM encrypted pg_dump / Redis / volume snapshots (mode 0600)
 │   ├── mirror/<peer>/            # Streaming copy of a peer's Postgres (its own compose.yaml + data/)
+│   ├── scale/                    # Measurements, decision diary, <app>.step.json while a scaling step runs (0700, files 0600)
 │   └── pool/                     # Helper pool: pool_ed25519 (own SSH key, 0600), known_hosts (pinned PCs), seen.json (last answers)
-├── paasmcp-pool-lb/              # Pool balancer (Caddy), only while an app has copies on helper PCs
+├── paasmcp-pool-lb/              # Pool balancer (Caddy), only while an app uses helper PCs (copies or automatic scaling)
 ├── paasmcp-postgres/             # Shared PostgreSQL 16 cluster (127.0.0.1:5432)
 ├── paasmcp-redis/                # Shared Redis 7 cluster (127.0.0.1:6379)
 ├── paasmcp-garage/               # Garage S3 object storage (127.0.0.1:3900, admin 127.0.0.1:3903)
@@ -256,14 +257,16 @@ memory and nothing needs to be reachable from the internet.
 
 ## 10a. Measuring for automatic scaling, phase 1 (`src/scale.ts`, `src/loadtest.ts`)
 
-Phase 1 of the automatic scaling plan only measures and rehearses; it never starts or stops a copy.
+Phase 1 of the automatic scaling plan measures and rehearses; the rehearsal never starts or stops a copy.
+Phase 4 (section 10c) lets the same rule act for apps with automatic scaling on.
 
 - **Round:** `paasmcp scale tick`, run by a systemd oneshot timer (`scale install-timer [--seconds 15]`,
   `AccuracySec=1s`, `Nice=10`), so nothing stays in memory between rounds. One `docker stats --no-stream`
   call for all containers, then a GET of each running app's health path on `127.0.0.1:<port>` (3 s
-  timeout, `ok` = status < 500, apps with the health check off are not probed). The round only reads
-  `state.json` and skips the state lock, so a long deploy never pauses it; a lock file in `scale/`
-  (stale after 120 s) stops two rounds from overlapping.
+  timeout, `ok` = status < 500, apps with the health check off are not probed). Measuring only reads
+  `state.json` and skips the state lock, so a long deploy never pauses it (a step of automatic scaling
+  takes the lock, section 10c); a lock file in `scale/` naming the round's process (stale when that
+  process is gone, or after 2 h) stops two rounds from overlapping.
 - **Files** (`paasmcp/scale/`, dir 0700, files 0600): `<app>.json` (last 10 minutes of samples, network
   counters, rehearsal state; rewritten each round, a few KB), `<app>.history.ndjson` (one averaged point
   per finished minute, appended once a minute and trimmed to 24 h), `diary.ndjson` (7 days, at most
@@ -287,9 +290,9 @@ Phase 1 of the automatic scaling plan only measures and rehearses; it never star
   limit), `database` (Postgres ≥ 80% of one core), `client` (the test itself ≥ 90% of one core), `errors`,
   `latency`, `none` or `unknown`. The result (`app.scale.capacity`) suggests 70% of the best rate as a
   per-copy target. The client runs on the same server, so the numbers are a lower bound.
-- **Not measured yet:** requests per second per app in live traffic. Cloudflare Tunnel and the Caddy edge
-  (2.8) do not split their counters by site, so phase 1 decides on CPU and uses the capacity test for
-  requests per second; a per-app counter can come from the phase 3 balancer (below) when phase 4 needs it.
+- **Visits per second:** only for apps behind the pool balancer (section 10b), which counts each app's
+  requests (section 10c). Cloudflare Tunnel and the Caddy edge (2.8) do not split their counters by site,
+  so apps that run only here decide on CPU, and the capacity test gives a per-copy reference.
 - **With copies on helpers** (phase 3), this server's copy carries only its share of the visits, so the
   rehearsal estimates the whole load as its CPU times the copies really running (`realCopies`);
   `scale status` shows both numbers.
@@ -346,7 +349,9 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   admin on a unix socket): one site per pooled app on the app's own port number, with this server's
   container and each helper copy (`<PC IP>:<port>`), round robin, `lb_try_duration 5s`, active health
   checks on the app's health path every 3 s (2 s timeout, 2xx, out after 2 failures, back after 1). It
-  exists only while an app uses helpers. Turning copies on moves the app's Cloudflare Tunnel hostnames to
+  exists only while an app uses helpers (copies, or automatic scaling even at one copy). Each app's site is
+  a named server (`servers :<port> { name <app>; metrics }`, `port-<n>` for a name that is not a plain
+  slug) so the metrics on the admin socket count its requests (section 10c). Turning copies on moves the app's Cloudflare Tunnel hostnames to
   `http://paasmcp-pool-lb:<port>` (`appServiceUrl`, also used by `expose`), and `scale off` moves them
   back before the balancer forgets the app. A self-hosted edge on this server lists the helper copies as
   backends directly (`edgeBackends`).
@@ -375,7 +380,55 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
 - **Limits of this phase:** only the owner's own PCs (whoever controls a PC can read the variables of the
   copies it runs); requests in progress on a PC that vanishes are lost (new ones go elsewhere within about
   6 s, retried while connecting); copies of one app may briefly run two versions during a rolling
-  replace; no automatic decisions (phase 4).
+  replace. Automatic decisions: section 10c.
+
+## 10c. Automatic scaling, phase 4: the rule acts (`src/autoscale.ts`, `src/scale.ts`)
+
+- **On and off:** `scale auto on <app> [--min --max]` (guard `scale.auto`, always confirm; MCP
+  `paas_scale auto enabled=true` needs a destroy token and a person) checks `poolReadiness`, refuses a
+  maximum below 2, sets `app.scale.auto = {since, by}` and calls `setCopies(fromDecider)` with the copies
+  it has, kept within the limits: the first time this puts the app behind the pool balancer at one copy,
+  so its visits are counted before any decision. `scale auto off` only clears the flag (copies stay).
+  `scale off` / dashboard **Stop everything** (`disablePool`) clears the flag first, then goes back to one
+  copy here. While it is on, `scale set` and the dashboard selector are refused (`setCopies` without
+  `fromDecider`).
+- **Visits:** each round reads the balancer's Prometheus metrics on its admin unix socket (`/metrics`,
+  empty `Host`, 3 s timeout, 8 MB at most; nothing listens on a port): `caddy_http_requests_total` with
+  `handler="reverse_proxy"` per named server, and `caddy_reverse_proxy_upstreams_healthy` per copy
+  address. Visits per second = counter delta / seconds since the last round (a smaller counter, after a
+  balancer restart, gives no rate). Only visits that pass the balancer count (Cloudflare Tunnel or edge
+  entries); Tailscale Serve still goes straight to the container. Before reading, a round rewrites the
+  balancer when its Caddyfile differs from the state (an update of PaaSMCP, a hand edit) or it is down.
+- **Decision** (`observe`, pure, shared with the rehearsal): pressure = the larger of CPU per copy /
+  `targetCpu` and visits per copy / `targetRps` (when set; visits are divided by the copies the balancer
+  sees healthy). Above 1 for `upRounds` rounds → one copy up; both below half for `downAfterSeconds` →
+  one copy down; never past `min`/`max`, `cooldownSeconds` after each step. Going down from n to n-1
+  multiplies the load per copy by at most 2, so it never lands above the target (no flapping). A rule
+  whose limits now exclude the copies running moves them to the nearest limit (`why: min|max`). Nothing
+  changes while the app's health path fails. A step is committed (`commitStep`) only after it happened.
+- **Step** (`applyStep`): under the state lock, waiting at most 2 s (`StateLockBusyError` → asked again
+  next round). Inside it, the app is checked again (automatic scaling still on, copies still what the
+  round saw, not stopped or fenced), `scale/<app>.step.json` is written (`pid`, host, time), and the same
+  `setCopies`/`reconcilePool` as a manual change runs: a new copy joins the balancer only after its health
+  path answers 2xx, a copy leaving is taken out and drained before it stops. If fewer copies could run
+  than asked, the copies asked go back to what runs. Before a load step up, Postgres is asked how many
+  client connections it has (`pg_stat_activity`, via `docker exec ... psql` as the admin user); at 80% of
+  `max_connections - superuser_reserved_connections` the step is held (`db_busy`).
+- **Held steps** (`holdStep`): no room on helpers (`no_room`), a copy that did not start (`start_failed`)
+  or `db_busy` wait min(30 min, max(60 s, cooldown) × 2^(n-1)) before the next try, and are written to the
+  diary once per reason until the load eases or a step happens.
+- **Repair:** a `step.json` whose process is gone (the server restarted, the round was killed), or older
+  than 2 h, makes the next round run `reconcilePool` for that app before deciding anything for it: the
+  helpers are asked what they run, missing copies come back and copies no record knows stop. The same
+  repair runs at most every 10 minutes when the balancer has seen a helper copy unhealthy for 8 rounds.
+  The systemd service allows a round 45 minutes (an image to send, draining).
+- **Guard:** moving within `min`/`max` is free; `scale.auto` always confirms; `scale.rule` confirms only
+  a higher `max` while automatic scaling is on. Audit: `scale.auto.on`, `scale.auto.off`, `scale.copies`
+  (by `decider`), `pool.reconcile`, `scale.off`.
+- **Diary:** `up`, `down` (with the signal, the numbers and the helper), `held` (with the reason and the
+  wait), `repaired`, `auto_on`, `auto_off`, `stopped_all`; same codes-and-numbers format as phase 1.
+- **Not in this phase:** asking the PC's owner before using it ("courteous mode") and waking sleeping PCs
+  (Wake-on-LAN); a step is one copy at a time, so a sudden peak takes a few rounds to cover.
 
 ## 11. Environment variables
 
@@ -413,6 +466,14 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   the network: from 10 s after the cut every visit succeeds in under a second; pause and resume; a new
   deploy rolls every copy to v2; `scale off`, `pool remove` (the key stops working) and `pool leave`.
   Builds its helper image if missing (`POOL_LAB_BUILD_FLAGS` passes extra build flags).
+- `scripts/autoscale-lab.sh`: scale phase 4 with real Docker, on the same kind of helper PCs. An app with
+  Postgres gets automatic scaling (1 to 3 copies, 20 visits/s per copy) and rounds run by hand. The
+  balancer must count exactly the visits sent through it; under 50 visits/s copies go 1 → 2 → 3 on the
+  helpers with no failed visit, and back 3 → 2 → 1 when the load stops; 10 s waves only add copies;
+  lowering the maximum is free and raising it asks; with 80 idle Postgres connections no copy is added
+  (the diary says why) until they close; a round killed while its new copy warms up on a helper leaves a
+  `step.json`, and the next round stops the orphan and leaves the helpers with exactly the copies this
+  server knows; "stop everything" leaves one copy here and nothing on the helpers.
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,

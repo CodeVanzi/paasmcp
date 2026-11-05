@@ -24,6 +24,7 @@ import {
   WATCHTOWER_OFF_COMPOSE,
 } from "./config.js";
 import { audit } from "./guard.js";
+import { appendDiary } from "./scale.js";
 import {
   CopySpec,
   copyLimits,
@@ -50,7 +51,8 @@ import {
 import { getSecrets, setSecretEntries, timingSafeCompare } from "./vault.js";
 
 // Helper pool, scale phase 3: the owner's own PCs run extra copies of an app when a person (or the AI,
-// within the guard) sets how many. Nothing decides on its own yet (that is phase 4).
+// within the guard) sets how many, or (phase 4, autoscale.ts) when the decider does, within the app's
+// scale rule.
 //
 // The origin stays the owner of everything: it keeps the vault, builds the image, decides where copies
 // run and receives the traffic. Helpers only run stateless copies when told:
@@ -899,18 +901,25 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
 
 /**
  * Sets how many copies an app has (manual scale). The first time above one, the caller has checked the
- * guard ("app.pool", confirm): the app's traffic moves to the pool balancer here.
+ * guard ("app.pool", confirm): the app's traffic moves to the pool balancer here. With automatic scaling
+ * on, only the decider sets the number (`fromDecider`), and it may put the app behind the balancer at one
+ * copy, so visits are counted from the start.
  */
-export async function setCopies(appName: string, n: number, opts: { by?: string; log?: (l: string) => void } = {}) {
+export async function setCopies(appName: string, n: number, opts: { by?: string; log?: (l: string) => void; fromDecider?: boolean } = {}) {
   const slug = sanitizeSlug(appName);
   if (!Number.isInteger(n) || n < 1 || n > MAX_COPIES) throw new Error(`Copies must be a whole number from 1 to ${MAX_COPIES}.`);
   const state = loadState();
   const app = state.apps[slug];
   if (!app) throw new Error(`App '${slug}' not found.`);
-  if (!app.pool?.enabled && n === 1) return { app: slug, wanted: 1, running: 1, note: "The app already runs only on this server." };
+  if (app.scale?.auto && !opts.fromDecider) {
+    throw new Error(
+      `Automatic scaling is on for '${slug}': the decider sets its copies within the rule. Change the rule's minimum or maximum ('paasmcp scale rule ${slug} --min 2 --max 4'), turn automatic scaling off ('paasmcp scale auto off ${slug}'), or stop everything ('paasmcp scale off ${slug}').`
+    );
+  }
+  if (!app.pool?.enabled && n === 1 && !opts.fromDecider) return { app: slug, wanted: 1, running: 1, note: "The app already runs only on this server." };
   const enabling = !app.pool?.enabled;
   const warnings: string[] = [];
-  if (n > 1) {
+  if (n > 1 || enabling) {
     const r = poolReadiness(slug, state);
     if (!r.ok) throw new Error(`App '${slug}' cannot have copies on helpers yet:\n- ${r.problems.join("\n- ")}`);
     if (enabling) warnings.push(...r.warnings);
@@ -941,12 +950,23 @@ export async function setCopies(appName: string, n: number, opts: { by?: string;
   return { ...report, warnings: [...warnings, ...report.warnings], ...(enabling ? { balancer: `${POOL_BALANCER}:${app.localPort}` } : {}), ...(tunnel ? { tunnel } : {}) };
 }
 
-/** Back to one copy, here, with no balancer in the way (the "stop everything" of manual scaling). */
+/**
+ * Stop everything: automatic scaling off, back to one copy, here, with no balancer in the way. Automatic
+ * scaling goes off first, so the decider takes no step even if the rest fails halfway.
+ */
 export async function disablePool(appName: string, opts: { by?: string; log?: (l: string) => void } = {}) {
   const slug = sanitizeSlug(appName);
   const app = loadState().apps[slug];
   if (!app) throw new Error(`App '${slug}' not found.`);
-  if (!app.pool) return { app: slug, disabled: false, note: "The app has no copies on helpers." };
+  const wasAuto = Boolean(app.scale?.auto);
+  if (wasAuto) {
+    patchApp(slug, (a) => delete a.scale!.auto);
+    audit({ event: "scale.auto.off", app: slug, by: opts.by || "cli" });
+  }
+  if (!app.pool) {
+    if (wasAuto) appendDiary({ t: new Date().toISOString(), app: slug, kind: "stopped_all", p: { auto: 1 } });
+    return { app: slug, disabled: false, note: "The app has no copies on helpers." };
+  }
   // The tunnel goes back to the container before the balancer forgets the app.
   let tunnel: unknown;
   try {
@@ -960,6 +980,7 @@ export async function disablePool(appName: string, opts: { by?: string; log?: (l
   await applyBalancer();
   await refreshEdgeQuietly();
   audit({ event: "scale.off", app: slug, by: opts.by || "cli" });
+  appendDiary({ t: new Date().toISOString(), app: slug, kind: "stopped_all", p: wasAuto ? { auto: 1 } : {} });
   return { app: slug, disabled: true, stopped: report.stopped, errors: report.errors, ...(tunnel ? { tunnel } : {}) };
 }
 
@@ -999,9 +1020,19 @@ export async function poolAfterLifecycle(appName: string, action: string, log?: 
 
 // ---------- balancer ----------
 
-/** The balancer's Caddyfile (pure): one port per pooled app, the app's own number. */
+/** The name of an app's server in the balancer, which labels its request counter (autoscale.ts reads it). */
+export function balancerServerName(app: Pick<AppRecord, "name" | "localPort">): string {
+  return /^[a-z0-9][a-z0-9-]{0,62}$/.test(app.name) ? app.name : `port-${Number(app.localPort)}`;
+}
+
+/**
+ * The balancer's Caddyfile (pure): one port per pooled app, the app's own number. Each port is a server
+ * named after the app with metrics on, so the admin socket counts each app's visits apart.
+ */
 export function buildBalancerCaddyfile(state: PaaSState): string {
-  const lines = ["{", `\tadmin ${LB_ADMIN}`, "\tauto_https off", "}", ""];
+  const lines = ["{", `\tadmin ${LB_ADMIN}`, "\tauto_https off"];
+  for (const app of pooledApps(state)) lines.push(`\tservers :${Number(app.localPort)} {`, `\t\tname ${balancerServerName(app)}`, "\t\tmetrics", "\t}");
+  lines.push("}", "");
   const helpers = state.pool?.helpers || {};
   for (const app of pooledApps(state)) {
     const backends = [`${app.containerName}:${app.internalPort}`];
@@ -1009,7 +1040,7 @@ export function buildBalancerCaddyfile(state: PaaSState): string {
       const h = helpers[c.helper];
       if (h && !h.paused) backends.push(`${validateIpv4(h.ip)}:${c.port}`);
     }
-    lines.push(`:${app.localPort} {`, `\treverse_proxy ${backends.join(" ")} {`);
+    lines.push(`:${Number(app.localPort)} {`, `\treverse_proxy ${backends.join(" ")} {`);
     lines.push("\t\tlb_policy round_robin", "\t\tlb_try_duration 5s", "\t\tfail_duration 30s");
     // Checked again here (state.json can be edited by hand): one plain URL path, no spaces or braces.
     const healthUri = /^\/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{0,511}$/.test(app.healthcheckPath || "") ? app.healthcheckPath : "/";
@@ -1037,7 +1068,7 @@ networks:
     external: true
 `;
 
-function balancerRunning(): boolean {
+export function balancerRunning(): boolean {
   if (OFFLINE()) return Boolean(loadState().pool?.balancerAt);
   try {
     return execFileSync("docker", ["inspect", "--format", "{{.State.Running}}", POOL_BALANCER], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim() === "true";
@@ -1202,6 +1233,7 @@ export async function poolStatus(opts: { probe?: boolean } = {}) {
       wanted: a.pool!.copies,
       running: a.pool!.stoppedAt ? 0 : 1 + a.pool!.placed.filter(answering).length,
       copies: a.pool!.placed.map((c) => ({ helper: c.helper, copy: c.id, since: c.startedAt, answering: answering(c) })),
+      ...(a.scale?.auto ? { auto: true } : {}),
       ...(a.pool!.stoppedAt ? { stoppedAt: a.pool!.stoppedAt } : {}),
       ...(a.pool!.lastError ? { lastError: a.pool!.lastError } : {}),
       };
