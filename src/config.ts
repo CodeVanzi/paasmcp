@@ -134,6 +134,11 @@ export interface PoolHelperRecord {
   courtesy?: { mode: CourtesyMode; cpuPct: number };
   /** Set by the scale round while the owner uses the PC (CPU outside the copies above `courtesy.cpuPct`). */
   ownerBusy?: { since: string; cpuPct: number };
+  /**
+   * Wake-on-LAN (wol.ts): this server may wake the PC with a magic packet to its card when a copy must run
+   * and no awake helper has room. Set by a person (`pool wake <name> on`); absent = never woken.
+   */
+  wake?: { mac: string; broadcast: string; port: number; since: string; by: string };
 }
 
 export type CourtesyMode = "auto" | "warn" | "off";

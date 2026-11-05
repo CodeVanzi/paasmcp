@@ -5,6 +5,7 @@ import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy, validateCourtesy } from "./pool.js";
+import { setWake } from "./wake.js";
 import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
@@ -668,6 +669,11 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           // Checked before the job starts, so a bad value answers at once.
           validateCourtesy(body.mode, body.cpuPct);
           return reply({ job: startPoolJob("courtesy", name, (log) => setCourtesy(name, body.mode, body.cpuPct, { by: actor, log })) });
+        }
+        if (pathname === "/api/pool/wake" && req.method === "POST") {
+          // Quick (no copies move): answered at once, with the warnings to show on the PC's card.
+          const body = await readJsonBody(req);
+          return reply(await setWake(String(body.name || ""), body.action, { by: actor }));
         }
         if (pathname === "/api/pool/remove" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -3613,6 +3619,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnCourtesySave": "Salvar",
           "courtesyHint": "Conta como uso do dono a CPU do PC fora das cópias, medida a cada minuto. Acima do limite duas vezes seguidas, as cópias saem (automático) ou só ficam avisadas no diário (com aviso).",
           "poolJob_courtesy": "mudar o modo cortês de {s}",
+          "poolSt_asleep": "dormindo",
+          "poolSt_waking": "acordando",
+          "lblWake": "Acordar pela rede (Wake-on-LAN)",
+          "wakeOnLine": "ligado · placa {mac} · pacote para {to}",
+          "wakeOffLine": "desligado",
+          "btnWakeOn": "Ligar",
+          "btnWakeOff": "Desligar",
+          "btnWakeNow": "Acordar agora",
+          "wakeHint": "Com isto ligado, este servidor acorda o PC quando uma cópia precisa rodar e nenhum ajudante acordado tem espaço. Ele leva de 30 s a 1 min para ligar, então serve para carga que dura. Precisa de cabo de rede, do PC na mesma rede que este servidor e de <code>sudo paasmcp pool wake-setup</code> rodado uma vez nele.",
+          "wakeNoLan": "Este PC ainda não informou a placa de rede. Atualize o PaaSMCP nele e rode <code>sudo paasmcp pool update-worker</code>.",
+          "wakeWifi": "Este PC usa Wi-Fi ({iface}). Acordar pela rede quase nunca funciona por Wi-Fi: ligue-o por cabo.",
+          "wakeNotArmed": "A placa ainda não foi preparada: rode <code>sudo paasmcp pool wake-setup</code> uma vez no PC.",
+          "wakeWaking": "Pedido para acordar enviado {date} ({n}ª tentativa).",
+          "wakeGaveUp": "Não acordou depois de {n} tentativas. O servidor parou de tentar até o PC responder de novo ou alguém usar “Acordar agora”.",
+          "wakeSent": "Pacote enviado para {to}. Um PC que acorda costuma responder em até 1 min.",
           "btnPoolPause": "Pausar",
           "btnPoolResume": "Retomar",
           "btnPoolRemove": "Remover",
@@ -3643,7 +3664,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolStep5Desc": "Sem isto, um ajudante alcança tudo na sua Tailscale. Rode o primeiro comando em cada ajudante e cole as regras abaixo no painel da Tailscale, em Access controls. Com elas, este servidor fala com os ajudantes só por SSH e pelas portas dos apps, e os ajudantes alcançam só o banco, o Redis e o S3 daqui.",
           "poolHowTitle": "O que fica no PC e o que acontece quando ele some",
           "poolHow1": "O PC recebe a imagem do app e as variáveis dele, inclusive senhas. As variáveis ficam só na memória do PC e somem quando a cópia para ou o PC desliga. Mesmo assim, quem controla o PC consegue lê-las enquanto a cópia roda: use como ajudante só um PC em que você confia tanto quanto neste servidor.",
-          "poolHow2": "Este servidor confere cada cópia a cada 3 segundos. Se um ajudante dorme, desliga ou perde a rede, as visitas param de ir para ele em uns 6 segundos, e as que estavam a caminho são reenviadas para outra cópia.",
+          "poolHow2": "Este servidor confere cada cópia a cada 3 segundos. Se um ajudante dorme, desliga ou perde a rede, as visitas param de ir para ele em uns 6 segundos, e as que estavam a caminho são reenviadas para outra cópia. Com o Wake-on-LAN ligado no PC, este servidor o acorda enquanto a cópia dele ainda for necessária.",
           "poolHow3": "Quando o dono usa o PC para algo pesado, o modo cortês automático tira as cópias dele sozinho, em 1 ou 2 minutos: elas terminam as visitas em curso e vão para outro ajudante, se houver. Pausar aqui faz o mesmo na hora. Remover também apaga a chave deste servidor no PC.",
           "poolHow4": "Só vão para ajudantes os apps de um contêiner só, com verificação de saúde por HTTP e que rodam só neste servidor. O banco continua aqui: mais cópias aliviam a CPU do app, não o banco.",
           "poolJobRunning": "Em andamento: {what}",
@@ -3730,6 +3751,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnCourtesySave": "Save",
           "courtesyHint": "The owner's use is the PC's CPU outside the copies, measured every minute. Above the limit twice in a row, the copies leave (automatic) or it is only noted in the diary (warn only).",
           "poolJob_courtesy": "change the courteous mode of {s}",
+          "poolSt_asleep": "asleep",
+          "poolSt_waking": "waking up",
+          "lblWake": "Wake over the network (Wake-on-LAN)",
+          "wakeOnLine": "on · card {mac} · packet to {to}",
+          "wakeOffLine": "off",
+          "btnWakeOn": "Turn on",
+          "btnWakeOff": "Turn off",
+          "btnWakeNow": "Wake now",
+          "wakeHint": "With this on, this server wakes the PC when a copy must run and no awake helper has room. It takes 30 s to a minute to start, so it helps load that lasts. Needs a network cable, the PC on the same network as this server, and <code>sudo paasmcp pool wake-setup</code> run once on it.",
+          "wakeNoLan": "This PC has not reported its network card yet. Update PaaSMCP on it and run <code>sudo paasmcp pool update-worker</code>.",
+          "wakeWifi": "This PC uses Wi-Fi ({iface}). Waking over the network almost never works over Wi-Fi: connect it by cable.",
+          "wakeNotArmed": "The card is not prepared yet: run <code>sudo paasmcp pool wake-setup</code> once on the PC.",
+          "wakeWaking": "Wake-up sent {date} (try {n}).",
+          "wakeGaveUp": "Did not wake after {n} tries. The server stopped trying until the PC answers again or someone uses “Wake now”.",
+          "wakeSent": "Packet sent to {to}. A PC that wakes usually answers within a minute.",
           "btnPoolPause": "Pause",
           "btnPoolResume": "Resume",
           "btnPoolRemove": "Remove",
@@ -3760,7 +3796,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolStep5Desc": "Without this, a helper reaches everything in your Tailnet. Run the first command on each helper and paste the rules below into the Tailscale admin console, under Access controls. With them, this server talks to helpers only over SSH and the apps' ports, and helpers reach only the database, Redis and S3 here.",
           "poolHowTitle": "What stays on the PC and what happens when it goes away",
           "poolHow1": "The PC receives the app's image and its variables, passwords included. The variables stay only in the PC's memory and are gone when the copy stops or the PC turns off. Even so, whoever controls the PC can read them while the copy runs: only use a PC you trust as much as this server.",
-          "poolHow2": "This server checks each copy every 3 seconds. If a helper sleeps, shuts down or loses the network, visits stop going to it within about 6 seconds, and those on their way are retried on another copy.",
+          "poolHow2": "This server checks each copy every 3 seconds. If a helper sleeps, shuts down or loses the network, visits stop going to it within about 6 seconds, and those on their way are retried on another copy. With Wake-on-LAN on for the PC, this server wakes it while its copy is still needed.",
           "poolHow3": "When the owner uses the PC for something heavy, automatic courteous mode takes its copies off by itself within 1 or 2 minutes: they finish the visits in progress and move to another helper, if there is one. Pausing here does the same at once. Removing also deletes this server's key from the PC.",
           "poolHow4": "Only single-container apps with an HTTP health check that run only on this server go to helpers. The database stays here: more copies relieve the app's CPU, not the database.",
           "poolJobRunning": "In progress: {what}",
@@ -4758,7 +4794,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!d) return;
       document.getElementById('poolAcl').textContent = d.acl ? d.acl.acl : '';
       renderPoolJob(d.job, 'poolJobBox');
-      const stateCls = { available: 'success', working: 'success', paused: 'warning', busy: 'warning', gone: 'danger', unknown: '' };
+      const stateCls = { available: 'success', working: 'success', paused: 'warning', busy: 'warning', gone: 'danger', asleep: '', waking: 'warning', unknown: '' };
       const hs = d.helpers || [];
       document.getElementById('poolHelpers').innerHTML = hs.length ? hs.map(h => {
         const facts = [
@@ -4777,6 +4813,22 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           + '<input id="courtCpu_' + esc(h.name) + '" type="number" min="10" max="95" step="5" style="width:80px;" value="' + esc(String((h.courtesy && h.courtesy.cpuPct) || 50)) + '" /></div>'
           + '<button class="secondary" data-helper="' + esc(h.name) + '" onclick="poolCourtesy(this.dataset.helper)">' + esc(t('btnCourtesySave')) + '</button>'
           + '</div><div style="color:var(--muted);font-size:12px;margin-top:4px;">' + esc(t('courtesyHint')) + '</div>';
+        const wk = h.wake;
+        const muted = (html) => '<div style="color:var(--muted);font-size:12px;margin-top:4px;">' + html + '</div>';
+        const warnLine = (html) => '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + html + '</div>';
+        const wake = '<div style="margin-top:8px;"><span class="field-label">' + esc(t('lblWake')) + '</span>'
+          + '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:2px;">'
+          + '<span style="font-size:12.5px;">' + esc(wk ? t('wakeOnLine').replace('{mac}', wk.mac).replace('{to}', wk.broadcast + ':' + wk.port) : t('wakeOffLine')) + '</span>'
+          + (wk || h.lan ? '<button class="secondary" data-helper="' + esc(h.name) + '" data-action="' + (wk ? 'off' : 'on') + '" onclick="poolWake(this.dataset.helper, this.dataset.action)">' + esc(t(wk ? 'btnWakeOff' : 'btnWakeOn')) + '</button>' : '')
+          + (wk ? '<button class="secondary" data-helper="' + esc(h.name) + '" data-action="now" onclick="poolWake(this.dataset.helper, this.dataset.action)">' + esc(t('btnWakeNow')) + '</button>' : '')
+          + '</div>'
+          + (h.waking && h.waking.gaveUp ? warnLine(esc(t('wakeGaveUp').replace('{n}', h.waking.tries)))
+            : h.waking ? muted(esc(t('wakeWaking').replace('{date}', fmtDate(h.waking.since)).replace('{n}', h.waking.tries))) : '')
+          + (!h.lan ? (wk ? warnLine(t('wakeNoLan')) : muted(t('wakeNoLan')))
+            : !h.lan.wired ? warnLine(esc(t('wakeWifi').replace('{iface}', h.lan.iface)))
+            : !h.lan.armed ? (wk ? warnLine(t('wakeNotArmed')) : '') : '')
+          + '<div id="wakeBox_' + esc(h.name) + '"></div>'
+          + muted(t('wakeHint')) + '</div>';
         const copies = h.copies.length ? t('poolCopiesOn').replace('{list}', h.copies.map(c => c.app).join(', ')) : t('poolNoCopies');
         const seen = h.lastSeenAt ? ' · <span style="color:var(--muted)">' + esc(t('poolSeen').replace('{date}', fmtDate(h.lastSeenAt))) + '</span>' : '';
         const extra = (h.secretsInMemory === false ? '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + t('poolSecretsDisk') + '</div>' : '')
@@ -4791,7 +4843,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         return card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><strong>🖥️ ' + esc(h.name) + '</strong>' + badge(stateCls[h.state] || '', t('poolSt_' + h.state)) + '</div>'
           + '<div style="color:var(--muted);font-size:12.5px;margin-top:4px;">' + facts + '</div>'
           + '<div style="font-size:12.5px;margin-top:4px;">' + esc(copies) + seen + '</div>'
-          + extra + courtesy + btns);
+          + extra + courtesy + wake + btns);
       }).join('') : '<p class="card-desc">' + esc(t('poolNone')) + '</p>';
       const apps = d.apps || [];
       document.getElementById('poolApps').innerHTML = apps.length ? apps.map(a => card('<strong>' + esc(a.app) + '</strong>' + (a.auto ? ' ' + badge('success', t('poolAutoBadge')) : '') + ' · '
@@ -4831,6 +4883,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const cpuPct = Number(document.getElementById('courtCpu_' + name).value);
       const r = await postJson('/api/pool/courtesy', { name, mode, cpuPct });
       if (r) watchPoolJob();
+    }
+    async function poolWake(name, action) {
+      const r = await postJson('/api/pool/wake', { name, action });
+      if (!r) return;
+      await loadPool(false);
+      const box = document.getElementById('wakeBox_' + name);
+      if (!box) return;
+      const lines = (r.warnings || []).map(w => '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + esc(w) + '</div>');
+      if (r.sent) lines.unshift('<div style="font-size:12.5px;margin-top:4px;">' + esc(t('wakeSent').replace('{to}', r.to)) + '</div>');
+      box.innerHTML = lines.join('');
     }
     async function poolRemove(name) {
       const r = await postJson('/api/pool/remove', { name });

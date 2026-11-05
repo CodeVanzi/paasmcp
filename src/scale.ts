@@ -15,6 +15,7 @@ import {
   writeFileAtomic,
 } from "./config.js";
 import { audit } from "./guard.js";
+import { wakeRecheckMs } from "./wol.js";
 
 // Automatic scaling: measure, rehearse and (phase 4) act.
 //
@@ -158,7 +159,10 @@ export type DiaryKind =
   | "repaired"
   // Courteous mode (courtesy.ts): the owner of a helper PC started or stopped using it.
   | "owner_busy"
-  | "owner_calm";
+  | "owner_calm"
+  // Wake-on-LAN (wol.ts, wake.ts): a sleeping helper woke up, or did not.
+  | "woke"
+  | "wake_failed";
 
 export interface DiaryEntry {
   t: string;
@@ -467,6 +471,12 @@ export function commitStep(prev: RehearsalState, dir: "up" | "down", t: number, 
 
 /** Records a step that could not happen: the next try waits (at least a minute, doubling, up to 30). */
 export function holdStep(prev: RehearsalState, why: string, t: number, rule: ScaleRule, copies?: number): { state: RehearsalState; note: boolean } {
+  // A PC is waking up for this step: try again soon (it answers within a minute or so), without the
+  // growing wait of a step that found no room.
+  if (why === "waking") {
+    const st: RehearsalState = { ...prev, retryAt: t + wakeRecheckMs(), heldNoted: why, ...(copies !== undefined ? { copies } : {}) };
+    return { state: st, note: prev.heldNoted !== why };
+  }
   const heldCount = (prev.heldCount || 0) + 1;
   const wait = Math.min(RETRY_MAX_MS, Math.max(RETRY_MIN_MS, rule.cooldownSeconds * 1000) * 2 ** (heldCount - 1));
   const st: RehearsalState = { ...prev, heldCount, retryAt: t + wait, heldNoted: why, ...(copies !== undefined ? { copies } : {}) };
@@ -664,6 +674,8 @@ const DIARY_KINDS = new Set<DiaryKind>([
   "repaired",
   "owner_busy",
   "owner_calm",
+  "woke",
+  "wake_failed",
 ]);
 
 /** Diary entries, oldest first (last 7 days), optionally for one app. */
@@ -819,6 +831,11 @@ export function renderDiary(e: DiaryEntry, lang: DiaryLang): string {
           ? `Tentei subir para ${copies("to")}, mas a cópia nova não chegou a rodar (o motivo aparece em Ajudantes). Sigo com ${copies("running")} e tento de novo em ${wait()}.`
           : `Tried to go to ${copies("to")}, but the new copy did not get to run (the reason shows on the Helpers screen). Staying at ${copies("running")} and trying again in ${wait()}.`;
       }
+      if (p.why === "waking") {
+        return pt
+          ? `Precisava de ${copies("to")} e nenhum ajudante acordado tinha espaço. Mandei acordar ${name("helper")} pela rede (Wake-on-LAN), o que leva de 30 s a 1 min. Sigo com ${copies("running")} e tento de novo em ${wait()}.`
+          : `Needed ${copies("to")} and no awake helper had room. Sent ${name("helper")} a wake-up over the network (Wake-on-LAN), which takes 30 s to a minute. Staying at ${copies("running")} and trying again in ${wait()}.`;
+      }
       if (p.why === "stop_failed") {
         return pt
           ? `Tentei descer para ${copies("to")}, mas não deu (o motivo aparece em Ajudantes). Sigo com ${copies("running")} e tento de novo em ${wait()}.`
@@ -882,6 +899,14 @@ export function renderDiary(e: DiaryEntry, lang: DiaryLang): string {
       }
       return pt ? `${free} Ele volta a receber cópias.` : `${free} It takes copies again.`;
     }
+    case "woke":
+      return pt
+        ? `${name("helper")} acordou pela rede: respondeu ${n("seconds")} s depois do primeiro pedido.`
+        : `${name("helper")} woke up over the network: it answered ${n("seconds")} s after the first request.`;
+    case "wake_failed":
+      return pt
+        ? `Pedi ${n("tries")} vezes para ${name("helper")} acordar pela rede e ele não respondeu em ${n("minutes")} min. Paro de tentar até ele responder de novo ou alguém usar "Acordar agora" na tela Ajudantes.`
+        : `Asked ${name("helper")} ${n("tries")} times to wake up over the network and it did not answer in ${n("minutes")} min. No more tries until it answers again or someone uses "Wake now" on the Helpers screen.`;
   }
   return e.kind;
 }
@@ -923,12 +948,13 @@ export interface StepOutcome {
   running: number;
   /**
    * Why it did not happen. busy (another operation holds the state) and changed (a person changed the
-   * app meanwhile) are asked again next round; no_room, start_failed and db_busy wait before trying again.
+   * app meanwhile) are asked again next round; no_room, start_failed and db_busy wait before trying again;
+   * waking (a sleeping helper was woken over the network for it) tries again after about a minute.
    */
-  held?: "busy" | "changed" | "no_room" | "start_failed" | "stop_failed" | "db_busy";
+  held?: "busy" | "changed" | "no_room" | "start_failed" | "stop_failed" | "db_busy" | "waking";
   started?: string[];
   stopped?: string[];
-  p?: Record<string, number>;
+  p?: Record<string, number | string>;
 }
 
 /** What the pool balancer counted: requests per app (counters since it started) and each copy's health. */
@@ -1058,6 +1084,8 @@ export interface TickResult {
   >;
   /** Courteous mode: helpers whose owner started or stopped using them in this round. */
   courtesy?: { helper: string; change: "busy" | "calm"; cpuPct: number; done: boolean; held?: string; apps: { app: string; started: string[]; stopped: number; running: number }[] }[];
+  /** Wake-on-LAN: helpers that answered after a wake-up, got another try, or were given up on. */
+  wake?: { helper: string; change: "woke" | "sent" | "gave_up"; apps: { app: string; started: string[]; running: number }[] }[];
 }
 
 /** Rounds in a row a helper copy must look unhealthy to the balancer before the helpers are checked. */
@@ -1077,6 +1105,7 @@ export async function scaleTick(
     log?: (line: string) => void;
     auto?: AutoHooks;
     courtesy?: (o: { now?: number; log?: (l: string) => void; note: (app: string, kind: "owner_busy" | "owner_calm", p: Record<string, number | string>) => string }) => Promise<NonNullable<TickResult["courtesy"]>>;
+    wake?: (o: { now?: number; log?: (l: string) => void; note: (app: string, kind: "wake_failed", p: Record<string, number | string>) => string }) => Promise<NonNullable<TickResult["wake"]>>;
   } = {}
 ): Promise<TickResult> {
   const now = opts.now ?? Date.now();
@@ -1243,6 +1272,16 @@ export async function scaleTick(
         for (const c of changes) for (const a of c.apps) if (result.apps[a.app]) result.apps[a.app].copies = a.running;
       } catch (err) {
         log(`courteous mode: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // Wake-on-LAN: PCs woken earlier are asked whether they answer now; those that do get their copies
+      // back, the others another try, until the tries run out (wake.ts).
+      try {
+        const { wakeRound } = await (opts.wake ? Promise.resolve({ wakeRound: opts.wake }) : import("./wake.js"));
+        const changes = await wakeRound({ now, log, note });
+        if (changes.length) result.wake = changes;
+        for (const c of changes) for (const a of c.apps) if (result.apps[a.app]) result.apps[a.app].copies = a.running;
+      } catch (err) {
+        log(`Wake-on-LAN: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     return result;

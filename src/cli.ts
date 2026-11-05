@@ -48,7 +48,8 @@ import {
 } from "./backup.js";
 import { assessRisk, authorizeHuman, decideApproval, listApprovals } from "./guard.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy } from "./pool.js";
-import { joinPool, leavePool, previewJoin, updateWorker } from "./pooljoin.js";
+import { joinPool, leavePool, previewJoin, setupWake, undoWakeSetup, updateWorker } from "./pooljoin.js";
+import { setWake } from "./wake.js";
 import { validateHelperName } from "./poolproto.js";
 import {
   ensureDashboardBackgroundService,
@@ -656,6 +657,18 @@ async function runCli() {
         console.log(JSON.stringify(leavePool(), null, 2));
       } else if (sub === "update-worker") {
         console.log(JSON.stringify(updateWorker(), null, 2));
+      } else if (sub === "wake-setup") {
+        if (rest.includes("--undo")) console.log(JSON.stringify(undoWakeSetup(), null, 2));
+        else {
+          const r = setupWake({ iface: getFlagValue(rest, "--interface") });
+          console.error(`Wake-on-LAN armed on ${r.iface} (${r.mac}); it was '${r.before}'.`);
+          for (const n of r.notes) console.error(`- ${n}`);
+          console.log(JSON.stringify({ iface: r.iface, mac: r.mac }, null, 2));
+        }
+      } else if (sub === "wake" && arg1 && arg2) {
+        const r = await setWake(arg1, arg2, { mac: getFlagValue(rest, "--mac"), broadcast: getFlagValue(rest, "--broadcast"), port: getFlagValue(rest, "--port"), by });
+        for (const w of (r.warnings as string[] | undefined) || []) console.error(`⚠️  ${w}`);
+        console.log(JSON.stringify(r, null, 2));
       } else if (sub === "add" && arg1 && arg2) {
         const sshPort = getFlagValue(rest, "--ssh-port");
         console.log(JSON.stringify(await addHelper(arg1, arg2, { sshPort: sshPort ? Number(sshPort) : undefined, by }), null, 2));
@@ -678,7 +691,7 @@ async function runCli() {
         for (const st of a.steps) console.error(`- ${st}`);
       } else {
         throw new Error(
-          "Usage: paasmcp pool status [--no-probe]|list|invite <name> [--advertise <ip>] [--yes]|add <name> <tailscale-ip> [--ssh-port 22]|pause <name>|resume <name>|courtesy <name> <auto|warn|off> [--cpu 50]|remove <name> [--yes]|check <app>|acl\n       On a helper PC: sudo paasmcp pool join '<invite>' [--cpus n] [--memory 2g] [--ip <tailscale-ip>] [--yes] | sudo paasmcp pool update-worker (after updating PaaSMCP there) | sudo paasmcp pool leave [--yes]"
+          "Usage: paasmcp pool status [--no-probe]|list|invite <name> [--advertise <ip>] [--yes]|add <name> <tailscale-ip> [--ssh-port 22]|pause <name>|resume <name>|courtesy <name> <auto|warn|off> [--cpu 50]|wake <name> <on|off|now> [--mac aa:bb:cc:dd:ee:ff] [--broadcast 192.168.1.255] [--port 9]|remove <name> [--yes]|check <app>|acl\n       On a helper PC: sudo paasmcp pool join '<invite>' [--cpus n] [--memory 2g] [--ip <tailscale-ip>] [--yes] | sudo paasmcp pool update-worker (after updating PaaSMCP there) | sudo paasmcp pool wake-setup [--interface eth0] [--undo] | sudo paasmcp pool leave [--yes]"
         );
       }
       break;
@@ -1047,7 +1060,7 @@ const command = process.argv[2];
 // capacity test takes it only to save its result.
 const SCALE_LOCK_FREE = new Set(["tick", "status", "history", "diary", "test", undefined]);
 // On a helper PC, join/leave never touch PaaSMCP's own files; status and acl only read.
-const POOL_LOCK_FREE = new Set(["join", "leave", "update-worker", "status", "list", "acl", "check", undefined]);
+const POOL_LOCK_FREE = new Set(["join", "leave", "update-worker", "wake-setup", "status", "list", "acl", "check", undefined]);
 const lockFree =
   LOCK_FREE_COMMANDS.has(command) ||
   (command === "pool" && POOL_LOCK_FREE.has(process.argv[3])) ||

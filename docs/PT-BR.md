@@ -82,6 +82,11 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
      - no modo **com aviso**, as cópias ficam e o diário avisa;
      - nos dois, nenhuma cópia nova vai para esse PC. Depois de 5 minutos abaixo de 80% do limite, ele volta a receber cópias.
      - `paasmcp pool courtesy <nome> auto|warn|off [--cpu 50]`, ou o seletor no cartão de cada PC na tela **Ajudantes**. Precisa da medição ligada e do PaaSMCP atualizado no PC (`sudo paasmcp pool update-worker`). Só a CPU conta (memória não). Testado com Docker real em `scripts/courtesy-lab.sh`.
+   - **Acordar PCs dormindo (Wake-on-LAN):** um PC ajudante na mesma rede de casa que este servidor pode ficar dormindo enquanto ninguém precisa dele. Quando uma cópia precisa rodar e nenhum ajudante acordado tem espaço (ou um PC com cópia para de responder), este servidor manda um “pacote mágico” para a placa de rede dele:
+     - o PC responde em 30 s a 1 min e recebe a cópia, então isso serve para carga que dura, não para picos curtos. A escala automática espera por ele (cerca de 1 min) em vez da espera longa de “sem espaço”, e o diário conta o que aconteceu (“Mandei acordar desk pela rede...”, “desk acordou pela rede: respondeu 42 s depois do primeiro pedido.”);
+     - um PC que não responde recebe 3 pacotes, a cada 3 min, e depois o servidor para de tentar até ele responder de novo ou alguém usar **Acordar agora**;
+     - uma vez no PC: `sudo paasmcp pool wake-setup` (liga o Wake-on-LAN na placa com cabo, agora e a cada boot; Wi-Fi é recusado porque quase nunca funciona). Para acordar do desligado, e não só da suspensão, ligue também a opção na BIOS/UEFI;
+     - neste servidor: `paasmcp pool wake <nome> on` (a placa e a rede vêm do que o PC informou; este servidor precisa estar na mesma rede, e só redes privadas valem), `pool wake <nome> now` para testar, ou o botão no cartão do PC na tela **Ajudantes**. Voltar a dormir fica por conta da configuração de energia do próprio PC. Testado com Docker real em `scripts/wake-lab.sh`.
 10. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---

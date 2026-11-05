@@ -343,6 +343,8 @@ export interface WorkerFacts {
   secretsInMemory: boolean;
   /** Courteous mode: how much CPU the PC used outside the copies (absent on workers older than it). */
   owner?: OwnerReading;
+  /** Wake-on-LAN: the PC's network card on its home network (absent on older workers, or when unknown). */
+  lan?: LanFacts;
 }
 
 export interface WorkerCopy {
@@ -366,6 +368,7 @@ const text = (v: unknown, max: number, re = /^[A-Za-z0-9 ._:+()-]*$/) => {
 export function validateFacts(raw: unknown): WorkerFacts {
   const r = (raw || {}) as Record<string, unknown>;
   const give = (r.give || {}) as Record<string, unknown>;
+  const lan = validateLan(r.lan);
   return {
     name: validateHelperName(r.name),
     arch: normalizeArch(r.arch),
@@ -378,6 +381,7 @@ export function validateFacts(raw: unknown): WorkerFacts {
     load1: Math.round(num(r.load1, 0, 10_000) * 100) / 100,
     secretsInMemory: r.secretsInMemory === true,
     ...(r.owner && typeof r.owner === "object" ? { owner: validateOwnerReading(r.owner) } : {}),
+    ...(lan ? { lan } : {}),
   };
 }
 
@@ -490,4 +494,65 @@ export function validateCopyList(raw: unknown): WorkerCopy[] {
     out.push({ copyId, app, running: r.running === true, status: text(r.status, 60), fingerprint: HEX64.test(String(r.fingerprint)) ? String(r.fingerprint) : "" });
   }
   return out;
+}
+
+// ---------- Wake-on-LAN: the PC's network card ----------
+//
+// To wake a sleeping PC, the origin sends a "magic packet" (its card's MAC repeated) to the broadcast
+// address of the network they share. Helpers are reached over Tailscale, so each worker also reports the
+// card of its default route: MAC, address on the home network, and whether `pool wake-setup` armed it.
+
+/** Written by `sudo paasmcp pool wake-setup` on the helper (root, 0644): the card it armed. */
+export const WOL_MARKER = "/etc/paasmcp-wol.json";
+export const IFACE_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,14}$/;
+
+export interface LanFacts {
+  /** Interface of the default route (eth0, enp5s0...). */
+  iface: string;
+  mac: string;
+  /** IPv4 address and prefix on the home network (the magic packet goes to that network's broadcast). */
+  ip: string;
+  prefix: number;
+  /** False for a Wi-Fi card: Wake-on-LAN almost never works over Wi-Fi. */
+  wired: boolean;
+  /** `pool wake-setup` armed this card (the worker cannot read the card's setting without root). */
+  armed: boolean;
+}
+
+/** A unicast MAC, written aa:bb:cc:dd:ee:ff (accepts - or : separators, or 12 hex digits). */
+export function normalizeMac(v: unknown): string {
+  const raw = String(v ?? "").trim().toLowerCase();
+  const hex = /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$/.test(raw) ? raw.replace(/[:-]/g, "") : /^[0-9a-f]{12}$/.test(raw) ? raw : "";
+  if (!hex) throw new Error("A MAC address looks like aa:bb:cc:dd:ee:ff.");
+  if (hex === "000000000000" || parseInt(hex.slice(0, 2), 16) & 1) throw new Error("That MAC is not a network card's own address (it is empty, broadcast or multicast).");
+  return hex.match(/../g)!.join(":");
+}
+
+/** The interface of the default route in /proc/net/route (the main table; Tailscale routes elsewhere). */
+export function defaultRouteIface(procNetRoute: string): string | undefined {
+  for (const line of String(procNetRoute).split("\n").slice(1)) {
+    const f = line.trim().split(/\s+/);
+    // Iface Destination Gateway Flags RefCnt Use Metric Mask: destination and mask 0, flags up (1).
+    if (f.length >= 8 && f[1] === "00000000" && f[7] === "00000000" && (parseInt(f[3], 16) & 1) && IFACE_NAME.test(f[0])) return f[0];
+  }
+  return undefined;
+}
+
+/** What a helper says about its card (untrusted): kept only when every part is well formed. */
+export function validateLan(raw: unknown): LanFacts | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  try {
+    const prefix = Number(r.prefix);
+    if (!IFACE_NAME.test(String(r.iface ?? "")) || !Number.isInteger(prefix) || prefix < 8 || prefix > 30) return undefined;
+    return { iface: String(r.iface), mac: normalizeMac(r.mac), ip: validateIpv4(r.ip), prefix, wired: r.wired === true, armed: r.armed === true };
+  } catch {
+    return undefined;
+  }
+}
+
+/** What `ethtool <card>` says about Wake-on-LAN: the modes it supports and the one set now ("g" = magic packet). */
+export function parseEthtoolWake(out: string): { supports: string; current: string } {
+  const pick = (re: RegExp) => (re.exec(String(out))?.[1] || "").trim();
+  return { supports: pick(/^\s*Supports Wake-on:\s*(\S+)\s*$/m), current: pick(/^\s*Wake-on:\s*(\S+)\s*$/m) };
 }

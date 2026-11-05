@@ -427,8 +427,8 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   (by `decider`), `pool.reconcile`, `scale.off`.
 - **Diary:** `up`, `down` (with the signal, the numbers and the helper), `held` (with the reason and the
   wait), `repaired`, `auto_on`, `auto_off`, `stopped_all`; same codes-and-numbers format as phase 1.
-- **Not in this phase:** waking sleeping PCs (Wake-on-LAN); a step is one copy at a time, so a sudden peak
-  takes a few rounds to cover. Courteous mode: section 10d.
+- **Not in this phase:** a step is one copy at a time, so a sudden peak takes a few rounds to cover.
+  Courteous mode: section 10d. Waking sleeping PCs (Wake-on-LAN): section 10e.
 
 ## 10d. Courteous mode: the PC's owner comes first (`src/courtesy.ts`, `src/worker.ts`, `src/poolproto.ts`)
 
@@ -463,6 +463,60 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   so about 1-2 minutes plus the drain; a PC that is itself busy with something that is not its owner (a
   backup, an update) counts as its owner.
 
+## 10e. Wake-on-LAN: waking sleeping helpers (`src/wol.ts`, `src/wake.ts`, `src/pool.ts`)
+
+- **What the helper reports:** at each `facts`/`list` order the worker adds `lan` (`lanFacts`, no root): the
+  interface of the default route in `/proc/net/route` (main table, so Tailscale's routes do not count), its
+  MAC (`/sys/class/net/<if>/address`), its IPv4 and prefix, whether it is Wi-Fi (`wireless`/`phy80211`) and
+  whether `pool wake-setup` armed it (`/etc/paasmcp-wol.json`). Validated on arrival (`validateLan`: a
+  unicast MAC, a plain interface name, prefix 8-30) and kept in `seen.json`, so it is known while the PC
+  sleeps. Older workers send nothing.
+- **On the helper, once** (`sudo paasmcp pool wake-setup [--interface eth0]`, root, `setupWake`): refuses
+  Wi-Fi and cards whose `ethtool` lacks `g`; runs `ethtool -s <if> wol g`; installs the oneshot unit
+  `paasmcp-wol.service` that sets it again at every boot (many systems reset it), tells NetworkManager
+  (`802-3-ethernet.wake-on-lan magic`) when it manages the card, and writes the marker. `--undo` and
+  `pool leave` remove the unit and the marker, set `wol d` and NetworkManager back to `default`. Waking from
+  power off may also need the BIOS/UEFI option; waking from suspend usually needs only this.
+- **On the origin** (`pool wake <name> on|off|now [--mac --broadcast --port]`, MCP `paas_pool action=wake`,
+  dashboard; free, audited `pool.wake`): `on` takes the MAC and the network from the last answer, computes
+  the broadcast address (`broadcastFor`) and requires this server to have an address on that network
+  (`originAddressFor`: magic packets do not cross routers); a broadcast given by hand only warns. The
+  broadcast must be a real broadcast address (the last of a /30 or larger network, never one machine's) on
+  a private network (10/8, 172.16/12, 192.168/16), or 255.255.255.255, and the port 9 or 7
+  (`validateBroadcast`, `validateWakePort`, checked again whenever they are used, so a hand-edited state or
+  a token cannot aim UDP at the internet or at one host's service). Warnings: Wi-Fi, card not armed, a MAC different from the reported one. Stored as
+  `helper.wake = {mac, broadcast, port, since, by}`; `off` deletes it and forgets the tries.
+- **The packet** (`sendMagicPacket`): 6 × `0xff` and the MAC 16 times (102 bytes), UDP to `broadcast:port`
+  (9 by default), sent twice 100 ms apart from an ephemeral port with `SO_BROADCAST`. Nothing secret: anyone
+  on the network can send it; what decides is the person who turned it on for the PC.
+- **Who wakes a PC:** placement in `reconcilePool`. (1) A copy must start and no awake helper fits
+  (`pickHelpers` found none): `wakeForRoom` runs `pickHelpers` again over the PCs that do not answer, have
+  Wake-on-LAN on and were not given up on (same rules: not paused, owner not busy, same architecture,
+  room), at most one per missing copy, and the report lists them in `waking`. (2) A PC holding a copy that is
+  kept (current, still wanted) does not answer: it is woken. A manual `scale set` answers with "Waking ...";
+  the copy starts when the PC answers (next paragraph). The decider (`applyStep`) turns a step that could
+  not place its copy while a PC wakes into `held: "waking"`: the copies asked go back to what runs, and
+  `holdStep` retries after `PAASMCP_WAKE_RECHECK_SECONDS` (60) without the growing wait of `no_room`, with
+  one diary line.
+- **Tries** (`pool/wake.json`, 0600, apart from state.json so sending needs no lock; `wakeStatus`, pure): a
+  PC gets `PAASMCP_WAKE_WAIT_SECONDS` (180) to answer before another packet, 3 packets at most; then
+  `gaveUpAt` is set, the diary says it did not wake (`wake_failed`, audited `pool.wake.failed`) and it is
+  neither asked nor woken again by itself until it answers or a person uses `pool wake <name> now` (which
+  starts the tries over). Every packet is audited (`pool.wake.sent`).
+- **Follow-up** (`wakeRound`, called by every scale round after the courteous check, so it needs the timer):
+  asks only the PCs being woken. Any probe that gets an answer from one (`recordWakeAnswers`) ends its tries,
+  writes `woke` (with the seconds since the first packet) to the diary of each app that needed it, and puts
+  it on the follow-up list; under the state lock (2 s wait, busy → next round, for up to 30 minutes), apps
+  missing copies or with a copy on that PC are reconciled, so a copy asked by hand starts there and a copy
+  lost to a reboot comes back. PCs that do not answer yet get their next try, or are given up on.
+- **Status:** a PC that does not answer shows `asleep` when it can be woken, `waking` while packets are
+  on their way (`waking: {since, tries}`), and `gone` otherwise or once given up (`waking.gaveUp`).
+- **Limits:** the PC must share a network (layer 2) with this server, by cable; it takes 30 s to a minute to
+  answer, so it helps load that lasts (the decider already wants `upRounds` rounds above the target).
+  Going back to sleep is the PC's own power settings: nothing puts it to sleep, and a PC whose automatic
+  suspend is shorter than the load sleeps with copies on it (the balancer stops sending it visits within
+  about 6 s, and it is woken again while its copy is still wanted).
+
 ## 11. Environment variables
 
 | Variable | Default | Purpose |
@@ -481,6 +535,7 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
 | `PAASMCP_MIRROR_NAME_SUFFIX`, `PAASMCP_MIRROR_PORT_BASE` | —, `5433` | Labs only: copy container name suffix and first local port, so several copies of one server fit on one Docker host. |
 | `PAASMCP_POOL_DRAIN_SECONDS` | `30` | Seconds a helper copy keeps its visits in progress after it leaves the balancer, before it stops. |
 | `PAASMCP_COURTESY_EVERY_SECONDS`, `PAASMCP_COURTESY_CALM_SECONDS` | `60`, `300` | Labs only: how often the courteous check asks the helpers, and how long a PC must stay free before it takes copies again. |
+| `PAASMCP_WAKE_WAIT_SECONDS`, `PAASMCP_WAKE_RECHECK_SECONDS` | `180`, `60` | Labs only: how long a woken PC gets to answer before another magic packet, and how soon the decider retries a step it held for a PC waking up. |
 | `PAASMCP_WORKER_HOME`, `PAASMCP_WORKER_RUN_DIR` | `/var/lib/paasmcp-worker`, `/run/paasmcp-worker` | Tests only: where the helper's worker keeps its settings and the in-memory variables folder. |
 | `PAASMCP_WORKER_ALLOW_DISK` | — | Tests only: `1` lets the worker write variables outside tmpfs. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
@@ -515,6 +570,14 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   copy stays and a third copy goes to the other PC; mode off clears the mark and watches nothing; no visit
   fails while the owner's PCs hand their copies over, and no round errors (visits lost in the manual `scale
   set` steps, a balancer reload racing a keep-alive connection, are reported apart).
+- `scripts/wake-lab.sh`: Wake-on-LAN with real Docker, on the same kind of helper PCs. A PC "sleeps" frozen
+  (`docker pause`: no answer, copies kept in memory, like a suspend), and a listener on the lab network
+  plays its card: a magic packet with its MAC unfreezes it 5 s later. Checks: the PC reports its card and
+  Wake-on-LAN is turned on from it (a public broadcast is refused; `wake-setup` refuses a card it cannot
+  arm); a manual third copy with no awake room wakes the PC with one packet and starts there, and the diary
+  says it woke; automatic scaling holds its step while the PC wakes and then steps up there; a PC that falls
+  asleep holding a copy is woken and the copy survives; a PC that never answers gets 3 packets, then none,
+  until a person wakes it by hand; with it off, nothing is sent.
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,

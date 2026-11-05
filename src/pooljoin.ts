@@ -5,13 +5,18 @@ import path from "node:path";
 import {
   authorizedKeysLine,
   decodeInvite,
+  defaultRouteIface,
   HELPER_TAG,
+  IFACE_NAME,
+  normalizeMac,
+  parseEthtoolWake,
   parseMemoryMb,
   POOL_IMAGE_REPO,
   sshKeyFingerprint,
   TMPFILES_CONF,
   validateIpv4,
   WORKER_HOME,
+  WOL_MARKER,
   WORKER_RUN_DIR,
   WORKER_USER,
 } from "./poolproto.js";
@@ -260,6 +265,7 @@ export function leavePool(): { removedUser: boolean; stoppedCopies: number } {
   }
   fs.rmSync(WORKER_RUN_DIR, { recursive: true, force: true });
   fs.rmSync(TMPFILES_CONF, { force: true });
+  if (fs.existsSync(WOL_UNIT) || fs.existsSync(WOL_MARKER)) undoWakeSetup();
   fs.rmSync(WORKER_LIB, { recursive: true, force: true });
   const existed = Boolean(userIds(WORKER_USER));
   if (existed) {
@@ -268,4 +274,110 @@ export function leavePool(): { removedUser: boolean; stoppedCopies: number } {
     fs.rmSync(WORKER_HOME, { recursive: true, force: true });
   }
   return { removedUser: existed, stoppedCopies };
+}
+
+// ---------- Wake-on-LAN on this PC (`sudo paasmcp pool wake-setup`) ----------
+//
+// For the server to wake this PC with a magic packet, its network card must listen for one while the PC
+// sleeps. That is a setting of the card (ethtool "wol g") that many systems reset at boot, so a small
+// oneshot unit sets it again at every start (nothing stays running). NetworkManager, when it manages the
+// card, is told too. Waking from power off may also need the BIOS/UEFI option (Wake on LAN, Power On by
+// PCI-E): that part only the owner can do.
+
+export const WOL_UNIT = "/etc/systemd/system/paasmcp-wol.service";
+
+function findEthtool(): string {
+  for (const p of ["/usr/sbin/ethtool", "/sbin/ethtool", "/usr/bin/ethtool", "/bin/ethtool"]) if (fs.existsSync(p)) return p;
+  throw new Error("ethtool is not installed. Install it (Debian/Ubuntu: sudo apt install ethtool) and run this again.");
+}
+
+export function wolUnit(ethtool: string, iface: string): string {
+  if (!IFACE_NAME.test(iface) || !/^\/[A-Za-z0-9/._-]+$/.test(ethtool)) throw new Error("Unexpected interface or ethtool path.");
+  return [
+    "[Unit]",
+    `Description=PaaSMCP helper: keep Wake-on-LAN on ${iface}`,
+    "After=network.target NetworkManager.service",
+    "",
+    "[Service]",
+    "Type=oneshot",
+    `ExecStart=${ethtool} -s ${iface} wol g`,
+    "",
+    "[Install]",
+    "WantedBy=multi-user.target",
+    "",
+  ].join("\n");
+}
+
+/** Arms this PC's wired card for magic packets, now and at every boot. Run as root on the helper. */
+export function setupWake(opts: { iface?: string } = {}): { iface: string; mac: string; before: string; notes: string[] } {
+  requireRoot();
+  const iface = opts.iface ?? defaultRouteIface(fs.readFileSync("/proc/net/route", "utf-8"));
+  if (!iface) throw new Error("This PC has no default route, so the card to arm is unknown. Pass it: --interface <name> (see 'ip link').");
+  if (!IFACE_NAME.test(iface) || !fs.existsSync(path.join("/sys/class/net", iface))) throw new Error(`No network interface named '${iface}' here (see 'ip link').`);
+  if (fs.existsSync(path.join("/sys/class/net", iface, "wireless")) || fs.existsSync(path.join("/sys/class/net", iface, "phy80211"))) {
+    throw new Error(`${iface} is a Wi-Fi card: Wake-on-LAN almost never works over Wi-Fi. Connect the PC by cable and run this again (or pass --interface <wired card>).`);
+  }
+  const ethtool = findEthtool();
+  const info = parseEthtoolWake(run(ethtool, [iface]));
+  if (!info.supports.includes("g")) {
+    throw new Error(`The card ${iface} does not support waking by magic packet (ethtool says "Supports Wake-on: ${info.supports || "nothing"}"). This PC cannot be woken over the network.`);
+  }
+  run(ethtool, ["-s", iface, "wol", "g"]);
+  const notes: string[] = [];
+  fs.writeFileSync(WOL_UNIT, wolUnit(ethtool, iface), { mode: 0o644 });
+  if (!ok("systemctl", ["daemon-reload"]) || !ok("systemctl", ["enable", "paasmcp-wol.service"])) {
+    notes.push(`systemd could not enable ${WOL_UNIT}: after a reboot, run this again (or 'sudo ethtool -s ${iface} wol g').`);
+  }
+  // NetworkManager applies its own Wake-on-LAN setting when it brings the card up: make it the same.
+  if (ok("nmcli", ["-v"])) {
+    let conn = "";
+    try {
+      conn = run("nmcli", ["-g", "GENERAL.CONNECTION", "device", "show", iface]).split("\n")[0].trim();
+    } catch {
+      // not managed by NetworkManager
+    }
+    if (conn && conn !== "--" && !ok("nmcli", ["connection", "modify", conn, "802-3-ethernet.wake-on-lan", "magic"])) {
+      notes.push(`NetworkManager could not be told to keep Wake-on-LAN on '${conn}': nmcli connection modify '${conn}' 802-3-ethernet.wake-on-lan magic`);
+    }
+  }
+  const mac = normalizeMac(fs.readFileSync(path.join("/sys/class/net", iface, "address"), "utf-8"));
+  fs.writeFileSync(WOL_MARKER, JSON.stringify({ iface, mac, at: new Date().toISOString() }) + "\n", { mode: 0o644 });
+  notes.push(
+    "Waking from sleep (suspend) usually works with this alone. To wake from power off, also turn on 'Wake on LAN' (or 'Power On by PCI-E') in the PC's BIOS/UEFI.",
+    "On the server: paasmcp pool wake <this PC's name> on, then test with: suspend this PC and run paasmcp pool wake <name> now.",
+    "A PC woken by the server still sleeps by its own power settings when idle; while it runs copies, keep its automatic suspend long enough (or off), or it will sleep with visits in progress and be woken again."
+  );
+  return { iface, mac, before: info.current || "?", notes };
+}
+
+/** Undoes wake-setup (also run by `pool leave`): the unit and the marker go, the card stops listening. */
+export function undoWakeSetup(): { removed: boolean } {
+  requireRoot();
+  let iface: string | undefined;
+  try {
+    iface = JSON.parse(fs.readFileSync(WOL_MARKER, "utf-8")).iface;
+  } catch {
+    // no marker
+  }
+  const had = fs.existsSync(WOL_UNIT) || fs.existsSync(WOL_MARKER);
+  if (fs.existsSync(WOL_UNIT)) {
+    ok("systemctl", ["disable", "paasmcp-wol.service"]);
+    fs.rmSync(WOL_UNIT, { force: true });
+    ok("systemctl", ["daemon-reload"]);
+  }
+  fs.rmSync(WOL_MARKER, { force: true });
+  if (iface && IFACE_NAME.test(iface)) {
+    try {
+      spawnSync(findEthtool(), ["-s", iface, "wol", "d"], { stdio: "ignore" });
+    } catch {
+      // no ethtool any more
+    }
+    try {
+      const conn = run("nmcli", ["-g", "GENERAL.CONNECTION", "device", "show", iface]).split("\n")[0].trim();
+      if (conn && conn !== "--") ok("nmcli", ["connection", "modify", conn, "802-3-ethernet.wake-on-lan", "default"]);
+    } catch {
+      // no NetworkManager
+    }
+  }
+  return { removed: had };
 }

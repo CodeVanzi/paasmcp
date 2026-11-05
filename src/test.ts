@@ -432,7 +432,8 @@ volumes:
     assert.match(token, /^pmcp_[0-9a-f]{8}_/);
     assert.equal(tokens.verifyToken(token)?.level, "read");
     assert.equal(tokens.verifyToken(token + "x"), null);
-    assert.equal(JSON.stringify(tokens.listTokens()).includes(token.split("_")[2]), false);
+    // The secret is base64url and may itself contain "_": take everything after "pmcp_<id>_".
+    assert.equal(JSON.stringify(tokens.listTokens()).includes(token.slice("pmcp_".length + 9)), false);
     assert.equal(tokens.levelAllows("deploy", "read"), true);
     assert.equal(tokens.levelAllows("deploy", "destroy"), false);
     assert.equal(tokens.revokeToken(record.id), true);
@@ -2902,6 +2903,299 @@ volumes:
     config.saveState(s4);
     scale.forgetScaleData("court-a");
     scale.forgetScaleData("court-b");
+  });
+
+  await t.test("38. Wake-on-LAN: magic packet, where it may go, tries and giving up, the round's follow-up, settings, guard and screens", async () => {
+    const proto = await import("./poolproto.js");
+    const pool = await import("./pool.js");
+    const wol = await import("./wol.js");
+    const wake = await import("./wake.js");
+    const scale = await import("./scale.js");
+    const worker = await import("./worker.js");
+    const join = await import("./pooljoin.js");
+    const mcp = await import("./mcp-server.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    type PoolHelperRecord = import("./config.js").PoolHelperRecord;
+
+    // MACs: any usual spelling, written one way; not empty, broadcast or multicast.
+    assert.equal(proto.normalizeMac("AA-BB-CC-DD-EE-F0"), "aa:bb:cc:dd:ee:f0");
+    assert.equal(proto.normalizeMac(" a0b1c2d3e4f5\n"), "a0:b1:c2:d3:e4:f5");
+    for (const bad of ["", "aa:bb:cc:dd:ee", "ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00", "01:00:5e:00:00:01", "aa:bb:cc:dd:ee:ff; rm -rf /", "gg:bb:cc:dd:ee:ff"]) {
+      assert.throws(() => proto.normalizeMac(bad), Error, bad);
+    }
+    // The packet: 6 × 0xff, then the MAC 16 times.
+    const pkt = wol.magicPacket("a0:b1:c2:d3:e4:f5");
+    assert.equal(pkt.length, 102);
+    assert.equal(pkt.subarray(0, 6).toString("hex"), "ffffffffffff");
+    assert.equal(pkt.subarray(6).toString("hex"), "a0b1c2d3e4f5".repeat(16));
+    // Where it may go: the broadcast of a private network (or 255.255.255.255), never the internet.
+    assert.equal(wol.broadcastFor("192.168.31.50", 24), "192.168.31.255");
+    assert.equal(wol.broadcastFor("10.1.2.3", 8), "10.255.255.255");
+    assert.equal(wol.broadcastFor("172.31.252.11", 22), "172.31.255.255");
+    assert.throws(() => wol.broadcastFor("10.0.0.1", 31), /8 to 30/);
+    assert.equal(wol.validateBroadcast("192.168.31.255"), "192.168.31.255");
+    assert.equal(wol.validateBroadcast("255.255.255.255"), "255.255.255.255");
+    assert.throws(() => wol.validateBroadcast("192.168.31.9"), /not a broadcast address/, "a single machine is not a broadcast address");
+    assert.equal(wol.validateBroadcast("192.168.31.3"), "192.168.31.3", "a /30's broadcast");
+    for (const bad of ["8.8.8.255", "100.64.0.255", "172.32.0.255", "192.169.0.255", "192.168.1.255 ", "x"]) {
+      if (bad === "192.168.1.255 ") assert.equal(wol.validateBroadcast(bad), "192.168.1.255");
+      else assert.throws(() => wol.validateBroadcast(bad), Error, bad);
+    }
+    assert.equal(wol.validateWakePort(undefined), 9);
+    assert.equal(wol.validateWakePort("7"), 7);
+    assert.throws(() => wol.validateWakePort(70000), /9 .* or 7/);
+    assert.throws(() => wol.validateWakePort(53), /9 .* or 7/);
+    // This server must be on that network (magic packets do not cross routers).
+    const fakeIfaces = { lo: [{ address: "127.0.0.1", netmask: "255.0.0.0", family: "IPv4", mac: "00:00:00:00:00:00", internal: true, cidr: "127.0.0.1/8" }], enp5s0: [{ address: "192.168.31.9", netmask: "255.255.255.0", family: "IPv4", mac: "94:de:80:f6:ed:00", internal: false, cidr: "192.168.31.9/24" }] } as unknown as NodeJS.Dict<import("node:os").NetworkInterfaceInfo[]>;
+    assert.equal(wol.originAddressFor("192.168.31.255", fakeIfaces), "192.168.31.9");
+    assert.equal(wol.originAddressFor("192.168.1.255", fakeIfaces), undefined);
+    assert.equal(wol.originAddressFor("255.255.255.255", fakeIfaces), "192.168.31.9");
+
+    // What the worker reports about its card (untrusted): kept only when every part is well formed.
+    const route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+      "tailscale0\t0040A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n" +
+      "enp5s0\t00000000\t011FA8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n";
+    assert.equal(proto.defaultRouteIface(route), "enp5s0");
+    assert.equal(proto.defaultRouteIface("Iface\tDestination\n"), undefined);
+    assert.equal(proto.defaultRouteIface(route.replace("enp5s0", "$(evil)")), undefined);
+    const lan = { iface: "enp5s0", mac: "94:DE:80:F6:ED:01", ip: "192.168.31.50", prefix: 24, wired: true, armed: true };
+    assert.deepEqual(proto.validateLan(lan), { ...lan, mac: "94:de:80:f6:ed:01" });
+    for (const bad of [{ ...lan, iface: "eth0;reboot" }, { ...lan, mac: "ff:ff:ff:ff:ff:ff" }, { ...lan, ip: "999.1.1.1" }, { ...lan, prefix: 4 }, "x", null]) assert.equal(proto.validateLan(bad), undefined);
+    assert.deepEqual(proto.validateLan({ ...lan, wired: "yes", armed: 1 }), { ...lan, mac: "94:de:80:f6:ed:01", wired: false, armed: false });
+    const fBase = { name: "desk", arch: "amd64", cpus: 4, memMb: 8192, give: { cpus: 2, memMb: 2048 } };
+    assert.deepEqual(proto.validateFacts({ ...fBase, lan }).lan?.iface, "enp5s0");
+    assert.equal("lan" in proto.validateFacts({ ...fBase, lan: { ...lan, mac: "<script>" } }), false);
+    assert.deepEqual(proto.parseEthtoolWake("Settings for enp5s0:\n\tSupports Wake-on: pumbg\n\tWake-on: d\n\tLink detected: yes\n"), { supports: "pumbg", current: "d" });
+    assert.deepEqual(proto.parseEthtoolWake("Settings for veth0:\n\tLink detected: yes\n"), { supports: "", current: "" });
+
+    // The worker reads its card without root: default route, its MAC, Wi-Fi or not, and the setup's marker.
+    const os = await import("node:os");
+    const realIface = Object.entries(os.networkInterfaces()).find(([n, l]) => proto.IFACE_NAME.test(n) && (l || []).some((a) => a.family === "IPv4" && !a.internal && a.cidr));
+    if (realIface) {
+      const [ifName, addrs] = realIface;
+      const v4 = addrs!.find((a) => a.family === "IPv4" && !a.internal)!;
+      const fake = fs.mkdtempSync(path.join(tempRoot, "net-"));
+      fs.mkdirSync(path.join(fake, "sys", ifName), { recursive: true });
+      fs.writeFileSync(path.join(fake, "sys", ifName, "address"), "a0:b1:c2:d3:e4:f5\n");
+      fs.writeFileSync(path.join(fake, "route"), `Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n${ifName}\t00000000\t01000000\t0003\t0\t0\t0\t00000000\n`);
+      process.env.PAASMCP_WORKER_SYS_NET = path.join(fake, "sys");
+      process.env.PAASMCP_WORKER_PROC_ROUTE = path.join(fake, "route");
+      process.env.PAASMCP_WORKER_WOL_MARKER = path.join(fake, "marker.json");
+      assert.deepEqual(worker.lanFacts(), { iface: ifName, mac: "a0:b1:c2:d3:e4:f5", ip: v4.address, prefix: Number(v4.cidr!.split("/")[1]), wired: true, armed: false });
+      fs.writeFileSync(path.join(fake, "marker.json"), JSON.stringify({ iface: ifName, mac: "a0:b1:c2:d3:e4:f5" }));
+      fs.mkdirSync(path.join(fake, "sys", ifName, "wireless"));
+      assert.deepEqual([worker.lanFacts()?.armed, worker.lanFacts()?.wired], [true, false]);
+      fs.writeFileSync(path.join(fake, "route"), "Iface\tDestination\n");
+      assert.equal(worker.lanFacts(), undefined, "no default route: nothing to report");
+      delete process.env.PAASMCP_WORKER_SYS_NET;
+      delete process.env.PAASMCP_WORKER_PROC_ROUTE;
+      delete process.env.PAASMCP_WORKER_WOL_MARKER;
+    }
+    // The helper's boot unit: only a plain interface name and ethtool path go in.
+    assert.match(join.wolUnit("/usr/sbin/ethtool", "enp5s0"), /^ExecStart=\/usr\/sbin\/ethtool -s enp5s0 wol g$/m);
+    assert.throws(() => join.wolUnit("/usr/sbin/ethtool", "enp5s0\nExecStart=/bin/sh"), /Unexpected/);
+
+    // Tries (pure): waiting for the answer, another try after the wait, given up after 3.
+    const W = 180_000;
+    const tr = (over: Partial<import("./wol.js").WakeTrack> = {}) => ({ firstSentAt: 0, sentAt: 0, tries: 1, apps: [], ...over });
+    assert.equal(wol.wakeStatus(undefined, 0, W), "idle");
+    assert.equal(wol.wakeStatus(tr(), 60_000, W), "waking");
+    assert.equal(wol.wakeStatus(tr(), W, W), "retry");
+    assert.equal(wol.wakeStatus(tr({ tries: 3, sentAt: 400_000 }), 500_000, W), "waking");
+    assert.equal(wol.wakeStatus(tr({ tries: 3, sentAt: 400_000 }), 580_000, W), "gave_up");
+    assert.equal(wol.wakeStatus(tr({ gaveUpAt: 1 }), 2, W), "gave_up");
+
+    // Three helpers: desk (Wake-on-LAN on), notebook (off), shelf (on, but its settings were hand-edited badly).
+    const st = config.loadState();
+    const helper = (name: string, ip: string, extra: Partial<PoolHelperRecord> = {}): PoolHelperRecord => ({
+      name, ip, sshPort: 22, tier: "own", arch: "amd64", cpus: 4, memMb: 8192, diskFreeGb: 50, give: { cpus: 2, memMb: 2048 }, addedAt: new Date().toISOString(), ...extra,
+    });
+    const deskWake = { mac: "a0:b1:c2:d3:e4:f5", broadcast: "192.168.31.255", port: 9, since: new Date().toISOString(), by: "test" };
+    st.pool = {
+      bindIp: "100.64.0.1",
+      invites: {},
+      helpers: {
+        desk: helper("desk", "100.64.0.8", { wake: deskWake }),
+        notebook: helper("notebook", "100.64.0.7"),
+        shelf: helper("shelf", "100.64.0.9", { wake: { ...deskWake, broadcast: "8.8.8.8" } }),
+      },
+    };
+    config.saveState(st);
+    assert.deepEqual(wol.wakeOf(st.pool.helpers.desk), { mac: "a0:b1:c2:d3:e4:f5", broadcast: "192.168.31.255", port: 9 });
+    assert.equal(wol.wakeOf(st.pool.helpers.notebook), undefined);
+    assert.equal(wol.wakeOf(st.pool.helpers.shelf), undefined, "a public broadcast address is never used, even from a hand edit");
+
+    // Sending (offline the packets are only recorded): once, then nothing while it wakes, then a few more.
+    wol.offlineSent.length = 0;
+    const t0 = 10_000_000;
+    assert.deepEqual(await wol.wakeHelper(st.pool.helpers.notebook, { app: "wake-a", now: t0 }), { state: "off" });
+    assert.deepEqual(await wol.wakeHelper(st.pool.helpers.desk, { app: "wake-a", now: t0 }), { state: "sent", tries: 1 });
+    assert.deepEqual(wol.offlineSent, [{ mac: "a0:b1:c2:d3:e4:f5", broadcast: "192.168.31.255", port: 9 }]);
+    assert.deepEqual(await wol.wakeHelper(st.pool.helpers.desk, { app: "wake-b", now: t0 + 30_000 }), { state: "waking", tries: 1 });
+    assert.equal(wol.offlineSent.length, 1);
+    assert.deepEqual(wol.readWake().helpers.desk.apps, ["wake-a", "wake-b"]);
+    assert.equal(fs.statSync(path.join(pool.POOL_DIR, "wake.json")).mode & 0o777, 0o600);
+
+    // The round's follow-up: a PC that does not answer gets another try after the wait, then is given up on.
+    process.env.PAASMCP_WAKE_WAIT_SECONDS = "60";
+    const answers: Record<string, boolean> = { desk: false };
+    const asked: string[][] = [];
+    const probe = async (hs: PoolHelperRecord[]) => {
+      asked.push(hs.map((h) => h.name));
+      return Object.fromEntries(hs.map((h) => [h.name, answers[h.name] ? { ok: true as const, facts: proto.validateFacts({ ...fBase, name: h.name }), copies: [] } : { ok: false as const, error: "timed out" }]));
+    };
+    const notes: string[] = [];
+    const note = (app: string, kind: "wake_failed", p: Record<string, number | string>) => {
+      const e = { t: new Date().toISOString(), app, kind, p };
+      scale.appendDiary(e);
+      notes.push(scale.renderDiary(e, "pt"));
+      return notes[notes.length - 1];
+    };
+    const sa = config.loadState();
+    sa.apps["wake-a"] = { ...sa.apps[Object.keys(sa.apps)[0]], name: "wake-a", containerName: "paasmcp-wake-a", localPort: 4400, internalPort: 3000, domains: [], status: "running", pool: undefined, scale: undefined, trashedAt: undefined } as import("./config.js").AppRecord;
+    config.saveState(sa);
+    assert.deepEqual(await wake.wakeRound({ now: t0 + 30_000, note, probe }), []);
+    assert.deepEqual(asked, [["desk"]], "only PCs being woken are asked");
+    assert.deepEqual((await wake.wakeRound({ now: t0 + 61_000, note, probe })).map((c) => c.change), ["sent"]);
+    assert.equal(wol.offlineSent.length, 2);
+    await wake.wakeRound({ now: t0 + 122_000, note, probe });
+    assert.equal(wol.readWake().helpers.desk.tries, 3);
+    assert.deepEqual(await wake.wakeRound({ now: t0 + 150_000, note, probe }), [], "waiting for the third try's answer");
+    assert.deepEqual((await wake.wakeRound({ now: t0 + 183_000, note, probe })).map((c) => c.change), ["gave_up"]);
+    assert.equal(wol.offlineSent.length, 3);
+    assert.deepEqual(notes, [`Pedi 3 vezes para desk acordar pela rede e ele não respondeu em 3 min. Paro de tentar até ele responder de novo ou alguém usar "Acordar agora" na tela Ajudantes.`]);
+    assert.equal(notes.length, 1, "wake-b is not an app: it hears nothing");
+    asked.length = 0;
+    assert.deepEqual(await wake.wakeRound({ now: t0 + 400_000, note, probe }), []);
+    assert.deepEqual(asked, [], "a PC given up on is not asked or woken again by itself");
+    assert.equal((await wol.wakeHelper(config.loadState().pool!.helpers.desk, { app: "wake-a", now: t0 + 400_000 })).state, "gave_up");
+    assert.equal(wol.offlineSent.length, 3);
+    let status = await pool.poolStatus({ probe: false });
+    const deskSt = () => status.helpers.find((h) => h.name === "desk")!;
+    assert.deepEqual(deskSt().waking, { since: new Date(t0).toISOString(), tries: 3, gaveUp: true });
+
+    // A person wakes it by hand: the tries start over.
+    const now1 = await wake.setWake("desk", "now", { by: "test" });
+    assert.deepEqual([now1.sent, now1.to, wol.offlineSent.length], [true, "192.168.31.255:9", 4]);
+    assert.equal(wol.readWake().helpers.desk.tries, 1);
+    await assert.rejects(wake.setWake("notebook", "now"), /off for 'notebook'/);
+
+    // It answers: the diary of each app that needed it hears it, and the next round follows up.
+    answers.desk = true;
+    const nowAns = Date.now();
+    const woke = await wake.wakeRound({ now: nowAns, note, probe });
+    assert.deepEqual(woke.map((c) => [c.helper, c.change]), [["desk", "woke"]]);
+    assert.equal(wol.readWake().helpers.desk, undefined);
+    assert.deepEqual(wol.readWake().follow, {}, "followed up (no app here needed its copies back)");
+    const wokeLine = scale.scaleDiary({ app: "wake-a", lang: "pt", limit: 1 })[0];
+    assert.match(wokeLine.text, /^desk acordou pela rede: respondeu \d+ s depois do primeiro pedido\.$/);
+    assert.equal(scale.renderDiary({ t: "", app: "x", kind: "woke", p: { helper: "desk", seconds: 41 } }, "en"), "desk woke up over the network: it answered 41 s after the first request.");
+    assert.equal(
+      scale.renderDiary({ t: "", app: "x", kind: "held", p: { why: "waking", helper: "desk", from: 2, to: 3, running: 2, waitSeconds: 60 } }, "pt"),
+      "Precisava de 3 cópias e nenhum ajudante acordado tinha espaço. Mandei acordar desk pela rede (Wake-on-LAN), o que leva de 30 s a 1 min. Sigo com 2 cópias e tento de novo em 1 min."
+    );
+    assert.match(scale.renderDiary({ t: "", app: "x", kind: "wake_failed", p: { helper: "desk", tries: 3, minutes: 9 } }, "en"), /^Asked desk 3 times to wake up over the network and it did not answer in 9 min\./);
+
+    // The decider: a step held because a PC is waking tries again in about a minute, without the growing wait.
+    process.env.PAASMCP_WAKE_RECHECK_SECONDS = "45";
+    const rule = scale.ruleFor({});
+    const h1 = scale.holdStep(scale.freshRehearsal(rule), "waking", 1000, rule, 2);
+    assert.deepEqual([h1.state.retryAt, h1.state.heldCount, h1.note], [46_000, undefined, true]);
+    const h2 = scale.holdStep(h1.state, "waking", 50_000, rule, 2);
+    assert.deepEqual([h2.state.retryAt, h2.note], [95_000, false]);
+    const h3 = scale.holdStep(h2.state, "no_room", 100_000, rule, 2);
+    assert.deepEqual([h3.state.heldCount, h3.note], [1, true], "no room after the PC gave up: the usual waits start");
+    delete process.env.PAASMCP_WAKE_RECHECK_SECONDS;
+
+    // A person's settings: the MAC and the network come from what the PC reported, and this server must be on it.
+    const seenFile = path.join(pool.POOL_DIR, "seen.json");
+    const writeSeenLan = (name: string, l: unknown) => {
+      const seen = JSON.parse(fs.existsSync(seenFile) ? fs.readFileSync(seenFile, "utf-8") : "{}");
+      seen[name] = { at: new Date().toISOString(), ok: true, facts: proto.validateFacts({ ...fBase, name, lan: l }), copies: [] };
+      fs.writeFileSync(seenFile, JSON.stringify(seen), { mode: 0o600 });
+    };
+    await assert.rejects(wake.setWake("notebook", "on"), /has not reported its network card/);
+    await assert.rejects(wake.setWake("notebook", "sleep"), /use on .*, off, or now/);
+    await assert.rejects(wake.setWake("ghost", "on"), /not found/);
+    writeSeenLan("notebook", { ...lan, ip: "192.168.250.10", wired: false, armed: false });
+    await assert.rejects(wake.setWake("notebook", "on"), /no address on notebook's network \(192\.168\.250\.10\/24\)/);
+    writeSeenLan("notebook", { ...lan, ip: "8.8.4.4" });
+    await assert.rejects(wake.setWake("notebook", "on"), /home or office network/);
+    await assert.rejects(wake.setWake("notebook", "on", { broadcast: "8.8.8.255" }), /home or office network/);
+    // By hand, a network this server is not on is only a warning (the person may know a route).
+    await assert.rejects(wake.setWake("notebook", "on", { broadcast: "192.168.250.10" }), /not a broadcast address/);
+    const byHand = await wake.setWake("notebook", "on", { mac: "a0:b1:c2:d3:e4:f6", broadcast: "192.168.250.255", port: 7, by: "test" });
+    assert.deepEqual(byHand.wake, { mac: "a0:b1:c2:d3:e4:f6", broadcast: "192.168.250.255", port: 7 });
+    assert.ok((byHand.warnings as string[]).some((w) => w.includes("most routers drop it")));
+    assert.ok((byHand.warnings as string[]).some((w) => w.includes("you gave a0:b1:c2:d3:e4:f6")));
+    const here = Object.values(os.networkInterfaces()).flat().find((a) => a && a.family === "IPv4" && !a.internal && a.cidr && wol.isPrivateIpv4(a.address) && Number(a.cidr.split("/")[1]) <= 30);
+    if (here) {
+      // On this machine's own network: on, from what the PC reported, with the warnings that apply.
+      writeSeenLan("notebook", { iface: "wlp6s0", mac: "e8:de:27:8e:a6:35", ip: here.address, prefix: Number(here.cidr!.split("/")[1]), wired: false, armed: false });
+      const on = await wake.setWake("notebook", "on", { by: "test" });
+      assert.deepEqual(on.wake, { mac: "e8:de:27:8e:a6:35", broadcast: wol.broadcastFor(here.address, Number(here.cidr!.split("/")[1])), port: 9 });
+      assert.equal(on.from, here.address);
+      assert.ok((on.warnings as string[]).some((w) => w.includes("by Wi-Fi (wlp6s0)")));
+      assert.ok((on.warnings as string[]).some((w) => w.includes("sudo paasmcp pool wake-setup")));
+    }
+    const off = await wake.setWake("notebook", "off", { by: "test" });
+    assert.equal(off.wake, null);
+    assert.equal(config.loadState().pool!.helpers.notebook.wake, undefined);
+
+    // Status: a PC that does not answer is "asleep" when it can be woken, "waking" while a packet is on its way.
+    const seen = JSON.parse(fs.readFileSync(seenFile, "utf-8"));
+    seen.desk = { ok: false, failedAt: new Date().toISOString(), error: "timed out", facts: proto.validateFacts({ ...fBase, name: "desk", lan }) };
+    seen.notebook = { ok: false, failedAt: new Date().toISOString(), error: "timed out" };
+    fs.writeFileSync(seenFile, JSON.stringify(seen), { mode: 0o600 });
+    status = await pool.poolStatus({ probe: false });
+    assert.deepEqual([deskSt().state, deskSt().lan?.mac, status.helpers.find((h) => h.name === "notebook")!.state], ["asleep", "94:de:80:f6:ed:01", "gone"]);
+    await wake.setWake("desk", "now", { by: "test" });
+    status = await pool.poolStatus({ probe: false });
+    assert.equal(deskSt().state, "waking");
+    assert.deepEqual(deskSt().wake && [deskSt().wake!.mac, deskSt().wake!.port], ["a0:b1:c2:d3:e4:f5", 9]);
+
+    // MCP: deploy level; the AI sees the same words.
+    const mcpCall = async (args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => (await mcp.handleToolCall("paas_pool", args, level)).content[0].text;
+    assert.match(await mcpCall({ action: "wake", name: "desk", wake: "now" }, "read"), /level 'deploy'/);
+    assert.equal(JSON.parse(await mcpCall({ action: "wake", name: "desk", wake: "now" }, "deploy")).sent, true);
+    assert.match(await mcpCall({ action: "wake", name: "desk", wake: "on", broadcast: "1.2.3.255" }, "deploy"), /home or office network/);
+
+    // Dashboard: the setting answers at once, and the page's script compiles.
+    const dashToken = dashboard.getOrCreateDashboardToken();
+    const srv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((res) => srv.once("listening", res));
+    const baseUrl = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (url: string, body: unknown) => fetch(`${baseUrl}${url}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const code of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(code);
+      assert.ok(page.includes("poolWake(") && page.includes('"wakeHint"') && page.includes('"poolSt_asleep"'));
+      const bad = await post("/api/pool/wake", { name: "desk", action: "explode" });
+      assert.equal(bad.ok, false);
+      const sent = await (await post("/api/pool/wake", { name: "desk", action: "now" })).json();
+      assert.equal(sent.to, "192.168.31.255:9");
+      const offRes = await (await post("/api/pool/wake", { name: "desk", action: "off" })).json();
+      assert.equal(offRes.wake, null);
+    } finally {
+      srv.close();
+    }
+    assert.equal(wol.readWake().helpers.desk, undefined, "off forgets the tries");
+    const audit = fs.readFileSync(path.join(config.PAAS_DATA_DIR, "audit.log"), "utf-8");
+    assert.ok(audit.includes('"pool.wake.sent"') && audit.includes('"pool.wake.failed"') && audit.includes('"pool.wake.now"') && audit.includes('"pool.wake"'));
+
+    delete process.env.PAASMCP_WAKE_WAIT_SECONDS;
+    const s4 = config.loadState();
+    delete s4.apps["wake-a"];
+    delete s4.pool;
+    config.saveState(s4);
+    scale.forgetScaleData("wake-a");
+    fs.rmSync(path.join(pool.POOL_DIR, "wake.json"), { force: true });
+    fs.rmSync(seenFile, { force: true });
   });
 
   fs.rmSync(tempRoot, { recursive: true, force: true });

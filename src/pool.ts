@@ -50,6 +50,7 @@ import {
   WorkerFacts,
 } from "./poolproto.js";
 import { getSecrets, setSecretEntries, timingSafeCompare } from "./vault.js";
+import { clearWake, noteWakeAnswers, readWake, wakeHelper, wakeOf, wakeStatus } from "./wol.js";
 
 // Helper pool, scale phase 3: the owner's own PCs run extra copies of an app when a person (or the AI,
 // within the guard) sets how many, or (phase 4, autoscale.ts) when the decider does, within the app's
@@ -357,7 +358,24 @@ export async function probeHelpers(helpers: PoolHelperRecord[]): Promise<Record<
       s[name] = l.ok ? { at: now, ok: true, facts: l.facts, copies: l.copies } : { ...(s[name] || {}), ok: false, failedAt: now, error: l.error };
     }
   });
+  recordWakeAnswers(results.filter(([, l]) => l.ok).map(([n]) => n));
   return Object.fromEntries(results);
+}
+
+/** The last answer a helper gave (facts and copies), without asking it again. */
+export function lastAnswer(name: string): { at?: string; ok: boolean; facts?: WorkerFacts } | undefined {
+  const s = readSeen()[name];
+  return s ? { at: s.at, ok: s.ok, facts: s.facts } : undefined;
+}
+
+/** Helpers that answer after being woken over the network: each app that needed them hears it in its diary. */
+export function recordWakeAnswers(names: string[], now = Date.now()): { helper: string; seconds: number }[] {
+  const woke = noteWakeAnswers(names, now);
+  for (const w of woke) {
+    if (w.gaveUp) continue;
+    for (const app of w.apps) appendDiary({ t: new Date(now).toISOString(), app, kind: "woke", p: { helper: w.helper, seconds: w.seconds } });
+  }
+  return woke.map((w) => ({ helper: w.helper, seconds: w.seconds }));
 }
 
 // ---------- courteous mode (the decision itself is in courtesy.ts) ----------
@@ -532,6 +550,7 @@ export async function removeHelper(nameIn: string, opts: { by?: string; log?: (l
   savePool((p) => delete p.helpers[name]);
   removeKnownHost(name);
   writeSeen((s) => delete s[name]);
+  clearWake(name);
   audit({ event: "pool.remove", helper: name, revoked, by: opts.by || "cli" });
   const reports: ReconcileReport[] = [];
   for (const app of affected) reports.push(await reconcilePool(app.name, { log: opts.log }));
@@ -740,6 +759,8 @@ export interface ReconcileReport {
   stopped: { helper: string; copy: string; why: string }[];
   errors: { helper?: string; error: string }[];
   warnings: string[];
+  /** Helpers woken over the network (or still waking) for this app's copies: they answer within a minute or so. */
+  waking: string[];
 }
 
 async function startCopy(app: AppRecord, h: PoolHelperRecord, img: OriginImage, bindIp: string, log: (l: string) => void): Promise<PoolCopyRecord> {
@@ -796,6 +817,43 @@ async function stopCopies(list: { rec: PoolCopyRecord; why: string }[], report: 
 }
 
 /**
+ * Wakes, over the network, sleeping helpers that would have room for this app's missing copies: Wake-on-LAN
+ * on, not answering now, not given up on, and fit for a copy by the same rules as an awake PC (not paused,
+ * owner not busy, same architecture, room in what its owner gave). At most one PC per missing copy.
+ */
+async function wakeForRoom(
+  state: PaaSState,
+  app: AppRecord,
+  arch: string,
+  reachable: Set<string>,
+  tried: Set<string>,
+  missing: number,
+  ownerHigh: Set<string>,
+  report: ReconcileReport
+): Promise<string[]> {
+  const now = Date.now();
+  const tracks = readWake().helpers;
+  const asleep = new Set(
+    Object.values(state.pool?.helpers || {})
+      .filter((h) => !reachable.has(h.name) && !tried.has(h.name) && wakeOf(h) && wakeStatus(tracks[h.name], now) !== "gave_up")
+      .map((h) => h.name)
+  );
+  if (!asleep.size) return [];
+  const { picked } = pickHelpers(state, app, arch, asleep, missing, ownerHigh);
+  const woken: string[] = [];
+  for (const h of picked) {
+    try {
+      const w = await wakeHelper(h, { app: app.name, now });
+      if (w.state === "sent" || w.state === "waking") woken.push(h.name);
+    } catch (err) {
+      report.warnings.push(`Could not wake ${h.name} over the network: ${msg(err)}`);
+    }
+  }
+  report.waking.push(...woken.filter((n) => !report.waking.includes(n)));
+  return woken;
+}
+
+/**
  * Brings an app's copies on helpers to what is wanted, with the image and settings this server runs
  * now. Copies leave the balancer and drain before they stop; a replacement answers its health check
  * before it joins. Called after `scale set`, deploys, rollbacks, start/stop and pool changes; it
@@ -807,7 +865,7 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
   const state = loadState();
   const app = state.apps[slug];
   if (!app) throw new Error(`App '${slug}' not found.`);
-  const report: ReconcileReport = { app: slug, wanted: app.pool?.copies ?? 1, running: 1, started: [], stopped: [], errors: [], warnings: [] };
+  const report: ReconcileReport = { app: slug, wanted: app.pool?.copies ?? 1, running: 1, started: [], stopped: [], errors: [], warnings: [], waking: [] };
   const pool = app.pool;
   if (!pool?.enabled) return report;
   // A fenced server (another one serves its data now) keeps no copies anywhere: they would write here.
@@ -837,6 +895,8 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
 
   const keep: PoolCopyRecord[] = [];
   const outdated: PoolCopyRecord[] = [];
+  // PCs that hold a copy we keep but do not answer: the ones that can be woken over the network are.
+  const wakeKept: PoolHelperRecord[] = [];
   const toStop: { rec: PoolCopyRecord; why: string }[] = [];
   const dropSilent = (rec: PoolCopyRecord, why: string) => report.stopped.push({ helper: rec.helper, copy: rec.id, why });
   for (const rec of pool.placed) {
@@ -850,8 +910,10 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
       // Not answering now (asleep, rebooting, network). A current copy stays listed: the balancer's
       // health checks decide whether it gets visits. Any other leaves the balancer now and stops when
       // the PC answers again (a later round sees it as unknown).
-      if (wantHelpers > 0 && !h.paused && !ownerWantsOut(h) && isCurrent(rec, h)) keep.push(rec);
-      else dropSilent(rec, "helper not answering");
+      if (wantHelpers > 0 && !h.paused && !ownerWantsOut(h) && isCurrent(rec, h)) {
+        keep.push(rec);
+        if (wakeOf(h) && !wakeKept.includes(h)) wakeKept.push(h);
+      } else dropSilent(rec, "helper not answering");
       report.warnings.push(`${rec.helper} does not answer now (${l?.ok === false ? l.error : "no answer"}).`);
       continue;
     }
@@ -883,6 +945,12 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
     else dropSilent(rec, "fewer copies wanted (the PC does not answer; it stops when it does)");
   }
   while (outdated.length && keep.length + outdated.length > wantHelpers) toStop.push({ rec: outdated.pop()!, why: "fewer copies wanted" });
+  for (const h of wakeKept) {
+    if (!keep.some((c) => c.helper === h.name)) continue;
+    const w = await wakeHelper(h, { app: slug }).catch((err) => ({ state: "error", error: msg(err) }) as const);
+    if (w.state === "sent" || w.state === "waking") report.waking.push(h.name);
+    else if (w.state === "error") report.warnings.push(`Could not wake ${h.name} over the network: ${w.error}`);
+  }
 
   // Copies of this app on helpers that no record knows (an interrupted order, a PC that came back), and
   // copies of apps that no longer use helpers. Other apps' copies are left to their own rounds.
@@ -944,8 +1012,15 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
     const ok = new Set([...reachable].filter((n) => !tried.has(n)));
     const { picked, skipped } = pickHelpers(s, s.apps[slug], img.arch, ok, 1, ownerHigh);
     if (!picked.length) {
-      const left = skipped.filter((x) => !tried.has(x.helper)).map((x) => `${x.helper}: ${x.why}`);
-      report.warnings.push(`Only ${(s.apps[slug].pool?.placed.length || 0) + 1} of ${pool.copies} copies could run.${left.length ? ` Other helpers: ${left.join("; ")}.` : Object.keys(helpers).length ? "" : " No helper PC was added yet."}`);
+      // No awake PC has room: PCs asleep that may be woken over the network, and have room, are.
+      const woken = await wakeForRoom(s, s.apps[slug], img.arch, reachable, tried, missing, ownerHigh, report);
+      const left = skipped.filter((x) => !tried.has(x.helper) && !woken.includes(x.helper)).map((x) => `${x.helper}: ${x.why}`);
+      const short = `Only ${(s.apps[slug].pool?.placed.length || 0) + 1} of ${pool.copies} copies could run.`;
+      if (woken.length) {
+        report.warnings.push(`${short} Waking ${woken.join(", ")} over the network (Wake-on-LAN): a PC takes 30 s to a minute to answer, then its copy starts.${left.length ? ` Other helpers: ${left.join("; ")}.` : ""}`);
+      } else {
+        report.warnings.push(`${short}${left.length ? ` Other helpers: ${left.join("; ")}.` : Object.keys(helpers).length ? "" : " No helper PC was added yet."}`);
+      }
       break;
     }
     const h = picked[0];
@@ -1259,7 +1334,8 @@ export async function routeTunnel(slug: string, viaBalancer: boolean): Promise<{
 
 // ---------- reading ----------
 
-export type HelperState = "available" | "working" | "paused" | "busy" | "gone" | "unknown";
+/** asleep: not answering, and it can be woken over the network; waking: a magic packet is on its way. */
+export type HelperState = "available" | "working" | "paused" | "busy" | "gone" | "asleep" | "waking" | "unknown";
 
 export async function poolStatus(opts: { probe?: boolean } = {}) {
   let state = loadState();
@@ -1270,6 +1346,8 @@ export async function poolStatus(opts: { probe?: boolean } = {}) {
   }
   const seen = readSeen();
   const used = usedOnHelpers(state);
+  const tracks = readWake().helpers;
+  const now = Date.now();
   const placedOn = (name: string) =>
     pooledApps(state).flatMap((a) => a.pool!.placed.filter((c) => c.helper === name).map((c) => ({ app: a.name, copy: c.id, since: c.startedAt })));
   return {
@@ -1280,7 +1358,11 @@ export async function poolStatus(opts: { probe?: boolean } = {}) {
       .map((h) => {
         const s = seen[h.name];
         const copies = placedOn(h.name);
-        const st: HelperState = h.paused ? "paused" : !s ? "unknown" : !s.ok ? "gone" : ownerBusy(h) ? "busy" : copies.length ? "working" : "available";
+        const wake = wakeOf(h);
+        const track = tracks[h.name];
+        const ws = wakeStatus(track, now);
+        const asleep: HelperState = !wake || ws === "gave_up" ? "gone" : track ? "waking" : "asleep";
+        const st: HelperState = h.paused ? "paused" : !s ? "unknown" : !s.ok ? asleep : ownerBusy(h) ? "busy" : copies.length ? "working" : "available";
         return {
           name: h.name,
           ip: h.ip,
@@ -1301,6 +1383,10 @@ export async function poolStatus(opts: { probe?: boolean } = {}) {
           ownerBusy: ownerBusy(h) ? h.ownerBusy : null,
           // The owner's CPU at the last answer; null when that answer could not tell, absent on an old worker.
           ...(s?.ok && s.facts ? { owner: s.facts.owner ?? { cpuPct: null, seconds: 0, why: "old_worker" } } : {}),
+          // Wake-on-LAN: the settings, the card the PC reported last time it answered, and any wake in progress.
+          wake: wake ? { ...wake, since: h.wake!.since, by: h.wake!.by } : null,
+          lan: s?.facts?.lan ?? null,
+          ...(track ? { waking: { since: new Date(track.firstSentAt).toISOString(), tries: track.tries, ...(ws === "gave_up" ? { gaveUp: true } : {}) } } : {}),
           addedAt: h.addedAt,
         };
       }),
