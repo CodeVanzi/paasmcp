@@ -2120,13 +2120,20 @@ volumes:
       ["postgres:16"]
     );
     assert.deepStrictEqual(worker.foreignLoadedTags("Loaded image: paasmcp-pool/web:0123456789ab\n"), []);
-    const diskDir = fs.mkdtempSync(path.join(tempRoot, "run-"));
+    // The "not in memory" case needs a folder on disk: /tmp is a tmpfs on many systems (Ubuntu 24.10+).
+    const TMPFS = 0x01021994;
+    const diskBase = [tempRoot, process.cwd()].find((d) => fs.statfsSync(d).type !== TMPFS);
+    const diskDir = fs.mkdtempSync(path.join(diskBase ?? tempRoot, diskBase && diskBase !== tempRoot ? ".paasmcp-test-run-" : "run-"));
     fs.chmodSync(diskDir, 0o700);
-    assert.throws(() => worker.checkSecretsDir(diskDir), /not in memory/);
-    fs.chmodSync(diskDir, 0o755);
-    assert.throws(() => worker.checkSecretsDir(diskDir), /mode 700/);
-    fs.symlinkSync(diskDir, path.join(tempRoot, "run-link"));
-    assert.throws(() => worker.checkSecretsDir(path.join(tempRoot, "run-link")), /plain folder/);
+    try {
+      if (diskBase) assert.throws(() => worker.checkSecretsDir(diskDir), /not in memory/);
+      fs.chmodSync(diskDir, 0o755);
+      assert.throws(() => worker.checkSecretsDir(diskDir), /mode 700/);
+      fs.symlinkSync(diskDir, path.join(tempRoot, "run-link"));
+      assert.throws(() => worker.checkSecretsDir(path.join(tempRoot, "run-link")), /plain folder/);
+    } finally {
+      if (diskBase && diskBase !== tempRoot) fs.rmSync(diskDir, { recursive: true, force: true });
+    }
     if (fs.existsSync("/dev/shm")) {
       const shm = fs.mkdtempSync("/dev/shm/paasmcp-test-");
       fs.chmodSync(shm, 0o700);
