@@ -3225,5 +3225,134 @@ volumes:
     fs.rmSync(seenFile, { force: true });
   });
 
+  await t.test("39. Deploy progress: phases on disk, interrupted runs, GitHub links without credentials, first deploys, dashboard", async () => {
+    const deploys = await import("./deploys.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const { execFileSync } = await import("node:child_process");
+
+    // GitHub links: only owner/repo survive, whatever form the source has.
+    for (const src of ["CodeVanzi/paasmcp", "https://github.com/CodeVanzi/paasmcp.git", "git@github.com:CodeVanzi/paasmcp.git", "https://x-access-token:ghp_secret123@github.com/CodeVanzi/paasmcp", "ssh://git@github.com/CodeVanzi/paasmcp/"]) {
+      const g = deploys.githubSource(src, "main");
+      assert.equal(g?.name, "CodeVanzi/paasmcp", src);
+      assert.equal(g?.url, "https://github.com/CodeVanzi/paasmcp");
+      assert.ok(!JSON.stringify(g).includes("secret"));
+    }
+    assert.equal(deploys.githubSource("https://github.com/CodeVanzi/paasmcp", "feat/x")?.branchUrl, "https://github.com/CodeVanzi/paasmcp/tree/feat%2Fx");
+    for (const src of ["https://gitlab.com/a/b", "/srv/code", "https://github.com/a/b/c", "https://github.com.evil.io/a/b", "a/b\" onmouseover=x", "javascript:alert(1)", undefined]) {
+      assert.equal(deploys.githubSource(src, "main"), undefined, String(src));
+    }
+    const gh = deploys.githubSource("CodeVanzi/paasmcp", "main");
+    assert.equal(deploys.commitUrl(gh, "a".repeat(40)), `https://github.com/CodeVanzi/paasmcp/commit/${"a".repeat(40)}`);
+    assert.equal(deploys.commitUrl(gh, "abc1234"), undefined, "only full SHAs make a link");
+
+    // Credentials never reach the stored error.
+    assert.equal(deploys.redactCredentials("fatal: https://x-access-token:ghp_abcdefghijklmnopqrstuv@github.com/a/b failed"), "fatal: https://***@github.com/a/b failed");
+    assert.equal(deploys.redactCredentials("token github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ_123 here"), "token *** here");
+    assert.equal(deploys.cleanText("fix:\u001b[31m red\nline", 200), "fix: [31m red line");
+    assert.equal(deploys.cleanText("x".repeat(300), 10)?.length, 10);
+
+    // A run goes through its phases on disk and ends live.
+    const sha = "b".repeat(40);
+    const run = deploys.startDeployRun({ app: "dep-a", trigger: "poll", branch: "main", commit: deploys.shortCommit(sha), phase: "detected" });
+    assert.equal(deploys.deployRuns("dep-a")[0].phase, "detected");
+    run.phase("building");
+    run.commit({ sha, short: "bbbbbbb", message: "Add login", author: "Ana", date: "2026-11-05T10:00:00.000Z" });
+    const mid = deploys.deploySummary({});
+    assert.equal(mid["dep-a"].active?.phase, "building", "a first deploy shows before the app has a record");
+    assert.equal(mid["dep-a"].active?.trigger, "poll");
+    run.succeed();
+    assert.equal(deploys.deployRuns("dep-a")[0].phase, "live");
+    assert.equal(deploys.deploySummary({})["dep-a"], undefined, "no record and nothing running: not listed");
+
+    const app = { name: "dep-a", repoUrl: "https://x-access-token:ghp_zzzzzzzzzzzzzzzzzzzzzz@github.com/CodeVanzi/demo.git", branch: "main", lastCommit: "bbbbbbb", lastCommitSha: sha } as unknown as import("./config.js").AppRecord;
+    const sum = deploys.deploySummary({ "dep-a": app })["dep-a"];
+    assert.equal(sum.running?.message, "Add login");
+    assert.equal(sum.running?.date, "2026-11-05T10:00:00.000Z");
+    assert.equal(sum.running?.commitUrl, `https://github.com/CodeVanzi/demo/commit/${sha}`);
+    assert.equal(sum.last?.phase, "live");
+    assert.equal(sum.active, undefined);
+    assert.ok(!JSON.stringify(sum).includes("ghp_"), "the token in the stored URL never reaches the summary");
+
+    // A failed run keeps a short error with credentials removed.
+    const bad = deploys.startDeployRun({ app: "dep-a", trigger: "dashboard", branch: "main" });
+    bad.fail(new Error("Command failed: git clone https://x-access-token:ghp_abcdefghijklmnopqrstuv@github.com/a/b\nfatal: repository not found"));
+    const failed = deploys.deployRuns("dep-a")[0];
+    assert.equal(failed.phase, "failed");
+    assert.ok(!JSON.stringify(failed).includes("ghp_"));
+    assert.match(failed.log || "", /repository not found/);
+    assert.equal(deploys.deploySummary({ "dep-a": app })["dep-a"].last?.phase, "failed");
+    assert.equal(deploys.deploySummary({ "dep-a": app })["dep-a"].running?.message, "Add login", "the running version is still the old one");
+
+    // A run whose process died shows as interrupted, not as building forever.
+    deploys.startDeployRun({ app: "dep-b", trigger: "cli", branch: "main" }).phase("building");
+    assert.equal(deploys.deployRuns("dep-b", () => false)[0].phase, "failed");
+    assert.match(deploys.deployRuns("dep-b", () => false)[0].error || "", /Interrupted/);
+    assert.equal(deploys.deployRuns("dep-b")[0].phase, "building");
+    // Started on another host or PID namespace (dashboard container vs. host CLI): only a long silence counts.
+    const other = JSON.parse(fs.readFileSync(path.join(deploys.DEPLOYS_DIR, "dep-b.json"), "utf-8"));
+    other.runs[0].host = "elsewhere";
+    fs.writeFileSync(path.join(deploys.DEPLOYS_DIR, "dep-b.json"), JSON.stringify(other));
+    assert.equal(deploys.deployRuns("dep-b", () => false)[0].phase, "building", "a foreign PID proves nothing");
+    assert.equal(deploys.deployRuns("dep-b", () => false, Date.now() + 11 * 60_000)[0].phase, "failed");
+
+    // Only the last 10 runs are kept.
+    for (let i = 0; i < 12; i++) deploys.startDeployRun({ app: "dep-c", trigger: "cli", branch: "main" }).succeed();
+    assert.equal(deploys.deployRuns("dep-c").length, 10);
+    assert.equal((fs.statSync(path.join(deploys.DEPLOYS_DIR, "dep-c.json")).mode & 0o777), 0o600);
+
+    // A refused deploy is recorded as failed (the trigger is kept).
+    const st = config.loadState();
+    st.apps["dep-d"] = { ...app, name: "dep-d", trashedAt: new Date().toISOString() } as never;
+    config.saveState(st);
+    await assert.rejects(() => deployer.deployApp({ appName: "dep-d", repoSource: "/tmp", trigger: "webhook", announcedCommit: sha }), /trash/);
+    const refused = deploys.deployRuns("dep-d")[0];
+    assert.equal(refused.phase, "failed");
+    assert.equal(refused.trigger, "webhook");
+    assert.equal(refused.commit?.sha, sha);
+
+    // The build runs without blocking, and a failure carries the end of the output.
+    await assert.rejects(() => deployer.runAsync("sh", ["-c", "echo step1; echo boom >&2; exit 3"], tempRoot), (err: Error) => /exit 3/.test(err.message) && /boom/.test(err.message));
+    await deployer.runAsync("true", [], tempRoot);
+
+    // Commit subject, author and date from a real repository.
+    const repo = fs.mkdtempSync(path.join(tempRoot, "git-"));
+    const git = (...a: string[]) => execFileSync("git", ["-C", repo, "-c", "user.name=Ana Dev", "-c", "user.email=a@example.com", ...a], { stdio: "pipe" });
+    git("init", "-q");
+    fs.writeFileSync(path.join(repo, "a.txt"), "x");
+    git("add", ".");
+    git("commit", "-q", "-m", "Fix the login page\n\nlong body");
+    const info = github.headCommitInfo(repo);
+    assert.equal(info.subject, "Fix the login page");
+    assert.equal(info.author, "Ana Dev");
+    assert.ok(info.date && Date.now() - Date.parse(info.date) < 600_000);
+    assert.deepEqual(github.headCommitInfo(path.join(tempRoot, "nope")), {});
+
+    // Dashboard: progress answers on its own route, behind the login, and the page's script compiles.
+    const dashToken = dashboard.getOrCreateDashboardToken();
+    const srv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((res) => srv.once("listening", res));
+    const baseUrl = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      assert.equal((await fetch(`${baseUrl}/api/deploys`)).status, 401);
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const live = await (await fetch(`${baseUrl}/api/deploys`, { headers: { cookie } })).json();
+      assert.equal(live.deploys["dep-b"].active.phase, "building");
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const code of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(code);
+      assert.ok(page.includes("pollDeploys(") && page.includes("depPhase_building") && page.includes("depCommitted"));
+    } finally {
+      srv.close();
+    }
+
+    const st2 = config.loadState();
+    delete st2.apps["dep-d"];
+    config.saveState(st2);
+    for (const a of ["dep-a", "dep-b", "dep-c", "dep-d"]) deploys.forgetDeploys(a);
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

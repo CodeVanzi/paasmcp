@@ -467,7 +467,7 @@ export async function promoteMirror(peerName: string, opts: { epoch?: number; st
         if (!app.repoUrl) throw new Error("no repository recorded; deploy it by hand");
         // An active-active app keeps the version it already ran here.
         const commit = app.activeActive && app.activeSync?.commit ? app.activeSync.commit : undefined;
-        if (!OFFLINE()) await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, commit });
+        if (!OFFLINE()) await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, commit, trigger: "mirror" });
       }
       // DNS switch: re-exposing points the hostname at this server's tunnel. Hostnames served by the
       // origin's tunnel for apps on both servers already reach this server (it runs that connector).

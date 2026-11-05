@@ -217,6 +217,21 @@ export function cloneOrUpdateRepo(
   return { commitHash, commitSha, sourceType: "git" };
 }
 
+/** Subject, author and commit date of HEAD in a checked-out repository (empty when unknown). */
+export function headCommitInfo(repoDir: string): { subject?: string; author?: string; date?: string } {
+  try {
+    const out = execFileSync("git", ["log", "-1", "--format=%s%x00%an%x00%cI"], {
+      cwd: repoDir,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const [subject, author, date] = out.replace(/\n$/, "").split("\0");
+    return { subject, author, date: date && !Number.isNaN(Date.parse(date)) ? new Date(date).toISOString() : undefined };
+  } catch {
+    return {};
+  }
+}
+
 export interface DetectedBuildPlan {
   runtimeType: string;
   dockerfilePath: string;

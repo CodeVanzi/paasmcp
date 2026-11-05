@@ -342,7 +342,7 @@ export async function switchActiveActive(appName: string, on: boolean): Promise<
   let redeployed: string | undefined;
   let warning: string | undefined;
   if (app.repoUrl && !OFFLINE()) {
-    const d = await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha });
+    const d = await deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit: app.lastCommitSha, trigger: "active" });
     redeployed = d.commitHash;
     warning = d.warning;
   }
@@ -446,7 +446,7 @@ type DeployFn = (app: AppRecord, commit: string | undefined) => Promise<unknown>
 
 const defaultDeploy: DeployFn = async (app, commit) => {
   if (!app.repoUrl) throw new Error("no repository recorded");
-  return deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit, trusted: app.trusted });
+  return deployApp({ appName: app.name, repoSource: app.repoUrl, branch: app.branch, commit, trusted: app.trusted, trigger: "active" });
 };
 
 const defaultStop = (appName: string) => {
