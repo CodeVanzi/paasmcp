@@ -15,8 +15,9 @@ import {
 } from "./arbiter.js";
 import { installPollTimer, pollRepos, setPolling } from "./poller.js";
 import {
-  DiaryLang, installScaleTimer, scaleDiary, scaleHistory, scaleStatus, scaleTick, setDiaryLanguage, setScaleRule, uninstallScaleTimer, ruleFor
+  DiaryLang, installScaleTimer, scaleDiary, scaleHistory, scaleStatus, scaleTick, setDiaryLanguage, setScaleRule, uninstallScaleTimer, ruleFor, ruleRiskParams
 } from "./scale.js";
+import { autoRiskParams, setAutoScale } from "./autoscale.js";
 import { capacityTest, saveCapacity, validateTestPath } from "./loadtest.js";
 import { activeReadiness, activeStatus, publishActiveState, switchActiveActive, syncActiveFiles, syncActivePeers } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel, routeActiveTunnel, tunnelWatchTick } from "./activetunnel.js";
@@ -116,7 +117,7 @@ async function ask(question: string): Promise<string | undefined> {
  * Asks the person at the terminal before risky actions (guard.ts). `--yes` skips normal
  * confirmations; strong ones need the name typed or `--confirm-name <name>`.
  */
-const SCALE_SUBCOMMANDS = new Set(["tick", "status", "history", "diary", "rule", "language", "test", "install-timer", "uninstall-timer", "set", "off"]);
+const SCALE_SUBCOMMANDS = new Set(["tick", "status", "history", "diary", "rule", "language", "test", "install-timer", "uninstall-timer", "set", "off", "auto"]);
 
 async function confirmInCli(action: string, params: Record<string, unknown>, args: string[]): Promise<void> {
   const r = assessRisk(action, params);
@@ -574,11 +575,18 @@ async function runCli() {
         }
       } else if (sub === "rule" && arg1) {
         const input: Record<string, unknown> = {};
-        for (const [flag, key] of [["--min", "min"], ["--max", "max"], ["--target-cpu", "targetCpu"], ["--up-rounds", "upRounds"], ["--down-after", "downAfterSeconds"], ["--cooldown", "cooldownSeconds"]]) {
+        for (const [flag, key] of [["--min", "min"], ["--max", "max"], ["--target-cpu", "targetCpu"], ["--target-rps", "targetRps"], ["--up-rounds", "upRounds"], ["--down-after", "downAfterSeconds"], ["--cooldown", "cooldownSeconds"]]) {
           const v = getFlagValue(rest, flag);
           if (v !== undefined) input[key] = v;
         }
+        await confirmInCli("scale.rule", ruleRiskParams(arg1, input), rest);
         console.log(JSON.stringify(setScaleRule(arg1, input, `cli:${process.env.USER || "unknown"}`), null, 2));
+      } else if (sub === "auto" && (arg1 === "on" || arg1 === "off") && rest[2] && !rest[2].startsWith("--")) {
+        // Automatic scaling (autoscale.ts): the decider adds or removes copies within the rule.
+        const input = { min: getFlagValue(rest, "--min"), max: getFlagValue(rest, "--max") };
+        if (arg1 === "on") await confirmInCli("scale.auto", autoRiskParams(rest[2], input), rest);
+        const by = `cli:${process.env.USER || "unknown"}`;
+        console.log(JSON.stringify(await setAutoScale(rest[2], arg1 === "on", { ...input, by, log: (l) => console.error(l) }), null, 2));
       } else if (sub === "language" && arg1) {
         console.log(JSON.stringify(setDiaryLanguage(arg1), null, 2));
       } else if (sub === "test" && arg1) {
@@ -613,7 +621,7 @@ async function runCli() {
         console.log(JSON.stringify(uninstallScaleTimer(), null, 2));
       } else {
         throw new Error(
-          "Usage: paasmcp scale [status [app]]|set <app> <copies> [--yes]|<app> <copies>|off <app>|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--up-rounds n] [--down-after s] [--cooldown s]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
+          "Usage: paasmcp scale [status [app]]|auto on <app> [--min n] [--max n] [--yes]|auto off <app>|set <app> <copies> [--yes]|<app> <copies>|off <app>|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--target-rps n] [--up-rounds n] [--down-after s] [--cooldown s] [--yes]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
         );
       }
       break;
@@ -972,8 +980,9 @@ Commands:
   paasmcp edge <status|install|add|remove|reload|uninstall>  Self-hosted entry (Caddy) splitting requests between both servers
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp scale <status|tick|history|diary|rule|language|test|install-timer|uninstall-timer>
-                                                    Measure apps for 24 h and rehearse scaling decisions
-  paasmcp scale <app> <copies> | scale off <app>     Run copies of an app on helper PCs, set by hand
+                                                    Measure apps, rehearse and explain scaling decisions
+  paasmcp scale auto <on|off> <app> [--min n --max n]  Let PaaSMCP add and remove copies by itself
+  paasmcp scale <app> <copies> | scale off <app>     Copies on helper PCs by hand; off stops everything
   paasmcp pool <status|invite|add|pause|resume|remove|check|acl>
                                                     Your own PCs as helpers (orders over SSH, nothing runs idle)
   sudo paasmcp pool join '<invite>' | pool leave     On the helper PC: obey this server's orders, or stop
@@ -1031,8 +1040,9 @@ async function runActiveSyncWithFiles() {
 const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", "mcp", "token", undefined]);
 const command = process.argv[2];
 // Long-running loops take the lock per round instead of holding it.
-// Scale rounds only read state.json (they keep their own files), so a long deploy never pauses the
-// measuring; the capacity test takes the lock only to save its result.
+// Scale rounds measure without the lock (they keep their own files), so a long deploy never pauses the
+// measuring; they take it, waiting a couple of seconds at most, only to add or remove a copy. The
+// capacity test takes it only to save its result.
 const SCALE_LOCK_FREE = new Set(["tick", "status", "history", "diary", "test", undefined]);
 // On a helper PC, join/leave never touch PaaSMCP's own files; status and acl only read.
 const POOL_LOCK_FREE = new Set(["join", "leave", "update-worker", "status", "list", "acl", "check", undefined]);

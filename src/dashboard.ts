@@ -2,7 +2,8 @@ import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
-import { DiaryLang, ruleFor, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
+import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
+import { autoRiskParams, setAutoScale } from "./autoscale.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies } from "./pool.js";
 import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
@@ -604,8 +605,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/scale/rule" && req.method === "POST") {
           const body = await readJsonBody(req);
           const input: Record<string, unknown> = {};
-          for (const k of ["min", "max", "targetCpu", "downAfterSeconds", "cooldownSeconds"]) if (body[k] !== undefined) input[k] = body[k];
+          for (const k of ["min", "max", "targetCpu", "targetRps", "upRounds", "downAfterSeconds", "cooldownSeconds"]) if (body[k] !== undefined) input[k] = body[k];
+          confirmFromBody("scale.rule", ruleRiskParams(String(body.appName || ""), input), body);
           return reply(setScaleRule(String(body.appName || ""), input, actor));
+        }
+        if (pathname === "/api/scale/auto" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const slug = sanitizeSlug(String(body.appName || ""));
+          if (body.enabled !== true) return reply(await setAutoScale(slug, false, { by: actor }));
+          const input = { min: body.min, max: body.max };
+          confirmFromBody("scale.auto", autoRiskParams(slug, input), body);
+          return reply({ job: startPoolJob("auto", slug, (log) => setAutoScale(slug, true, { ...input, by: actor, log })) });
         }
         if (pathname === "/api/scale/language" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -616,6 +626,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const slug = sanitizeSlug(String(body.appName || ""));
           const app = loadState().apps[slug];
           if (!app) throw new Error(`App '${slug}' not found.`);
+          if (app.scale?.auto) throw new Error(`Automatic scaling is on for '${slug}': it sets the copies within the rule. Change the minimum or maximum, turn it off, or stop everything.`);
           const copies = Number(body.copies);
           if (!Number.isInteger(copies) || copies < 1 || copies > 20) throw new Error("Copies must be a whole number from 1 to 20.");
           if (copies > 1) {
@@ -1522,12 +1533,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div id="scaleNow"></div>
             <div id="scaleCharts" style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px;"></div>
             <div id="scaleBody">
+              <h3 data-i18n="autoTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="autoDesc"></p>
+              <div id="autoBox"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+                <button onclick="setAuto(true)" id="btnAutoOn" data-i18n="btnAutoOn"></button>
+                <button class="secondary" onclick="setAuto(false)" id="btnAutoOff" data-i18n="btnAutoOff"></button>
+              </div>
               <h3 data-i18n="copiesTitle" style="margin-top:18px;"></h3>
               <p class="card-desc" data-i18n="copiesDesc"></p>
               <div id="copiesBox"></div>
               <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-                <div style="width:160px;"><label class="field-label" for="copiesN" data-i18n="lblCopiesN"></label><input id="copiesN" type="number" min="1" max="20" /></div>
-                <button onclick="applyCopies()" data-i18n="btnCopiesApply"></button>
+                <div id="copiesManual" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+                  <div style="width:160px;"><label class="field-label" for="copiesN" data-i18n="lblCopiesN"></label><input id="copiesN" type="number" min="1" max="20" /></div>
+                  <button onclick="applyCopies()" data-i18n="btnCopiesApply"></button>
+                </div>
                 <button class="secondary" onclick="copiesOff()" id="btnCopiesOff" data-i18n="btnCopiesOff"></button>
               </div>
               <div id="copiesJobBox" style="margin-top:8px;"></div>
@@ -1537,6 +1557,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <div><label class="field-label" for="scaleMin" data-i18n="lblScaleMin"></label><input id="scaleMin" type="number" min="1" max="20" /></div>
                 <div><label class="field-label" for="scaleMax" data-i18n="lblScaleMax"></label><input id="scaleMax" type="number" min="1" max="20" /></div>
                 <div><label class="field-label" for="scaleTarget" data-i18n="lblScaleTarget"></label><input id="scaleTarget" type="number" min="10" max="95" /></div>
+                <div><label class="field-label" for="scaleTargetRps" data-i18n="lblScaleTargetRps"></label><input id="scaleTargetRps" type="number" min="0" max="100000" /></div>
+                <div><label class="field-label" for="scaleUp" data-i18n="lblScaleUp"></label><input id="scaleUp" type="number" min="1" max="20" /></div>
                 <div><label class="field-label" for="scaleDown" data-i18n="lblScaleDown"></label><input id="scaleDown" type="number" min="1" max="1440" /></div>
                 <div><label class="field-label" for="scaleCooldown" data-i18n="lblScaleCooldown"></label><input id="scaleCooldown" type="number" min="0" max="3600" /></div>
               </div>
@@ -3429,8 +3451,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
 
     Object.assign(I18N.pt, {
-          "scaleTitle": "📈 Uso nas últimas 24 h e ensaio da escala",
-          "scaleDesc": "O PaaSMCP mede a CPU, a memória, o tráfego e o tempo de resposta de cada app e guarda 24 horas. Com esses números, o <strong>ensaio</strong> aplica a regra da escala automática e anota o que faria, sem subir nem desligar nada. Serve para ver quais apps ganhariam com mais cópias e para calibrar a regra antes de ela agir de verdade.",
+          "scaleTitle": "📈 Uso nas últimas 24 h e escala automática",
+          "scaleDesc": "O PaaSMCP mede a CPU, a memória, o tráfego, as visitas e o tempo de resposta de cada app e guarda 24 horas. Com a escala automática desligada, a regra só é <strong>ensaiada</strong>: o diário anota o que ela faria, sem subir nem desligar nada. Ligada, ela age de verdade nos seus PCs ajudantes.",
           "scaleNoTimer": "A medição ainda não está ligada. No servidor, rode <code>sudo paasmcp scale install-timer</code>. Ela mede a cada 15 s e não deixa nenhum programa rodando entre uma medição e outra.",
           "scaleTimerOn": "Medindo a cada {n} s.",
           "scaleNoApps": "Nenhum app para medir ainda.",
@@ -3454,19 +3476,25 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "scaleChartLat": "Tempo de resposta (ms)",
           "scaleChartNet": "Tráfego (kB/s)",
           "scaleChartMem": "Memória (MB)",
-          "scaleRuleTitle": "Regra do ensaio",
-          "scaleRuleDesc": "O ensaio divide a CPU do app pelas cópias que ele teria. Sobe uma cópia quando a CPU por cópia passa do alvo em 3 medições seguidas, e desce uma quando ela fica abaixo da metade do alvo pelo tempo escolhido. Depois de cada passo, espera antes do próximo, para não ficar subindo e descendo.",
+          "scaleChartRps": "Visitas por segundo",
+          "scaleChartCopies": "Cópias rodando",
+          "scaleRps": "visitas",
+          "scaleRuleTitle": "Regra da escala",
+          "scaleRuleDesc": "A carga do app é dividida pelas cópias: a CPU e, se você der um alvo, as visitas por segundo. Sobe uma cópia quando uma das duas passa do alvo nas medições seguidas escolhidas, e desce uma quando as duas ficam abaixo da metade do alvo pelo tempo escolhido. Depois de cada passo, espera antes do próximo, para não ficar subindo e descendo. As visitas só são contadas com o app no balanceador (com cópias ou com a escala automática), e só as que chegam pelo Cloudflare Tunnel. Com a escala automática ligada, subir o máximo pede confirmação.",
           "lblScaleMin": "Mínimo de cópias",
           "lblScaleMax": "Máximo de cópias",
           "lblScaleTarget": "Alvo de CPU por cópia (%)",
+          "lblScaleTargetRps": "Alvo de visitas/s por cópia (0 = sem)",
+          "lblScaleUp": "Subir depois de (medições)",
           "lblScaleDown": "Descer depois de (min)",
           "lblScaleCooldown": "Espera entre passos (s)",
-          "scaleRuleSaved": "Regra salva. O ensaio passa a usar a regra nova na próxima medição.",
+          "scaleRuleSaved": "Regra salva. Vale a partir da próxima medição.",
           "scaleCapTitle": "Teste de capacidade",
           "scaleCapDesc": "Descobre quantas visitas por segundo uma cópia aguenta e o que trava primeiro (a CPU do app ou o banco). Como põe carga de verdade no app, ele roda pelo terminal do servidor e pede confirmação.",
           "scaleCapNone": "Este app ainda não foi testado.",
           "scaleCapResult": "Em {date}, uma cópia aguentou <strong>{rps} visitas/s</strong> em <code>{path}</code>, com {c} pedidos ao mesmo tempo (p95 de {p95} ms). O que travou: {bn}.",
           "scaleCapSuggest": "Até uns {s} visitas/s por cópia, sobra folga (70% do medido).",
+          "scaleCapUse": "Usar como alvo de visitas",
           "scaleBn_app_cpu": "a CPU do app",
           "scaleBn_database": "o banco de dados",
           "scaleBn_client": "o próprio teste, porque o servidor não conseguiu gerar mais carga",
@@ -3475,14 +3503,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "scaleBn_none": "nada, até a carga máxima testada",
           "scaleBn_unknown": "não identificado (talvez disco, rede ou um limite do próprio app)",
           "scaleDiaryTitle": "Diário do decisor",
-          "scaleDiaryDesc": "Cada decisão do ensaio com o motivo. A IA lê o mesmo diário pelo MCP para responder, por exemplo, “por que o app teria 3 cópias agora?”.",
+          "scaleDiaryDesc": "Cada decisão com o motivo: as do ensaio e, com a escala automática ligada, os passos de verdade. A IA lê o mesmo diário pelo MCP para responder, por exemplo, “por que o app está com 3 cópias?”.",
           "scaleDiaryNone": "Nada anotado ainda.",
           "lblScaleLang": "Idioma do diário no terminal, no log e na IA",
           "scaleLangSaved": "Idioma do diário salvo."
     });
     Object.assign(I18N.en, {
-          "scaleTitle": "📈 Last 24 h of use and the scaling rehearsal",
-          "scaleDesc": "PaaSMCP measures each app's CPU, memory, traffic and response time and keeps 24 hours. On those numbers, the <strong>rehearsal</strong> runs the automatic scaling rule and writes down what it would do, without starting or stopping anything. Use it to see which apps would gain from more copies and to tune the rule before it acts for real.",
+          "scaleTitle": "📈 Last 24 h of use and automatic scaling",
+          "scaleDesc": "PaaSMCP measures each app's CPU, memory, traffic, visits and response time and keeps 24 hours. With automatic scaling off, the rule is only <strong>rehearsed</strong>: the diary writes down what it would do, without starting or stopping anything. On, it acts for real on your helper PCs.",
           "scaleNoTimer": "Measuring is not on yet. On the server, run <code>sudo paasmcp scale install-timer</code>. It measures every 15 s and leaves no program running between rounds.",
           "scaleTimerOn": "Measuring every {n} s.",
           "scaleNoApps": "No app to measure yet.",
@@ -3506,19 +3534,25 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "scaleChartLat": "Response time (ms)",
           "scaleChartNet": "Traffic (kB/s)",
           "scaleChartMem": "Memory (MB)",
-          "scaleRuleTitle": "Rehearsal rule",
-          "scaleRuleDesc": "The rehearsal spreads the app's CPU over the copies it would have. It adds a copy when CPU per copy is above the target for 3 measurements in a row, and removes one when it stays below half the target for the time you choose. After each step it waits before the next, so it does not keep going up and down.",
+          "scaleChartRps": "Visits per second",
+          "scaleChartCopies": "Copies running",
+          "scaleRps": "visits",
+          "scaleRuleTitle": "Scaling rule",
+          "scaleRuleDesc": "The app's load is spread over its copies: CPU and, if you give a target, visits per second. A copy is added when either is above its target for the measurements in a row you choose, and one is removed when both stay below half their target for the time you choose. After each step it waits before the next, so it does not keep going up and down. Visits are counted only while the app is behind the balancer (with copies or automatic scaling), and only those that come through Cloudflare Tunnel. With automatic scaling on, raising the maximum asks for confirmation.",
           "lblScaleMin": "Fewest copies",
           "lblScaleMax": "Most copies",
           "lblScaleTarget": "CPU target per copy (%)",
+          "lblScaleTargetRps": "Visits/s target per copy (0 = none)",
+          "lblScaleUp": "Add after (measurements)",
           "lblScaleDown": "Remove after (min)",
           "lblScaleCooldown": "Wait between steps (s)",
-          "scaleRuleSaved": "Rule saved. The rehearsal uses it from the next measurement.",
+          "scaleRuleSaved": "Rule saved. It applies from the next measurement.",
           "scaleCapTitle": "Capacity test",
           "scaleCapDesc": "Finds how many requests per second one copy handles and what chokes first (the app's CPU or the database). Since it puts real load on the app, it runs from the server's terminal and asks for confirmation.",
           "scaleCapNone": "This app has not been tested yet.",
           "scaleCapResult": "On {date}, one copy handled <strong>{rps} requests/s</strong> on <code>{path}</code> with {c} requests at once (p95 {p95} ms). What choked: {bn}.",
           "scaleCapSuggest": "Up to about {s} requests/s per copy there is room to spare (70% of the measured value).",
+          "scaleCapUse": "Use as visits target",
           "scaleBn_app_cpu": "the app's CPU",
           "scaleBn_database": "the database",
           "scaleBn_client": "the test itself, since the server could not generate more load",
@@ -3527,7 +3561,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "scaleBn_none": "nothing, up to the highest load tested",
           "scaleBn_unknown": "not identified (maybe disk, network or a limit inside the app)",
           "scaleDiaryTitle": "Decision diary",
-          "scaleDiaryDesc": "Each rehearsal decision with its reason. The AI reads the same diary over MCP to answer, for example, “why would the app have 3 copies now?”.",
+          "scaleDiaryDesc": "Each decision with its reason: the rehearsal's and, with automatic scaling on, the real steps. The AI reads the same diary over MCP to answer, for example, “why does the app have 3 copies?”.",
           "scaleDiaryNone": "Nothing written yet.",
           "lblScaleLang": "Diary language in the terminal, the log and the AI",
           "scaleLangSaved": "Diary language saved."
@@ -3535,7 +3569,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     Object.assign(I18N.pt, {
           "navPool": "🖥️ Ajudantes",
-          "aaP_pool": "O app tem cópias em PCs ajudantes: volte a uma cópia primeiro. Por enquanto, um app usa ajudantes ou os dois servidores, não as duas coisas.",
+          "aaP_pool": "O app usa PCs ajudantes (cópias ou escala automática): use “Parar tudo” na escala dele primeiro. Por enquanto, um app usa ajudantes ou os dois servidores, não as duas coisas.",
           "poolTitle": "🖥️ PCs ajudantes",
           "poolDesc": "Seus próprios computadores podem rodar cópias extras dos apps deste servidor. Este servidor continua dono de tudo: guarda as senhas, monta a imagem, recebe as visitas e as divide entre a cópia daqui e as dos ajudantes. Num ajudante sem cópias, nenhum programa do PaaSMCP fica ligado.",
           "btnPoolCheck": "🔄 Verificar agora",
@@ -3558,7 +3592,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnPoolResume": "Retomar",
           "btnPoolRemove": "Remover",
           "poolAppsTitle": "Apps com cópias em ajudantes",
-          "poolAppsDesc": "O número de cópias de cada app se escolhe na tela Apps, no quadro de uso e escala.",
+          "poolAppsDesc": "O número de cópias de cada app se escolhe na tela Apps, no quadro de uso e escala, à mão ou pela escala automática.",
+          "poolAutoBadge": "escala automática",
           "poolAppsNone": "Nenhum app usa ajudantes ainda.",
           "poolAppLine": "{running} de {wanted} cópias rodando",
           "poolCopyNoAnswer": "{helper}: sem resposta",
@@ -3596,10 +3631,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolJob_remove": "remover {s}",
           "poolJob_app": "atualizar as cópias de {s} nos ajudantes",
           "copiesTitle": "Cópias agora",
-          "copiesDesc": "Põe cópias deste app nos seus PCs ajudantes (tela Ajudantes). A cópia deste servidor fica sempre ligada e as visitas se dividem entre todas. Por enquanto quem escolhe o número é você: o ensaio abaixo só sugere.",
+          "copiesDesc": "Cópias deste app nos seus PCs ajudantes (tela Ajudantes). A cópia deste servidor fica sempre ligada e as visitas se dividem entre todas. “Parar tudo” desliga a escala automática e volta o app a uma cópia, só aqui.",
           "lblCopiesN": "Cópias no total",
           "btnCopiesApply": "Aplicar",
-          "btnCopiesOff": "Voltar a uma cópia",
+          "btnCopiesOff": "Parar tudo",
           "copiesRunning1": "Rodando agora: 1 cópia, só neste servidor.",
           "copiesRunningN": "Rodando agora: {n} cópias, a deste servidor e {h} em ajudantes ({list}).",
           "copiesWanted": "Pedidas: {n}.",
@@ -3607,6 +3642,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "copiesBlocked": "Este app ainda não pode ter cópias em ajudantes:",
           "copiesWarn": "Antes de pôr cópias, vale saber:",
           "copiesStarted": "Ajustando as cópias. Acompanhe aqui ou na tela Ajudantes.",
+          "copiesAutoNote": "Com a escala automática ligada, o número de cópias é decidido sozinho. Para mudar, ajuste o mínimo e o máximo da regra abaixo.",
+          "poolJob_auto": "ligar a escala automática de {s}",
+          "autoTitle": "Escala automática",
+          "autoDesc": "Ligada, o PaaSMCP põe uma cópia num PC ajudante quando o app passa do alvo da regra abaixo e tira quando ele acalma, sem sair do mínimo e do máximo. Antes de desligar uma cópia, ele espera as visitas em curso terminarem. Não sobe cópias com o Postgres perto do limite de conexões, e se um passo falha (sem espaço nos ajudantes, cópia que não responde), tenta de novo mais tarde, esperando cada vez mais. Ligar pede confirmação, porque cada ajudante recebe a imagem e as variáveis do app.",
+          "btnAutoOn": "Ligar a escala automática",
+          "btnAutoOff": "Desligar",
+          "autoOn": "Ligada",
+          "autoWaiting": "Ligada, mas em espera: o app está parado ou este servidor não serve os dados agora",
+          "autoOff": "Desligada: você escolhe o número de cópias e a regra só é ensaiada.",
+          "autoSince": "desde {date}",
+          "autoLimits": "Entre {min} e {max} cópias, pela regra abaixo.",
+          "autoNoTimer": "A medição não está ligada, então nada decide ainda (veja o aviso no alto do quadro).",
+          "autoStarting": "Ligando a escala automática. Acompanhe aqui.",
+          "autoOffDone": "Escala automática desligada. As cópias ficaram como estavam.",
           "poolP_dashboard": "O painel controla este servidor e nunca roda em ajudantes.",
           "poolP_trashed": "O app está na lixeira.",
           "poolP_fromPeer": "Este app veio de outro servidor: escolha as cópias lá.",
@@ -3624,7 +3673,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
     Object.assign(I18N.en, {
           "navPool": "🖥️ Helpers",
-          "aaP_pool": "The app has copies on helper PCs: go back to one copy first. For now an app uses either helpers or both servers, not both.",
+          "aaP_pool": "The app uses helper PCs (copies or automatic scaling): use “Stop everything” in its scaling first. For now an app uses either helpers or both servers, not both.",
           "poolTitle": "🖥️ Helper PCs",
           "poolDesc": "Your own computers can run extra copies of this server's apps. This server stays in charge of everything: it keeps the passwords, builds the image, receives the visits and splits them between its own copy and the helpers'. A helper with no copies runs no PaaSMCP program at all.",
           "btnPoolCheck": "🔄 Check now",
@@ -3647,7 +3696,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnPoolResume": "Resume",
           "btnPoolRemove": "Remove",
           "poolAppsTitle": "Apps with copies on helpers",
-          "poolAppsDesc": "Choose each app's number of copies on the Apps screen, in the usage and scaling card.",
+          "poolAppsDesc": "Each app's number of copies is set on the Apps screen, in the usage and scaling card, by hand or by automatic scaling.",
+          "poolAutoBadge": "automatic scaling",
           "poolAppsNone": "No app uses helpers yet.",
           "poolAppLine": "{running} of {wanted} copies running",
           "poolCopyNoAnswer": "{helper}: not answering",
@@ -3685,10 +3735,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolJob_remove": "remove {s}",
           "poolJob_app": "update the copies of {s} on helpers",
           "copiesTitle": "Copies now",
-          "copiesDesc": "Puts copies of this app on your helper PCs (Helpers screen). This server's copy always stays on and visits are split among all of them. For now you choose the number: the rehearsal below only suggests.",
+          "copiesDesc": "Copies of this app on your helper PCs (Helpers screen). This server's copy always stays on and visits are split among all of them. “Stop everything” turns automatic scaling off and brings the app back to one copy, here only.",
           "lblCopiesN": "Copies in total",
           "btnCopiesApply": "Apply",
-          "btnCopiesOff": "Back to one copy",
+          "btnCopiesOff": "Stop everything",
           "copiesRunning1": "Running now: 1 copy, on this server only.",
           "copiesRunningN": "Running now: {n} copies, this server's and {h} on helpers ({list}).",
           "copiesWanted": "Asked for: {n}.",
@@ -3696,6 +3746,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "copiesBlocked": "This app cannot have copies on helpers yet:",
           "copiesWarn": "Worth knowing before adding copies:",
           "copiesStarted": "Setting the copies. Follow along here or on the Helpers screen.",
+          "copiesAutoNote": "With automatic scaling on, the number of copies is decided by itself. To change it, adjust the rule's minimum and maximum below.",
+          "poolJob_auto": "turn on automatic scaling for {s}",
+          "autoTitle": "Automatic scaling",
+          "autoDesc": "On, PaaSMCP puts a copy on a helper PC when the app goes over the rule's target below and removes it when the app calms down, never past the minimum and maximum. Before stopping a copy, it lets the visits in progress finish. It adds no copy while Postgres is near its connection limit, and when a step fails (no room on helpers, a copy that does not answer) it tries again later, waiting longer each time. Turning it on asks for confirmation, since each helper receives the app's image and variables.",
+          "btnAutoOn": "Turn on automatic scaling",
+          "btnAutoOff": "Turn off",
+          "autoOn": "On",
+          "autoWaiting": "On, but waiting: the app is stopped or this server does not serve the data now",
+          "autoOff": "Off: you choose the number of copies and the rule is only rehearsed.",
+          "autoSince": "since {date}",
+          "autoLimits": "Between {min} and {max} copies, by the rule below.",
+          "autoNoTimer": "Measuring is not on, so nothing decides yet (see the note at the top of this card).",
+          "autoStarting": "Turning on automatic scaling. Follow along here.",
+          "autoOffDone": "Automatic scaling turned off. The copies stay as they were.",
           "poolW_localRefs": "These variables point at this machine or at containers that only exist here, so they will not work on a helper: {v}."
     });
 
@@ -4442,13 +4506,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function scaleChart(title, points, valueOf, opts) {
       const W = 300, H = 90, now = Date.now(), from = now - 24 * 3600 * 1000;
       const vals = points.map(p => ({ t: p.t, v: valueOf(p) })).filter(p => p.v !== null && p.v !== undefined && isFinite(p.v));
-      const top = Math.max(1, ...vals.map(p => p.v), opts.target ? opts.target * 1.25 : 0);
+      const top = Math.max(1, opts.top || 0, ...vals.map(p => p.v), opts.target ? opts.target * 1.25 : 0);
       const x = t => ((t - from) / (now - from)) * W;
       const y = v => H - (v / top) * (H - 6);
       const segs = [];
       let cur = [];
       vals.forEach((p, i) => {
         if (i && p.t - vals[i - 1].t > 12 * 60 * 1000) { segs.push(cur); cur = []; }
+        // Steps (copies): the line stays flat until the value changes.
+        else if (i && opts.step) cur.push(x(p.t).toFixed(1) + ',' + y(vals[i - 1].v).toFixed(1));
         cur.push(x(p.t).toFixed(1) + ',' + y(p.v).toFixed(1));
       });
       segs.push(cur);
@@ -4491,11 +4557,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         now = '<strong>' + esc(t('scaleNowLbl')) + ':</strong> CPU ' + esc(a.cpuOfLimit ?? '-') + '% ' + esc(cpuUnit)
           + ' · ' + esc(t('scaleMem')) + ' ' + esc(l.mem === null ? '-' : fmtNum(l.mem) + ' MB')
           + ' · ' + esc(t('scaleLat')) + ' ' + esc(l.lat === null ? (l.ok === false ? t('scaleNoAnswer') : '-') : fmtNum(l.lat) + ' ms')
-          + ' · ' + esc(t('scaleNet')) + ' ' + esc(l.rx === null ? '-' : fmtRate((l.rx || 0) + (l.tx || 0)));
+          + ' · ' + esc(t('scaleNet')) + ' ' + esc(l.rx === null ? '-' : fmtRate((l.rx || 0) + (l.tx || 0)))
+          + (a.rps !== undefined && a.rps !== null ? ' · ' + esc(t('scaleRps')) + ' ' + esc(fmtNum(a.rps, 1)) + '/s' : '');
         if (!a.measuring) now += '<div style="color:var(--warning);margin-top:4px;">' + esc(t('scaleStale')) + '</div>';
       }
       const copies = a.rehearsalCopies;
-      now += '<div style="margin-top:6px;"><span class="badge' + (copies > a.rule.min ? ' warning' : '') + '">' + esc((copies === 1 ? t('scaleWould1') : t('scaleWouldN')).replace('{n}', copies)) + '</span></div>';
+      now += '<div style="margin-top:6px;">' + (a.auto
+        ? badge(a.auto.acting ? 'success' : 'warning', t('autoTitle') + ': ' + (a.auto.acting ? t('autoOn') : t('autoWaiting')))
+        : '<span class="badge' + (copies > a.rule.min ? ' warning' : '') + '">' + esc((copies === 1 ? t('scaleWould1') : t('scaleWouldN')).replace('{n}', copies)) + '</span>') + '</div>';
       if (a.lastEvent) now += '<div style="margin-top:6px;font-size:12.5px;color:var(--muted);">' + esc(fmtDate(a.lastEvent.t)) + ' · ' + esc(a.lastEvent.text) + '</div>';
       document.getElementById('scaleNow').innerHTML = card(now);
 
@@ -4504,13 +4573,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         scaleChart(t('scaleChartCpu') + ' ' + cpuUnit, pts, p => p.cpu === null ? null : p.cpu / ref, { target: a.rule.targetCpu })
         + scaleChart(t('scaleChartLat'), pts, p => p.lat, {})
         + scaleChart(t('scaleChartNet'), pts, p => p.rx === null ? null : ((p.rx || 0) + (p.tx || 0)) / 1024, {})
-        + scaleChart(t('scaleChartMem'), pts, p => p.mem, {});
+        + scaleChart(t('scaleChartMem'), pts, p => p.mem, {})
+        // Visits and copies: only for apps that have been behind the pool balancer.
+        + (a.wantedCopies || pts.some(p => p.rps !== null && p.rps !== undefined)
+          ? scaleChart(t('scaleChartRps'), pts, p => p.rps, { target: a.rule.targetRps || 0 })
+            + scaleChart(t('scaleChartCopies'), pts, p => p.copies, { step: true, top: a.rule.max })
+          : '');
 
       document.getElementById('scaleMin').value = a.rule.min;
       document.getElementById('scaleMax').value = a.rule.max;
       document.getElementById('scaleTarget').value = a.rule.targetCpu;
+      document.getElementById('scaleTargetRps').value = a.rule.targetRps || 0;
+      document.getElementById('scaleUp').value = a.rule.upRounds;
       document.getElementById('scaleDown').value = Math.round(a.rule.downAfterSeconds / 60);
       document.getElementById('scaleCooldown').value = a.rule.cooldownSeconds;
+      renderAuto(a, d);
       renderCopies(a, d.pool);
 
       const cmd = '<code>sudo paasmcp scale test ' + esc(a.app) + '</code>';
@@ -4519,7 +4596,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         (c
           ? t('scaleCapResult').replace('{date}', esc(fmtDate(c.at))).replace('{rps}', esc(fmtNum(c.rps))).replace('{path}', esc(c.path))
               .replace('{c}', esc(c.concurrency)).replace('{p95}', esc(c.p95Ms)).replace('{bn}', esc(t('scaleBn_' + c.bottleneck)))
-            + '<div style="margin-top:4px;color:var(--muted);font-size:12.5px;">' + esc(t('scaleCapSuggest').replace('{s}', fmtNum(c.suggestedTargetRps))) + '</div>'
+            + '<div style="margin-top:4px;color:var(--muted);font-size:12.5px;">' + esc(t('scaleCapSuggest').replace('{s}', fmtNum(c.suggestedTargetRps)))
+            + (c.suggestedTargetRps > 0 ? ' <button class="secondary" style="padding:3px 8px;font-size:11.5px;" onclick="document.getElementById(&#39;scaleTargetRps&#39;).value=' + Number(c.suggestedTargetRps) + ';document.getElementById(&#39;scaleTargetRps&#39;).focus()">' + esc(t('scaleCapUse')) + '</button>' : '')
+            + '</div>'
           : esc(t('scaleCapNone')))
         + '<div style="margin-top:6px;">' + cmd + '</div>');
 
@@ -4537,10 +4616,41 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         min: num('scaleMin'),
         max: num('scaleMax'),
         targetCpu: num('scaleTarget'),
+        targetRps: num('scaleTargetRps'),
+        upRounds: num('scaleUp'),
         downAfterSeconds: String(Math.round(Number(num('scaleDown')) * 60)),
         cooldownSeconds: num('scaleCooldown'),
       });
       if (r) { showToast(t('scaleRuleSaved')); loadScale(); }
+    }
+    function renderAuto(a, d) {
+      const box = document.getElementById('autoBox');
+      if (!box) return;
+      const ready = d.pool && d.pool.readiness;
+      let html;
+      if (a.auto) {
+        html = badge(a.auto.acting ? 'success' : 'warning', a.auto.acting ? t('autoOn') : t('autoWaiting'))
+          + ' <span style="color:var(--muted);font-size:12.5px;">' + esc(t('autoSince').replace('{date}', fmtDate(a.auto.since))) + '</span>'
+          + '<div style="margin-top:6px;font-size:12.5px;">' + esc(t('autoLimits').replace('{min}', a.rule.min).replace('{max}', a.rule.max)) + '</div>'
+          + (d.timer ? '' : '<div style="color:var(--warning);margin-top:4px;font-size:12.5px;">' + esc(t('autoNoTimer')) + '</div>');
+      } else {
+        html = '<span style="font-size:12.5px;">' + esc(t('autoOff')) + '</span>';
+      }
+      box.innerHTML = '<div style="margin-bottom:8px;">' + html + '</div>';
+      const on = document.getElementById('btnAutoOn');
+      on.style.display = a.auto ? 'none' : '';
+      on.disabled = Boolean(ready && !ready.ok);
+      document.getElementById('btnAutoOff').style.display = a.auto ? '' : 'none';
+    }
+    async function setAuto(enabled) {
+      const a = scaleData && scaleData.app;
+      if (!a) return;
+      const body = { appName: a, enabled };
+      if (enabled) { body.min = document.getElementById('scaleMin').value; body.max = document.getElementById('scaleMax').value; }
+      const r = await postJson('/api/scale/auto', body);
+      if (!r) return;
+      if (r.job) { showToast(t('autoStarting')); watchPoolJob(); }
+      else { showToast(t('autoOffDone')); loadScale(); }
     }
     async function saveScaleLang() {
       const r = await postJson('/api/scale/language', { language: document.getElementById('scaleLang').value });
@@ -4635,7 +4745,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           + extra + btns);
       }).join('') : '<p class="card-desc">' + esc(t('poolNone')) + '</p>';
       const apps = d.apps || [];
-      document.getElementById('poolApps').innerHTML = apps.length ? apps.map(a => card('<strong>' + esc(a.app) + '</strong> · '
+      document.getElementById('poolApps').innerHTML = apps.length ? apps.map(a => card('<strong>' + esc(a.app) + '</strong>' + (a.auto ? ' ' + badge('success', t('poolAutoBadge')) : '') + ' · '
         + esc(a.stoppedAt ? t('poolAppStopped') : t('poolAppLine').replace('{running}', a.running).replace('{wanted}', a.wanted))
         + (a.copies.length ? ' <span style="color:var(--muted)">(' + esc(a.copies.map(c => c.answering === false ? t('poolCopyNoAnswer').replace('{helper}', c.helper) : c.helper).join(', ')) + ')</span>' : '')
         + (a.lastError ? '<div style="color:var(--danger);font-size:12px;margin-top:4px;white-space:pre-wrap;">' + esc(a.lastError) + '</div>' : ''))).join('')
@@ -4688,10 +4798,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         html += '<div style="margin-top:6px;font-size:12.5px;color:var(--muted);"><strong>' + esc(t('copiesWarn')) + '</strong>'
           + r.warningCodes.map((w, i) => '<div>• ' + esc(tr('poolW_' + w.code, r.warnings[i]).replace('{v}', w.value || '')) + '</div>').join('') + '</div>';
       }
+      if (a.auto) html += '<div style="margin-top:6px;font-size:12.5px;color:var(--muted);">' + esc(t('copiesAutoNote')) + '</div>';
       box.innerHTML = card(html);
       const n = document.getElementById('copiesN');
       if (document.activeElement !== n) n.value = a.wantedCopies || a.copies;
-      document.getElementById('btnCopiesOff').style.display = a.wantedCopies ? '' : 'none';
+      document.getElementById('copiesManual').style.display = a.auto ? 'none' : 'flex';
+      document.getElementById('btnCopiesOff').style.display = a.wantedCopies || a.auto ? '' : 'none';
       renderPoolJob(p.job, 'copiesJobBox');
       if (p.job && !p.job.done) watchPoolJob();
     }

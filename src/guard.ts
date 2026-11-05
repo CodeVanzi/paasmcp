@@ -150,6 +150,32 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `O app '${subject}' vai rodar ${copies} cópias: a deste servidor e ${copies - 1} em PCs ajudantes. Cada ajudante recebe a imagem e as variáveis do app (inclusive senhas, guardadas só na memória dele), as cópias acessam o banco, o Redis e o S3 daqui pela Tailscale, e as visitas do app passam por um pequeno balanceador neste servidor.`,
         params);
     }
+    case "scale.auto": {
+      // Turning automatic scaling on lets the decider start and stop copies by itself, up to the maximum.
+      const min = Number(params.min);
+      const max = Number(params.max);
+      const first = params.enabling
+        ? " The app's visits start going through the pool balancer on this server, so they can be counted."
+        : "";
+      const firstPt = params.enabling
+        ? " As visitas do app passam a ir pelo balanceador do pool neste servidor, para poderem ser contadas."
+        : "";
+      return risk(action, subject, "confirm",
+        `App '${subject}' will scale by itself: PaaSMCP adds copies on helper PCs when it is busy and removes them when it is calm, between ${min} and ${max} copies, without asking each time. Each helper that runs a copy receives the app's image and variables (secrets included, kept only in memory there).${first} 'Stop everything' goes back to one copy here.`,
+        `O app '${subject}' vai escalar sozinho: o PaaSMCP põe cópias em PCs ajudantes quando ele estiver ocupado e tira quando acalmar, entre ${min} e ${max} cópias, sem perguntar a cada vez. Cada ajudante que rodar uma cópia recebe a imagem e as variáveis do app (inclusive senhas, guardadas só na memória dele).${firstPt} "Parar tudo" volta a uma cópia aqui.`,
+        params);
+    }
+    case "scale.rule": {
+      // Free, except raising the maximum of an app that scales by itself: the decider may then run more
+      // copies on helpers without asking.
+      const max = Number(params.max);
+      const previousMax = Number(params.previousMax);
+      if (!params.auto || !(max > previousMax)) return null;
+      return risk(action, subject, "confirm",
+        `App '${subject}' scales by itself: with a maximum of ${max} copies (was ${previousMax}), PaaSMCP may run up to ${max - 1} copies on helper PCs without asking.`,
+        `O app '${subject}' escala sozinho: com o máximo de ${max} cópias (era ${previousMax}), o PaaSMCP pode rodar até ${max - 1} cópias em PCs ajudantes sem perguntar.`,
+        params);
+    }
     case "pool.join": {
       const origin = String(params.origin);
       return risk(action, origin, "confirm",
