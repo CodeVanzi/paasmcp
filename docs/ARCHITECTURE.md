@@ -513,7 +513,8 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   CPU; two busy loops on the PC with the copy move it to the other PC (which does not count that CPU as its
   owner's), the diary says why and where, and the PC is free again after the calm while; in warn mode the
   copy stays and a third copy goes to the other PC; mode off clears the mark and watches nothing; no visit
-  fails and no round errors.
+  fails while the owner's PCs hand their copies over, and no round errors (visits lost in the manual `scale
+  set` steps, a balancer reload racing a keep-alive connection, are reported apart).
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,
