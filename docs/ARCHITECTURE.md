@@ -581,7 +581,7 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,
-  Django, Go, Go `cmd/`, static).
+  Django, Go, Go `cmd/`, static, C# / ASP.NET in `src/<name>/`).
 - `scripts/mirror-lab.sh`: two simulated servers on one Docker host (own network, ports 5432/5433):
   offer, accept, replication, promote, fencing, failback and handback. Refuses to run over an existing
   install and removes everything it created on exit.

@@ -1525,6 +1525,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <button class="chip" id="presetFastapi" onclick="fillDeployPreset('fastapi', this)">FastAPI + PG</button>
                 <button class="chip" id="presetNode" onclick="fillDeployPreset('node', this)">API Node / Express</button>
                 <button class="chip" id="presetGo" onclick="fillDeployPreset('go', this)">API Go</button>
+                <button class="chip" id="presetDotnet" onclick="fillDeployPreset('dotnet', this)">C# / ASP.NET + PG</button>
                 <button class="chip" id="presetCompose" onclick="fillDeployPreset('compose', this)">Multi-Service Compose + PG + Redis</button>
                 <button class="chip" id="presetSpa" onclick="fillDeployPreset('spa', this)">SPA / Site Estático</button>
                 <button class="chip" id="presetDockerfile" onclick="fillDeployPreset('dockerfile', this)">Dockerfile próprio (Rails, Laravel…)</button>
@@ -2287,6 +2288,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetFastapi: "FastAPI + PG",
         presetNode: "API Node / Express",
         presetGo: "API Go",
+        presetDotnet: "C# / ASP.NET + PG",
+        presetHint_dotnet: "C#: precisa de um <code>.csproj</code> na raiz (ou um projeto web em <code>src/&lt;nome&gt;</code>). O painel roda <code>dotnet publish</code> com a versão do <code>TargetFramework</code> e o app ouve a porta 8080. O banco chega em <code>DATABASE_URL</code>.",
         presetDockerfile: "Dockerfile próprio (Rails, Laravel…)",
         presetHint_saas: "Next.js: precisa de <code>package.json</code> com os scripts <code>build</code> e <code>start</code>. Roda na porta 3000 e o banco chega em <code>DATABASE_URL</code>.",
         presetHint_django: "Django: precisa de <code>manage.py</code>, <code>requirements.txt</code> e da pasta do projeto com <code>wsgi.py</code>. Roda com gunicorn na porta 8000. Coloque o domínio em <code>ALLOWED_HOSTS</code> e leia o banco de <code>DATABASE_URL</code> (ex.: dj-database-url).",
@@ -2295,7 +2298,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_go: "Go: precisa de <code>go.mod</code>; o <code>main</code> pode ficar na raiz ou em <code>cmd/&lt;nome&gt;</code>. O app deve ouvir a porta da variável <code>PORT</code> (8080).",
         presetHint_compose: "Usa o <code>docker-compose.yml</code> do repositório. O serviço <code>web</code>, <code>app</code> ou <code>api</code> (ou o primeiro) recebe o tráfego. Opções inseguras como <code>privileged</code> são removidas.",
         presetHint_spa: "Vite, React ou Astro sem script <code>start</code>: o painel faz o build e serve os arquivos com nginx. Um <code>index.html</code> na raiz também funciona.",
-        presetHint_dockerfile: "Para Rails, Laravel, Java, .NET ou qualquer outra stack: deixe um <code>Dockerfile</code> na raiz do repositório. A porta vem do <code>EXPOSE</code>.",
+        presetHint_dockerfile: "Para Rails, Laravel, Java ou qualquer outra stack: deixe um <code>Dockerfile</code> na raiz do repositório. A porta vem do <code>EXPOSE</code>.",
         chipSystemScope: "⚙️ system (Tokens Globais)",
         promptEx1Title: "💬 Deploy & Banco 1-Click",
         promptEx1Desc: "'Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>'",
@@ -2464,6 +2467,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetFastapi: "FastAPI + PG",
         presetNode: "Node / Express API",
         presetGo: "Go API",
+        presetDotnet: "C# / ASP.NET + PG",
+        presetHint_dotnet: "C#: needs a <code>.csproj</code> at the root (or one web project in <code>src/&lt;name&gt;</code>). The dashboard runs <code>dotnet publish</code> with the <code>TargetFramework</code> version and the app listens on port 8080. The database arrives in <code>DATABASE_URL</code>.",
         presetDockerfile: "Own Dockerfile (Rails, Laravel…)",
         presetHint_saas: "Next.js: needs a <code>package.json</code> with <code>build</code> and <code>start</code> scripts. Runs on port 3000 and the database arrives in <code>DATABASE_URL</code>.",
         presetHint_django: "Django: needs <code>manage.py</code>, <code>requirements.txt</code> and the project folder with <code>wsgi.py</code>. Runs with gunicorn on port 8000. Put the domain in <code>ALLOWED_HOSTS</code> and read the database from <code>DATABASE_URL</code> (e.g. dj-database-url).",
@@ -2472,7 +2477,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_go: "Go: needs <code>go.mod</code>; <code>main</code> can live at the root or in <code>cmd/&lt;name&gt;</code>. The app must listen on the <code>PORT</code> variable (8080).",
         presetHint_compose: "Uses the repository's <code>docker-compose.yml</code>. The <code>web</code>, <code>app</code> or <code>api</code> service (or the first one) gets the traffic. Unsafe options such as <code>privileged</code> are stripped.",
         presetHint_spa: "Vite, React or Astro without a <code>start</code> script: the dashboard builds it and serves the files with nginx. A root <code>index.html</code> works too.",
-        presetHint_dockerfile: "For Rails, Laravel, Java, .NET or any other stack: put a <code>Dockerfile</code> at the repository root. The port comes from <code>EXPOSE</code>.",
+        presetHint_dockerfile: "For Rails, Laravel, Java or any other stack: put a <code>Dockerfile</code> at the repository root. The port comes from <code>EXPOSE</code>.",
         chipSystemScope: "⚙️ system (Global Tokens)",
         promptEx1Title: "💬 1-Click Deploy & Database",
         promptEx1Desc: "'Deploy repository <code>user/my-saas</code> with PostgreSQL, 512m RAM limit, and publish on <code>saas.{domain}</code>'",
@@ -3557,7 +3562,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'fedTitle', 'fedDesc', 'lblFedUrl', 'lblFedMode', 'optFedActive', 'optFedWarm', 'btnGenInvite', 'btnExportSync', 'lblJoinPeer', 'btnJoinPeer',
       'whTitle', 'whDesc', 'lblWhUrl', 'lblWhSecret', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
       'doctorTitle', 'doctorDesc', 'btnRunDoctor',
-      'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetCompose', 'presetSpa', 'presetDockerfile', 'chipSystemScope',
+      'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetDotnet', 'presetCompose', 'presetSpa', 'presetDockerfile', 'chipSystemScope',
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
       'agentsTitle', 'agentsDesc', 'logsTitle', 'btnCloseLogs',
     ];
@@ -3697,6 +3702,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       fastapi: ['minha-api', 'seu-usuario/minha-api', true, false, '256m', '0.5'],
       node: ['api-node', 'seu-usuario/api-node', false, false, '256m', '0.5'],
       go: ['api-go', 'seu-usuario/api-go', false, false, '128m', '0.5'],
+      dotnet: ['api-dotnet', 'seu-usuario/api-dotnet', true, false, '512m', '1.0'],
       compose: ['api-worker', 'seu-usuario/api-compose', true, true, '1g', '2.0'],
       spa: ['landing', 'seu-usuario/landing', false, false, '256m', '0.5'],
       dockerfile: ['meu-app', 'seu-usuario/meu-app', true, false, '512m', '1.0'],
