@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { deploySummary } from "./deploys.js";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -115,6 +116,8 @@ export function getSystemStatusSummary(includeMetrics = true) {
     databasesCount: Object.keys(state.databases).length,
     backupsCount: Object.keys(state.backups || {}).length,
     apps: state.apps,
+    /** Per app: version running (commit, GitHub links), deploy in progress, last deploy result. */
+    deploys: deploySummary(state.apps),
     containerMetrics,
     databases: state.databases,
     backups: listDatabaseBackups(),
@@ -1172,6 +1175,7 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           authorize("app.trust", { appName: sanitizeSlug(String(args.appName)) });
         }
         const result = await deployApp({
+          trigger: "mcp",
           trusted,
           healthcheckPath: args.healthcheckPath ? String(args.healthcheckPath) : undefined,
           healthcheckTimeoutSeconds: args.healthcheckTimeoutSeconds ? Number(args.healthcheckTimeoutSeconds) : undefined,

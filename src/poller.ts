@@ -42,7 +42,7 @@ export async function pollRepos(head = remoteHead): Promise<{ checked: string[];
     try {
       const sha = head(app.repoUrl!, app.branch);
       if (app.lastCommit && sha.startsWith(app.lastCommit)) continue;
-      const result = await deployApp({ appName: app.name, repoSource: app.repoUrl!, branch: app.branch, trusted: app.trusted });
+      const result = await deployApp({ appName: app.name, repoSource: app.repoUrl!, branch: app.branch, trusted: app.trusted, trigger: "poll", announcedCommit: sha });
       deployed.push({ app: app.name, commit: result.commitHash });
       audit({ event: "poll.deploy", app: app.name, commit: result.commitHash });
     } catch (err) {

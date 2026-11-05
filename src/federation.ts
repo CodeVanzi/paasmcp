@@ -46,6 +46,7 @@ export function verifyGitHubWebhookSignature(
 
 export async function handleGitHubPushWebhook(payload: {
   ref?: string;
+  after?: string;
   repository?: { full_name?: string; clone_url?: string; ssh_url?: string };
 }): Promise<{
   matchedApps: string[];
@@ -58,6 +59,7 @@ export async function handleGitHubPushWebhook(payload: {
     ? ref.slice("refs/heads/".length)
     : "";
   const repoFullName = String(payload.repository?.full_name || "").toLowerCase();
+  const pushedSha = /^[0-9a-f]{40}$/.test(String(payload.after || "")) ? String(payload.after) : undefined;
 
   const matchedApps: string[] = [];
   const rebuiltApps: string[] = [];
@@ -86,6 +88,8 @@ export async function handleGitHubPushWebhook(payload: {
             appName: app.name,
             repoSource: app.repoUrl,
             branch: app.branch,
+            trigger: "webhook",
+            announcedCommit: pushedSha,
           });
           const latest = loadState();
           if (latest.apps[app.name]) {

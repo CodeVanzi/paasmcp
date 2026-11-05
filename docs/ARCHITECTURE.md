@@ -72,6 +72,25 @@ Every deploy builds the new image while the running version keeps serving, then 
 
 Traffic that reaches the app through the Docker network never finds the name unanswered; a request that is in flight on the old container when it stops can still fail unless the app shuts down gracefully (the lab sees 0–1 failed requests out of ~1,150 during a swap). Traffic to the loopback port itself (`tailscale serve`, `curl 127.0.0.1:<port>`) still has the short recreate gap, because only one container can own that port. Apps that do not serve HTTP deploy with `skipHealthcheck: true` (CLI `--no-healthcheck`), which restores the direct replace. `healthcheckPath`, `healthcheckTimeoutSeconds` and `skipHealthcheck` are stored on the app, so webhook and polling redeploys use them. Nothing stays running between deploys: the candidate exists only during `deployApp`.
 
+### Live deploy status (`src/deploys.ts`)
+
+Deploys start in several processes (dashboard, CLI, MCP, the `paasmcp poll` timer, webhooks inside the dashboard), so
+progress lives on disk, not in memory: `deployApp` opens a run (`startDeployRun`) and writes each phase to
+`paasmcp/deploys/<app>.json` (0600, atomic rename, last 10 runs). Phases: `detected` (poll/webhook saw a new
+commit; its SHA is shown until the code is fetched), `fetching`, `building`, `checking` (candidate + health check),
+`switching`, then `live` or `failed`. After the fetch the run records the commit's subject, author and commit date
+(`headCommitInfo`, control characters stripped, length capped). A failed run keeps the first line of the error and
+the last 30 lines of output, with credentials in URLs and GitHub tokens removed (`redactCredentials`). Each run notes
+its process id: a run whose process died shows as interrupted instead of building forever.
+
+`docker compose build` runs asynchronously (`runAsync`), so a dashboard-started or webhook build no longer blocks
+the dashboard's event loop and `/api/deploys` keeps answering. `deploySummary` gives the dashboard (and `paas_status`)
+one entry per app: the run in progress, the last finished one, the running commit and the GitHub links. Links are
+built only from the `owner/repo` parsed out of `repoUrl` (`githubSource`) and full 40-hex SHAs, so a token inside a
+stored clone URL never reaches the page. The dashboard reads `/api/deploys` every 10 s (2.5 s while a deploy runs, not
+while the tab is hidden) and reloads the app list when a deploy ends. A brand-new app shows as its own row during its
+first deploy.
+
 ---
 
 ## 4. Multi-Server High Availability (HA) Handshake & Federation (`src/federation.ts`)
@@ -580,6 +599,9 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   until a person wakes it by hand; with it off, nothing is sent.
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
+- `scripts/deploy-status-lab.sh`: real Docker deploys started from the dashboard API: the phases are seen while
+  they run, `/api/deploys` keeps answering quickly during the build, a crashing commit ends `failed` with its log
+  while the previous version keeps serving, and the commit's message and author are recorded.
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,
   Django, Go, Go `cmd/`, static, C# / ASP.NET in `src/<name>/`).
 - `scripts/mirror-lab.sh`: two simulated servers on one Docker host (own network, ports 5432/5433):

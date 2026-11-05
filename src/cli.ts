@@ -84,6 +84,7 @@ import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { installMcpService, startMcpHttpServer } from "./mcp-http.js";
 import { getSystemStatusSummary } from "./mcp-server.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
+import { deployRuns, deploySummary } from "./deploys.js";
 import {
   enableDashboardTwoFactor,
   isDashboardTwoFactorEnabled,
@@ -535,6 +536,16 @@ async function runCli() {
       break;
     }
 
+    case "deploys": {
+      const [appArg] = rest;
+      if (appArg) {
+        console.log(JSON.stringify(deployRuns(sanitizeSlug(appArg)), null, 2));
+      } else {
+        console.log(JSON.stringify(deploySummary(loadState().apps), null, 2));
+      }
+      break;
+    }
+
     case "poll": {
       const [sub, arg1] = rest;
       if (!sub || sub === "run") {
@@ -859,6 +870,7 @@ async function runCli() {
 
       const hcTimeout = getFlagValue(rest, "--healthcheck-timeout");
       const res = await deployApp({
+        trigger: "cli",
         trusted,
         healthcheckPath: getFlagValue(rest, "--healthcheck-path"),
         healthcheckTimeoutSeconds: hcTimeout ? Number(hcTimeout) : undefined,
@@ -993,6 +1005,7 @@ Commands:
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
   paasmcp active tunnel <status|on|off>             Cloudflare Tunnel just for those apps, on both servers
   paasmcp edge <status|install|add|remove|reload|uninstall>  Self-hosted entry (Caddy) splitting requests between both servers
+  paasmcp deploys [app]                       Deploys in progress and recent ones (phase, commit, error)
   paasmcp poll <run|enable <app>|disable <app>|install-timer>  Auto-deploy by polling git (no public webhook, 0 MB idle)
   paasmcp scale <status|tick|history|diary|rule|language|test|install-timer|uninstall-timer>
                                                     Measure apps, rehearse and explain scaling decisions

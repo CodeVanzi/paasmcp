@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -21,7 +21,8 @@ import {
 } from "./config.js";
 import { checkHost } from "./hostcheck.js";
 import { ensureDockerNetwork, provisionDatabase } from "./database.js";
-import { cloneOrUpdateRepo, DetectedBuildPlan, detectOrGenerateDockerfile } from "./github.js";
+import { cloneOrUpdateRepo, DetectedBuildPlan, detectOrGenerateDockerfile, headCommitInfo } from "./github.js";
+import { cleanText, DeployTracker, DeployTrigger, forgetDeploys, shortCommit, startDeployRun } from "./deploys.js";
 import { getSecrets, setSecretEntries, writeRuntimeEnvFile } from "./vault.js";
 import { activeComposeExtras, publishActiveState } from "./active.js";
 import { forgetScaleData } from "./scale.js";
@@ -46,6 +47,32 @@ export interface DeployOptions {
   skipHealthcheck?: boolean;
   /** Exact full commit SHA to build instead of the branch head (active-active peers). */
   commit?: string;
+  /** Who started the deploy, shown on the dashboard (default "cli"). */
+  trigger?: DeployTrigger;
+  /** Commit that made the deploy start (poll timer, webhook), shown until the code is fetched. */
+  announcedCommit?: string;
+}
+
+const RUN_OUTPUT_LIMIT = 64 * 1024;
+
+/** Runs a command without blocking the event loop; the error carries the end of its output. */
+export function runAsync(cmd: string, args: string[], cwd: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    const keep = (chunk: Buffer) => {
+      output += chunk.toString("utf-8");
+      if (output.length > RUN_OUTPUT_LIMIT) output = output.slice(-RUN_OUTPUT_LIMIT);
+    };
+    child.stdout.on("data", keep);
+    child.stderr.on("data", keep);
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code === 0) return resolve();
+      const tail = output.trim().split("\n").slice(-60).join("\n");
+      reject(new Error(`Command failed: ${cmd} ${args.join(" ")} (${signal || `exit ${code}`})\n${tail}`));
+    });
+  });
 }
 
 export function syncHomepageDashboard(): void {
@@ -384,7 +411,7 @@ function containerLogs(name: string, lines = CANDIDATE_LOG_LINES): string {
   return out.length > 6000 ? out.slice(-6000) : out;
 }
 
-export async function deployApp(opts: DeployOptions): Promise<{
+export interface DeployResult {
   app: AppRecord;
   commitHash: string;
   provisionedDatabases: string[];
@@ -395,7 +422,33 @@ export async function deployApp(opts: DeployOptions): Promise<{
   removedForSafety?: string[];
   hostAccessKept?: string[];
   hint?: string;
-}> {
+}
+
+/**
+ * Builds and starts an app. Progress (fetching, building, checking, switching, live/failed) is written
+ * to deploys/<app>.json as it goes, so the dashboard can show it live whichever process deploys.
+ */
+export async function deployApp(opts: DeployOptions): Promise<DeployResult> {
+  const slug = sanitizeSlug(opts.appName);
+  const announced = opts.announcedCommit || opts.commit;
+  const tracker = startDeployRun({
+    app: slug,
+    trigger: opts.trigger || "cli",
+    branch: opts.branch || "main",
+    commit: announced ? shortCommit(announced) : undefined,
+    phase: opts.trigger === "poll" || opts.trigger === "webhook" ? "detected" : "fetching",
+  });
+  try {
+    const result = await runDeploy(opts, tracker);
+    tracker.succeed(result.warning);
+    return result;
+  } catch (err) {
+    tracker.fail(err);
+    throw err;
+  }
+}
+
+async function runDeploy(opts: DeployOptions, tracker: DeployTracker): Promise<DeployResult> {
   const slug = sanitizeSlug(opts.appName);
   const branch = validateBranchName(opts.branch || "main");
   const memoryLimit = validateResourceLimit(opts.memoryLimit, "memory");
@@ -443,7 +496,19 @@ export async function deployApp(opts: DeployOptions): Promise<{
     provisionedDatabases.push(res.record.name);
   }
 
+  tracker.phase("fetching");
   const { commitHash, commitSha } = cloneOrUpdateRepo(opts.repoSource, repoDir, branch, opts.commit);
+  if (commitSha) {
+    const info = headCommitInfo(repoDir);
+    tracker.commit({
+      sha: commitSha,
+      short: commitHash,
+      message: cleanText(info.subject, 200),
+      author: cleanText(info.author, 80),
+      date: info.date,
+    });
+  }
+  tracker.phase("building");
   const buildPlan: DetectedBuildPlan = detectOrGenerateDockerfile(repoDir, opts.internalPort);
   const internalPort = opts.internalPort || buildPlan.detectedPort;
 
@@ -541,8 +606,10 @@ networks:
   const timeoutMs = (healthcheckTimeoutSeconds || DEFAULT_HEALTHCHECK_TIMEOUT_SECONDS) * 1000;
   const candidateName = `${containerName}-candidate`;
   try {
-    compose("build");
+    // Asynchronous: a long build must not freeze the dashboard (it answers progress requests meanwhile).
+    await runAsync("docker", ["compose", "-f", composePath, "build"], appDir);
     if (!healthcheckDisabled) {
+      tracker.phase("checking");
       // Blue/green: run the new image as a one-off candidate on a free loopback port and probe it.
       const candidatePort = await findFreeLoopbackPort();
       removeContainer(candidateName); // leftover from an interrupted deploy
@@ -581,6 +648,7 @@ networks:
   }
 
   // Swap: recreate the production container(s) from the new image.
+  tracker.phase("switching");
   try {
     compose("up", "-d", "--no-build", "--remove-orphans");
     if (healthcheck) {
@@ -749,6 +817,7 @@ export function manageAppLifecycle(
       delete state.apps[slug];
       saveState(state);
       forgetScaleData(slug);
+      forgetDeploys(slug);
       syncHomepageDashboard();
       return `App '${slug}' was permanently deleted (containers, volumes, images and files).`;
     }

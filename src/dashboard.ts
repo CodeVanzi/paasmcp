@@ -1,4 +1,5 @@
 import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
+import { deploySummary } from "./deploys.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
@@ -351,6 +352,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         }
 
+        if (pathname === "/api/deploys" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ deploys: deploySummary(loadState().apps) }));
+          return true;
+        }
+
         if (pathname === "/api/doctor" && req.method === "GET") {
           const appName = url.searchParams.get("app") || undefined;
           const report = runPaaSDoctor(appName);
@@ -507,6 +514,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             confirmFromBody("app.trust", { appName: sanitizeSlug(String(body.appName)) }, body);
           }
           const result = await deployApp({
+            trigger: "dashboard",
             trusted,
             healthcheckPath: body.healthcheckPath ? String(body.healthcheckPath) : undefined,
             healthcheckTimeoutSeconds: body.healthcheckTimeoutSeconds ? Number(body.healthcheckTimeoutSeconds) : undefined,
@@ -1318,6 +1326,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .actions { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
     .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--success); margin-right: 7px; }
     .status-dot.stopped { background: var(--danger); }
+    .status-dot.deploying { background: var(--warning); animation: dep-pulse 1.2s ease-in-out infinite; }
+    .status-dot.failed { background: var(--warning); }
+    @keyframes dep-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @media (prefers-reduced-motion: reduce) { .status-dot.deploying { animation: none; } }
+    .dep-line { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.45; }
+    .dep-line.active { color: var(--warning); font-weight: 600; }
+    .dep-line.failed { color: var(--danger); font-weight: 600; }
+    .dep-msg { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+    .dep-err summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+    .dep-err pre { max-width: 420px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 10.5px; margin: 4px 0 0; }
     .arch-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
@@ -2349,6 +2367,30 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         sizeLabel: "Tamanho:",
         stoppedStatus: "Parado",
         onDemandStatus: "Sob demanda",
+        depPhase_detected: "🔔 Nova versão no repositório",
+        depPhase_fetching: "⬇️ Baixando o código",
+        depPhase_building: "🔨 Montando a imagem",
+        depPhase_checking: "🩺 Testando a nova versão",
+        depPhase_switching: "🔁 Trocando de versão",
+        depPhase_live: "🟢 No ar",
+        depPhase_failed: "❌ Último deploy falhou",
+        depOldStillLive: "a versão anterior segue no ar",
+        depShowError: "Ver o erro",
+        depFirstDeploy: "primeiro deploy",
+        depStarted: "começou",
+        depDeployed: "deploy",
+        depCommitted: "commit",
+        depTrig_dashboard: "pelo painel",
+        depTrig_cli: "pela linha de comando",
+        depTrig_mcp: "pela IA",
+        depTrig_webhook: "por push no GitHub",
+        depTrig_poll: "pela verificação do repositório",
+        depTrig_active: "pelo outro servidor",
+        depTrig_mirror: "pelo segundo servidor",
+        relNow: "agora",
+        relMin: "há {n} min",
+        relHour: "há {n} h",
+        relDay: "há {n} dias",
       },
       en: {
         setupTitle: "🧭 First-time setup: what do you need?",
@@ -2528,6 +2570,30 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         sizeLabel: "Size:",
         stoppedStatus: "Stopped",
         onDemandStatus: "On demand",
+        depPhase_detected: "🔔 New version in the repository",
+        depPhase_fetching: "⬇️ Fetching the code",
+        depPhase_building: "🔨 Building the image",
+        depPhase_checking: "🩺 Testing the new version",
+        depPhase_switching: "🔁 Switching versions",
+        depPhase_live: "🟢 Live",
+        depPhase_failed: "❌ Last deploy failed",
+        depOldStillLive: "the previous version is still live",
+        depShowError: "Show the error",
+        depFirstDeploy: "first deploy",
+        depStarted: "started",
+        depDeployed: "deployed",
+        depCommitted: "committed",
+        depTrig_dashboard: "from the dashboard",
+        depTrig_cli: "from the command line",
+        depTrig_mcp: "by the AI",
+        depTrig_webhook: "by a GitHub push",
+        depTrig_poll: "by the repository check",
+        depTrig_active: "by the other server",
+        depTrig_mirror: "by the second server",
+        relNow: "just now",
+        relMin: "{n} min ago",
+        relHour: "{n} h ago",
+        relDay: "{n} days ago",
       }
     };
 
@@ -2546,7 +2612,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "homeTitle": "🏠 Início",
           "setupTitle": "🧭 Integrações opcionais",
           "appsTitle": "📦 Seus apps",
-          "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app.",
+          "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app. Quando chega um commit novo, a linha do app mostra a nova versão sendo montada e testada; a versão atual continua no ar até a nova passar no teste.",
           "deployTitle": "➕ Publicar um app",
           "deployDesc": "Informe o repositório do GitHub (ou uma pasta do servidor). O painel descobre a linguagem e monta tudo sozinho. As senhas do app ficam em Senhas e chaves.",
           "exposeTitle": "🌐 Deixar um app acessível",
@@ -2826,7 +2892,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "homeTitle": "🏠 Home",
           "setupTitle": "🧭 Optional integrations",
           "appsTitle": "📦 Your apps",
-          "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app.",
+          "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app. When a new commit arrives, the app's row shows the new version being built and tested; the current version stays live until the new one passes the test.",
           "deployTitle": "➕ Publish an app",
           "deployDesc": "Enter the GitHub repository (or a folder on the server). The dashboard detects the language and builds everything. App passwords live in Passwords & keys.",
           "exposeTitle": "🌐 Make an app reachable",
@@ -3752,6 +3818,82 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.getElementById('expApp').scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 
+    // Deploy progress: /api/deploys is read every few seconds (faster while a deploy runs).
+    let deployState = null;
+    let deployStateJson = '';
+    let deployPollTimer = null;
+    function relTime(iso) {
+      const ts = Date.parse(iso || '');
+      if (!ts) return '';
+      const sec = Math.max(0, (Date.now() - ts) / 1000);
+      if (sec < 60) return t('relNow');
+      if (sec < 3600) return t('relMin').replace('{n}', Math.floor(sec / 60));
+      if (sec < 172800) return t('relHour').replace('{n}', Math.floor(sec / 3600));
+      return t('relDay').replace('{n}', Math.floor(sec / 86400));
+    }
+    function relSpan(iso) {
+      return iso ? \`<span class="rel-time" data-ts="\${esc(iso)}" title="\${esc(iso.replace('T', ' ').slice(0, 19))}">\${esc(relTime(iso))}</span>\` : '';
+    }
+    function refreshRelTimes() {
+      document.querySelectorAll('.rel-time').forEach(el => { el.textContent = relTime(el.dataset.ts); });
+    }
+    function commitHtml(c, url) {
+      if (!c || !c.short) return '';
+      const code = \`<code>\${esc(c.short)}</code>\`;
+      const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener noreferrer">\${code}</a>\` : code;
+      const msg = c.message ? \` <span class="dep-msg" title="\${esc(c.message)}\${c.author ? ' · ' + esc(c.author) : ''}">\${esc(c.message)}</span>\` : '';
+      const when = c.date ? \` · \${esc(t('depCommitted'))} \${relSpan(c.date)}\` : '';
+      return link + msg + when;
+    }
+    function deployStatusHtml(d, hasApp) {
+      if (!d) return '';
+      if (d.active) {
+        const r = d.active;
+        const target = r.commit ? \`<div class="dep-line">→ \${commitHtml(r.commit, r.commitUrl)}</div>\` : '';
+        return \`<div class="dep-line active">\${esc(t('depPhase_' + r.phase))}</div>\${target}
+          <div class="dep-line">\${esc(t('depStarted'))} \${relSpan(r.startedAt)} · \${esc(t('depTrig_' + r.trigger))}\${hasApp ? '' : ' · ' + esc(t('depFirstDeploy'))}</div>\`;
+      }
+      const r = d.last;
+      if (!r) return '';
+      if (r.phase === 'failed') {
+        const details = (r.error || '') + (r.log ? '\\n\\n' + r.log : '');
+        const target = r.commit ? \`<div class="dep-line">→ \${commitHtml(r.commit, r.commitUrl)}</div>\` : '';
+        return \`<div class="dep-line failed">\${esc(t('depPhase_failed'))} \${relSpan(r.finishedAt)}</div>\${target}
+          \${hasApp ? \`<div class="dep-line">\${esc(t('depOldStillLive'))}</div>\` : ''}
+          \${details ? \`<details class="dep-err"><summary>\${esc(t('depShowError'))}</summary><pre>\${esc(details)}</pre></details>\` : ''}\`;
+      }
+      return \`<div class="dep-line">\${esc(t('depPhase_live'))} · \${esc(t('depDeployed'))} \${relSpan(r.finishedAt)}</div>\`;
+    }
+    async function pollDeploys() {
+      clearTimeout(deployPollTimer);
+      let next = 10000;
+      try {
+        if (document.visibilityState === 'visible') {
+          const res = await rawFetch('/api/deploys');
+          if (res.ok) {
+            const data = await res.json();
+            const before = deployState || (lastStatus && lastStatus.deploys) || {};
+            const now = data.deploys || {};
+            const json = JSON.stringify(now);
+            if (json !== deployStateJson) {
+              deployStateJson = json;
+              deployState = now;
+              const finished = Object.keys(before).some(k => before[k].active && !(now[k] && now[k].active));
+              if (finished) loadAll();
+              else if (lastStatus) renderStatusData(lastStatus);
+            }
+            if (Object.values(now).some(d => d.active)) next = 2500;
+          } else if (res.status === 401) {
+            next = 30000;
+          }
+        }
+      } catch {
+        // offline for a moment: try again later
+      }
+      deployPollTimer = setTimeout(pollDeploys, next);
+    }
+    setInterval(refreshRelTimes, 20000);
+
     function renderStatusData(s) {
       const domain = getBaseDomain();
       document.getElementById('topDomainBadge').textContent = '🌐 ' + domain;
@@ -3792,11 +3934,30 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
       document.getElementById('dynamicScopeChips').innerHTML = apps.map(a => \`<button class="chip" onclick="setVaultScope('\${esc(a.name)}')">📦 \${esc(a.name)}</button>\`).join(' ');
 
+      const deploys = deployState || s.deploys || {};
       const tbody = document.getElementById('appsTable');
-      if (apps.length === 0) {
+      // First deploy of a new app: it has no record yet, only its progress.
+      const pendingRows = Object.entries(deploys)
+        .filter(([name, d]) => d.active && !(s.apps || {})[name])
+        .map(([name, d]) => \`
+            <tr>
+              <td><span class="status-dot deploying"></span><strong>\${esc(name)}</strong>\${deployStatusHtml(d, false)}</td>
+              <td colspan="5" style="color:var(--muted);font-size:11.5px;">\${d.source ? \`🐙 <a href="\${esc(d.source.url)}" target="_blank" rel="noopener noreferrer">\${esc(d.source.name)}</a>\` : ''}</td>
+            </tr>\`).join('');
+      if (apps.length === 0 && !pendingRows) {
         tbody.innerHTML = \`<tr><td colspan="6" style="color:var(--muted)">\${esc(t('emptyApps'))}</td></tr>\`;
       } else {
-        tbody.innerHTML = apps.map(a => {
+        tbody.innerHTML = pendingRows + apps.map(a => {
+          const d = deploys[a.name];
+          const dotClass = a.status === 'stopped' ? 'stopped' : d && d.active ? 'deploying' : d && !d.active && d.last && d.last.phase === 'failed' ? 'failed' : '';
+          const src = d && d.source;
+          const sourceHtml = src
+            ? \`<div class="dep-line">🐙 <a href="\${esc(src.url)}" target="_blank" rel="noopener noreferrer">\${esc(src.name)}</a> · <a href="\${esc(src.branchUrl)}" target="_blank" rel="noopener noreferrer">\${esc(a.branch)}</a></div>\`
+            : '';
+          const running = d && d.running;
+          const commitLine = running
+            ? \`<div class="dep-line">\${commitHtml(running, running.commitUrl)}</div>\`
+            : (a.lastCommit ? \`<div class="dep-line">commit: <code>\${esc(a.lastCommit)}</code></div>\` : '');
           const m = metricsMap[a.containerName];
           const metricHtml = m
             ? \`<div><code>CPU: \${esc(m.cpuPercent)}</code></div><div style="margin-top:3px;"><code>RAM: \${esc(m.memUsage)}</code></div>\`
@@ -3811,13 +3972,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           return \`
             <tr>
               <td>
-                <span class="status-dot \${a.status === 'stopped' ? 'stopped' : ''}"></span>
+                <span class="status-dot \${dotClass}"></span>
                 <strong>\${esc(a.name)}</strong>
+                \${deployStatusHtml(d, true)}
                 \${a.lastWebhookAt ? \`<div style="font-size:10.5px;color:var(--muted);">⚡ Webhook: \${esc(a.lastWebhookAt.slice(0,19))}</div>\` : ''}
               </td>
               <td>
                 <code>\${esc(a.runtimeType)}</code>
-                \${a.lastCommit ? \`<div style="font-size:11px;color:var(--muted);margin-top:3px;">commit: <code>\${esc(a.lastCommit)}</code></div>\` : ''}
+                \${sourceHtml}
+                \${commitLine}
               </td>
               <td>\${metricHtml}\${limitsHtml}</td>
               <td>
@@ -3825,7 +3988,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                 <div style="margin-top:3px;">\${(a.databases || []).map(d => \`<span class="badge" style="font-size:10px;padding:1px 6px;">\${esc(d)}</span>\`).join(' ') || ''}</div>
               </td>
               <td>\${(a.domains || []).map(d => \`<div style="margin-bottom:3px;"><a href="\${esc(d.url)}" target="_blank" rel="noopener noreferrer">🔗 \${esc(d.url)}</a> <span class="badge" style="padding:1px 6px;font-size:10px;">\${esc(d.mode)}</span></div>\`).join('') || '<span style="color:var(--muted)">Local only</span>'}</td>
-              <td class="actions">
+              <td><div class="actions">
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="selectAppForExpose('\${esc(a.name)}')">\${esc(t('actionExpose'))}</button>
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="setVaultScope('\${esc(a.name)}')">\${esc(t('actionEnv'))}</button>
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
@@ -3836,7 +3999,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                      <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
                      <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','purge')">\${esc(t('actionPurge'))}</button>\`
                   : \`<button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>\`}
-              </td>
+              </div></td>
             </tr>
           \`;
         }).join('');
@@ -4939,6 +5102,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       btn.textContent = t('toastDeploying');
       btn.disabled = true;
       try {
+        setTimeout(pollDeploys, 800);
         const res = await fetch('/api/deploy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -4999,6 +5163,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     applyPreferences();
     loadAll();
+    pollDeploys();
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pollDeploys(); });
   </script>
 </body>
 </html>`;
