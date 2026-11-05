@@ -70,6 +70,65 @@ export interface AppRecord {
     rule?: Partial<ScaleRule>;
     capacity?: CapacityResult;
   };
+  /**
+   * Copies on helper PCs (pool.ts, scale phase 3, set by hand). While `enabled`, the app's traffic goes
+   * through the pool balancer on this server, which splits it between this copy and the helpers'.
+   */
+  pool?: AppPoolConfig;
+}
+
+export interface AppPoolConfig {
+  enabled: boolean;
+  /** Copies wanted in total: one here plus `copies - 1` on helpers. */
+  copies: number;
+  /** Copies running on helpers, as last started or confirmed. */
+  placed: PoolCopyRecord[];
+  enabledAt: string;
+  /** Set by `stop`: copies on helpers are stopped too and come back on `start`. */
+  stoppedAt?: string;
+  lastError?: string;
+}
+
+export interface PoolCopyRecord {
+  id: string;
+  helper: string;
+  port: number;
+  /** Store-independent image fingerprint (poolproto.imageFingerprint). */
+  fingerprint: string;
+  /** Hash of the variables and limits the copy was started with: a change replaces it. */
+  configHash: string;
+  cpus: number;
+  memMb: number;
+  startedAt: string;
+}
+
+/** A PC that runs copies when the origin asks (scale phase 3: the owner's own machines). */
+export interface PoolHelperRecord {
+  name: string;
+  /** Tailscale IPv4 (the worker publishes copies only there, and accepts orders only from the origin's). */
+  ip: string;
+  sshPort: number;
+  tier: "own";
+  arch: string;
+  cpus: number;
+  memMb: number;
+  diskFreeGb: number;
+  /** What the owner gave to copies (set at join). */
+  give: { cpus: number; memMb: number };
+  dockerVersion?: string;
+  workerVersion?: string;
+  addedAt: string;
+  /** Paused by a person or the AI: gets no copies, and its copies move away. */
+  paused?: { at: string; by: string };
+}
+
+export interface PoolConfig {
+  /** This server's Tailscale IP: Postgres, Redis and S3 are also published there for the copies. */
+  bindIp?: string;
+  helpers: Record<string, PoolHelperRecord>;
+  /** Pending invites (the secret is derived from the system vault, never stored). */
+  invites: Record<string, { name: string; createdAt: string; expiresAt: string; usedAt?: string }>;
+  balancerAt?: string;
 }
 
 /** When the decision rule would add or remove a copy (scale.ts). Numbers are starting points to calibrate. */
@@ -264,6 +323,8 @@ export interface PaaSState {
   /** Images moved by 'paasmcp update apply' (see updater.ts PINNED). */
   versions?: Partial<Record<"postgres" | "redis" | "garage", string>>;
   federation?: FederationConfig;
+  /** PCs that run extra copies of apps (pool.ts). */
+  pool?: PoolConfig;
   /** Measuring for automatic scaling (scale.ts). */
   scale?: {
     /** Language of the decision diary in the CLI, the MCP tool and the log (the dashboard follows its own switch). */
@@ -458,6 +519,22 @@ export function allocateAppPort(state: PaaSState, existingAppName?: string): num
     }
   }
   throw new Error("No available ports in range 4000-4998");
+}
+
+/**
+ * The Tailscale IP where this server also publishes Postgres, Redis and S3: set by the mirror (the peer
+ * reaches the data) or by the helper pool (copies on helpers reach it). Both are the same address.
+ */
+export function tailnetBindIp(state: Pick<PaaSState, "mirror" | "pool">): string | undefined {
+  return state.mirror?.bindIp || state.pool?.bindIp;
+}
+
+/** The container that splits a pooled app's requests between its copies (pool.ts). */
+export const POOL_BALANCER = "paasmcp-pool-lb";
+
+/** Where Cloudflare Tunnel sends an app's requests: its container, or the pool balancer while helpers serve it. */
+export function appServiceUrl(app: Pick<AppRecord, "containerName" | "internalPort" | "localPort" | "pool">): string {
+  return app.pool?.enabled ? `http://${POOL_BALANCER}:${app.localPort}` : `http://${app.containerName}:${app.internalPort}`;
 }
 
 /** Offers of this server's own Postgres (not of a promoted copy of another server's data). */

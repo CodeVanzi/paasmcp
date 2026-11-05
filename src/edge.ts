@@ -39,6 +39,14 @@ export function edgeBackends(state: PaaSState, appName: string): EdgeBackend[] {
   const app = state.apps[appName];
   if (!app) return [];
   const out: EdgeBackend[] = [{ address: `127.0.0.1:${app.localPort}`, where: "here" }];
+  if (app.pool?.enabled && !app.originNodeId) {
+    // Copies on helper PCs (pool.ts), reached over Tailscale. Paused helpers leave the list.
+    for (const c of app.pool.placed) {
+      const h = state.pool?.helpers[c.helper];
+      if (h && !h.paused && IPV4.test(h.ip)) out.push({ address: `${h.ip}:${c.port}`, where: `helper ${h.name}` });
+    }
+    return out;
+  }
   if (!app.activeActive) return out;
   if (!app.originNodeId) {
     for (const [peer, offer] of ownOffers(state)) {

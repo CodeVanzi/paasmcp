@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { loadState, sanitizeSlug, saveState } from "./config.js";
+import { appServiceUrl, loadState, sanitizeSlug, saveState } from "./config.js";
 import { syncHomepageDashboard } from "./deployer.js";
 import { assessRisk } from "./guard.js";
 import { getSecrets } from "./vault.js";
@@ -86,7 +86,8 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
   const fullHostname = subdomain.endsWith(baseDomain)
     ? subdomain
     : `${subdomain}.${baseDomain}`;
-  const internalServiceUrl = `http://${app.containerName}:${app.internalPort}`;
+  // With copies on helpers, visits go through the pool balancer here (pool.ts).
+  const internalServiceUrl = appServiceUrl(app);
 
   const sysSecrets = getSecrets("system");
   const cfToken = sysSecrets.CF_API_TOKEN || process.env.CF_API_TOKEN;

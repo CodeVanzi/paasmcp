@@ -2,7 +2,9 @@ import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
-import { DiaryLang, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
+import { DiaryLang, ruleFor, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
+import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies } from "./pool.js";
+import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
@@ -68,6 +70,44 @@ function checkLoginRateLimit(ip: string): boolean {
   }
   entry.count += 1;
   return entry.count <= 12;
+}
+
+
+// Helper pool tasks can take minutes (sending an image, 30 s drains), longer than a proxy waits for an
+// answer: they run in the background, one at a time, under the state lock, and the screen follows them.
+interface PoolJob {
+  id: string;
+  kind: string;
+  subject: string;
+  startedAt: string;
+  log: string[];
+  done: boolean;
+  finishedAt?: string;
+  result?: unknown;
+  error?: string;
+}
+let poolJob: PoolJob | undefined;
+
+function startPoolJob(kind: string, subject: string, fn: (log: (l: string) => void) => Promise<unknown>): PoolJob {
+  if (poolJob && !poolJob.done) throw new Error(`Wait for the current helper task to finish (${poolJob.kind} ${poolJob.subject}).`);
+  const job: PoolJob = { id: crypto.randomBytes(4).toString("hex"), kind, subject, startedAt: new Date().toISOString(), log: [], done: false };
+  poolJob = job;
+  const log = (l: string) => {
+    job.log.push(`${new Date().toISOString().slice(11, 19)} ${l}`);
+    if (job.log.length > 200) job.log.splice(0, job.log.length - 200);
+  };
+  withStateLock(() => fn(log))
+    .then((r) => {
+      job.result = r;
+    })
+    .catch((err) => {
+      job.error = err instanceof Error ? err.message : String(err);
+    })
+    .finally(() => {
+      job.done = true;
+      job.finishedAt = new Date().toISOString();
+    });
+  return job;
 }
 
 export function getOrCreateDashboardToken(): string {
@@ -507,8 +547,19 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             action,
             body.tailLines ? Number(body.tailLines) : 120
           );
+          // Copies on helper PCs follow this server's copy, in the background.
+          let poolNote = "";
+          const lifeSlug = sanitizeSlug(String(body.appName));
+          if (loadState().apps[lifeSlug]?.pool && ["restart", "stop", "start", "rollback", "destroy"].includes(action)) {
+            try {
+              startPoolJob(action, lifeSlug, (log) => poolAfterLifecycle(lifeSlug, action, log));
+              poolNote = "\nCopies on helper PCs are being updated (Helpers screen).";
+            } catch (err) {
+              poolNote = `\nCopies on helper PCs were not updated: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ output }));
+          res.end(JSON.stringify({ output: output + poolNote }));
           return true;
         }
 
@@ -534,11 +585,20 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const status = scaleStatus({ lang });
           const wanted = url.searchParams.get("app");
           const app = status.apps.find((a) => a.app === wanted)?.app ?? status.apps[0]?.app;
+          const st = loadState();
           return reply({
             ...status,
             app: app || null,
             history: app ? scaleHistory(app, { bucketMinutes: 5 }) : null,
             diary: app ? scaleDiary({ app, lang, limit: 30 }) : [],
+            pool: app
+              ? {
+                  readiness: poolReadiness(app, st),
+                  helpers: Object.keys(st.pool?.helpers || {}).length,
+                  copies: (st.apps[app]?.pool?.placed || []).map((c) => ({ helper: c.helper, since: c.startedAt })),
+                  job: poolJob || null,
+                }
+              : null,
           });
         }
         if (pathname === "/api/scale/rule" && req.method === "POST") {
@@ -550,6 +610,52 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/scale/language" && req.method === "POST") {
           const body = await readJsonBody(req);
           return reply(setDiaryLanguage(String(body.language || "")));
+        }
+        if (pathname === "/api/scale/copies" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const slug = sanitizeSlug(String(body.appName || ""));
+          const app = loadState().apps[slug];
+          if (!app) throw new Error(`App '${slug}' not found.`);
+          const copies = Number(body.copies);
+          if (!Number.isInteger(copies) || copies < 1 || copies > 20) throw new Error("Copies must be a whole number from 1 to 20.");
+          if (copies > 1) {
+            const ready = poolReadiness(slug);
+            if (!ready.ok) throw new Error(`App '${slug}' cannot have copies on helpers yet:\n- ${ready.problems.join("\n- ")}`);
+          }
+          confirmFromBody("app.pool", { appName: slug, copies, enabling: !app.pool?.enabled, max: ruleFor(app).max }, body);
+          return reply({ job: startPoolJob("copies", slug, (log) => setCopies(slug, copies, { by: actor, log })) });
+        }
+        if (pathname === "/api/scale/off" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const slug = sanitizeSlug(String(body.appName || ""));
+          return reply({ job: startPoolJob("off", slug, (log) => disablePool(slug, { by: actor, log })) });
+        }
+
+        if (pathname === "/api/pool" && req.method === "GET") {
+          return reply({ ...(await poolStatus({ probe: url.searchParams.get("probe") === "1" })), job: poolJob || null, acl: poolAcl() });
+        }
+        if (pathname === "/api/pool/job" && req.method === "GET") return reply({ job: poolJob || null });
+        if (pathname === "/api/pool/invite" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = validateHelperName(String(body.name || ""));
+          confirmFromBody("pool.invite", { helper: name }, body);
+          return reply(await createInvite(name, { by: actor }));
+        }
+        if (pathname === "/api/pool/add" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await addHelper(String(body.name || ""), String(body.ip || ""), { by: actor }));
+        }
+        if (pathname === "/api/pool/pause" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = validateHelperName(String(body.name || ""));
+          const paused = body.paused === true;
+          return reply({ job: startPoolJob(paused ? "pause" : "resume", name, (log) => pauseHelper(name, paused, { by: actor, log })) });
+        }
+        if (pathname === "/api/pool/remove" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = validateHelperName(String(body.name || ""));
+          confirmFromBody("pool.remove", { helper: name }, body);
+          return reply({ job: startPoolJob("remove", name, (log) => removeHelper(name, { by: actor, log })) });
         }
 
         if (pathname === "/api/poll" && req.method === "POST") {
@@ -1267,6 +1373,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <button class="nav-btn" onclick="switchTab('vault', this)" id="navVault">🔐 Senhas e chaves</button>
           <button class="nav-btn" onclick="switchTab('email', this)" id="navEmail">✉️ E-mail</button>
           <button class="nav-btn" onclick="switchTab('mirror', this)" id="navMirror">🔁 Segundo servidor</button>
+          <button class="nav-btn" onclick="switchTab('pool', this)" id="navPool">🖥️ Ajudantes</button>
           <button class="nav-btn" onclick="switchTab('updates', this)" id="navUpdates">⬆️ Atualizações</button>
           <button class="nav-btn" onclick="switchTab('federation', this)" id="navFederation">🔗 Conexões e webhook</button>
           <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Diagnóstico</button>
@@ -1415,6 +1522,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div id="scaleNow"></div>
             <div id="scaleCharts" style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px;"></div>
             <div id="scaleBody">
+              <h3 data-i18n="copiesTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="copiesDesc"></p>
+              <div id="copiesBox"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+                <div style="width:160px;"><label class="field-label" for="copiesN" data-i18n="lblCopiesN"></label><input id="copiesN" type="number" min="1" max="20" /></div>
+                <button onclick="applyCopies()" data-i18n="btnCopiesApply"></button>
+                <button class="secondary" onclick="copiesOff()" id="btnCopiesOff" data-i18n="btnCopiesOff"></button>
+              </div>
+              <div id="copiesJobBox" style="margin-top:8px;"></div>
               <h3 data-i18n="scaleRuleTitle" style="margin-top:18px;"></h3>
               <p class="card-desc" data-i18n="scaleRuleDesc"></p>
               <div class="form-grid">
@@ -1974,6 +2090,68 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <li data-i18n="failback4"></li>
             </ol>
             <details style="margin-top:10px;font-size:12.5px;color:var(--muted);"><summary data-i18n="detailsTech"></summary><p data-i18n="mirrorTech"></p></details>
+          </div>
+        </div>
+
+        <div class="tab-pane" id="tab-pool">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="poolTitle"></h2>
+              <p class="card-desc" data-i18n="poolDesc"></p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+              <button class="secondary" onclick="loadPool(true)" data-i18n="btnPoolCheck"></button>
+            </div>
+            <div id="poolJobBox"></div>
+            <div id="poolHelpers"></div>
+            <h3 data-i18n="poolAppsTitle" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="poolAppsDesc"></p>
+            <div id="poolApps"></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2 data-i18n="poolAddTitle"></h2><p class="card-desc" data-i18n="poolAddDesc"></p></div>
+
+            <h3 data-i18n="poolStep1" style="margin-top:12px;"></h3>
+            <p class="card-desc" data-i18n="poolStep1Desc"></p>
+            <pre style="user-select:all;white-space:pre-wrap;word-break:break-all;">sudo apt install openssh-server
+git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm install &amp;&amp; npm run build</pre>
+
+            <h3 data-i18n="poolStep2" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="poolStep2Desc"></p>
+            <div class="form-grid" style="grid-template-columns:minmax(0,280px);">
+              <div><label class="field-label" for="poolInviteName" data-i18n="lblPoolName"></label><input id="poolInviteName" placeholder="notebook" /></div>
+            </div>
+            <button onclick="poolInvite()" data-i18n="btnPoolInvite"></button>
+            <div id="poolInviteBox" style="display:none;margin-top:10px;">
+              <p class="card-desc" id="poolInviteExp"></p>
+              <pre id="poolJoinCmd" style="user-select:all;white-space:pre-wrap;word-break:break-all;font-size:11.5px;"></pre>
+              <button class="secondary" onclick="copyText(document.getElementById('poolJoinCmd').textContent)" data-i18n="aiCopy"></button>
+            </div>
+
+            <h3 data-i18n="poolStep3" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="poolStep3Desc"></p>
+
+            <h3 data-i18n="poolStep4" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="poolStep4Desc"></p>
+            <div class="form-grid">
+              <div><label class="field-label" for="poolAddName" data-i18n="lblPoolName"></label><input id="poolAddName" placeholder="notebook" /></div>
+              <div><label class="field-label" for="poolAddIp" data-i18n="lblPoolIp"></label><input id="poolAddIp" placeholder="100.64.0.7" /></div>
+            </div>
+            <button onclick="poolAdd()" data-i18n="btnPoolAdd"></button>
+            <div id="poolAddBox" style="margin-top:10px;"></div>
+
+            <h3 data-i18n="poolStep5" style="margin-top:16px;"></h3>
+            <p class="card-desc" data-i18n="poolStep5Desc"></p>
+            <pre style="user-select:all;">sudo tailscale up --advertise-tags=tag:paasmcp-helper</pre>
+            <pre id="poolAcl" style="user-select:all;white-space:pre-wrap;word-break:break-all;font-size:11.5px;max-height:320px;overflow:auto;"></pre>
+            <button class="secondary" onclick="copyText(document.getElementById('poolAcl').textContent)" data-i18n="aiCopy"></button>
+          </div>
+          <div class="card">
+            <div class="card-header"><h2 data-i18n="poolHowTitle"></h2></div>
+            <p class="card-desc" data-i18n="poolHow1"></p>
+            <p class="card-desc" data-i18n="poolHow2"></p>
+            <p class="card-desc" data-i18n="poolHow3"></p>
+            <p class="card-desc" data-i18n="poolHow4"></p>
           </div>
         </div>
 
@@ -3355,6 +3533,172 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           "scaleLangSaved": "Diary language saved."
     });
 
+    Object.assign(I18N.pt, {
+          "navPool": "🖥️ Ajudantes",
+          "aaP_pool": "O app tem cópias em PCs ajudantes: volte a uma cópia primeiro. Por enquanto, um app usa ajudantes ou os dois servidores, não as duas coisas.",
+          "poolTitle": "🖥️ PCs ajudantes",
+          "poolDesc": "Seus próprios computadores podem rodar cópias extras dos apps deste servidor. Este servidor continua dono de tudo: guarda as senhas, monta a imagem, recebe as visitas e as divide entre a cópia daqui e as dos ajudantes. Num ajudante sem cópias, nenhum programa do PaaSMCP fica ligado.",
+          "btnPoolCheck": "🔄 Verificar agora",
+          "poolNone": "Nenhum PC ajudante ainda. Siga os passos abaixo para adicionar o primeiro.",
+          "poolSt_available": "disponível",
+          "poolSt_working": "trabalhando",
+          "poolSt_paused": "pausado",
+          "poolSt_gone": "sem resposta",
+          "poolSt_unknown": "ainda não verificado",
+          "poolGives": "cede {cpus} CPU e {mem} MB",
+          "poolUsing": "em uso {cpus} CPU e {mem} MB",
+          "poolDisk": "{gb} GB livres no disco",
+          "poolLoad": "carga {l}",
+          "poolSeen": "última resposta {date}",
+          "poolCopiesOn": "Cópias: {list}",
+          "poolNoCopies": "Sem cópias agora.",
+          "poolSecretsDisk": "A pasta em memória das variáveis não está pronta neste PC, então ele recusa cópias. Rode <code>sudo systemd-tmpfiles --create</code> nele.",
+          "poolPausedNote": "Pausado: não recebe cópias. As que tinha foram para outros ajudantes ou pararam.",
+          "btnPoolPause": "Pausar",
+          "btnPoolResume": "Retomar",
+          "btnPoolRemove": "Remover",
+          "poolAppsTitle": "Apps com cópias em ajudantes",
+          "poolAppsDesc": "O número de cópias de cada app se escolhe na tela Apps, no quadro de uso e escala.",
+          "poolAppsNone": "Nenhum app usa ajudantes ainda.",
+          "poolAppLine": "{running} de {wanted} cópias rodando",
+          "poolCopyNoAnswer": "{helper}: sem resposta",
+          "poolAppStopped": "app parado: as cópias dos ajudantes também pararam",
+          "poolAddTitle": "Adicionar um PC",
+          "poolAddDesc": "São cinco passos, dois deles no próprio PC. Leva uns 10 minutos.",
+          "poolStep1": "1. Prepare o PC",
+          "poolStep1Desc": "O PC precisa de Linux com Docker, o servidor OpenSSH, a Tailscale conectada na mesma conta deste servidor e o Node.js 20 ou mais novo instalado para todos os usuários (pelo pacote da distribuição ou do NodeSource, não pelo nvm). Depois, baixe e compile o PaaSMCP nele. Não rode o <code>init</code> nem o <code>install.sh</code> lá: o PC não vira um servidor.",
+          "poolStep2": "2. Crie o convite aqui",
+          "poolStep2Desc": "Dê um nome ao PC. O convite serve para um PC só e vale por 15 minutos.",
+          "lblPoolName": "Nome do PC",
+          "btnPoolInvite": "Criar convite",
+          "poolInviteExp": "Rode este comando no PC, dentro da pasta do PaaSMCP, até {time}:",
+          "poolStep3": "3. Rode o comando no PC",
+          "poolStep3Desc": "Ele mostra qual servidor vai dar as ordens e pergunta antes de mudar algo. Por padrão o PC cede metade das CPUs e da memória; para escolher, acrescente <code>--cpus 2 --memory 4g</code> no fim. Ao terminar, ele mostra o IP Tailscale do PC, que vai no próximo passo.",
+          "poolStep4": "4. Conclua aqui",
+          "poolStep4Desc": "Com o nome e o IP Tailscale do PC, este servidor se conecta a ele, confere que ele tem o convite e passa a reconhecer só aquele PC com esse nome. Faça isso em até uma hora depois de criar o convite.",
+          "lblPoolIp": "IP Tailscale do PC",
+          "btnPoolAdd": "Adicionar PC",
+          "poolAdded": "PC {name} adicionado: cede {cpus} CPU e {mem} MB para cópias.",
+          "poolStep5": "5. Feche a rede (recomendado)",
+          "poolStep5Desc": "Sem isto, um ajudante alcança tudo na sua Tailscale. Rode o primeiro comando em cada ajudante e cole as regras abaixo no painel da Tailscale, em Access controls. Com elas, este servidor fala com os ajudantes só por SSH e pelas portas dos apps, e os ajudantes alcançam só o banco, o Redis e o S3 daqui.",
+          "poolHowTitle": "O que fica no PC e o que acontece quando ele some",
+          "poolHow1": "O PC recebe a imagem do app e as variáveis dele, inclusive senhas. As variáveis ficam só na memória do PC e somem quando a cópia para ou o PC desliga. Mesmo assim, quem controla o PC consegue lê-las enquanto a cópia roda: use como ajudante só um PC em que você confia tanto quanto neste servidor.",
+          "poolHow2": "Este servidor confere cada cópia a cada 3 segundos. Se um ajudante dorme, desliga ou perde a rede, as visitas param de ir para ele em uns 6 segundos, e as que estavam a caminho são reenviadas para outra cópia.",
+          "poolHow3": "Antes de usar o PC para algo pesado, pause-o aqui: as cópias dele terminam as visitas em curso e vão para outro ajudante, se houver. Remover também apaga a chave deste servidor no PC.",
+          "poolHow4": "Só vão para ajudantes os apps de um contêiner só, com verificação de saúde por HTTP e que rodam só neste servidor. O banco continua aqui: mais cópias aliviam a CPU do app, não o banco.",
+          "poolJobRunning": "Em andamento: {what}",
+          "poolJobDone": "Concluído: {what}",
+          "poolJobFailed": "Falhou: {what}",
+          "poolJob_copies": "ajustar as cópias de {s}",
+          "poolJob_off": "voltar {s} a uma cópia",
+          "poolJob_pause": "pausar {s}",
+          "poolJob_resume": "retomar {s}",
+          "poolJob_remove": "remover {s}",
+          "poolJob_app": "atualizar as cópias de {s} nos ajudantes",
+          "copiesTitle": "Cópias agora",
+          "copiesDesc": "Põe cópias deste app nos seus PCs ajudantes (tela Ajudantes). A cópia deste servidor fica sempre ligada e as visitas se dividem entre todas. Por enquanto quem escolhe o número é você: o ensaio abaixo só sugere.",
+          "lblCopiesN": "Cópias no total",
+          "btnCopiesApply": "Aplicar",
+          "btnCopiesOff": "Voltar a uma cópia",
+          "copiesRunning1": "Rodando agora: 1 cópia, só neste servidor.",
+          "copiesRunningN": "Rodando agora: {n} cópias, a deste servidor e {h} em ajudantes ({list}).",
+          "copiesWanted": "Pedidas: {n}.",
+          "copiesError": "Último problema: {e}",
+          "copiesBlocked": "Este app ainda não pode ter cópias em ajudantes:",
+          "copiesWarn": "Antes de pôr cópias, vale saber:",
+          "copiesStarted": "Ajustando as cópias. Acompanhe aqui ou na tela Ajudantes.",
+          "poolP_dashboard": "O painel controla este servidor e nunca roda em ajudantes.",
+          "poolP_trashed": "O app está na lixeira.",
+          "poolP_fromPeer": "Este app veio de outro servidor: escolha as cópias lá.",
+          "poolP_activeActive": "O app roda nos dois servidores. Por enquanto, ajudantes só recebem apps que rodam só neste servidor (desligue o modo dos dois servidores antes).",
+          "poolP_ownCompose": "O app traz o próprio docker-compose.yml (vários serviços, talvez um banco próprio): só apps de um contêiner rodam em ajudantes.",
+          "poolP_trusted": "O app está marcado como confiável (campos privilegiados no compose) e nunca roda em ajudantes.",
+          "poolP_noHealthcheck": "O app não tem verificação de saúde por HTTP, e o balanceador precisa dela para parar de mandar visitas a uma cópia que não responde.",
+          "poolP_notDeployed": "Faça o deploy do app antes.",
+          "poolP_fenced": "Este servidor está bloqueado: outro servidor serve os dados dele agora.",
+          "poolW_rootHealthPath": "Use um caminho de saúde que consulte o banco (por exemplo /healthz). Com '/', uma cópia que perdeu o banco continua recebendo visitas.",
+          "poolW_noLimits": "O app não tem limite de CPU ou de memória, então cada cópia num ajudante usa tudo o que o PC cede. Com limites (novo deploy com CPU e RAM), cabem mais cópias.",
+          "poolW_zeroTrustBypass": "O app fica atrás do login da Cloudflare (zero-trust). As cópias nos ajudantes ficam no IP Tailscale deles, onde aparelhos da sua Tailscale chegam sem esse login. Mantenha o login do próprio app ou feche a rede (passo 5 da tela Ajudantes).",
+          "poolW_localRefs": "Estas variáveis apontam para esta máquina ou para contêineres que só existem aqui, e não vão funcionar num ajudante: {v}.",
+          "poolW_noHelpers": "Nenhum PC ajudante ainda: adicione um na tela Ajudantes."
+    });
+    Object.assign(I18N.en, {
+          "navPool": "🖥️ Helpers",
+          "aaP_pool": "The app has copies on helper PCs: go back to one copy first. For now an app uses either helpers or both servers, not both.",
+          "poolTitle": "🖥️ Helper PCs",
+          "poolDesc": "Your own computers can run extra copies of this server's apps. This server stays in charge of everything: it keeps the passwords, builds the image, receives the visits and splits them between its own copy and the helpers'. A helper with no copies runs no PaaSMCP program at all.",
+          "btnPoolCheck": "🔄 Check now",
+          "poolNone": "No helper PC yet. Follow the steps below to add the first one.",
+          "poolSt_available": "available",
+          "poolSt_working": "working",
+          "poolSt_paused": "paused",
+          "poolSt_gone": "not answering",
+          "poolSt_unknown": "not checked yet",
+          "poolGives": "gives {cpus} CPU and {mem} MB",
+          "poolUsing": "in use {cpus} CPU and {mem} MB",
+          "poolDisk": "{gb} GB free on disk",
+          "poolLoad": "load {l}",
+          "poolSeen": "last answer {date}",
+          "poolCopiesOn": "Copies: {list}",
+          "poolNoCopies": "No copies now.",
+          "poolSecretsDisk": "The in-memory folder for app variables is not ready on this PC, so it refuses copies. Run <code>sudo systemd-tmpfiles --create</code> there.",
+          "poolPausedNote": "Paused: it takes no copies. The ones it had moved to other helpers or stopped.",
+          "btnPoolPause": "Pause",
+          "btnPoolResume": "Resume",
+          "btnPoolRemove": "Remove",
+          "poolAppsTitle": "Apps with copies on helpers",
+          "poolAppsDesc": "Choose each app's number of copies on the Apps screen, in the usage and scaling card.",
+          "poolAppsNone": "No app uses helpers yet.",
+          "poolAppLine": "{running} of {wanted} copies running",
+          "poolCopyNoAnswer": "{helper}: not answering",
+          "poolAppStopped": "app stopped: its copies on helpers stopped too",
+          "poolAddTitle": "Add a PC",
+          "poolAddDesc": "Five steps, two of them on the PC itself. About 10 minutes.",
+          "poolStep1": "1. Prepare the PC",
+          "poolStep1Desc": "The PC needs Linux with Docker, the OpenSSH server, Tailscale logged in to the same account as this server, and Node.js 20 or newer installed for all users (from your distribution or NodeSource, not nvm). Then download and build PaaSMCP there. Do not run <code>init</code> or <code>install.sh</code> on it: the PC does not become a server.",
+          "poolStep2": "2. Create the invite here",
+          "poolStep2Desc": "Name the PC. The invite works for one PC only, for 15 minutes.",
+          "lblPoolName": "PC name",
+          "btnPoolInvite": "Create invite",
+          "poolInviteExp": "Run this on the PC, in the PaaSMCP folder, before {time}:",
+          "poolStep3": "3. Run the command on the PC",
+          "poolStep3Desc": "It shows which server will give the orders and asks before changing anything. By default the PC gives half its CPUs and memory; to choose, add <code>--cpus 2 --memory 4g</code> at the end. When it finishes, it shows the PC's Tailscale IP for the next step.",
+          "poolStep4": "4. Finish here",
+          "poolStep4Desc": "With the PC's name and Tailscale IP, this server connects to it, checks that it holds the invite and from then on accepts only that PC under that name. Do it within an hour of creating the invite.",
+          "lblPoolIp": "PC's Tailscale IP",
+          "btnPoolAdd": "Add PC",
+          "poolAdded": "PC {name} added: it gives {cpus} CPU and {mem} MB to copies.",
+          "poolStep5": "5. Fence the network (recommended)",
+          "poolStep5Desc": "Without this, a helper reaches everything in your Tailnet. Run the first command on each helper and paste the rules below into the Tailscale admin console, under Access controls. With them, this server talks to helpers only over SSH and the apps' ports, and helpers reach only the database, Redis and S3 here.",
+          "poolHowTitle": "What stays on the PC and what happens when it goes away",
+          "poolHow1": "The PC receives the app's image and its variables, passwords included. The variables stay only in the PC's memory and are gone when the copy stops or the PC turns off. Even so, whoever controls the PC can read them while the copy runs: only use a PC you trust as much as this server.",
+          "poolHow2": "This server checks each copy every 3 seconds. If a helper sleeps, shuts down or loses the network, visits stop going to it within about 6 seconds, and those on their way are retried on another copy.",
+          "poolHow3": "Before using the PC for something heavy, pause it here: its copies finish the visits in progress and move to another helper, if there is one. Removing also deletes this server's key from the PC.",
+          "poolHow4": "Only single-container apps with an HTTP health check that run only on this server go to helpers. The database stays here: more copies relieve the app's CPU, not the database.",
+          "poolJobRunning": "In progress: {what}",
+          "poolJobDone": "Done: {what}",
+          "poolJobFailed": "Failed: {what}",
+          "poolJob_copies": "set the copies of {s}",
+          "poolJob_off": "bring {s} back to one copy",
+          "poolJob_pause": "pause {s}",
+          "poolJob_resume": "resume {s}",
+          "poolJob_remove": "remove {s}",
+          "poolJob_app": "update the copies of {s} on helpers",
+          "copiesTitle": "Copies now",
+          "copiesDesc": "Puts copies of this app on your helper PCs (Helpers screen). This server's copy always stays on and visits are split among all of them. For now you choose the number: the rehearsal below only suggests.",
+          "lblCopiesN": "Copies in total",
+          "btnCopiesApply": "Apply",
+          "btnCopiesOff": "Back to one copy",
+          "copiesRunning1": "Running now: 1 copy, on this server only.",
+          "copiesRunningN": "Running now: {n} copies, this server's and {h} on helpers ({list}).",
+          "copiesWanted": "Asked for: {n}.",
+          "copiesError": "Last problem: {e}",
+          "copiesBlocked": "This app cannot have copies on helpers yet:",
+          "copiesWarn": "Worth knowing before adding copies:",
+          "copiesStarted": "Setting the copies. Follow along here or on the Helpers screen.",
+          "poolW_localRefs": "These variables point at this machine or at containers that only exist here, so they will not work on a helper: {v}."
+    });
+
     function t(key) {
       const dict = I18N[currentLang] || I18N.pt;
       return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
@@ -3364,7 +3708,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
       'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
       'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
       'topHealthBadge', 'btnRefresh', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -3439,6 +3783,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') loadStorage();
       if (tabName === 'overview') loadScale();
+      if (tabName === 'pool') loadPool(true);
     }
 
     function toggleTheme() {
@@ -4166,6 +4511,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       document.getElementById('scaleTarget').value = a.rule.targetCpu;
       document.getElementById('scaleDown').value = Math.round(a.rule.downAfterSeconds / 60);
       document.getElementById('scaleCooldown').value = a.rule.cooldownSeconds;
+      renderCopies(a, d.pool);
 
       const cmd = '<code>sudo paasmcp scale test ' + esc(a.app) + '</code>';
       const c = a.capacity;
@@ -4199,6 +4545,167 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     async function saveScaleLang() {
       const r = await postJson('/api/scale/language', { language: document.getElementById('scaleLang').value });
       if (r) showToast(t('scaleLangSaved'));
+    }
+
+    // ---- Helper PCs (pool) and manual copies ----
+    let poolData = null;
+    let poolJobTimer = null;
+    async function loadPool(probe) {
+      const res = await fetch('/api/pool' + (probe ? '?probe=1' : ''));
+      if (!res.ok) return;
+      poolData = await res.json();
+      renderPool();
+      if (poolData.job && !poolData.job.done) watchPoolJob();
+    }
+    function poolJobWhat(job) {
+      return tr('poolJob_' + job.kind, t('poolJob_app')).replace('{s}', job.subject);
+    }
+    // Warnings and errors a finished task brought back (server sentences, shown as they are).
+    function poolJobNotes(r) {
+      const out = [];
+      const walk = (x) => {
+        if (!x || typeof x !== 'object') return;
+        (x.warnings || []).forEach(w => out.push(['warning', String(w)]));
+        (x.errors || []).forEach(e => out.push(['danger', (e.helper ? e.helper + ': ' : '') + String(e.error)]));
+        if (x.note) out.push(['warning', String(x.note)]);
+        (x.apps || []).forEach(walk);
+      };
+      walk(r);
+      return out;
+    }
+    function renderPoolJob(job, boxId) {
+      const box = document.getElementById(boxId);
+      if (!box) return;
+      if (!job) { box.innerHTML = ''; return; }
+      const what = poolJobWhat(job);
+      const head = !job.done ? badge('warning', t('poolJobRunning').replace('{what}', what))
+        : job.error ? badge('danger', t('poolJobFailed').replace('{what}', what))
+        : badge('success', t('poolJobDone').replace('{what}', what));
+      const lines = job.log.slice(-8).map(l => esc(l)).join('<br/>');
+      const notes = job.done ? poolJobNotes(job.result).map(n => '<div style="color:var(--' + n[0] + ');margin-top:4px;font-size:12.5px;white-space:pre-wrap;">' + esc(n[1]) + '</div>').join('') : '';
+      const err = job.error ? '<div style="color:var(--danger);margin-top:6px;font-size:12.5px;white-space:pre-wrap;">' + esc(job.error) + '</div>' : '';
+      box.innerHTML = card(head
+        + (lines ? '<div style="font-family:monospace;font-size:11.5px;margin-top:6px;color:var(--muted);">' + lines + '</div>' : '')
+        + err + notes);
+    }
+    function watchPoolJob() {
+      if (poolJobTimer) return;
+      const tick = async () => {
+        const res = await fetch('/api/pool/job');
+        const d = res.ok ? await res.json() : { job: null };
+        renderPoolJob(d.job, 'poolJobBox');
+        renderPoolJob(d.job, 'copiesJobBox');
+        if (!d.job || d.job.done) {
+          clearInterval(poolJobTimer);
+          poolJobTimer = null;
+          if (document.getElementById('tab-pool').classList.contains('active')) loadPool(false);
+          if (scaleData) loadScale();
+        }
+      };
+      poolJobTimer = setInterval(tick, 2000);
+      tick();
+    }
+    function renderPool() {
+      const d = poolData;
+      if (!d) return;
+      document.getElementById('poolAcl').textContent = d.acl ? d.acl.acl : '';
+      renderPoolJob(d.job, 'poolJobBox');
+      const stateCls = { available: 'success', working: 'success', paused: 'warning', gone: 'danger', unknown: '' };
+      const hs = d.helpers || [];
+      document.getElementById('poolHelpers').innerHTML = hs.length ? hs.map(h => {
+        const facts = [
+          h.ip, h.arch,
+          t('poolGives').replace('{cpus}', fmtNum(h.give.cpus, 2)).replace('{mem}', fmtNum(h.give.memMb)),
+          t('poolUsing').replace('{cpus}', fmtNum(h.used.cpus, 2)).replace('{mem}', fmtNum(h.used.memMb)),
+          h.diskFreeGb !== null && h.diskFreeGb !== undefined ? t('poolDisk').replace('{gb}', fmtNum(h.diskFreeGb)) : '',
+          h.load1 !== null && h.load1 !== undefined ? t('poolLoad').replace('{l}', fmtNum(h.load1, 2)) : '',
+        ].filter(Boolean).map(esc).join(' · ');
+        const copies = h.copies.length ? t('poolCopiesOn').replace('{list}', h.copies.map(c => c.app).join(', ')) : t('poolNoCopies');
+        const seen = h.lastSeenAt ? ' · <span style="color:var(--muted)">' + esc(t('poolSeen').replace('{date}', fmtDate(h.lastSeenAt))) + '</span>' : '';
+        const extra = (h.secretsInMemory === false ? '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + t('poolSecretsDisk') + '</div>' : '')
+          + (h.paused ? '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + esc(t('poolPausedNote')) + '</div>' : '')
+          + (h.lastError ? '<div style="color:var(--danger);font-size:12px;margin-top:4px;white-space:pre-wrap;">' + esc(h.lastError) + '</div>' : '');
+        const btns = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">'
+          + '<button class="secondary" data-helper="' + esc(h.name) + '" onclick="poolPause(this.dataset.helper, ' + (h.paused ? 'false' : 'true') + ')">' + esc(t(h.paused ? 'btnPoolResume' : 'btnPoolPause')) + '</button>'
+          + '<button class="danger" data-helper="' + esc(h.name) + '" onclick="poolRemove(this.dataset.helper)">' + esc(t('btnPoolRemove')) + '</button>'
+          + '</div>';
+        return card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><strong>🖥️ ' + esc(h.name) + '</strong>' + badge(stateCls[h.state] || '', t('poolSt_' + h.state)) + '</div>'
+          + '<div style="color:var(--muted);font-size:12.5px;margin-top:4px;">' + facts + '</div>'
+          + '<div style="font-size:12.5px;margin-top:4px;">' + esc(copies) + seen + '</div>'
+          + extra + btns);
+      }).join('') : '<p class="card-desc">' + esc(t('poolNone')) + '</p>';
+      const apps = d.apps || [];
+      document.getElementById('poolApps').innerHTML = apps.length ? apps.map(a => card('<strong>' + esc(a.app) + '</strong> · '
+        + esc(a.stoppedAt ? t('poolAppStopped') : t('poolAppLine').replace('{running}', a.running).replace('{wanted}', a.wanted))
+        + (a.copies.length ? ' <span style="color:var(--muted)">(' + esc(a.copies.map(c => c.answering === false ? t('poolCopyNoAnswer').replace('{helper}', c.helper) : c.helper).join(', ')) + ')</span>' : '')
+        + (a.lastError ? '<div style="color:var(--danger);font-size:12px;margin-top:4px;white-space:pre-wrap;">' + esc(a.lastError) + '</div>' : ''))).join('')
+        : '<p class="card-desc">' + esc(t('poolAppsNone')) + '</p>';
+    }
+    async function poolInvite() {
+      const name = document.getElementById('poolInviteName').value.trim();
+      if (!name) return;
+      const r = await postJson('/api/pool/invite', { name });
+      if (!r) return;
+      document.getElementById('poolInviteBox').style.display = '';
+      document.getElementById('poolInviteExp').textContent = t('poolInviteExp').replace('{time}', fmtDate(r.expiresAt));
+      document.getElementById('poolJoinCmd').textContent = r.joinCommand;
+      document.getElementById('poolAddName').value = r.name;
+    }
+    async function poolAdd() {
+      const name = document.getElementById('poolAddName').value.trim();
+      const ip = document.getElementById('poolAddIp').value.trim();
+      if (!name || !ip) return;
+      document.getElementById('poolAddBox').innerHTML = '';
+      const r = await postJson('/api/pool/add', { name, ip });
+      if (!r) return;
+      document.getElementById('poolAddBox').innerHTML = card(esc(t('poolAdded').replace('{name}', r.helper.name).replace('{cpus}', fmtNum(r.helper.give.cpus, 2)).replace('{mem}', fmtNum(r.helper.give.memMb)))
+        + (r.warnings || []).map(w => '<div style="color:var(--warning);margin-top:4px;font-size:12.5px;">' + esc(w) + '</div>').join(''));
+      document.getElementById('poolInviteBox').style.display = 'none';
+      loadPool(false);
+    }
+    async function poolPause(name, paused) {
+      const r = await postJson('/api/pool/pause', { name, paused });
+      if (r) watchPoolJob();
+    }
+    async function poolRemove(name) {
+      const r = await postJson('/api/pool/remove', { name });
+      if (r) watchPoolJob();
+    }
+    function renderCopies(a, p) {
+      const box = document.getElementById('copiesBox');
+      if (!box || !p) return;
+      const onHelpers = (p.copies || []).map(c => c.helper);
+      let html = a.copies > 1
+        ? esc(t('copiesRunningN').replace('{n}', a.copies).replace('{h}', a.copies - 1).replace('{list}', onHelpers.join(', ')))
+        : esc(t('copiesRunning1'));
+      if (a.wantedCopies && a.wantedCopies !== a.copies) html += ' ' + esc(t('copiesWanted').replace('{n}', a.wantedCopies));
+      if (a.poolError) html += '<div style="color:var(--danger);margin-top:4px;font-size:12.5px;white-space:pre-wrap;">' + esc(t('copiesError').replace('{e}', a.poolError)) + '</div>';
+      const r = p.readiness;
+      if (r && !r.ok) {
+        html += '<div style="margin-top:6px;font-size:12.5px;"><strong>' + esc(t('copiesBlocked')) + '</strong>'
+          + r.problemCodes.map((c, i) => '<div>✗ ' + esc(tr('poolP_' + c, r.problems[i])) + '</div>').join('') + '</div>';
+      } else if (r && r.warningCodes.length) {
+        html += '<div style="margin-top:6px;font-size:12.5px;color:var(--muted);"><strong>' + esc(t('copiesWarn')) + '</strong>'
+          + r.warningCodes.map((w, i) => '<div>• ' + esc(tr('poolW_' + w.code, r.warnings[i]).replace('{v}', w.value || '')) + '</div>').join('') + '</div>';
+      }
+      box.innerHTML = card(html);
+      const n = document.getElementById('copiesN');
+      if (document.activeElement !== n) n.value = a.wantedCopies || a.copies;
+      document.getElementById('btnCopiesOff').style.display = a.wantedCopies ? '' : 'none';
+      renderPoolJob(p.job, 'copiesJobBox');
+      if (p.job && !p.job.done) watchPoolJob();
+    }
+    async function applyCopies() {
+      const a = scaleData && scaleData.app;
+      if (!a) return;
+      const r = await postJson('/api/scale/copies', { appName: a, copies: Number(document.getElementById('copiesN').value) });
+      if (r) { showToast(t('copiesStarted')); watchPoolJob(); }
+    }
+    async function copiesOff() {
+      const a = scaleData && scaleData.app;
+      if (!a) return;
+      const r = await postJson('/api/scale/off', { appName: a });
+      if (r) { showToast(t('copiesStarted')); watchPoolJob(); }
     }
 
     // ---- Connect AI ----

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, saveState, StorageRecord } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp } from "./config.js";
 import { ensureDockerNetwork } from "./database.js";
 import { imageFor } from "./updater.js";
 import { getSecrets, setSecretEntries } from "./vault.js";
@@ -64,8 +64,8 @@ admin_token = "${adminToken}"
 `,
       { mode: 0o600 }
     );
-    // S3 (not admin) is also published on the Tailscale IP once a mirror peer needs it.
-    const mirrorBind = loadState().mirror?.bindIp;
+    // S3 (not admin) is also published on the Tailscale IP once a mirror peer or helper PCs need it.
+    const mirrorBind = tailnetBindIp(loadState());
     const composeFile = path.join(PAAS_GARAGE_DIR, "compose.yaml");
     fs.writeFileSync(
       composeFile,

@@ -25,8 +25,12 @@
 - `src/exposure.ts`: Cloudflare Tunnel ingress API, Cloudflare DNS CNAME management, Cloudflare Zero Trust Access policy creation, and Tailscale Serve integration.
 - `src/scale.ts`: automatic scaling, phase 1 (measure and rehearse, never act). `scaleTick` (systemd oneshot timer `paasmcp scale tick`, lock-free for state.json, own lock file) reads `docker stats` + times the health path; `scale/<app>.json` keeps 10 min of samples and the rehearsal state, `scale/<app>.history.ndjson` one point per minute for 24 h. `rehearse` is the pure decision rule (CPU per copy vs `targetCpu`, `upRounds` in a row, `downAfterSeconds` below half, `cooldownSeconds`, gaps reset streaks). The decision diary (`scale/diary.ndjson`) stores codes + numbers; `renderDiary` turns them into pt/en sentences. `forgetScaleData` on purge.
 - `src/loadtest.ts`: capacity test (`paasmcp scale test`, guard `scale.test` confirm): GET only, only the app's 127.0.0.1 port, at most 64 parallel requests and 30 s per step; `classifyBottleneck` (app CPU, database, client, errors, latency).
+- `src/pool.ts`: scale phase 3, helper pool on the owner's own PCs, manual copies. Origin side: `createInvite` (guard `pool.invite`; proof key = HMAC of the system vault's `POOL_INVITE_KEY`, never in state.json), `addHelper` (nonce + HMAC proof, `timingSafeCompare`, host key pinned in `pool/known_hosts`), `sshOrder` (pool key `pool/pool_ed25519`, `StrictHostKeyChecking=yes`), `poolReadiness`, `reconcilePool` (drain, rolling replace, placement), `setCopies` (guard `app.pool`), `poolAfterLifecycle`, the Caddy balancer `paasmcp-pool-lb` and the tunnel rewrite, `stopAllPoolCopies` on fencing.
+- `src/poolproto.ts`: pure protocol shared by both sides: invite text, `parseOrder` (fixed order names, argument patterns), `keyLine` (`from=`, `command=`, `restrict`), `buildRunArgs`, `renderEnvFile`, image fingerprint, validators for everything a helper answers.
+- `src/worker.ts`: runs on the helper as the SSH forced command, one order per session, then exits (nothing resident). Writes variables only to tmpfs (`checkSecretsDir`), never `--env`.
+- `src/pooljoin.ts`: helper-side `pool join` / `leave` / `update-worker` (root): user `paasmcp-worker`, root-owned worker copy in `/usr/local/lib/paasmcp-worker`, one `authorized_keys` line, tmpfiles.d entry, self test.
 - `src/dashboard.ts`: Modern Web Workspace Control Plane (`127.0.0.1:4099`) with CSP/security headers, login rate-limiting, XSS escaping, PT-BR/EN i18n, Dark/Light themes, and Webhook/Federation HTTP endpoints.
-- `src/mcp-server.ts`: `createMcpServer(level)` with all 22 `paas_*` tools (stdio entry point runs with full level).
+- `src/mcp-server.ts`: `createMcpServer(level)` with all 23 `paas_*` tools (stdio entry point runs with full level).
 - `src/mcp-http.ts`: Stateless Streamable HTTP endpoint `/mcp` (bearer token, loopback/Tailscale only).
 - `src/tokens.ts`: Personal MCP tokens (hashed, levels read/deploy/destroy).
 - `src/totp.ts`: RFC 6238 TOTP for the dashboard second factor.
@@ -38,7 +42,8 @@
 2. **Enforce strict security boundaries:**
    - Never pass unsanitized strings to a shell; always use `execFileSync` with argument arrays.
    - Always use `timingSafeCompare` when comparing tokens or HMAC signatures.
-   - Never bind application or database ports to `0.0.0.0` on the host (`127.0.0.1` only).
+   - Never bind application or database ports to `0.0.0.0` on the host (`127.0.0.1` only). The only other address allowed is this machine's own Tailscale IP (`tailnetBindIp`), for the mirror, active-active and the helper pool.
+   - Helper PCs are reached only through `sshOrder` (forced command, fixed orders). Never send app variables as `--env`/`--env-file` or write them to a helper's disk; they go in the `run` spec on stdin to the tmpfs file.
    - Never return plaintext secret values from MCP tools or API endpoints.
    - Every risky action goes through `src/guard.ts`: classify it in `assessRisk`, call `authorizeAgent` from MCP tools and `authorizeHuman` from the dashboard/CLI. Agents must never be able to approve their own requests.
    - Prefer "allow with warning + confirmation" over removing a feature; forbid only what has no safe use.

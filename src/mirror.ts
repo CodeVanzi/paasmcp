@@ -193,6 +193,10 @@ export async function offerMirror(opts: {
   }
 
   const bindIp = IPV4.test(host) && !host.startsWith("127.") ? host : undefined;
+  const poolIp = loadState().pool?.bindIp;
+  if (bindIp && poolIp && poolIp !== bindIp) {
+    throw new Error(`Helper PCs already reach this server's data on ${poolIp}: offer the mirror on the same address (--advertise ${poolIp}).`);
+  }
   const rebind = bindIp && mirrorState().bindIp !== bindIp;
   saveMirror((m) => {
     if (bindIp) m.bindIp = bindIp;
@@ -682,6 +686,15 @@ export async function watchTick(opts: { streaming?: (rec: MirrorReplicaRecord) =
     });
     audit({ event: "mirror.fenced", by: myOwner.owner, epoch: myOwner.epoch, stopped });
     out.fenced = { by: myOwner.owner, epoch: myOwner.epoch, stopped };
+    // Copies on helper PCs (pool.ts) stop too: they would keep writing to this server's data.
+    if (loadState().pool && !OFFLINE()) {
+      try {
+        const { stopAllPoolCopies } = await import("./pool.js");
+        out.poolStopped = await stopAllPoolCopies();
+      } catch (err) {
+        out.poolError = err instanceof Error ? err.message : String(err);
+      }
+    }
   }
 
   // Several servers: this server serves another server's data since a takeover, and the arbiter now

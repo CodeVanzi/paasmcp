@@ -646,6 +646,17 @@ networks:
       active.warnings.push(`The other server was not told about this version: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
     }
   }
+  // Copies on helper PCs (pool.ts) follow this version: new image, variables or limits, one at a time.
+  if (record.pool?.enabled) {
+    try {
+      const { reconcilePool } = await import("./pool.js");
+      const r = await reconcilePool(slug);
+      const problems = [...r.errors.map((e) => (e.helper ? `${e.helper}: ` : "") + e.error.split("\n")[0]), ...r.warnings];
+      if (problems.length) active.warnings.push(`Copies on helpers: ${problems.join("; ")}`);
+    } catch (err) {
+      active.warnings.push(`Copies on helpers were not updated: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+    }
+  }
   if (active.warnings.length) warning = [warning, ...active.warnings].filter(Boolean).join(" ");
 
   return {
