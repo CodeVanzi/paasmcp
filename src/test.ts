@@ -2328,5 +2328,310 @@ volumes:
     config.saveState(st4);
   });
 
+  await t.test("35. Automatic scaling (phase 4): visits from the balancer, steps within the limits, no flapping, retries, repair after a restart, guard and screens", async () => {
+    const scale = await import("./scale.js");
+    const auto = await import("./autoscale.js");
+    const pool = await import("./pool.js");
+    const guard = await import("./guard.js");
+    const mcp = await import("./mcp-server.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const { spawnSync } = await import("node:child_process");
+    type AppRecord = import("./config.js").AppRecord;
+    type StepOutcome = import("./scale.js").StepOutcome;
+
+    // The balancer's numbers: only the proxy's count per app (other handlers count the same visit) and each copy's health.
+    const metrics = [
+      "# HELP caddy_http_requests_total Counter of HTTP(S) requests made.",
+      "# TYPE caddy_http_requests_total counter",
+      'caddy_http_requests_total{handler="reverse_proxy",server="auto-a"} 120',
+      'caddy_http_requests_total{handler="subroute",server="auto-a"} 120',
+      'caddy_http_requests_total{handler="reverse_proxy",server="port-4201"} 7',
+      'caddy_http_requests_total{handler="reverse_proxy",server="we\\"ird"} 3',
+      'caddy_http_requests_total{handler="reverse_proxy",server="__proto__"} 3',
+      'caddy_reverse_proxy_upstreams_healthy{upstream="x\\ny:1"} 1',
+      'caddy_http_requests_total{handler="reverse_proxy",server="auto-b"} NaN',
+      'caddy_reverse_proxy_upstreams_healthy{upstream="paasmcp-auto-a:3000"} 1',
+      'caddy_reverse_proxy_upstreams_healthy{upstream="100.64.0.9:4200"} 0',
+      'caddy_http_request_duration_seconds_bucket{handler="reverse_proxy",server="auto-a",le="0.1"} 99',
+      "caddy_http_requests_total{broken 5",
+    ].join("\n");
+    assert.deepEqual(auto.parseCaddyMetrics(metrics), {
+      requests: { "auto-a": 120, "port-4201": 7 },
+      healthy: { "paasmcp-auto-a:3000": true, "100.64.0.9:4200": false },
+    });
+    assert.equal(await auto.readBalancer(), null, "offline: nothing to read");
+    assert.equal(pool.balancerServerName({ name: "auto-a", localPort: 4200 }), "auto-a");
+    assert.equal(pool.balancerServerName({ name: "Not a slug", localPort: 4201 }), "port-4201");
+
+    // An app ready for helpers, two helpers, and this server's Tailscale address.
+    const fp = "e".repeat(64);
+    const st = config.loadState();
+    st.apps["auto-a"] = {
+      ...st.apps[Object.keys(st.apps)[0]],
+      name: "auto-a",
+      containerName: "paasmcp-auto-a",
+      localPort: 4200,
+      internalPort: 3000,
+      healthcheckPath: "/healthz",
+      healthcheckDisabled: undefined,
+      cpuLimit: "1",
+      memoryLimit: "256m",
+      domains: [],
+      databases: [],
+      status: "running",
+      activeActive: undefined,
+      originNodeId: undefined,
+      composePassThrough: undefined,
+      trusted: undefined,
+      trashedAt: undefined,
+      pool: undefined,
+      scale: undefined,
+    } as AppRecord;
+    const helper = (name: string, ip: string): import("./config.js").PoolHelperRecord => ({
+      name, ip, sshPort: 22, tier: "own", arch: "amd64", cpus: 4, memMb: 8192, diskFreeGb: 50, give: { cpus: 2, memMb: 2048 }, addedAt: new Date().toISOString(),
+    });
+    st.pool = { bindIp: "100.64.0.1", helpers: { big: helper("big", "100.64.0.9"), notebook: helper("notebook", "100.64.0.7") }, invites: {} };
+    config.saveState(st);
+
+    // Guard: turning it on always asks a person; raising the maximum asks only while it is on.
+    const risk = guard.assessRisk("scale.auto", { appName: "auto-a", min: 1, max: 4, enabling: true });
+    assert.equal(risk?.level, "confirm");
+    assert.match(risk!.warning.pt, /entre 1 e 4 cópias/);
+    assert.match(risk!.warning.en, /balancer/);
+    assert.equal(guard.assessRisk("scale.auto", { appName: "auto-a", min: 1, max: 4, enabling: false })!.warning.en.includes("balancer"), false);
+    assert.equal(guard.assessRisk("scale.rule", { appName: "auto-a", max: 6, previousMax: 4, auto: false }), null);
+    assert.equal(guard.assessRisk("scale.rule", { appName: "auto-a", max: 4, previousMax: 4, auto: true }), null);
+    assert.equal(guard.assessRisk("scale.rule", { appName: "auto-a", max: 2, previousMax: 4, auto: true }), null);
+    assert.equal(guard.assessRisk("scale.rule", { appName: "auto-a", max: 6, previousMax: 4, auto: true })?.level, "confirm");
+    assert.deepEqual(auto.autoRiskParams("auto-a", { max: 5 }), { appName: "auto-a", min: 1, max: 5, enabling: true });
+    assert.throws(() => auto.autoRiskParams("auto-a", { max: 99 }), /from 1 to 20/);
+
+    // Turning it on (offline): the app goes behind the balancer at one copy, so its visits are counted.
+    await assert.rejects(auto.setAutoScale("auto-a", true, { max: 1, by: "test" }), /nothing to decide/);
+    assert.equal(config.loadState().apps["auto-a"].scale?.auto, undefined);
+    const turnedOn = await auto.setAutoScale("auto-a", true, { min: 1, max: 4, by: "test" });
+    assert.equal(turnedOn.auto, true);
+    let sa = config.loadState().apps["auto-a"];
+    assert.deepEqual([sa.pool?.enabled, sa.pool?.copies, sa.scale?.auto?.by, scale.ruleFor(sa).max], [true, 1, "test", 4]);
+    assert.ok(scale.autoActive(sa, config.loadState()));
+    const lbConf = pool.buildBalancerCaddyfile(config.loadState());
+    assert.ok(lbConf.startsWith("{\n\tadmin unix//data/admin.sock\n\tauto_https off\n\tservers :4200 {\n\t\tname auto-a\n\t\tmetrics\n\t}\n}\n"), lbConf);
+    assert.match(lbConf, /\n:4200 \{\n\treverse_proxy paasmcp-auto-a:3000 \{/);
+    await assert.rejects(pool.setCopies("auto-a", 3), /Automatic scaling is on/);
+    assert.deepEqual(auto.autoRiskParams("auto-a", {}), { appName: "auto-a", min: 1, max: 4, enabling: false });
+    scale.setScaleRule("auto-a", { targetRps: 10, upRounds: 2, downAfterSeconds: 120, cooldownSeconds: 60 }, "test");
+
+    // The round, with the balancer and the steps faked: visits go up in a step, then down.
+    let clock = Date.now() - 3 * 3600_000;
+    let lbTotal = 0;
+    let rpsNow = 0;
+    let holdWith: StepOutcome["held"];
+    let applied: { t: number; kind: string; from: number; to: number; why: string }[] = [];
+    const placeCopies = (n: number) => {
+      const s = config.loadState();
+      s.apps["auto-a"].pool!.copies = n;
+      s.apps["auto-a"].pool!.placed = Array.from({ length: n - 1 }, (_, i) => ({
+        id: `auto-a-00000${i}`, helper: i % 2 ? "notebook" : "big", port: 4200, fingerprint: fp, configHash: "x", cpus: 0.5, memMb: 256, startedAt: new Date().toISOString(),
+      }));
+      config.saveState(s);
+    };
+    const hooks: import("./scale.js").AutoHooks = {
+      readBalancer: async () => ({ requests: { "auto-a": lbTotal }, healthy: {} }),
+      syncBalancer: async () => undefined,
+      apply: async (d) => {
+        applied.push({ t: clock, kind: d.kind, from: d.from, to: d.to, why: d.why });
+        if (d.kind === "repair") {
+          scale.clearIntent(d.app);
+          return { done: true, running: d.from || 1, started: [], stopped: ["big"] };
+        }
+        if (holdWith) return { done: false, running: d.from, held: holdWith };
+        placeCopies(d.to);
+        return { done: true, running: d.to, ...(d.kind === "up" ? { started: ["big"] } : { stopped: ["big"] }) };
+      },
+    };
+    const round = async () => {
+      lbTotal += rpsNow * 15;
+      const r = await scale.scaleTick({
+        now: clock,
+        auto: hooks,
+        stats: async () => ({ "paasmcp-auto-a": { cpu: 5, mem: 100, rxTotal: null, txTotal: null } }),
+        probe: async () => ({ ok: true, ms: 10 }),
+        log: () => undefined,
+      });
+      clock += 15_000;
+      return r;
+    };
+    const steps = () => applied.map((a) => [a.kind, a.from, a.to, a.why]);
+    const gapsOk = () => applied.every((a, i) => i === 0 || a.t - applied[i - 1].t >= 60_000);
+
+    rpsNow = 25;
+    for (let i = 0; i < 12; i++) await round();
+    rpsNow = 2;
+    for (let i = 0; i < 24; i++) await round();
+    assert.deepEqual(steps(), [["up", 1, 2, "load"], ["up", 2, 3, "load"], ["down", 3, 2, "load"], ["down", 2, 1, "load"]], "copies follow the load, one step at a time");
+    assert.ok(gapsOk(), "a wait between steps");
+    assert.equal(config.loadState().apps["auto-a"].pool?.copies, 1);
+    let diary = scale.scaleDiary({ app: "auto-a", lang: "pt" });
+    const upText = diary.find((e) => e.kind === "up")!.text;
+    assert.match(upText, /^Subi de 1 para 2 cópias: as visitas por cópia ficaram em 25\/s \(alvo 10\/s\) por 2 rodadas seguidas \(15 s\)\. A nova cópia roda em big\.$/);
+    assert.equal(diary.find((e) => e.kind === "down")!.text, "Desci de 3 para 2 cópias: a CPU por cópia ficou abaixo de 35% e as visitas abaixo de 5/s por cópia por 2 min. Saiu a cópia de big.");
+    assert.ok(scale.scaleDiary({ app: "auto-a", lang: "en" }).some((e) => e.text.startsWith("Went from 2 to 3 copies: visits per copy were 12.5/s (target 10/s)")));
+    assert.ok(diary.some((e) => e.kind === "auto_on" && e.text === "Escala automática ligada: entre 1 e 4 cópias, decididas pela regra a cada medição."));
+    const hist = scale.scaleHistory("auto-a", { bucketMinutes: 1, now: clock });
+    assert.ok(hist.points.some((p) => p.copies === 3) && hist.points.some((p) => p.rps === 25), "visits and copies kept for the charts");
+    const stNow = scale.scaleStatus({ app: "auto-a", now: clock }).apps[0];
+    assert.deepEqual([stNow.auto?.acting, stNow.rps, stNow.copies, stNow.rehearsalCopies], [true, 2, 1, 1]);
+
+    // Fast waves: one-round spikes change nothing; two-round waves only add copies, never flip back and forth.
+    const restart = () => {
+      scale.forgetScaleData("auto-a");
+      placeCopies(1);
+      applied = [];
+      clock += 10 * 60_000;
+    };
+    restart();
+    for (let i = 0; i < 20; i++) {
+      rpsNow = i % 2 ? 2 : 60;
+      await round();
+    }
+    assert.deepEqual(steps(), [], "single spikes: nothing");
+    restart();
+    for (let i = 0; i < 40; i++) {
+      rpsNow = i % 4 < 2 ? 25 : 2;
+      await round();
+    }
+    assert.deepEqual(steps(), [["up", 1, 2, "load"], ["up", 2, 3, "load"]], "waves: up to what the peaks need, then steady");
+    assert.ok(gapsOk());
+
+    // A step that cannot happen waits (doubling), is written down once, and happens when it can.
+    restart();
+    holdWith = "no_room";
+    rpsNow = 25;
+    for (let i = 0; i < 16; i++) await round();
+    assert.deepEqual(applied.map((a, i) => (i ? (a.t - applied[i - 1].t) / 1000 : 0)), [0, 60, 120], "tries at 0, +60 s, +120 s");
+    diary = scale.scaleDiary({ app: "auto-a", lang: "pt" });
+    assert.equal(diary.filter((e) => e.kind === "held").length, 1);
+    assert.equal(diary.filter((e) => e.kind === "held")[0].text, "Precisava de 2 cópias, mas nenhum PC ajudante tinha espaço livre ou respondeu. Sigo com 1 cópia e tento de novo em 1 min.");
+    holdWith = undefined;
+    for (let i = 0; i < 17 && config.loadState().apps["auto-a"].pool?.copies === 1; i++) await round();
+    assert.equal(config.loadState().apps["auto-a"].pool?.copies, 2);
+    assert.match(
+      scale.renderDiary({ t: "", app: "auto-a", kind: "held", p: { why: "db_busy", used: 85, limit: 97, from: 2, to: 3, running: 2, waitSeconds: 120 } }, "pt"),
+      /^Não subi para 3 cópias: o Postgres já usa 85 de 97 conexões, e mais cópias abririam mais\. Tento de novo em 2 min\.$/
+    );
+
+    // The rule's limits move the copies too (after the wait), with their own reason.
+    rpsNow = 12;
+    scale.setScaleRule("auto-a", { min: 3 }, "test");
+    applied = [];
+    for (let i = 0; i < 6 && !applied.length; i++) await round();
+    assert.deepEqual(steps(), [["up", 2, 3, "min"]]);
+    scale.setScaleRule("auto-a", { min: 1, max: 2 }, "test");
+    applied = [];
+    for (let i = 0; i < 6 && !applied.length; i++) await round();
+    assert.deepEqual(steps(), [["down", 3, 2, "max"]]);
+    diary = scale.scaleDiary({ app: "auto-a", lang: "pt" });
+    assert.ok(diary.some((e) => e.text === "Subi de 2 para 3 cópias para cumprir o mínimo da regra. A nova cópia roda em big."));
+    assert.ok(diary.some((e) => e.text === "Desci de 3 para 2 cópias para respeitar o máximo da regra. Saiu a cópia de big."));
+
+    // A step cut short (the server restarted halfway): the next round asks the helpers before anything else.
+    const intent = path.join(scale.SCALE_DIR, "auto-a.step.json");
+    const dead = spawnSync("true").pid;
+    fs.writeFileSync(intent, JSON.stringify({ app: "auto-a", kind: "up", from: 2, to: 3, pid: dead, host: os.hostname(), at: Date.now() }));
+    fs.writeFileSync(path.join(scale.SCALE_DIR, "ghost.step.json"), JSON.stringify({ app: "other", pid: dead, host: os.hostname(), at: Date.now() }));
+    assert.deepEqual(scale.interruptedSteps().map((d) => [d.app, d.kind, d.why]), [["auto-a", "repair", "interrupted"]]);
+    assert.equal(fs.existsSync(path.join(scale.SCALE_DIR, "ghost.step.json")), false, "a file naming another app is dropped");
+    rpsNow = 40;
+    applied = [];
+    await round();
+    assert.deepEqual(steps(), [["repair", 0, 0, "interrupted"]], "only the repair this round");
+    assert.equal(fs.existsSync(intent), false);
+    assert.equal(scale.scaleDiary({ app: "auto-a", lang: "pt", limit: 1 })[0].text, "Uma mudança de cópias foi interrompida no meio (o servidor reiniciou?). Conferi os ajudantes: 0 cópias iniciadas, 1 parada.");
+    // A step still running (its process is alive) is left alone.
+    fs.writeFileSync(intent, JSON.stringify({ app: "auto-a", kind: "up", from: 2, to: 3, pid: process.pid, host: os.hostname(), at: Date.now() }));
+    assert.deepEqual(scale.interruptedSteps(), []);
+    scale.clearIntent("auto-a");
+
+    // The real step (offline: no image to send): a copy that cannot start leaves the copies asked as they run.
+    placeCopies(1);
+    const upStep = { app: "auto-a", kind: "up" as const, from: 1, to: 2, why: "load" as const, p: {} };
+    const failed = await auto.applyStep(upStep);
+    assert.equal(failed.held, "start_failed");
+    assert.equal(config.loadState().apps["auto-a"].pool?.copies, 1);
+    assert.ok(config.loadState().apps["auto-a"].pool?.lastError);
+    assert.equal(fs.existsSync(intent), false, "the step's file is gone");
+    assert.equal((await auto.applyStep({ ...upStep, from: 3, to: 4 })).held, "changed", "a person changed the copies since the round measured");
+    assert.equal((await auto.applyStep({ app: "auto-a", kind: "repair", from: 1, to: 1, why: "interrupted", p: {} })).done, true);
+    // Another operation holds the state: the step is asked again next round.
+    const lockPath = path.join(config.PAAS_DATA_DIR, ".lock");
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: os.hostname(), at: Date.now() }));
+    try {
+      assert.equal((await auto.applyStep(upStep, { lockWaitMs: 300 })).held, "busy");
+    } finally {
+      fs.rmSync(lockPath, { force: true });
+    }
+
+    // MCP: turning it on needs a destroy token and a person; raising the maximum too; lowering it is free.
+    const call = async (args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => (await mcp.handleToolCall("paas_scale", args, level)).content[0].text;
+    assert.match(await call({ action: "auto", appName: "auto-a", enabled: true }, "read"), /level 'deploy'/);
+    assert.match(await call({ action: "auto", appName: "auto-a", enabled: true }, "deploy"), /level 'destroy'/);
+    assert.equal(JSON.parse(await call({ action: "auto", appName: "auto-a", enabled: true, max: 4 }, "destroy")).confirmationRequired, true);
+    assert.match(await call({ action: "auto", appName: "auto-a" }, "deploy"), /'enabled'/);
+    assert.match(await call({ action: "rule", appName: "auto-a", max: 6 }, "deploy"), /level 'destroy'/);
+    assert.equal(JSON.parse(await call({ action: "rule", appName: "auto-a", max: 6 }, "destroy")).confirmationRequired, true);
+    assert.equal(scale.ruleFor(config.loadState().apps["auto-a"]).max, 2);
+    assert.equal(JSON.parse(await call({ action: "rule", appName: "auto-a", max: 2, targetRps: 20 }, "deploy")).rule.targetRps, 20);
+    assert.match(await call({ action: "set", appName: "auto-a", copies: 2 }, "deploy"), /Automatic scaling is on/);
+    assert.equal(JSON.parse(await call({ action: "status", appName: "auto-a" }, "read")).apps[0].auto.by, "test");
+
+    // Dashboard: the switch asks for confirmation, the manual selector refuses, and the page compiles.
+    const dashToken = dashboard.getOrCreateDashboardToken();
+    const srv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((res) => srv.once("listening", res));
+    const baseUrl = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (url: string, body: unknown) => fetch(`${baseUrl}${url}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      assert.ok(page.includes('id="autoBox"') && page.includes('id="scaleTargetRps"'));
+      const onRes = await post("/api/scale/auto", { appName: "auto-a", enabled: true, min: 1, max: 3 });
+      assert.equal(onRes.status, 409);
+      assert.match(JSON.stringify(await onRes.json()), /scale by itself/);
+      assert.equal((await post("/api/scale/rule", { appName: "auto-a", max: 5 })).status, 409);
+      const manual = await post("/api/scale/copies", { appName: "auto-a", copies: 2 });
+      assert.equal(manual.ok, false);
+      assert.match(JSON.stringify(await manual.json()), /Automatic scaling is on/);
+      const scaleRes = await (await fetch(`${baseUrl}/api/scale?app=auto-a`, { headers: { cookie } })).json();
+      assert.equal(scaleRes.apps.find((a: { app: string }) => a.app === "auto-a").auto.acting, true);
+      const offRes = await post("/api/scale/auto", { appName: "auto-a", enabled: false });
+      assert.equal((await offRes.json()).auto, false);
+    } finally {
+      srv.close();
+    }
+    sa = config.loadState().apps["auto-a"];
+    assert.equal(sa.scale?.auto, undefined);
+    assert.equal(sa.pool?.enabled, true, "turning it off leaves the copies as they are");
+    assert.ok(scale.scaleDiary({ app: "auto-a", lang: "en", limit: 1 })[0].text.startsWith("Automatic scaling off. The app keeps"));
+
+    // Stop everything: automatic scaling off first, one copy here, no balancer.
+    await auto.setAutoScale("auto-a", true, { by: "test" });
+    const stopped = await pool.disablePool("auto-a");
+    assert.equal(stopped.disabled, true);
+    sa = config.loadState().apps["auto-a"];
+    assert.deepEqual([sa.pool, sa.scale?.auto], [undefined, undefined]);
+    assert.equal(scale.scaleDiary({ app: "auto-a", lang: "pt", limit: 1 })[0].text, "Parar tudo: o app voltou a uma cópia, só neste servidor, e a escala automática foi desligada.");
+    const audit = fs.readFileSync(path.join(config.PAAS_DATA_DIR, "audit.log"), "utf-8");
+    assert.ok(audit.includes('"scale.auto.on"') && audit.includes('"scale.auto.off"') && audit.includes('"scale.off"'));
+
+    const st5 = config.loadState();
+    delete st5.apps["auto-a"];
+    delete st5.pool;
+    config.saveState(st5);
+    scale.forgetScaleData("auto-a");
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

@@ -65,10 +65,15 @@ export interface AppRecord {
     /** Last refresh of this server's copy of the app's bucket. */
     files?: { at: string; copied?: number; removed?: number; tooLarge?: number; error?: string; pending?: boolean };
   };
-  /** Automatic scaling (scale.ts). Phase 1 only measures and rehearses: nothing is started or stopped. */
+  /**
+   * Automatic scaling (scale.ts, autoscale.ts). Without `auto`, the rule is only rehearsed: nothing is
+   * started or stopped. With `auto` (phase 4), the decider sets the app's copies itself, between the
+   * rule's `min` and `max`.
+   */
   scale?: {
     rule?: Partial<ScaleRule>;
     capacity?: CapacityResult;
+    auto?: { since: string; by: string };
   };
   /**
    * Copies on helper PCs (pool.ts, scale phase 3, set by hand). While `enabled`, the app's traffic goes
@@ -144,6 +149,11 @@ export interface ScaleRule {
   downAfterSeconds: number;
   /** Seconds to wait after an action before the next one. */
   cooldownSeconds: number;
+  /**
+   * Visits per second per copy, counted by the pool balancer (0 = not used). A copy is added when either
+   * CPU or visits pass their target, and removed only when both stay below half of theirs.
+   */
+  targetRps: number;
 }
 
 /** Result of `paasmcp scale test` (loadtest.ts). */
@@ -446,6 +456,14 @@ function lockIsStale(): boolean {
   }
 }
 
+/** Thrown by withStateLock when another operation kept the lock for longer than the caller would wait. */
+export class StateLockBusyError extends Error {
+  constructor() {
+    super("Another PaaSMCP operation is still running (lock held). Try again later.");
+    this.name = "StateLockBusyError";
+  }
+}
+
 /**
  * Serializes state-changing operations across the MCP server, the CLI and the dashboard
  * (which may run in a container sharing PAASMCP_ROOT). Do not nest calls: it would wait forever.
@@ -468,7 +486,7 @@ export function withStateLock<T>(fn: () => T | Promise<T>, timeoutMs = 20 * 60 *
           continue;
         }
         if (Date.now() - started > timeoutMs) {
-          throw new Error("Another PaaSMCP operation is still running (lock held). Try again later.");
+          throw new StateLockBusyError();
         }
         await new Promise((r) => setTimeout(r, 250));
       }
