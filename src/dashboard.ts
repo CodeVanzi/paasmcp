@@ -19,12 +19,13 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
   ConfirmationRequiredError,
   decideApproval,
+  DASHBOARD_APP_NAME,
   ForbiddenActionError,
   listApprovals,
 } from "./guard.js";
@@ -54,6 +55,8 @@ import {
   verifyGitHubWebhookSignature,
 } from "./federation.js";
 import { getSystemStatusSummary } from "./mcp-server.js";
+import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
+import { startPollLoop } from "./pollloop.js";
 import {
   deleteSecretKey,
   getSecrets,
@@ -346,7 +349,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
 
         if (pathname === "/api/status" && req.method === "GET") {
-          const status = getSystemStatusSummary(true);
+          const status = { ...getSystemStatusSummary(true), controlPlane: followStatus() };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
           return true;
@@ -692,6 +695,20 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         if (pathname === "/api/poll" && req.method === "POST") {
           const body = await readJsonBody(req);
+          if (String(body.appName || "") === DASHBOARD_APP_NAME) {
+            // The dashboard itself: follow a branch (built + tested in its own folder, rollback on failure).
+            if (body.on !== true) {
+              setFollow(false);
+              return reply({ controlPlane: followStatus() });
+            }
+            const known = followStatus();
+            const repoUrl = known.repoUrl || originOf(path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."));
+            if (!repoUrl) throw new Error("Unknown repository: run `paasmcp dashboard follow --repo <git URL>` once on the server.");
+            const branch = known.branch || "main";
+            confirmFromBody("dashboard.follow", { repoUrl, branch }, body);
+            setFollow(true, { repoUrl, branch });
+            return reply({ controlPlane: followStatus() });
+          }
           return reply(setPolling(String(body.appName || ""), body.on === true));
         }
 
@@ -854,6 +871,9 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   });
 
   server.listen(port, host);
+  // In the dashboard container the dashboard also does the auto-deploy checks, so no timer is needed.
+  const stopPolling = startPollLoop();
+  server.on("close", stopPolling);
   return server;
 }
 
@@ -2318,6 +2338,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_spa: "Vite, React ou Astro sem script <code>start</code>: o painel faz o build e serve os arquivos com nginx. Um <code>index.html</code> na raiz também funciona.",
         presetHint_dockerfile: "Para Rails, Laravel, Java ou qualquer outra stack: deixe um <code>Dockerfile</code> na raiz do repositório. A porta vem do <code>EXPOSE</code>.",
         chipSystemScope: "⚙️ system (Tokens Globais)",
+        followOn: "🔁 Atualiza sozinho",
+        followOff: "🔁 Atualizar sozinho",
+        followOnTitle: "Segue a branch {branch}: cada commit novo é compilado e testado antes de entrar. Clique para parar.",
+        followOffTitle: "Passa a seguir a main do repositório: cada commit novo é compilado e testado antes de entrar, e volta sozinho se falhar.",
+        followFailed: "Última atualização falhou ({step}) no commit {commit}; o painel segue na versão anterior.",
         promptEx1Title: "💬 Deploy & Banco 1-Click",
         promptEx1Desc: "'Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>'",
         promptEx2Title: "💬 Backup & Rollback",
@@ -2521,6 +2546,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_spa: "Vite, React or Astro without a <code>start</code> script: the dashboard builds it and serves the files with nginx. A root <code>index.html</code> works too.",
         presetHint_dockerfile: "For Rails, Laravel, Java or any other stack: put a <code>Dockerfile</code> at the repository root. The port comes from <code>EXPOSE</code>.",
         chipSystemScope: "⚙️ system (Global Tokens)",
+        followOn: "🔁 Auto-updates",
+        followOff: "🔁 Auto-update",
+        followOnTitle: "Follows branch {branch}: each new commit is built and tested before it goes live. Click to stop.",
+        followOffTitle: "Follow the repository's main branch: each new commit is built and tested before it goes live, and rolls back by itself if it fails.",
+        followFailed: "Last update failed ({step}) at commit {commit}; the dashboard stays on the previous version.",
         promptEx1Title: "💬 1-Click Deploy & Database",
         promptEx1Desc: "'Deploy repository <code>user/my-saas</code> with PostgreSQL, 512m RAM limit, and publish on <code>saas.{domain}</code>'",
         promptEx2Title: "💬 Backup & Rollback",
@@ -3965,6 +3995,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           const limitsHtml = (a.memoryLimit || a.cpuLimit)
             ? \`<div style="margin-top:3px;font-size:11px;color:var(--muted);">Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU</div>\`
             : '';
+          const cp = s.controlPlane || {};
+          const followBtn = a.runtimeType === 'paasmcp-control-plane'
+            ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
+            : '';
+          const followErr = a.runtimeType === 'paasmcp-control-plane' && cp.enabled && cp.lastError
+            ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:3px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
+            : '';
           const rollbackBtn = a.previousImageTag
             ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${esc(t('actionRollback'))}</button>\`
             : '';
@@ -3981,6 +4018,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                 <code>\${esc(a.runtimeType)}</code>
                 \${sourceHtml}
                 \${commitLine}
+                \${followErr}
               </td>
               <td>\${metricHtml}\${limitsHtml}</td>
               <td>
@@ -3994,6 +4032,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
                 <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restart')">\${esc(t('actionRestart'))}</button>
                 \${rollbackBtn}
+                \${followBtn}
                 \${a.trashedAt
                   ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10))}</span>
                      <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
@@ -5137,6 +5176,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
 
+    async function toggleFollow(on) {
+      const data = await postJson('/api/poll', { appName: 'paasmcp-dashboard', on });
+      if (!data) return;
+      showToast(on ? t('followOn') : t('followOff'));
+      loadAll();
+    }
+
     async function appAction(appName, action) {
       const res = await fetch('/api/lifecycle', {
         method: 'POST',
@@ -5176,7 +5222,7 @@ RUN apk add --no-cache docker-cli docker-cli-compose git openssh-client
 `;
 
 /** Builds the dashboard image once per Dockerfile version (tag = content hash). */
-function ensureDashboardImage(): string {
+export function ensureDashboardImage(): string {
   const tag = `paasmcp/dashboard:${crypto.createHash("sha256").update(DASHBOARD_DOCKERFILE).digest("hex").slice(0, 12)}`;
   try {
     execFileSync("docker", ["image", "inspect", tag], { stdio: "ignore" });
@@ -5186,20 +5232,23 @@ function ensureDashboardImage(): string {
   return tag;
 }
 
-export function ensureDashboardBackgroundService(port = 4099): {
+export function ensureDashboardBackgroundService(
+  port = 4099,
+  /** Code to run; default: the followed release (dashboard follow), else this installation's folder. */
+  code?: { dir: string; commit?: string; branch?: string }
+): {
   url: string;
   localPort: number;
   containerName: string;
+  codeDir: string;
 } {
   ensureDockerNetwork();
   getOrCreateDashboardToken();
   const dashDir = path.join(PAAS_DATA_DIR, "dashboard-service");
   fs.mkdirSync(dashDir, { recursive: true, mode: 0o700 });
 
-  const projectRoot = path.resolve(
-    path.dirname(new URL(import.meta.url).pathname),
-    ".."
-  );
+  const run = code || followedCode() || { dir: path.resolve(path.dirname(new URL(import.meta.url).pathname), "..") };
+  const projectRoot = run.dir;
 
   const image = ensureDashboardImage();
   const composePath = path.join(dashDir, "compose.yaml");
@@ -5210,11 +5259,14 @@ export function ensureDashboardBackgroundService(port = 4099): {
     restart: unless-stopped
 ${WATCHTOWER_OFF_COMPOSE}    working_dir: /app
     command: ["node", "dist/cli.js", "dashboard", "serve", "--port", "${port}", "--host", "0.0.0.0"]
+    environment:
+      PAASMCP_ROOT: "${HOMELAB_ROOT}"
+      PAASMCP_IN_DASHBOARD: "1"
     ports:
       - "127.0.0.1:${port}:${port}"
     volumes:
       - ${projectRoot}:/app:ro
-      - /opt/homelab:/opt/homelab
+      - ${HOMELAB_ROOT}:${HOMELAB_ROOT}
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - ${DOCKER_NETWORK}
@@ -5234,7 +5286,8 @@ networks:
   const now = new Date().toISOString();
   state.apps["paasmcp-dashboard"] = {
     name: "paasmcp-dashboard",
-    branch: "main",
+    branch: run.branch || "main",
+    ...(run.commit ? { lastCommit: run.commit.slice(0, 7), lastCommitSha: run.commit } : {}),
     localPort: port,
     internalPort: port,
     containerName: "paasmcp-dashboard",
@@ -5253,5 +5306,6 @@ networks:
     url: `http://127.0.0.1:${port}`,
     localPort: port,
     containerName: "paasmcp-dashboard",
+    codeDir: projectRoot,
   };
 }

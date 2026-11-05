@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AppRecord, PAAS_DATA_DIR, sanitizeSlug, writeFileAtomic } from "./config.js";
+import { DASHBOARD_APP_NAME } from "./guard.js";
+import { readFollow } from "./selfupdate.js";
 
 // Deploy progress, readable while a deploy runs. Deploys start in several processes (dashboard,
 // CLI, MCP, the poll timer, webhooks), so each one writes its progress to deploys/<app>.json and the
@@ -142,6 +144,22 @@ export function startDeployRun(opts: {
     host: os.hostname(),
   };
   writeRun(run);
+  return trackerFor(run);
+}
+
+/**
+ * Picks up a run started by another process (the dashboard hands its own update to a helper
+ * container, which finishes the same run). Undefined when the run is unknown or already finished.
+ */
+export function continueDeployRun(app: string, id: string): DeployTracker | undefined {
+  const found = readFile(app).runs.find((r) => r.id === id);
+  if (!found || found.finishedAt) return undefined;
+  const run: DeployRun = { ...found, pid: process.pid, host: os.hostname() };
+  writeRun(run);
+  return trackerFor(run);
+}
+
+function trackerFor(run: DeployRun): DeployTracker {
   const touch = () => {
     run.updatedAt = new Date().toISOString();
     writeRun(run);
@@ -272,7 +290,10 @@ export function deploySummary(apps: Record<string, AppRecord>, alive?: (pid: num
     const runs = deployRuns(name, alive);
     if (!app && !runs.length) continue;
     const branch = app?.branch || runs[0]?.branch || "main";
-    const source = githubSource(app?.repoUrl, branch);
+    // The dashboard has no repoUrl (webhooks and mirrors must not redeploy it as an app): it shows the
+    // branch it follows instead.
+    const followed = name === DASHBOARD_APP_NAME ? readFollow() : null;
+    const source = githubSource(app?.repoUrl || followed?.repoUrl, followed?.branch || branch);
     const withUrl = (r: DeployRun | undefined) =>
       r ? { ...r, commitUrl: commitUrl(source, r.commit?.sha) } : undefined;
     const active = runs.find((r) => ACTIVE_PHASES.includes(r.phase));

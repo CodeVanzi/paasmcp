@@ -270,9 +270,37 @@ back on failure. Major upgrades are refused: they need a migration.
 
 ## 10. Deploy on push without a public webhook (`src/poller.ts`)
 
-`paas_deploy(autoDeploy="poll")` marks an app; a systemd oneshot timer runs `paasmcp poll` every 2 minutes,
-compares `git ls-remote` with the last deployed commit and redeploys when it changed. Nothing stays in
-memory and nothing needs to be reachable from the internet.
+`paas_deploy(autoDeploy="poll")` marks an app; `paasmcp poll run` every 2 minutes compares `git ls-remote`
+with the last deployed commit and redeploys when it changed. Nothing needs to be reachable from the internet.
+
+Who runs it, with no step for the person (`ensurePollSchedule`, called by `poll enable` and `dashboard follow`):
+the dashboard when it is running (`src/pollloop.ts`: inside the dashboard container, `PAASMCP_IN_DASHBOARD=1`,
+it starts `poll run` as a child process every `PAASMCP_POLL_SECONDS`, default 120; a crash in a round never
+takes the dashboard down). Otherwise a oneshot systemd timer: system-wide when run as root, the user's own
+timer (`~/.config/systemd/user`, lingering turned on) otherwise. `sudo paasmcp poll install-timer` still exists.
+`poll run` takes the state lock only for the app deploys.
+
+### 10-1. The dashboard follows a branch (`src/selfupdate.ts`)
+
+Opt-in (`paasmcp dashboard follow`, or the button on the dashboard's row; guard `dashboard.follow`, confirm:
+whoever can push to that branch controls the server). The default repository is the `origin` of the
+installed copy, the default branch `main`; only remote git URLs are accepted. State in
+`paasmcp/control-plane/follow.json`.
+
+Each `poll run` (outside the state lock, own lock file `control-plane/update.lock`):
+1. `git ls-remote`; nothing to do when it is the running commit, or the commit that already failed.
+2. Clone exactly that commit into `control-plane/releases/<sha>` (temporary name until it passes), then
+   `npm ci`, `npm run build`, `npm test`, each in a `docker run` of the dashboard image (same Node and tools
+   as where it will run), as the owner of the data folder.
+3. Swap: rewrite the dashboard's compose file to mount that release at `/app`, `compose up`, wait up to 60 s
+   for an answer. If it does not answer, the previous code comes back and the commit is marked failed.
+   Only the running and the previous release are kept.
+
+A container cannot replace itself and check the result, so inside the dashboard the swap runs in a short-lived
+helper container (`paasmcp-dashboard-swap`, the known-good code, on the Docker network) that checks the new
+dashboard by name. Phases go to the dashboard's deploy record (deploy progress, section 3), and the helper finishes the same
+run (`continueDeployRun`). The dashboard record never gets a `repoUrl`: webhooks, the mirror and polling
+redeploy every app that has one.
 
 ## 10a. Measuring for automatic scaling, phase 1 (`src/scale.ts`, `src/loadtest.ts`)
 

@@ -217,9 +217,13 @@ paasmcp db-backup restore <backup-id>
 paasmcp db-backup create my-saas volume      # every Docker volume of the app
 paasmcp backup test <backup-id>              # restores into a temporary DB; live data untouched
 
-# Auto-deploy without a public webhook: a timer checks git every 2 min and exits (0 MB idle)
+# Auto-deploy without a public webhook: git is checked every 2 min. The dashboard does the checks
+# when it runs; without it, a systemd timer is set up by itself (no sudo needed)
 paasmcp poll enable my-saas
-sudo paasmcp poll install-timer
+
+# The dashboard updates itself from a branch (default: main of the repository it came from).
+# Each commit is built and tested in its own folder first; it rolls back if the new one does not answer
+paasmcp dashboard follow [--repo https://github.com/<owner>/<repo>.git] [--branch main]
 
 # Keep shared services current (same major only; backup, health check, automatic rollback)
 paasmcp update check

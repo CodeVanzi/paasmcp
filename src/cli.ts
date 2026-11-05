@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import path from "node:path";
 import readline from "node:readline/promises";
 import {
   ensureDirectories,
   loadState,
+  PAAS_DATA_DIR,
   sanitizeSlug,
   saveState,
   updatePlatformConfig,
@@ -13,7 +15,11 @@ import {
   addArbiterKey, arbiterClusterId, deriveArbiterKey, installArbiterService, listArbiterClusters, parseArbiterKeys, removeArbiterKey,
   resolveArbiterHost, startArbiterServer,
 } from "./arbiter.js";
-import { installPollTimer, pollRepos, setPolling } from "./poller.js";
+import { ensurePollSchedule, installPollTimer, pollRepos, remoteHead, setPolling } from "./poller.js";
+import {
+  buildInImage, composeCodeDir, ControlPlaneDeps, controlPlaneTick, dashboardHealthUrl, followStatus, insideDashboard, originOf,
+  readFollow, setFollow, startSwapHelper, swapTo, waitForDashboard,
+} from "./selfupdate.js";
 import {
   DiaryLang, installScaleTimer, scaleDiary, scaleHistory, scaleStatus, scaleTick, setDiaryLanguage, setScaleRule, uninstallScaleTimer, ruleFor, ruleRiskParams
 } from "./scale.js";
@@ -46,13 +52,14 @@ import {
   syncOffsite,
   testRestore,
 } from "./backup.js";
-import { assessRisk, authorizeHuman, decideApproval, listApprovals } from "./guard.js";
+import { assessRisk, authorizeHuman, DASHBOARD_APP_NAME, decideApproval, listApprovals } from "./guard.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy } from "./pool.js";
 import { joinPool, leavePool, previewJoin, setupWake, undoWakeSetup, updateWorker } from "./pooljoin.js";
 import { setWake } from "./wake.js";
 import { validateHelperName } from "./poolproto.js";
 import {
   ensureDashboardBackgroundService,
+  ensureDashboardImage,
   getOrCreateDashboardToken,
   startDashboardServer,
 } from "./dashboard.js";
@@ -219,6 +226,27 @@ async function runCli() {
         } else {
           console.log(JSON.stringify({ twoFactor: isDashboardTwoFactorEnabled() ? "enabled" : "disabled" }, null, 2));
         }
+      } else if (sub === "follow") {
+        if (rest[1] === "status") {
+          console.log(JSON.stringify(followStatus(), null, 2));
+        } else if (rest.includes("--off")) {
+          console.log(JSON.stringify({ controlPlane: setFollow(false) }, null, 2));
+        } else {
+          const here = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+          const repoUrl = getFlagValue(rest, "--repo") || readFollow()?.repoUrl || originOf(here);
+          if (!repoUrl) throw new Error("Unknown repository: pass --repo <git URL>.");
+          const branch = getFlagValue(rest, "--branch") || readFollow()?.branch || "main";
+          await confirmInCli("dashboard.follow", { repoUrl, branch }, rest);
+          setFollow(true, { repoUrl, branch });
+          console.error(`Building ${branch} of ${repoUrl} (clone, npm ci, build, tests)... this takes a few minutes.`);
+          const update = await controlPlaneTick(controlPlaneDeps({ inProcess: true }), { force: true, trigger: "cli" });
+          console.log(JSON.stringify({ controlPlane: followStatus(), update, checkedBy: ensurePollSchedule() }, null, 2));
+        }
+      } else if (sub === "update") {
+        console.log(JSON.stringify(await controlPlaneTick(controlPlaneDeps({ inProcess: true }), { force: rest.includes("--force"), trigger: "cli" }), null, 2));
+      } else if (sub === "swap") {
+        // Started by the dashboard (startSwapHelper) in a short-lived container: swap, check, roll back.
+        console.log(JSON.stringify(await swapTo(String(rest[1] || ""), controlPlaneDeps({ inProcess: true }), getFlagValue(rest, "--run")), null, 2));
       } else if (sub === "serve") {
         startDashboardServer(port, host);
         console.log(`PaaSMCP Dashboard listening on http://${host}:${port}`);
@@ -549,16 +577,28 @@ async function runCli() {
     case "poll": {
       const [sub, arg1] = rest;
       if (!sub || sub === "run") {
-        const polled = await pollRepos();
-        let activeSync: unknown;
+        // Runs without the global lock: apps deploy under it, the dashboard's own update (minutes of
+        // npm ci / build / tests) outside it.
+        const { polled, activeSync } = await withStateLock(async () => {
+          const polled = await pollRepos();
+          let activeSync: unknown;
+          try {
+            activeSync = await runActiveSyncWithFiles();
+          } catch (err) {
+            activeSync = { error: err instanceof Error ? err.message : String(err) };
+          }
+          return { polled, activeSync };
+        });
+        let controlPlane: unknown;
         try {
-          activeSync = await runActiveSyncWithFiles();
+          controlPlane = await controlPlaneTick(controlPlaneDeps());
         } catch (err) {
-          activeSync = { error: err instanceof Error ? err.message : String(err) };
+          controlPlane = { status: "error", error: err instanceof Error ? err.message : String(err) };
         }
-        console.log(JSON.stringify({ ...polled, activeSync }, null, 2));
+        console.log(JSON.stringify({ ...polled, activeSync, controlPlane }, null, 2));
       } else if ((sub === "enable" || sub === "disable") && arg1) {
-        console.log(JSON.stringify(setPolling(arg1, sub === "enable"), null, 2));
+        const result = setPolling(arg1, sub === "enable");
+        console.log(JSON.stringify(sub === "enable" ? { ...result, checkedBy: ensurePollSchedule() } : result, null, 2));
       } else if (sub === "install-timer") {
         console.log(JSON.stringify(installPollTimer(Number(getFlagValue(rest, "--minutes") || 2)), null, 2));
       } else {
@@ -1026,6 +1066,8 @@ Commands:
   paasmcp restore <app>                              Bring an app back from the trash
   paasmcp purge <app> [--confirm-name <app>]         Delete a trashed app for good (strong confirmation)
   paasmcp trash purge-expired                        Delete apps trashed more than 30 days ago (cron)
+  paasmcp dashboard follow [--repo URL] [--branch main] [--off] | follow status  Dashboard updates itself from a branch (build + tests first, rollback)
+  paasmcp dashboard update [--force]                 Check the followed branch now
   paasmcp dashboard 2fa <enable|disable|status>      Two-factor login for the dashboard (needed to publish it openly)
   paasmcp mcp serve [--port 4098] [--host tailscale] MCP over HTTP for remote AI clients (token required)
   paasmcp token <create|list|revoke> ...             Personal MCP tokens (levels: read, deploy, destroy)
@@ -1042,6 +1084,23 @@ async function runActiveSync() {
   const r = await syncActivePeers();
   if (r.some((p) => p.deployed.length || p.stopped.length)) refreshEdge();
   return r;
+}
+
+/** Real Docker / git helpers for the dashboard's own update (selfupdate.ts). */
+function controlPlaneDeps(opts: { inProcess?: boolean } = {}): ControlPlaneDeps {
+  const port = () => loadState().apps[DASHBOARD_APP_NAME]?.localPort || 4099;
+  const composePath = path.join(PAAS_DATA_DIR, "dashboard-service", "compose.yaml");
+  const helper = !opts.inProcess && insideDashboard();
+  return {
+    head: (repoUrl, branch) => remoteHead(repoUrl, branch),
+    build: (...args) => buildInImage(ensureDashboardImage())(...args),
+    restart: async (dir, commit) => {
+      await withStateLock(() => ensureDashboardBackgroundService(port(), { dir, commit, branch: readFollow()?.branch }));
+    },
+    runningDir: () => composeCodeDir(composePath),
+    healthy: () => waitForDashboard(dashboardHealthUrl(port())),
+    ...(helper ? { swapViaHelper: (sha: string, runId: string) => startSwapHelper(ensureDashboardImage(), sha, runId) } : {}),
+  };
 }
 
 /** One-shot commands already hold the state lock: copy buckets right after, within a time budget. */
@@ -1079,6 +1138,7 @@ const lockFree =
   (command === "pool" && POOL_LOCK_FREE.has(process.argv[3])) ||
   command === "arbiter" ||
   (command === "mirror" && process.argv[3] === "watch") ||
+  (command === "poll" && (!process.argv[3] || process.argv[3] === "run")) ||
   (command === "scale" && SCALE_LOCK_FREE.has(process.argv[3]));
 (lockFree ? runCli() : withStateLock(runCli)).catch((err) => {
   console.error("Error:", err instanceof Error ? err.message : String(err));
