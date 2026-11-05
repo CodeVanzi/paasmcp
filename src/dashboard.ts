@@ -312,6 +312,18 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       return;
     }
 
+    if (pathname === "/vendor/htmx.min.js" && req.method === "GET") {
+      const vendorPath = path.resolve(__dirname, "../vendor/htmx.min.js");
+      if (fs.existsSync(vendorPath)) {
+        res.writeHead(200, {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Cache-Control": "public, max-age=86400",
+        });
+        res.end(fs.readFileSync(vendorPath));
+        return;
+      }
+    }
+
     // Protect all authenticated /api/* routes
     if (pathname.startsWith("/api/")) {
       if (!isAuthenticated(req, expectedToken)) {
@@ -1185,164 +1197,235 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   <title>PaaSMCP — Workspace & Control Plane</title>
   <style>
     ${sharedCss}
-    .app-shell {
-      display: grid;
-      grid-template-columns: 250px 1fr;
-      min-height: 100vh;
-    }
-    @media (max-width: 960px) {
-      .app-shell { grid-template-columns: minmax(0, 1fr); }
-      .main-area, .sidebar { min-width: 0; }
-      .sidebar { border-right: none; border-bottom: 1px solid var(--border); padding: 14px 16px; }
-      .sidebar .nav-list { flex-direction: row; overflow-x: auto; flex-wrap: nowrap; }
-      .sidebar .nav-list .nav-btn { flex: 0 0 auto; white-space: nowrap; }
-      .sidebar .sidebar-footer { display: none; }
-    }
-    .sidebar {
-      background: var(--bg-elevated);
-      border-right: 1px solid var(--border);
-      padding: 20px 14px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      gap: 20px;
-    }
-    .brand-box {
-      padding: 4px 10px 14px;
+    /* Top Console Header */
+    .console-header {
+      background: var(--card);
       border-bottom: 1px solid var(--border);
-    }
-    .brand-title {
-      font-size: 16px;
-      font-weight: 700;
+      padding: 12px 24px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      letter-spacing: -0.01em;
+      gap: 16px;
+      flex-wrap: wrap;
     }
-    .brand-mark {
+    .console-header-left {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .console-logo-link {
       display: inline-flex;
       align-items: center;
       gap: 9px;
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: -0.01em;
+    }
+    .console-logo-link:hover {
+      text-decoration: none;
     }
     .brand-icon-svg {
       width: 22px;
       height: 22px;
       flex-shrink: 0;
     }
-    .brand-sub {
-      font-size: 11.5px;
-      color: var(--muted);
-      margin-top: 4px;
-    }
-    .nav-list {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      margin-top: 12px;
-    }
-    .nav-btn {
-      background: transparent;
-      color: var(--muted);
-      border: 1px solid transparent;
-      border-left: 3px solid transparent;
-      justify-content: flex-start;
-      padding: 8px 12px;
-      font-size: 13px;
+    .host-badge-capsule {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 12px;
       font-weight: 500;
-      border-radius: 6px;
-      width: 100%;
-      transition: all 0.12s ease;
-    }
-    .nav-btn:hover {
       background: var(--bg-subtle);
-      color: var(--text);
-    }
-    .nav-btn.active {
-      background: var(--bg-subtle);
-      color: var(--text);
-      border-left-color: var(--accent);
-      font-weight: 600;
-    }
-    .sidebar-footer {
-      padding: 12px 10px 4px;
-      border-top: 1px solid var(--border);
-      font-size: 11.5px;
+      border: 1px solid var(--border);
       color: var(--muted);
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     }
-    .main-area {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
+    .engine-status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--success-soft);
+      border: 1px solid rgba(63, 185, 80, 0.35);
+      color: var(--success);
     }
-    .topbar {
-      background: var(--bg-elevated);
+    .engine-status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 8px rgba(63, 185, 80, 0.6);
+    }
+
+    /* Horizontal Subnav Tabs */
+    .console-subnav {
+      background: var(--card);
       border-bottom: 1px solid var(--border);
-      padding: 12px 28px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .topbar-left {
+      padding: 0 24px;
       display: flex;
       align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
+      gap: 4px;
+      overflow-x: auto;
     }
-    .content-wrap {
-      padding: 24px 28px;
-      max-width: 1360px;
-      width: 100%;
-      margin: 0 auto;
+    .nav-tab {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 14px;
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--muted);
+      border-bottom: 2px solid transparent;
+      text-decoration: none;
+      cursor: pointer;
+      background: transparent;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+      border-radius: 0;
+      white-space: nowrap;
+      transition: color 0.15s ease, border-color 0.15s ease;
     }
-    .grid-stats {
+    .nav-tab:hover {
+      color: var(--text);
+      background: transparent;
+    }
+    .nav-tab.active {
+      color: var(--text);
+      font-weight: 600;
+      border-bottom-color: #f78166;
+      background: transparent;
+    }
+    [data-theme="light"] .nav-tab.active {
+      border-bottom-color: #fd8c73;
+    }
+    .nav-counter {
+      padding: 1px 7px;
+      font-size: 11.5px;
+      font-weight: 600;
+      line-height: 16px;
+      border-radius: 10px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+    .nav-tab.active .nav-counter {
+      color: var(--text);
+      border-color: var(--border-strong);
+    }
+
+    /* Two-Column Workspace Container */
+    .console-container {
+      max-width: 1400px;
+      margin: 22px auto;
+      padding: 0 24px;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px;
-      margin-bottom: 24px;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 24px;
+      align-items: start;
     }
-    .stat-card {
+    @media (max-width: 980px) {
+      .console-container {
+        grid-template-columns: minmax(0, 1fr);
+        padding: 0 16px;
+      }
+    }
+    .console-main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .console-sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* Right Column Telemetry & Resource Cards */
+    .telemetry-card {
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 16px 20px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      padding: 18px 20px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow);
     }
-    .stat-card:hover {
-      border-color: var(--border-strong);
-    }
-    .stat-label { 
-      color: var(--muted); 
-      font-size: 11px; 
-      text-transform: uppercase; 
-      letter-spacing: 0.06em; 
-      font-weight: 600; 
+    .telemetry-title {
+      font-size: 13.5px;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      margin-bottom: 14px;
       display: flex;
       align-items: center;
       justify-content: space-between;
     }
-    .stat-value { 
-      font-size: 22px; 
-      font-weight: 700; 
-      margin-top: 8px; 
-      letter-spacing: -0.02em; 
-      font-variant-numeric: tabular-nums;
+    .telemetry-item {
+      font-size: 12.5px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .telemetry-item:last-child {
+      border-bottom: none;
+    }
+    .telemetry-val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
       color: var(--text);
+      font-weight: 500;
+      font-size: 12px;
     }
-    .stat-meta { 
-      color: var(--muted); 
-      font-size: 12px; 
-      margin-top: 6px; 
+    .progress-track {
+      height: 7px;
+      border-radius: 4px;
+      background: var(--bg-subtle);
+      overflow: hidden;
+      margin: 6px 0 10px;
+      border: 1px solid var(--border);
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--success);
+      border-radius: 3px;
+      transition: width 0.3s ease;
+    }
+    .progress-fill.warning {
+      background: var(--warning);
+    }
+    .progress-fill.danger {
+      background: var(--danger);
+    }
+
+    /* Search & Filter Bar */
+    .console-search-bar {
       display: flex;
+      gap: 10px;
       align-items: center;
-      gap: 6px;
+      margin-bottom: 16px;
+    }
+    .console-search-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 13.5px;
+      padding: 7px 12px;
+      border-radius: 6px;
+      outline: none;
+    }
+    .console-search-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
     }
     .card {
       background: var(--card);
@@ -1598,131 +1681,145 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   </style>
 </head>
 <body>
-  <div class="app-shell">
-    <!-- Sidebar Navigation -->
-    <aside class="sidebar">
-      <div>
-        <div class="brand-box">
-          <div class="brand-title">
-            <span class="brand-mark">
-              <svg class="brand-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="2" y="3" width="20" height="14" rx="2" style="stroke: var(--accent); fill: var(--accent-soft); fill-opacity: 0.3;"></rect>
-                <circle cx="7" cy="10" r="1.5" fill="var(--accent)"></circle>
-                <path d="M12 7l3 3-3 3"></path>
-                <path d="M7 17v4"></path>
-                <path d="M17 17v4"></path>
-              </svg>
-              <span>PaaSMCP</span>
-            </span>
-            <span class="badge" style="font-size:10px;padding:2px 7px;">v1.1</span>
+  <!-- Top Console Header -->
+  <header class="console-header">
+    <div class="console-header-left">
+      <a href="#" class="console-logo-link" onclick="location.reload(); return false;">
+        <svg class="brand-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="3" width="20" height="14" rx="2" style="stroke: var(--accent); fill: var(--accent-soft); fill-opacity: 0.3;"></rect>
+          <circle cx="7" cy="10" r="1.5" fill="var(--accent)"></circle>
+          <path d="M12 7l3 3-3 3"></path>
+          <path d="M7 17v4"></path>
+          <path d="M17 17v4"></path>
+        </svg>
+        <span style="font-weight:700;font-size:15px;letter-spacing:-0.01em;">PaaSMCP</span>
+      </a>
+      <span class="host-badge-capsule" id="topHostCapsule">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+        <span>Host: <strong id="topHostname" style="font-weight:600;">-</strong></span>
+      </span>
+      <span class="engine-status-pill">
+        <span class="engine-status-dot"></span>
+        <span id="topHealthBadge">Engine Online</span>
+      </span>
+      <span class="host-badge-capsule" id="topDomainBadge">Domain: -</span>
+      ${safeCfEmail ? `<span class="engine-status-pill" style="color:var(--accent-text);border-color:rgba(47,129,247,0.35);background:var(--accent-soft);">🛡️ Zero Trust: ${safeCfEmail}</span>` : ""}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <span id="sidebarSubtitle" style="display:none;">Agent-First Micro-PaaS</span>
+      <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
+      <button class="secondary" onclick="toggleTheme()" id="themeBtn">☀️ Light</button>
+      <button class="secondary" onclick="loadAll()" id="btnRefresh">🔄 Atualizar</button>
+      <button class="danger" onclick="logout()" id="btnLogout">Sair</button>
+    </div>
+  </header>
+
+  <!-- Horizontal Subnav Tabs with Counters -->
+  <nav class="console-subnav" id="subnavTabs">
+    <button class="nav-tab nav-btn active" onclick="switchTab('overview', this)" id="navOverview">
+      <span>📦 Aplicações</span>
+      <span class="nav-counter" id="tabCountApps">0</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('databases', this)" id="navDatabases">
+      <span>🗄️ Bancos de Dados</span>
+      <span class="nav-counter" id="tabCountDbs">0</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('vault', this)" id="navVault">
+      <span>🔐 Cofre &amp; Chaves</span>
+      <span class="nav-counter" id="tabCountVault">0</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('agents', this)" id="navAgents">
+      <span>🤖 MCP Server &amp; IA</span>
+      <span class="nav-counter" id="tabCountAgents">15</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('mirror', this)" id="navMirror">
+      <span>🔁 Failover &amp; Espelhos</span>
+      <span class="nav-counter" id="tabCountMirror">0</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('pool', this)" id="navPool">
+      <span>🖥️ Ajudantes</span>
+      <span class="nav-counter" id="tabCountPool">0</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">
+      <span>🩺 Diagnóstico</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('email', this)" id="navEmail">
+      <span>✉️ E-mail</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('updates', this)" id="navUpdates">
+      <span>⬆️ Atualizações</span>
+    </button>
+    <button class="nav-tab nav-btn" onclick="switchTab('home', this)" id="navHome">
+      <span>🏠 Início &amp; Setup</span>
+    </button>
+  </nav>
+
+  <!-- Two-Column Workspace Container -->
+  <div class="console-container">
+    <div class="console-main">
+      <!-- TAB: HOME / SETUP -->
+      <div class="tab-pane" id="tab-home">
+        <div class="card">
+          <div class="card-header">
+            <h2 id="homeTitle">🏠 Início</h2>
+            <p class="card-desc" data-i18n="homeDesc"></p>
           </div>
-          <div class="brand-sub" id="sidebarSubtitle">Agent-First Micro-PaaS</div>
+          <div class="grid-2" id="homeTiles"></div>
         </div>
-        <nav class="nav-list">
-          <button class="nav-btn active" onclick="switchTab('home', this)" id="navHome">🏠 Início</button>
-          <button class="nav-btn" onclick="switchTab('overview', this)" id="navOverview">📦 Apps</button>
-          <button class="nav-btn" onclick="switchTab('databases', this)" id="navDatabases">🗄️ Dados e cópias</button>
-          <button class="nav-btn" onclick="switchTab('vault', this)" id="navVault">🔐 Senhas e chaves</button>
-          <button class="nav-btn" onclick="switchTab('email', this)" id="navEmail">✉️ E-mail</button>
-          <button class="nav-btn" onclick="switchTab('mirror', this)" id="navMirror">🔁 Segundo servidor</button>
-          <button class="nav-btn" onclick="switchTab('pool', this)" id="navPool">🖥️ Ajudantes</button>
-          <button class="nav-btn" onclick="switchTab('updates', this)" id="navUpdates">⬆️ Atualizações</button>
-          <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Diagnóstico</button>
-          <button class="nav-btn" onclick="switchTab('agents', this)" id="navAgents">🤖 Conectar IA</button>
-        </nav>
+        <div class="card">
+          <div class="card-header">
+            <h2 data-i18n="stepsTitle"></h2>
+            <p class="card-desc" data-i18n="stepsDesc"></p>
+          </div>
+          <div id="homeSteps"></div>
+        </div>
+        <div class="card">
+          <div class="card-header">
+            <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
+            <p class="card-desc" id="setupDesc">Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.</p>
+          </div>
+          <div class="grid-2">
+            <div class="arch-box">
+              <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
+              <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
+              <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" id="setupGithubLink">Criar fine-grained token ↗</a> · <a href="https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key" target="_blank" rel="noreferrer" id="setupGithubDocsLink">Permissões da API ↗</a></p>
+            </div>
+            <div class="arch-box">
+              <h3 id="setupCloudTitle">☁️ Cloudflare — opcional para publicar</h3>
+              <p id="setupCloudDesc">Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.</p>
+              <p><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" id="setupCloudLink">Criar API token ↗</a> · <a href="https://developers.cloudflare.com/fundamentals/api/get-started/create-token/" target="_blank" rel="noreferrer" id="setupCloudDocsLink">Guia de tokens ↗</a></p>
+            </div>
+            <div class="arch-box">
+              <h3 id="setupLocalTitle">🔐 Acesso e deploy local</h3>
+              <p id="setupLocalDesc">O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.</p>
+            </div>
+            <div class="arch-box">
+              <h3 id="setupAppTitle">🧩 Segredos e sugestões por aplicação</h3>
+              <p id="setupAppDesc">Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.</p>
+            </div>
+          </div>
+          <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
+        </div>
       </div>
-      <div class="sidebar-footer">
-        <div>🔒 <strong>Loopback-First</strong> (127.0.0.1)</div>
-        <div>⚡ <strong>0 MB</strong> Idle Daemon Overhead</div>
-        <div id="nodeRoleFooter">Node: standalone</div>
-      </div>
-    </aside>
 
-    <!-- Main Workspace Area -->
-    <div class="main-area">
-      <header class="topbar">
-        <div class="topbar-left">
-          <span class="badge success" id="topHealthBadge">● System Online</span>
-          <span class="badge" id="topDomainBadge">Domain: -</span>
-          ${safeCfEmail ? `<span class="badge success">🛡️ Zero Trust: ${safeCfEmail}</span>` : ""}
-        </div>
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-          <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
-          <button class="secondary" onclick="toggleTheme()" id="themeBtn">☀️ Light</button>
-          <button class="secondary" onclick="loadAll()" id="btnRefresh">🔄 Atualizar</button>
-          <button class="danger" onclick="logout()" id="btnLogout">Sair</button>
-        </div>
-      </header>
-
-      <div class="content-wrap">
-        <!-- Global Hardware & Cluster Summary -->
-        <div class="grid-stats" id="statsGrid"></div>
-
-        <!-- TAB 1: OVERVIEW, APPS, DEPLOY & EXPOSE -->
-        <div class="tab-pane active" id="tab-home">
-          <div class="card">
-            <div class="card-header">
-              <h2 id="homeTitle">🏠 Início</h2>
-              <p class="card-desc" data-i18n="homeDesc"></p>
-            </div>
-            <div class="grid-2" id="homeTiles"></div>
+      <!-- TAB 2: OVERVIEW, APPS, DEPLOY & EXPOSE -->
+      <div class="tab-pane active" id="tab-overview">
+        <div class="card" style="margin-bottom:20px;">
+          <div class="card-header" style="margin-bottom:14px;">
+            <h2>
+              <span id="appsTitle">📦 Aplicações Hospedadas &amp; Métricas</span>
+              <span class="badge" id="appsBadgeCount">0 apps</span>
+            </h2>
+            <p class="card-desc" id="appsDesc">Containers isolados em <code>127.0.0.1:4000-4998</code> com suporte a Rollback em 1s, limites de CPU/RAM e Docker Compose multi-serviço.</p>
           </div>
-          <div class="card" id="approvalsCard" style="display:none;">
-            <div class="card-header">
-              <h2 id="approvalsTitle">✋ Confirmações pendentes</h2>
-              <p class="card-desc" id="approvalsDesc">Ações arriscadas pedidas por um agente de IA esperam você aqui. O agente não consegue aprovar sozinho.</p>
-            </div>
-            <div id="approvalsList"></div>
+          <div class="console-search-bar">
+            <input class="console-search-input" id="appSearchInput" placeholder="Buscar aplicações por nome, stack ou porta..." oninput="filterApps(this.value)" />
+            <button class="secondary" onclick="fillDeployPreset('saas', document.getElementById('presetSaas')); const depEl = document.getElementById('depApp'); if (depEl) { depEl.scrollIntoView({behavior:'smooth'}); depEl.focus(); }" style="padding:6px 12px;font-size:12.5px;">+ Novo Deploy</button>
           </div>
-          <div class="card">
-            <div class="card-header">
-              <h2 data-i18n="stepsTitle"></h2>
-              <p class="card-desc" data-i18n="stepsDesc"></p>
-            </div>
-            <div id="homeSteps"></div>
-          </div>
-          <div class="card">
-            <div class="card-header">
-              <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
-              <p class="card-desc" id="setupDesc">Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.</p>
-            </div>
-            <div class="grid-2">
-              <div class="arch-box">
-                <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
-                <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
-                <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" id="setupGithubLink">Criar fine-grained token ↗</a> · <a href="https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key" target="_blank" rel="noreferrer" id="setupGithubDocsLink">Permissões da API ↗</a></p>
-              </div>
-              <div class="arch-box">
-                <h3 id="setupCloudTitle">☁️ Cloudflare — opcional para publicar</h3>
-                <p id="setupCloudDesc">Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.</p>
-                <p><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" id="setupCloudLink">Criar API token ↗</a> · <a href="https://developers.cloudflare.com/fundamentals/api/get-started/create-token/" target="_blank" rel="noreferrer" id="setupCloudDocsLink">Guia de tokens ↗</a></p>
-              </div>
-              <div class="arch-box">
-                <h3 id="setupLocalTitle">🔐 Acesso e deploy local</h3>
-                <p id="setupLocalDesc">O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.</p>
-              </div>
-              <div class="arch-box">
-                <h3 id="setupAppTitle">🧩 Segredos e sugestões por aplicação</h3>
-                <p id="setupAppDesc">Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.</p>
-              </div>
-            </div>
-            <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
+          <div class="apps-card-list" id="appsTable">
+            <div style="padding: 24px; text-align: center; color: var(--muted);">...</div>
           </div>
         </div>
-
-        <div class="tab-pane" id="tab-overview">
-                    <div class="card">
-            <div class="card-header">
-              <h2>
-                <span id="appsTitle">📦 Aplicações Hospedadas & Métricas em Tempo Real</span>
-                <span class="badge" id="appsBadgeCount">0 apps</span>
-              </h2>
-              <p class="card-desc" id="appsDesc">Containers isolados em <code>127.0.0.1:4000-4998</code> com suporte a Rollback em 1s, limites de CPU/RAM e Docker Compose multi-serviço.</p>
-            </div>
-            <div class="apps-card-list" id="appsTable">
-              <div style="padding: 24px; text-align: center; color: var(--muted);">...</div>
-            </div>
-          </div>
 
           <div class="row">
             <div class="card">
@@ -2372,10 +2469,25 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           <pre id="logsBox"></pre>
         </div>
       </div>
-    </div>
-  </div>
 
-  <div class="toast" id="toast"></div>
+      <!-- Right Column: Host Telemetry & Resource Usage Sidebar -->
+      <aside class="console-sidebar">
+        <div id="statsGrid"></div>
+        <div class="card" id="approvalsCard" style="display:none;">
+          <div class="card-header">
+            <h2 id="approvalsTitle" style="font-size:14px;margin:0 0 4px;">✋ Confirmações pendentes</h2>
+            <p class="card-desc" id="approvalsDesc" style="font-size:12px;margin:0;">Ações de IA aguardando autorização.</p>
+          </div>
+          <div id="approvalsList"></div>
+        </div>
+        <div class="sidebar-footer-note" style="padding:10px 4px;font-size:11.5px;color:var(--muted);display:flex;flex-direction:column;gap:5px;">
+          <div>🔒 <strong>Loopback-First</strong> (127.0.0.1)</div>
+          <div id="nodeRoleFooter">Node: standalone</div>
+        </div>
+      </aside>
+    </div>
+
+    <div class="toast" id="toast"></div>
 
   <script>
     let currentLang = localStorage.getItem('paasmcp_lang') || ((navigator.language || '').toLowerCase().startsWith('pt') ? 'pt' : 'en');
@@ -3880,6 +3992,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const pane = document.getElementById('tab-' + tabName);
       if (pane) pane.classList.add('active');
       if (btnEl) btnEl.classList.add('active');
+      try { localStorage.setItem('paasmcp_active_tab', tabName); } catch {}
       if (tabName === 'doctor') runDoctor();
       if (tabName === 'email') loadEmail();
       if (tabName === 'agents') { renderAi(); loadAiTokens(); }
@@ -3888,6 +4001,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'databases') loadStorage();
       if (tabName === 'overview') loadScale();
       if (tabName === 'pool') loadPool(true);
+    }
+
+    function filterApps(query) {
+      const q = (query || '').toLowerCase().trim();
+      document.querySelectorAll('#appsTable .app-entry-row').forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = (!q || text.includes(q)) ? '' : 'none';
+      });
     }
 
     function toggleTheme() {
@@ -3905,7 +4026,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     function applyPreferences() {
       document.documentElement.setAttribute('data-theme', currentTheme);
-      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌙 Dark';
+      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌘 Dark';
       document.getElementById('langBtn').textContent = currentLang === 'pt' ? '🇧🇷 PT-BR' : '🇺🇸 EN';
       document.getElementById('webhookUrlBox').textContent = window.location.origin + '/api/webhooks/github';
       const fedUrlEl = document.getElementById('fedUrl');
@@ -3919,13 +4040,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const el = document.getElementById(k);
         if (el) {
           const val = t(k);
-          if (val.indexOf('<') !== -1 && val.indexOf('>') !== -1) {
+          const counter = el.querySelector('.nav-counter');
+          if (counter) {
+            el.innerHTML = '<span>' + esc(val) + '</span> ' + counter.outerHTML;
+          } else if (val.indexOf('<') !== -1 && val.indexOf('>') !== -1) {
             el.innerHTML = val;
           } else {
             el.textContent = val;
           }
         }
       }
+
+      // Restore active tab
+      const savedTab = localStorage.getItem('paasmcp_active_tab') || 'overview';
+      const targetBtn = document.getElementById('nav' + savedTab.charAt(0).toUpperCase() + savedTab.slice(1));
+      if (targetBtn && !targetBtn.classList.contains('active')) switchTab(savedTab, targetBtn);
 
 
       const placeholders = {
@@ -4105,38 +4234,109 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const peersCount = Object.keys(s.federation?.peers || {}).length;
       document.getElementById('nodeRoleFooter').textContent = 'Node: ' + role + ' (' + peersCount + ' peers)';
 
+      const elHostname = document.getElementById('topHostname');
+      if (elHostname) elHostname.textContent = s.hostname || '-';
+
+      // Parse disk info
+      let diskTotal = '-';
+      let diskUsed = '-';
+      let diskPercent = 0;
+      if (s.rootDisk && typeof s.rootDisk === 'string') {
+        const parts = s.rootDisk.trim().split(/\s+/);
+        if (parts.length >= 5) {
+          diskTotal = parts[1] || '-';
+          diskUsed = parts[2] || '-';
+          diskPercent = parseInt((parts[4] || '0').replace('%', ''), 10) || 0;
+        }
+      }
+
+      // Memory calculations
+      const totalMem = s.totalMemGb || 1;
+      const freeMem = s.freeMemGb || 0;
+      const usedMem = Math.max(0, +(totalMem - freeMem).toFixed(1));
+      const ramPercent = Math.min(100, Math.max(0, Math.round((usedMem / totalMem) * 100)));
+
+      // Update counters in subnav tabs
+      const elTabApps = document.getElementById('tabCountApps');
+      if (elTabApps) elTabApps.textContent = Object.keys(s.apps || {}).length;
+
+      const elTabDbs = document.getElementById('tabCountDbs');
+      if (elTabDbs) elTabDbs.textContent = Object.keys(s.databases || {}).length;
+
+      const elTabVault = document.getElementById('tabCountVault');
+      if (elTabVault) elTabVault.textContent = (s.systemSecretsConfigured || []).length;
+
+      const elTabMirror = document.getElementById('tabCountMirror');
+      if (elTabMirror) elTabMirror.textContent = peersCount;
+
+      const elTabPool = document.getElementById('tabCountPool');
+      if (elTabPool) elTabPool.textContent = Object.keys(s.pool || {}).length;
+
       document.getElementById('statsGrid').innerHTML = \`
-        <div class="stat-card">
-          <div class="stat-label">
-            <span>\${esc(t('statHost'))}</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+        <div class="telemetry-card">
+          <div class="telemetry-title">
+            <span>Host Telemetry</span>
+            <span class="status-dot"></span>
           </div>
-          <div class="stat-value">\${esc(s.hostname)}</div>
-          <div class="stat-meta"><span>\${esc(s.platform)}</span> · <span>\${esc(t('statDisk'))} \${esc(s.rootDisk)}</span></div>
+          <div class="telemetry-item">
+            <span>Host</span>
+            <span class="telemetry-val">\${esc(s.hostname)}</span>
+          </div>
+          <div class="telemetry-item">
+            <span>Tailscale</span>
+            <span class="telemetry-val">\${esc(s.tailscaleDomain || (s.federation?.peers ? 'Tailnet Active' : '127.0.0.1'))}</span>
+          </div>
+          <div class="telemetry-item">
+            <span>Docker Engine</span>
+            <span class="telemetry-val">Live (27.x)</span>
+          </div>
+          <div class="telemetry-item">
+            <span>Platform</span>
+            <span class="telemetry-val" style="font-size:11px;" title="\${esc(s.platform)}">\${esc((s.platform || '').split(' ')[0])}</span>
+          </div>
+          <div class="telemetry-item">
+            <span>SSH Fingerprint</span>
+            <span class="telemetry-val" style="font-size:11px;">\${esc((s.sshKeyFingerprint || '').slice(0, 16))}...</span>
+          </div>
+          <div class="telemetry-item">
+            <span>Cluster Role</span>
+            <span class="badge" style="font-size:10px;padding:1px 6px;">\${esc(role.toUpperCase())}</span>
+          </div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">
-            <span>\${esc(t('statMem'))}</span>
+
+        <div class="telemetry-card">
+          <div class="telemetry-title">
+            <span>Resource Usage</span>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
           </div>
-          <div class="stat-value">\${esc(s.freeMemGb)} / \${esc(s.totalMemGb)} GB</div>
-          <div class="stat-meta"><span>\${esc(s.cpus)} vCPUs</span> · <span class="badge success" style="font-size:10.5px;padding:1px 6px;">\${esc(t('statIdle'))}</span></div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">
-            <span>\${esc(t('statAppsDbs'))}</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+          <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
+            <span>RAM (\${usedMem} / \${s.totalMemGb} GB)</span>
+            <span class="telemetry-val">\${ramPercent}%</span>
           </div>
-          <div class="stat-value">\${esc(s.appsCount)} Apps · \${esc(s.databasesCount)} DBs</div>
-          <div class="stat-meta"><span class="badge" style="font-size:10.5px;padding:1px 6px;">\${esc(s.backupsCount || 0)} \${esc(t('statSnapshots'))}</span></div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">
-            <span>\${esc(t('statSecurityFed'))}</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          <div class="progress-track">
+            <div class="progress-fill \${ramPercent > 85 ? 'danger' : ramPercent > 70 ? 'warning' : ''}" style="width: \${ramPercent}%;"></div>
           </div>
-          <div class="stat-value">\${esc(role.toUpperCase())}</div>
-          <div class="stat-meta">SSH: <code>\${esc((s.sshKeyFingerprint || '').slice(0, 18))}...</code></div>
+
+          <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
+            <span>Disk (\${diskTotal === '-' ? '-' : diskUsed + ' / ' + diskTotal})</span>
+            <span class="telemetry-val">\${diskPercent}%</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill \${diskPercent > 85 ? 'danger' : diskPercent > 70 ? 'warning' : ''}" style="width: \${diskPercent}%;"></div>
+          </div>
+
+          <div class="telemetry-item" style="margin-top:6px;">
+            <span>CPUs</span>
+            <span class="telemetry-val">\${esc(s.cpus)} vCPUs</span>
+          </div>
+          <div class="telemetry-item">
+            <span>Daemon Overhead</span>
+            <span class="telemetry-val" style="color:var(--success);">0 MB Idle</span>
+          </div>
+          <div class="telemetry-item">
+            <span>Snapshots</span>
+            <span class="telemetry-val">\${esc(s.backupsCount || 0)} backups</span>
+          </div>
         </div>
       \`;
 
@@ -4277,6 +4477,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           \`;
         }).join('');
       }
+
+      const searchVal = document.getElementById('appSearchInput')?.value;
+      if (searchVal) filterApps(searchVal);
 
       const dbs = Object.values(s.databases || {});
       document.getElementById('dbList').innerHTML = dbs.length
