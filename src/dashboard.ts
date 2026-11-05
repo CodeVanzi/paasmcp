@@ -1399,7 +1399,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <button class="nav-btn" onclick="switchTab('mirror', this)" id="navMirror">🔁 Segundo servidor</button>
           <button class="nav-btn" onclick="switchTab('pool', this)" id="navPool">🖥️ Ajudantes</button>
           <button class="nav-btn" onclick="switchTab('updates', this)" id="navUpdates">⬆️ Atualizações</button>
-          <button class="nav-btn" onclick="switchTab('federation', this)" id="navFederation">🔗 Conexões e webhook</button>
           <button class="nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">🩺 Diagnóstico</button>
           <button class="nav-btn" onclick="switchTab('agents', this)" id="navAgents">🤖 Conectar IA</button>
         </nav>
@@ -1462,7 +1461,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div class="grid-2">
               <div class="arch-box">
                 <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
-                <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública na seção Webhook abaixo e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
+                <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
                 <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" id="setupGithubLink">Criar fine-grained token ↗</a> · <a href="https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key" target="_blank" rel="noreferrer" id="setupGithubDocsLink">Permissões da API ↗</a></p>
               </div>
               <div class="arch-box">
@@ -1479,7 +1478,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <p id="setupAppDesc">Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.</p>
               </div>
             </div>
-            <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre a URL mostrada na aba Webhook no GitHub, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
+            <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
           </div>
         </div>
 
@@ -1508,84 +1507,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <tr><td colspan="6">...</td></tr>
                 </tbody>
               </table>
-            </div>
-            <div class="guide-box">
-              <div class="guide-box-title">
-                <span id="guideAppsTitle">💡 Funções de Gestão & Ciclo de Vida</span>
-              </div>
-              <div class="guide-grid">
-                <div class="guide-item">
-                  <strong id="guideAppsRollbackTitle">⏪ Rollback em 1s</strong>
-                  <span id="guideAppsRollbackDesc">Restaura o container para a imagem anterior instantaneamente caso o novo deploy falhe ou contenha bugs.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideAppsLimitsTitle">⚡ Limites de Memória & CPU</strong>
-                  <span id="guideAppsLimitsDesc">Isolamento cgroups do kernel Linux que impede que um app consuma toda a RAM do host ou trave outros containers.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideAppsActionsTitle">🛠️ Ações Rápidas (ENV, Logs, Restart)</strong>
-                  <span id="guideAppsActionsDesc">Edite segredos no cofre sem re-build, consulte logs em tempo real e reinicie containers sem downtime desnecessário.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideAppsLoopbackTitle">🔒 Isolamento Loopback</strong>
-                  <span id="guideAppsLoopbackDesc">Containers escutam exclusivamente em 127.0.0.1:4000-4998, sem portas expostas no firewall ou roteador.</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="card" id="scaleCard">
-            <div class="card-header">
-              <h2 data-i18n="scaleTitle"></h2>
-              <p class="card-desc" data-i18n="scaleDesc"></p>
-            </div>
-            <div id="scaleTimerNote"></div>
-            <div class="form-grid" style="grid-template-columns:minmax(0,280px);">
-              <div><label class="field-label" for="scaleApp" data-i18n="lblScaleApp"></label><select id="scaleApp" onchange="loadScale()"></select></div>
-            </div>
-            <div id="scaleNow"></div>
-            <div id="scaleCharts" style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px;"></div>
-            <div id="scaleBody">
-              <h3 data-i18n="autoTitle" style="margin-top:18px;"></h3>
-              <p class="card-desc" data-i18n="autoDesc"></p>
-              <div id="autoBox"></div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
-                <button onclick="setAuto(true)" id="btnAutoOn" data-i18n="btnAutoOn"></button>
-                <button class="secondary" onclick="setAuto(false)" id="btnAutoOff" data-i18n="btnAutoOff"></button>
-              </div>
-              <h3 data-i18n="copiesTitle" style="margin-top:18px;"></h3>
-              <p class="card-desc" data-i18n="copiesDesc"></p>
-              <div id="copiesBox"></div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-                <div id="copiesManual" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
-                  <div style="width:160px;"><label class="field-label" for="copiesN" data-i18n="lblCopiesN"></label><input id="copiesN" type="number" min="1" max="20" /></div>
-                  <button onclick="applyCopies()" data-i18n="btnCopiesApply"></button>
-                </div>
-                <button class="secondary" onclick="copiesOff()" id="btnCopiesOff" data-i18n="btnCopiesOff"></button>
-              </div>
-              <div id="copiesJobBox" style="margin-top:8px;"></div>
-              <h3 data-i18n="scaleRuleTitle" style="margin-top:18px;"></h3>
-              <p class="card-desc" data-i18n="scaleRuleDesc"></p>
-              <div class="form-grid">
-                <div><label class="field-label" for="scaleMin" data-i18n="lblScaleMin"></label><input id="scaleMin" type="number" min="1" max="20" /></div>
-                <div><label class="field-label" for="scaleMax" data-i18n="lblScaleMax"></label><input id="scaleMax" type="number" min="1" max="20" /></div>
-                <div><label class="field-label" for="scaleTarget" data-i18n="lblScaleTarget"></label><input id="scaleTarget" type="number" min="10" max="95" /></div>
-                <div><label class="field-label" for="scaleTargetRps" data-i18n="lblScaleTargetRps"></label><input id="scaleTargetRps" type="number" min="0" max="100000" /></div>
-                <div><label class="field-label" for="scaleUp" data-i18n="lblScaleUp"></label><input id="scaleUp" type="number" min="1" max="20" /></div>
-                <div><label class="field-label" for="scaleDown" data-i18n="lblScaleDown"></label><input id="scaleDown" type="number" min="1" max="1440" /></div>
-                <div><label class="field-label" for="scaleCooldown" data-i18n="lblScaleCooldown"></label><input id="scaleCooldown" type="number" min="0" max="3600" /></div>
-              </div>
-              <button onclick="saveScaleRule()" data-i18n="btnSave"></button>
-              <h3 data-i18n="scaleCapTitle" style="margin-top:18px;"></h3>
-              <p class="card-desc" data-i18n="scaleCapDesc"></p>
-              <div id="scaleCapacity"></div>
-              <h3 data-i18n="scaleDiaryTitle" style="margin-top:18px;"></h3>
-              <p class="card-desc" data-i18n="scaleDiaryDesc"></p>
-              <div id="scaleDiary"></div>
-              <div class="form-grid" style="grid-template-columns:minmax(0,320px);margin-top:8px;">
-                <div><label class="field-label" for="scaleLang" data-i18n="lblScaleLang"></label>
-                  <select id="scaleLang" onchange="saveScaleLang()"><option value="pt">Português</option><option value="en">English</option></select></div>
-              </div>
             </div>
           </div>
 
@@ -1689,26 +1610,85 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 </div>
               </div>
               <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
-              <div class="guide-box">
-                <div class="guide-box-title">
-                  <span id="guideExposeTitle">🛡️ Como funcionam os Modos de Publicação</span>
+            </div>
+          </div>
+
+          <div class="card" id="scaleCard">
+            <div class="card-header">
+              <h2 data-i18n="scaleTitle"></h2>
+              <p class="card-desc" data-i18n="scaleDesc"></p>
+            </div>
+            <div id="scaleTimerNote"></div>
+            <div class="form-grid" style="grid-template-columns:minmax(0,280px);">
+              <div><label class="field-label" for="scaleApp" data-i18n="lblScaleApp"></label><select id="scaleApp" onchange="loadScale()"></select></div>
+            </div>
+            <div id="scaleNow"></div>
+            <div id="scaleCharts" style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:10px;"></div>
+            <div id="scaleBody">
+              <h3 data-i18n="scaleAutoTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleAutoDesc"></p>
+              <div id="autoBox"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+                <button onclick="setAuto(true)" id="btnScaleAutoOn" data-i18n="btnScaleAutoOn"></button>
+                <button class="secondary" onclick="setAuto(false)" id="btnScaleAutoOff" data-i18n="btnScaleAutoOff"></button>
+              </div>
+              <h3 data-i18n="copiesTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="copiesDesc"></p>
+              <div id="copiesBox"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+                <div id="copiesManual" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;">
+                  <div style="width:160px;"><label class="field-label" for="copiesN" data-i18n="lblCopiesN"></label><input id="copiesN" type="number" min="1" max="20" /></div>
+                  <button onclick="applyCopies()" data-i18n="btnCopiesApply"></button>
                 </div>
-                <div class="guide-grid">
-                  <div class="guide-item">
-                    <strong id="guideExposePublicTitle">🌐 Público (Cloudflare Tunnel)</strong>
-                    <span id="guideExposePublicDesc">Túnel QUIC criptografado com DNS CNAME proxied e certificado SSL automático sem abrir portas.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideExposeZTTitle">🛡️ Zero Trust (PIN por E-mail)</strong>
-                    <span id="guideExposeZTDesc">Protege o app exigindo código OTP no e-mail antes do acesso. Recomendado para painéis e bancos.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideExposeTailscaleTitle">🔒 Tailscale (VPN Privada)</strong>
-                    <span id="guideExposeTailscaleDesc">Expõe o serviço de forma privada diretamente na sua Tailnet WireGuard, sem acesso público.</span>
-                  </div>
-                </div>
+                <button class="secondary" onclick="copiesOff()" id="btnCopiesOff" data-i18n="btnCopiesOff"></button>
+              </div>
+              <div id="copiesJobBox" style="margin-top:8px;"></div>
+              <h3 data-i18n="scaleRuleTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleRuleDesc"></p>
+              <div class="form-grid">
+                <div><label class="field-label" for="scaleMin" data-i18n="lblScaleMin"></label><input id="scaleMin" type="number" min="1" max="20" /></div>
+                <div><label class="field-label" for="scaleMax" data-i18n="lblScaleMax"></label><input id="scaleMax" type="number" min="1" max="20" /></div>
+                <div><label class="field-label" for="scaleTarget" data-i18n="lblScaleTarget"></label><input id="scaleTarget" type="number" min="10" max="95" /></div>
+                <div><label class="field-label" for="scaleTargetRps" data-i18n="lblScaleTargetRps"></label><input id="scaleTargetRps" type="number" min="0" max="100000" /></div>
+                <div><label class="field-label" for="scaleUp" data-i18n="lblScaleUp"></label><input id="scaleUp" type="number" min="1" max="20" /></div>
+                <div><label class="field-label" for="scaleDown" data-i18n="lblScaleDown"></label><input id="scaleDown" type="number" min="1" max="1440" /></div>
+                <div><label class="field-label" for="scaleCooldown" data-i18n="lblScaleCooldown"></label><input id="scaleCooldown" type="number" min="0" max="3600" /></div>
+              </div>
+              <button onclick="saveScaleRule()" data-i18n="btnSave"></button>
+              <h3 data-i18n="scaleCapTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleCapDesc"></p>
+              <div id="scaleCapacity"></div>
+              <h3 data-i18n="scaleDiaryTitle" style="margin-top:18px;"></h3>
+              <p class="card-desc" data-i18n="scaleDiaryDesc"></p>
+              <div id="scaleDiary"></div>
+              <div class="form-grid" style="grid-template-columns:minmax(0,320px);margin-top:8px;">
+                <div><label class="field-label" for="scaleLang" data-i18n="lblScaleLang"></label>
+                  <select id="scaleLang" onchange="saveScaleLang()"><option value="pt">Português</option><option value="en">English</option></select></div>
               </div>
             </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2 id="whTitle">⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
+              <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
+            </div>
+            <div style="margin-bottom:14px;">
+              <span class="field-label" id="lblWhUrl">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
+              <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
+            </div>
+            <div style="margin-bottom:16px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                <span class="field-label" id="lblWhSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
+                <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
+              </div>
+              <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
+              <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
+            </div>
+            <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
           </div>
         </div>
 
@@ -1743,29 +1723,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <button class="secondary" onclick="loadSecrets()" id="btnLoadSecrets">🔍 Recarregar Escopo</button>
             </div>
             <div id="secretsList"></div>
-            <div class="guide-box">
-              <div class="guide-box-title">
-                <span id="guideVaultTitle">🔐 Arquitetura de Segurança do Cofre (AES-256-GCM)</span>
-              </div>
-              <div class="guide-grid">
-                <div class="guide-item">
-                  <strong id="guideVaultScopesTitle">📁 Escopos Isolados</strong>
-                  <span id="guideVaultScopesDesc">O escopo <code>system</code> guarda tokens de nuvem. Cada aplicação possui seu próprio escopo isolado.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideVaultGcmTitle">🛡️ Criptografia AES-256-GCM</strong>
-                  <span id="guideVaultGcmDesc">Dados cifrados em repouso com IV aleatório de 96 bits e autenticação GCM contra adulterações.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideVaultInjectionTitle">⚡ Injeção Segura</strong>
-                  <span id="guideVaultInjectionDesc">Variáveis são descriptografadas em memória na partida do container, sem nunca vazarem no código ou git.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideVaultMasterKeyTitle">🔑 Chave Mestra 0600</strong>
-                  <span id="guideVaultMasterKeyDesc">Guardada em arquivo local com permissões restritas (0600), acessível apenas pelo daemon do PaaS.</span>
-                </div>
-              </div>
-            </div>
           </div>
         </div>
 
@@ -1812,21 +1769,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </div>
               <button onclick="createDb()" id="btnCreateDb" style="margin-bottom:16px;">+ Provisionar Banco</button>
               <div id="dbList"></div>
-              <div class="guide-box">
-                <div class="guide-box-title">
-                  <span id="guideDbTitle">🗄️ Como funciona o Banco Multi-Tenant</span>
-                </div>
-                <div class="guide-grid">
-                  <div class="guide-item">
-                    <strong id="guideDbIsolationTitle">🐘 PostgreSQL 16 & Redis 7</strong>
-                    <span id="guideDbIsolationDesc">Cada app recebe um banco lógico e usuário exclusivo com senha forte, isolado dos demais.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideDbInjectionTitle">🔗 DATABASE_URL Automática</strong>
-                    <span id="guideDbInjectionDesc">A URL de conexão é salva no Cofre do app e injetada no container sem configuração manual.</span>
-                  </div>
-                </div>
-              </div>
             </div>
 
             <div class="card">
@@ -1850,126 +1792,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </div>
               <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Criar Snapshot Criptografado</button>
               <div id="backupsList"></div>
-              <div class="guide-box">
-                <div class="guide-box-title">
-                  <span id="guideBackupTitle">🛡️ Como funcionam os Snapshots & Restore</span>
-                </div>
-                <div class="guide-grid">
-                  <div class="guide-item">
-                    <strong id="guideBackupDumpTitle">📸 Dumps Consistentes</strong>
-                    <span id="guideBackupDumpDesc">Executa <code>pg_dump</code> transacional ou RDB em tempo de execução sem interromper os serviços.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideBackupCryptoTitle">🔐 Criptografia em Repouso</strong>
-                    <span id="guideBackupCryptoDesc">O dump é criptografado com chave AES-256-GCM antes de ser gravado no diretório de backups.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideBackupIntegrityTitle">🛡️ Checksum SHA-256</strong>
-                    <span id="guideBackupIntegrityDesc">Todo snapshot calcula um hash SHA-256 que é estritamente verificado antes de qualquer restauração.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideBackupRestoreTitle">⏪ Restore 1-Click</strong>
-                    <span id="guideBackupRestoreDesc">Restaura o banco instantaneamente para recuperação de desastres ou testes de migração.</span>
-                  </div>
-                </div>
-              </div>
             </div>
           </div>
         </div>
 
-        <!-- TAB 4: MULTI-SERVER HA FEDERATION & GITHUB WEBHOOKS -->
-        <div class="tab-pane" id="tab-federation">
-          <div class="row">
-            <div class="card">
-              <div class="card-header">
-                <h2 id="fedTitle">🌐 Handshake Multi-Servidor & Redundância (HA Federation)</h2>
-                <p class="card-desc" id="fedDesc">Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.</p>
-              </div>
-              <div class="form-grid">
-                <div>
-                  <label class="field-label" id="lblFedUrl">URL deste Servidor (Primary)</label>
-                  <input id="fedUrl" placeholder="https://paas.seudominio.com" />
-                </div>
-                <div>
-                  <label class="field-label" id="lblFedMode">Modo de Redundância</label>
-                  <select id="fedMode">
-                    <option value="active-active-tunnel" id="optFedActive">Active-Active (Cloudflare Tunnel Multi-Connector)</option>
-                    <option value="warm-standby" id="optFedWarm">Warm Standby (Sync Criptografado de Vault & Apps)</option>
-                  </select>
-                </div>
-              </div>
-              <div class="actions" style="margin-bottom:12px;">
-                <button onclick="generateInvite()" id="btnGenInvite">🔑 Gerar Join Token (15 min)</button>
-                <button class="secondary" onclick="exportSyncBundle()" id="btnExportSync">📦 Exportar Bundle Criptografado</button>
-              </div>
-              <pre id="fedTokenBox" style="display:none;user-select:all;"></pre>
-              <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;" />
-              <label class="field-label" id="lblJoinPeer">Conectar este servidor como Réplica (Cole um Join Token):</label>
-              <div style="display:flex;gap:8px;margin-bottom:14px;">
-                <input id="fedJoinInput" placeholder="paasmcp-join://..." />
-                <button class="secondary" onclick="joinFederation()" id="btnJoinPeer">🤝 Fazer Handshake</button>
-              </div>
-              <div id="fedPeersList"></div>
-              <div class="guide-box">
-                <div class="guide-box-title">
-                  <span id="guideFedTitle">🌐 Redundância e Alta Disponibilidade</span>
-                </div>
-                <div class="guide-grid">
-                  <div class="guide-item">
-                    <strong id="guideFedTokenTitle">🤝 Handshake HMAC-SHA256</strong>
-                    <span id="guideFedTokenDesc">Pareia nós com token assinado e expiração de 15 minutos, impedindo conexões não autorizadas.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideFedActiveTitle">⚡ Active-Active (Cloudflare)</strong>
-                    <span id="guideFedActiveDesc">Os apps ligados nos dois servidores ganham um túnel só deles, que roda nos dois; o servidor com a cópia doente sai do túnel sozinho.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideFedWarmTitle">📦 Warm Standby & Sync</strong>
-                    <span id="guideFedWarmDesc">Exportação e importação de pacotes cifrados com segredos e apps para recuperação remota.</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="card">
-              <div class="card-header">
-                <h2 id="whTitle">⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
-                <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
-              </div>
-              <div style="margin-bottom:14px;">
-                <span class="field-label" id="lblWhUrl">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
-                <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
-              </div>
-              <div style="margin-bottom:16px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-                  <span class="field-label" id="lblWhSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
-                  <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
-                </div>
-                <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
-              </div>
-              <div style="display:flex;justify-content:space-between;align-items:center;">
-                <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
-                <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
-              </div>
-              <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
-              <div class="guide-box">
-                <div class="guide-box-title">
-                  <span id="guideWhTitle">⚡ Automação com GitHub Webhooks</span>
-                </div>
-                <div class="guide-grid">
-                  <div class="guide-item">
-                    <strong id="guideWhSigTitle">🔒 Validação HMAC-SHA256</strong>
-                    <span id="guideWhSigDesc">Compara a assinatura do GitHub em tempo constante (evitando timing attacks) antes de acionar rebuilds.</span>
-                  </div>
-                  <div class="guide-item">
-                    <strong id="guideWhSshTitle">🔑 Deploy Key Ed25519</strong>
-                    <span id="guideWhSshDesc">Chave SSH somente leitura para clonar repositórios privados sem expor senhas ou tokens globais.</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
 
         <div class="tab-pane" id="tab-email">
           <div class="card">
@@ -2013,6 +1839,37 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <p class="card-desc" data-i18n="mirrorDesc"></p>
             </div>
             <div id="mirrorStatusBox"></div>
+          </div>
+          <div class="card" id="pairCard">
+            <div class="card-header">
+              <h2 id="fedTitle">🌐 Handshake Multi-Servidor & Redundância (HA Federation)</h2>
+              <p class="card-desc" id="fedDesc">Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.</p>
+            </div>
+            <div class="form-grid">
+              <div>
+                <label class="field-label" id="lblFedUrl">URL deste Servidor (Primary)</label>
+                <input id="fedUrl" placeholder="https://paas.seudominio.com" />
+              </div>
+              <div>
+                <label class="field-label" id="lblFedMode">Modo de Redundância</label>
+                <select id="fedMode">
+                  <option value="active-active-tunnel" id="optFedActive">Active-Active (Cloudflare Tunnel Multi-Connector)</option>
+                  <option value="warm-standby" id="optFedWarm">Warm Standby (Sync Criptografado de Vault & Apps)</option>
+                </select>
+              </div>
+            </div>
+            <div class="actions" style="margin-bottom:12px;">
+              <button onclick="generateInvite()" id="btnGenInvite">🔑 Gerar Join Token (15 min)</button>
+              <button class="secondary" onclick="exportSyncBundle()" id="btnExportSync">📦 Exportar Bundle Criptografado</button>
+            </div>
+            <pre id="fedTokenBox" style="display:none;user-select:all;"></pre>
+            <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;" />
+            <label class="field-label" id="lblJoinPeer">Conectar este servidor como Réplica (Cole um Join Token):</label>
+            <div style="display:flex;gap:8px;margin-bottom:14px;">
+              <input id="fedJoinInput" placeholder="paasmcp-join://..." />
+              <button class="secondary" onclick="joinFederation()" id="btnJoinPeer">🤝 Fazer Handshake</button>
+            </div>
+            <div id="fedPeersList"></div>
           </div>
           <div class="grid-2">
             <div class="card">
@@ -2214,25 +2071,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
               <p class="card-desc" id="doctorDesc">Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.</p>
             </div>
             <div id="doctorReportBox"></div>
-            <div class="guide-box">
-              <div class="guide-box-title">
-                <span id="guideDoctorTitle">🩺 Como o Doctor protege o cluster</span>
-              </div>
-              <div class="guide-grid">
-                <div class="guide-item">
-                  <strong id="guideDoctorOomTitle">🚨 Detecção de OOMKilled</strong>
-                  <span id="guideDoctorOomDesc">Identifica containers mortos pelo kernel por estouro de RAM e sugere novos limites de memória.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideDoctorLoopTitle">🔄 Detecção de Crash Loops</strong>
-                  <span id="guideDoctorLoopDesc">Alerta quando containers falham repetidamente e diagnostica códigos de saída anormais.</span>
-                </div>
-                <div class="guide-item">
-                  <strong id="guideDoctorFixTitle">🛠️ Ações Corretivas 1-Click</strong>
-                  <span id="guideDoctorFixDesc">Botão de reinicialização direta para reanimar containers com problemas sem sair do painel.</span>
-                </div>
-              </div>
-            </div>
           </div>
         </div>
 
@@ -2300,30 +2138,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             </div>
           </div>
 
-          <div class="card">
-            <div class="card-header">
-              <h2 id="archTitle">🏛️ Arquitetura & Modelo de Segurança (Por dentro do PaaSMCP)</h2>
-              <p class="card-desc" id="archDesc">Projetado para máxima segurança e zero desperdício de recursos:</p>
-            </div>
-            <div class="arch-grid">
-              <div class="arch-box">
-                <h3 id="archPillar1Title">1. Isolamento Loopback (127.0.0.1)</h3>
-                <p id="archPillar1Desc">Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.</p>
-              </div>
-              <div class="arch-box">
-                <h3 id="archPillar2Title">2. Cofre & Backups AES-256-GCM</h3>
-                <p id="archPillar2Desc">Variáveis de ambiente e dumps de banco (<code>pg_dump</code>) são criptografados em repouso com chave mestra <code>0600</code> e mascarados nas respostas do MCP.</p>
-              </div>
-              <div class="arch-box">
-                <h3 id="archPillar3Title">3. Sanitização de Docker Compose</h3>
-                <p id="archPillar3Desc">Repositórios multi-serviço têm seus arquivos Compose auditados automaticamente, removendo <code>privileged: true</code>, <code>network_mode: host</code> e mounts inseguros.</p>
-              </div>
-              <div class="arch-box">
-                <h3 id="archPillar4Title">4. Redundância Multi-Servidor</h3>
-                <p id="archPillar4Desc">Dois servidores podem parear via handshake HMAC-SHA256 e operar em <strong>Active-Active</strong> no mesmo Cloudflare Tunnel ou em <strong>Warm Standby</strong>.</p>
-              </div>
-            </div>
-          </div>
         </div>
 
         <!-- Container Logs Drawer -->
@@ -2352,7 +2166,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupTitle: "🧭 Primeira configuração: o que você precisa?",
         setupDesc: "Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.",
         setupGithubTitle: "🐙 GitHub — opcional",
-        setupGithubDesc: "Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública na seção Webhook abaixo e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.",
+        setupGithubDesc: "Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.",
         setupGithubLink: "Criar fine-grained token ↗",
         setupGithubDocsLink: "Permissões da API ↗",
         setupCloudTitle: "☁️ Cloudflare — opcional para publicar",
@@ -2363,12 +2177,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupLocalDesc: "O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.",
         setupAppTitle: "🧩 Segredos e sugestões por aplicação",
         setupAppDesc: "Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.",
-        setupWebhookNote: "Auto-deploy por webhook é opcional: cadastre a URL mostrada na aba Webhook no GitHub, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.",
+        setupWebhookNote: "Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navOverview: "📦 Aplicações & Deploy",
         navVault: "🔐 Cofre AES-256-GCM",
         navDatabases: "🗄️ Bancos & Backups",
-        navFederation: "🌐 Multi-Server HA & Webhook",
         navDoctor: "🩺 Doctor & Diagnóstico",
         navAgents: "🤖 Studio IA (MCP) & Guia",
         topHealthBadge: "● System Online",
@@ -2450,8 +2263,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnRunDoctor: "🔍 Executar Diagnóstico Agora",
         agentsTitle: "🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)",
         agentsDesc: "O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:",
-        archTitle: "🏛️ Arquitetura & Modelo de Segurança (Por dentro do PaaSMCP)",
-        archDesc: "Projetado para máxima segurança e zero desperdício de recursos:",
         logsTitle: "📜 Logs do Container",
         btnCloseLogs: "Fechar",
         statHost: "Servidor Host",
@@ -2471,14 +2282,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         promptEx2Desc: "'Crie um backup criptografado do banco do app <code>meu-saas</code> antes de atualizar e faça rollback se der erro'",
         promptEx3Title: "💬 Diagnóstico & Multi-Node",
         promptEx3Desc: "'Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA'",
-        archPillar1Title: "1. Isolamento Loopback (127.0.0.1)",
-        archPillar1Desc: "Nenhuma porta de aplicação ou banco de dados é exposta em <code>0.0.0.0</code>. O tráfego externo entra exclusivamente via túnel outbound QUIC (Cloudflare Tunnel) ou Tailscale.",
-        archPillar2Title: "2. Cofre & Backups AES-256-GCM",
-        archPillar2Desc: "Variáveis de ambiente e dumps de banco (<code>pg_dump</code>) são criptografados em repouso com chave mestra <code>0600</code> e mascarados nas respostas do MCP.",
-        archPillar3Title: "3. Sanitização de Docker Compose",
-        archPillar3Desc: "Repositórios multi-serviço têm seus arquivos Compose auditados automaticamente, removendo <code>privileged: true</code>, <code>network_mode: host</code> e mounts inseguros.",
-        archPillar4Title: "4. Redundância Multi-Servidor",
-        archPillar4Desc: "Dois servidores podem parear via handshake HMAC-SHA256 e operar em <strong>Active-Active</strong> no mesmo Cloudflare Tunnel ou em <strong>Warm Standby</strong>.",
         emptyApps: "Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!",
         emptyDbs: "Nenhum banco provisionado ainda.",
         emptyBackups: "Nenhum snapshot criptografado criado ainda.",
@@ -2522,70 +2325,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         sizeLabel: "Tamanho:",
         stoppedStatus: "Parado",
         onDemandStatus: "Sob demanda",
-        guideAppsTitle: "💡 Funções de Gestão & Ciclo de Vida",
-        guideAppsRollbackTitle: "⏪ Rollback em 1s",
-        guideAppsRollbackDesc: "Restaura o container para a imagem anterior instantaneamente caso o novo deploy falhe ou contenha bugs.",
-        guideAppsLimitsTitle: "⚡ Limites de Memória & CPU",
-        guideAppsLimitsDesc: "Isolamento cgroups do kernel Linux que impede que um app consuma toda a RAM do host ou trave outros containers.",
-        guideAppsActionsTitle: "🛠️ Ações Rápidas (ENV, Logs, Restart)",
-        guideAppsActionsDesc: "Edite segredos no cofre sem re-build, consulte logs em tempo real e reinicie containers sem downtime desnecessário.",
-        guideAppsLoopbackTitle: "🔒 Isolamento Loopback",
-        guideAppsLoopbackDesc: "Containers escutam exclusivamente em 127.0.0.1:4000-4998, sem portas expostas no firewall ou roteador.",
-        guideExposeTitle: "🛡️ Como funcionam os Modos de Publicação",
-        guideExposePublicTitle: "🌐 Público (Cloudflare Tunnel)",
-        guideExposePublicDesc: "Túnel QUIC criptografado com DNS CNAME proxied e certificado SSL automático sem abrir portas.",
-        guideExposeZTTitle: "🛡️ Zero Trust (PIN por E-mail)",
-        guideExposeZTDesc: "Protege o app exigindo código OTP no e-mail antes do acesso. Recomendado para painéis e bancos.",
-        guideExposeTailscaleTitle: "🔒 Tailscale (VPN Privada)",
-        guideExposeTailscaleDesc: "Expõe o serviço de forma privada diretamente na sua Tailnet WireGuard, sem acesso público.",
-        guideVaultTitle: "🔐 Arquitetura de Segurança do Cofre (AES-256-GCM)",
-        guideVaultScopesTitle: "📁 Escopos Isolados",
-        guideVaultScopesDesc: "O escopo <code>system</code> guarda tokens de nuvem. Cada aplicação possui seu próprio escopo exclusivo.",
-        guideVaultGcmTitle: "🛡️ Criptografia AES-256-GCM",
-        guideVaultGcmDesc: "Dados cifrados em repouso com IV aleatório de 96 bits e autenticação GCM contra adulterações.",
-        guideVaultInjectionTitle: "⚡ Injeção Segura",
-        guideVaultInjectionDesc: "Variáveis são descriptografadas em memória na partida do container, sem nunca vazarem no código ou git.",
-        guideVaultMasterKeyTitle: "🔑 Chave Mestra 0600",
-        guideVaultMasterKeyDesc: "Guardada em arquivo local com permissões restritas (0600), acessível apenas pelo daemon do PaaS.",
-        guideDbTitle: "🗄️ Como funciona o Banco Multi-Tenant",
-        guideDbIsolationTitle: "🐘 PostgreSQL 16 & Redis 7",
-        guideDbIsolationDesc: "Cada app recebe um banco lógico e usuário exclusivo com senha forte, isolado dos demais.",
-        guideDbInjectionTitle: "🔗 DATABASE_URL Automática",
-        guideDbInjectionDesc: "A URL de conexão é salva no Cofre do app e injetada no container sem configuração manual.",
-        guideBackupTitle: "🛡️ Como funcionam os Snapshots & Restore",
-        guideBackupDumpTitle: "📸 Dumps Consistentes",
-        guideBackupDumpDesc: "Executa <code>pg_dump</code> transacional ou RDB em tempo de execução sem interromper os serviços.",
-        guideBackupCryptoTitle: "🔐 Criptografia em Repouso",
-        guideBackupCryptoDesc: "O dump é criptografado com chave AES-256-GCM antes de ser gravado no diretório de backups.",
-        guideBackupIntegrityTitle: "🛡️ Checksum SHA-256",
-        guideBackupIntegrityDesc: "Todo snapshot calcula um hash SHA-256 que é estritamente verificado antes de qualquer restauração.",
-        guideBackupRestoreTitle: "⏪ Restore 1-Click",
-        guideBackupRestoreDesc: "Restaura o banco instantaneamente para recuperação de desastres ou testes de migração.",
-        guideFedTitle: "🌐 Redundância e Alta Disponibilidade",
-        guideFedTokenTitle: "🤝 Handshake HMAC-SHA256",
-        guideFedTokenDesc: "Pareia nós com token assinado e expiração de 15 minutos, impedindo conexões não autorizadas.",
-        guideFedActiveTitle: "⚡ Active-Active (Cloudflare)",
-        guideFedActiveDesc: "Os apps ligados nos dois servidores ganham um túnel só deles, que roda nos dois; o servidor com a cópia doente sai do túnel sozinho.",
-        guideFedWarmTitle: "📦 Warm Standby & Sync",
-        guideFedWarmDesc: "Exportação e importação de pacotes cifrados com segredos e apps para recuperação remota.",
-        guideWhTitle: "⚡ Automação com GitHub Webhooks",
-        guideWhSigTitle: "🔒 Validação HMAC-SHA256",
-        guideWhSigDesc: "Compara a assinatura do GitHub em tempo constante (evitando timing attacks) antes de acionar rebuilds.",
-        guideWhSshTitle: "🔑 Deploy Key Ed25519",
-        guideWhSshDesc: "Chave SSH somente leitura para clonar repositórios privados sem expor senhas ou tokens globais.",
-        guideDoctorTitle: "🩺 Como o Doctor protege o cluster",
-        guideDoctorOomTitle: "🚨 Detecção de OOMKilled",
-        guideDoctorOomDesc: "Identifica containers mortos pelo kernel por estouro de RAM e sugere novos limites de memória.",
-        guideDoctorLoopTitle: "🔄 Detecção de Crash Loops",
-        guideDoctorLoopDesc: "Alerta quando containers falham repetidamente e diagnostica códigos de saída anormais.",
-        guideDoctorFixTitle: "🛠️ Ações Corretivas 1-Click",
-        guideDoctorFixDesc: "Botão de reinicialização direta para reanimar containers com problemas sem sair do painel."
       },
       en: {
         setupTitle: "🧭 First-time setup: what do you need?",
         setupDesc: "Configure only the integrations you plan to use. PaaSMCP works locally without third-party tokens; secret values are stored in the Vault.",
         setupGithubTitle: "🐙 GitHub — optional",
-        setupGithubDesc: "For a private repository, use a read-only SSH Deploy Key. Copy the public key from the Webhook section below and add it under Settings → Deploy keys. To register it automatically or clone over HTTPS, save <code>GITHUB_TOKEN</code> in the <code>system</code> scope. A fine-grained token needs access only to the target repository and <em>Administration: read and write</em>; the created key remains read-only.",
+        setupGithubDesc: "For a private repository, use a read-only SSH Deploy Key. Copy the public key from the webhook box at the end of the Apps screen and add it under Settings → Deploy keys. To register it automatically or clone over HTTPS, save <code>GITHUB_TOKEN</code> in the <code>system</code> scope. A fine-grained token needs access only to the target repository and <em>Administration: read and write</em>; the created key remains read-only.",
         setupGithubLink: "Create fine-grained token ↗",
         setupGithubDocsLink: "API permissions ↗",
         setupCloudTitle: "☁️ Cloudflare — optional for publishing",
@@ -2596,12 +2341,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupLocalDesc: "The dashboard token is generated automatically: retrieve it with <code>paasmcp dashboard token</code>. Public repositories, SSH access to private repositories, and local folders do not require a GitHub token if you add the public SSH key to the repository. Tailscale is a private alternative that does not require Cloudflare.",
         setupAppTitle: "🧩 App secrets and recommendations",
         setupAppDesc: "Save application keys in the scope named after its slug (for example <code>STRIPE_SECRET_KEY</code> or <code>API_KEY</code>), never in <code>system</code>. Select PostgreSQL/Redis during deployment if needed. Then check Logs and run Doctor; expose as Public only services with their own login. Use Zero Trust or Tailscale for admin tools.",
-        setupWebhookNote: "Webhook auto-deploy is optional: add the URL shown in the Webhook tab to GitHub, select Push events, and use the secret shown by the dashboard. Do not paste tokens into chat; enter them in the Vault.",
+        setupWebhookNote: "Webhook auto-deploy is optional: add the URL shown at the end of the Apps screen to GitHub, select Push events, and use the secret shown by the dashboard. Do not paste tokens into chat; enter them in the Vault.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navOverview: "📦 Applications & Deploy",
         navVault: "🔐 AES-256-GCM Vault",
         navDatabases: "🗄️ Databases & Backups",
-        navFederation: "🌐 Multi-Server HA & Webhook",
         navDoctor: "🩺 Doctor & Diagnostics",
         navAgents: "🤖 AI Studio (MCP) & Guide",
         topHealthBadge: "● System Online",
@@ -2683,8 +2427,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnRunDoctor: "🔍 Run Diagnostics Now",
         agentsTitle: "🤖 How to Connect your AI Agent (MCP Compatible Clients)",
         agentsDesc: "PaaSMCP exposes <strong>15 native MCP tools</strong> via stdio JSON-RPC. Copy the config below so your AI agent can manage the entire server for you:",
-        archTitle: "🏛️ Architecture & Security Model (Inside PaaSMCP)",
-        archDesc: "Designed for maximum security and zero resource waste:",
         logsTitle: "📜 Container Logs",
         btnCloseLogs: "Close",
         statHost: "Host Server",
@@ -2704,14 +2446,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         promptEx2Desc: "'Create an encrypted database backup for app <code>my-saas</code> before upgrading and rollback if it fails'",
         promptEx3Title: "💬 Diagnostics & Multi-Node",
         promptEx3Desc: "'Run <code>paas_doctor</code> to check if any container suffered an OOMKill and generate an HA pairing token'",
-        archPillar1Title: "1. Loopback Isolation (127.0.0.1)",
-        archPillar1Desc: "No application or database ports are exposed on <code>0.0.0.0</code>. External traffic enters exclusively via outbound QUIC tunnels (Cloudflare Tunnel) or Tailscale.",
-        archPillar2Title: "2. AES-256-GCM Vault & Backups",
-        archPillar2Desc: "Environment variables and database dumps (<code>pg_dump</code>) are encrypted at rest with a <code>0600</code> master key and masked in MCP responses.",
-        archPillar3Title: "3. Docker Compose Sanitization",
-        archPillar3Desc: "Multi-service repositories have their Compose manifests audited automatically, stripping <code>privileged: true</code>, <code>network_mode: host</code>, and insecure mounts.",
-        archPillar4Title: "4. Multi-Server Redundancy",
-        archPillar4Desc: "Two servers can pair via HMAC-SHA256 handshake and operate in <strong>Active-Active</strong> on the same Cloudflare Tunnel or in <strong>Warm Standby</strong>.",
         emptyApps: "No hosted applications yet. Use one of the presets below to get started!",
         emptyDbs: "No databases provisioned yet.",
         emptyBackups: "No encrypted snapshots created yet.",
@@ -2755,64 +2489,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         sizeLabel: "Size:",
         stoppedStatus: "Stopped",
         onDemandStatus: "On demand",
-        guideAppsTitle: "💡 Lifecycle Management & Functions",
-        guideAppsRollbackTitle: "⏪ 1-Second Rollback",
-        guideAppsRollbackDesc: "Instantly restores container to the previous working build if the new deploy fails or has bugs.",
-        guideAppsLimitsTitle: "⚡ Memory & CPU Limits",
-        guideAppsLimitsDesc: "Linux kernel cgroups isolation preventing memory leaks from freezing the host or other apps.",
-        guideAppsActionsTitle: "🛠️ Quick Actions (ENV, Logs, Restart)",
-        guideAppsActionsDesc: "Edit secrets in vault without rebuilds, monitor real-time logs, and restart containers without friction.",
-        guideAppsLoopbackTitle: "🔒 Loopback Isolation",
-        guideAppsLoopbackDesc: "Containers listen strictly on 127.0.0.1:4000-4998, with zero exposed ports in firewall or router.",
-        guideExposeTitle: "🛡️ How Publishing Modes Work",
-        guideExposePublicTitle: "🌐 Public (Cloudflare Tunnel)",
-        guideExposePublicDesc: "Encrypted outbound QUIC tunnel with proxied DNS CNAME and automatic SSL without open ports.",
-        guideExposeZTTitle: "🛡️ Zero Trust (Email OTP PIN)",
-        guideExposeZTDesc: "Protects the route requiring email verification before access. Recommended for admin tools and databases.",
-        guideExposeTailscaleTitle: "🔒 Tailscale (Private VPN)",
-        guideExposeTailscaleDesc: "Exposes the service privately to your WireGuard Tailnet mesh, with zero public exposure.",
-        guideVaultTitle: "🔐 Vault Security Architecture (AES-256-GCM)",
-        guideVaultScopesTitle: "📁 Isolated Scopes",
-        guideVaultScopesDesc: "The <code>system</code> scope holds cloud tokens. Each application has its own dedicated secret scope.",
-        guideVaultGcmTitle: "🛡️ AES-256-GCM Encryption",
-        guideVaultGcmDesc: "Data encrypted at rest using a 96-bit random IV and GCM authentication tag against tampering.",
-        guideVaultInjectionTitle: "⚡ Safe Injection",
-        guideVaultInjectionDesc: "Variables are decrypted in memory when starting the container, never committed to git or logs.",
-        guideVaultMasterKeyTitle: "🔑 0600 Master Key",
-        guideVaultMasterKeyDesc: "Preserved in a local file with strict 0600 permissions, accessible only by the PaaS daemon.",
-        guideDbTitle: "🗄️ How Isolated Multi-Tenant Databases Work",
-        guideDbIsolationTitle: "🐘 PostgreSQL 16 & Redis 7",
-        guideDbIsolationDesc: "Each app gets its own logical database and dedicated user with strong password, isolated from other apps.",
-        guideDbInjectionTitle: "🔗 Automatic DATABASE_URL",
-        guideDbInjectionDesc: "Connection string is written into the app Vault and auto-injected into containers without manual setup.",
-        guideBackupTitle: "🛡️ How Snapshots & Restore Work",
-        guideBackupDumpTitle: "📸 Consistent Dumps",
-        guideBackupDumpDesc: "Runs transactional <code>pg_dump</code> or Redis RDB in real time without taking services down.",
-        guideBackupCryptoTitle: "🔐 Encrypted at Rest",
-        guideBackupCryptoDesc: "The raw dump is encrypted with an AES-256-GCM key before being saved to backup storage.",
-        guideBackupIntegrityTitle: "🛡️ SHA-256 Checksum",
-        guideBackupIntegrityDesc: "Every snapshot calculates a SHA-256 hash strictly re-verified before performing any restore.",
-        guideBackupRestoreTitle: "⏪ 1-Click Restore",
-        guideBackupRestoreDesc: "Restores database state instantly for disaster recovery or testing migrations.",
-        guideFedTitle: "🌐 Redundancy & High Availability",
-        guideFedTokenTitle: "🤝 HMAC-SHA256 Handshake",
-        guideFedTokenDesc: "Pairs nodes with signed tokens and 15-minute expiration, blocking unauthorized cluster connections.",
-        guideFedActiveTitle: "⚡ Active-Active (Cloudflare)",
-        guideFedActiveDesc: "Apps turned on for both servers get a tunnel of their own, run on both; a server whose copy is sick steps out by itself.",
-        guideFedWarmTitle: "📦 Warm Standby & Sync",
-        guideFedWarmDesc: "Exports and imports encrypted bundles containing configs and vault data to keep standby nodes in sync.",
-        guideWhTitle: "⚡ Automation with GitHub Webhooks",
-        guideWhSigTitle: "🔒 HMAC-SHA256 Validation",
-        guideWhSigDesc: "Verifies GitHub webhook payloads in constant time (preventing timing attacks) before rebuilding.",
-        guideWhSshTitle: "🔑 Ed25519 Deploy Key",
-        guideWhSshDesc: "Read-only SSH deploy key to pull private repositories without exposing accounts or personal tokens.",
-        guideDoctorTitle: "🩺 How Doctor Protects the Cluster",
-        guideDoctorOomTitle: "🚨 OOMKilled Detection",
-        guideDoctorOomDesc: "Detects containers killed by the kernel due to RAM limits and suggests memory limit adjustments.",
-        guideDoctorLoopTitle: "🔄 Crash Loop Detection",
-        guideDoctorLoopDesc: "Alerts when containers restart repeatedly and reports abnormal process exit codes.",
-        guideDoctorFixTitle: "🛠️ 1-Click Corrective Actions",
-        guideDoctorFixDesc: "Provides instant restart actions to recover degraded containers directly from the dashboard."
       }
     };
 
@@ -2826,7 +2502,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navEmail": "✉️ E-mail",
           "navMirror": "🔁 Segundo servidor",
           "navUpdates": "⬆️ Atualizações",
-          "navFederation": "🔗 Conexões e webhook",
           "navDoctor": "🩺 Diagnóstico",
           "navAgents": "🤖 Conectar IA",
           "homeTitle": "🏠 Início",
@@ -2844,7 +2519,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "backupsTitle": "🛡️ Cópias de segurança",
           "backupsDesc": "Cópias cifradas dos bancos e dos arquivos dos apps. Use “Testar” para conferir que a cópia abre antes de precisar dela.",
           "fedTitle": "🔗 Conectar outro servidor",
-          "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use a aba <strong>Segundo servidor</strong> para a cópia ao vivo dos dados.",
+          "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use os quadros abaixo para a cópia ao vivo dos dados.",
           "optFedActive": "Os dois atendem juntos (apps sem dados próprios)",
           "optFedWarm": "Reserva: copia apps e senhas para o outro servidor",
           "btnGenInvite": "🔑 Gerar convite (vale 15 min)",
@@ -2909,8 +2584,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepHealth": "Endereço de teste antes de trocar (Opcional)",
           "lblDepNoHealth": "Não é um site (pular o teste antes de trocar)",
           "deployHealthFailed": "A nova versão não passou no teste e NÃO foi colocada no ar. A versão anterior continua funcionando. Veja o erro do app abaixo:",
-          "guideAppsRollbackTitle": "🛡️ Troca segura + volta em 1s",
-          "guideAppsRollbackDesc": "Cada nova versão é testada antes de substituir a atual: se ela não responder, nada muda. E se aparecer um problema depois, dá para voltar à versão anterior em 1 segundo.",
           "emailTitle": "✉️ Envio de e-mails",
           "emailDesc": "E-mail enviado direto de casa cai no spam ou nem sai. Por isso o painel usa um serviço de envio, configurado uma vez para todos os apps.",
           "emailTip": "Sugestão: o Brevo tem plano gratuito de 300 e-mails por dia. Crie a conta, confirme seu domínio e copie os dados de SMTP. A senha fica cifrada e só é enviada por conexão segura.",
@@ -2932,7 +2605,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnEmailApp": "Liberar",
           "emailAppDone": "Pronto. Remetente:",
           "mirrorTitle": "🔁 Segundo servidor",
-          "mirrorDesc": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro pode assumir os apps dele com os dados até o último segundo. Antes, conecte os dois em Conexões e webhook.",
+          "mirrorDesc": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro pode assumir os apps dele com os dados até o último segundo. Antes, conecte os dois no quadro “Conectar outro servidor”, logo abaixo.",
           "mirrorNone": "Nenhuma cópia configurada ainda. Use os dois quadros abaixo: um servidor oferece, o outro recebe.",
           "aaTitle": "⚖️ App nos dois servidores",
           "aaDesc": "O app roda aqui e no outro servidor ao mesmo tempo, e os dois recebem visitas. Os dados continuam gravados num banco só, o deste servidor: o outro grava nele pela Tailscale. Se este servidor cair, a troca automática acima faz o outro seguir sozinho.",
@@ -3074,7 +2747,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "arbErr_badUrl": "Endereço inválido. Use http://<IP do Tailscale do juiz>:4097",
           "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Reinstale o juiz com a chave do passo 2.",
           "arbErr_clock": "O juiz respondeu, mas o relógio dele está mais de 1 minuto diferente. Ligue o horário automático nos aparelhos.",
-          "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso em Conexões e webhook.",
+          "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso no quadro “Conectar outro servidor”, no topo da tela Segundo servidor.",
           "arbErr_notArbiter": "Algo respondeu nesse endereço, mas não é o juiz. Confira a porta (padrão 4097).",
           "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 3), se o IP é o do Tailscale dele e se a porta é 4097.",
           "lblArbiter": "Endereço do juiz",
@@ -3109,7 +2782,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navEmail": "✉️ Email",
           "navMirror": "🔁 Second server",
           "navUpdates": "⬆️ Updates",
-          "navFederation": "🔗 Connections & webhook",
           "navDoctor": "🩺 Diagnostics",
           "navAgents": "🤖 Connect AI",
           "homeTitle": "🏠 Home",
@@ -3127,7 +2799,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "backupsTitle": "🛡️ Backups",
           "backupsDesc": "Encrypted copies of app databases and files. Use “Test” to check a backup opens before you need it.",
           "fedTitle": "🔗 Connect another server",
-          "fedDesc": "First step to a second server: both exchange a trust key. Then use the <strong>Second server</strong> tab for the live copy of the data.",
+          "fedDesc": "First step to a second server: both exchange a trust key. Then use the boxes below for the live copy of the data.",
           "optFedActive": "Both serve together (apps without their own data)",
           "optFedWarm": "Standby: copy apps and passwords to the other server",
           "btnGenInvite": "🔑 Create invite (valid 15 min)",
@@ -3192,8 +2864,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepHealth": "Test address before switching (Optional)",
           "lblDepNoHealth": "Not a website (skip the test before switching)",
           "deployHealthFailed": "The new version failed its test and was NOT put live. The previous version is still running. The app's error is below:",
-          "guideAppsRollbackTitle": "🛡️ Safe switch + 1-second rollback",
-          "guideAppsRollbackDesc": "Every new version is tested before it replaces the current one: if it does not answer, nothing changes. If a problem shows up later, go back to the previous version in 1 second.",
           "emailTitle": "✉️ Email sending",
           "emailDesc": "Email sent straight from home lands in spam or never leaves. So the dashboard uses a sending service, set up once for all apps.",
           "emailTip": "Tip: Brevo has a free plan with 300 emails a day. Create the account, verify your domain and copy the SMTP details. The password is encrypted and only sent over a secure connection.",
@@ -3215,7 +2885,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnEmailApp": "Allow",
           "emailAppDone": "Done. Sender:",
           "mirrorTitle": "🔁 Second server",
-          "mirrorDesc": "Both servers keep a live copy of each other. If one goes down, the other can take over its apps with data up to the last second. First connect both in Connections & webhook.",
+          "mirrorDesc": "Both servers keep a live copy of each other. If one goes down, the other can take over its apps with data up to the last second. First connect both in the “Connect another server” box just below.",
           "mirrorNone": "No copy set up yet. Use the two boxes below: one server offers, the other receives.",
           "aaTitle": "⚖️ App on both servers",
           "aaDesc": "The app runs here and on the other server at the same time, and both take visits. Data is still written to one database, this server's: the other one writes to it over Tailscale. If this server goes down, the automatic failover above keeps the other one going alone.",
@@ -3346,7 +3016,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "arbErr_badUrl": "Invalid address. Use http://<arbiter Tailscale IP>:4097",
           "arbErr_badKey": "The arbiter answered but refused the key. Reinstall it with the key from step 2.",
           "arbErr_clock": "The arbiter answered but its clock is more than 1 minute off. Turn on automatic time on the devices.",
-          "arbErr_notPaired": "This server is not paired with the other one yet: do it in Connections & webhook.",
+          "arbErr_notPaired": "This server is not paired with the other one yet: do it in the “Connect another server” box at the top of the Second server screen.",
           "arbErr_notArbiter": "Something answered at that address, but it is not the arbiter. Check the port (default 4097).",
           "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 3), that the IP is its Tailscale IP and that the port is 4097.",
           "lblArbiter": "Arbiter address",
@@ -3375,8 +3045,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     Object.assign(I18N.pt, {
           "aiIntro": "Primeiro diga onde a IA está.",
-      "archPillar4Title": "4. Segundo servidor",
-      "archPillar4Desc": "Dois servidores guardam uma cópia ao vivo um do outro (replicação do PostgreSQL). Assumir é manual com confirmação, ou automático só com um juiz; a época impede que os dois gravem ao mesmo tempo.",
           "aiRemoteTitle": "Em outro computador",
           "aiRemoteDesc": "Seu notebook ou desktop, na mesma rede Tailscale do servidor. Precisa de um acesso (token).",
           "aiLocalTitle": "Neste servidor",
@@ -3422,8 +3090,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
     Object.assign(I18N.en, {
           "aiIntro": "First tell where the AI is.",
-      "archPillar4Title": "4. Second server",
-      "archPillar4Desc": "Two servers keep a live copy of each other (PostgreSQL replication). Taking over is manual with confirmation, or automatic only with an arbiter; the epoch stops both from writing at once.",
           "aiRemoteTitle": "On another computer",
           "aiRemoteDesc": "Your laptop or desktop, on the same Tailscale network as the server. Needs an access token.",
           "aiLocalTitle": "On this server",
@@ -3690,10 +3356,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "copiesStarted": "Ajustando as cópias. Acompanhe aqui ou na tela Ajudantes.",
           "copiesAutoNote": "Com a escala automática ligada, o número de cópias é decidido sozinho. Para mudar, ajuste o mínimo e o máximo da regra abaixo.",
           "poolJob_auto": "ligar a escala automática de {s}",
-          "autoTitle": "Escala automática",
-          "autoDesc": "Ligada, o PaaSMCP põe uma cópia num PC ajudante quando o app passa do alvo da regra abaixo e tira quando ele acalma, sem sair do mínimo e do máximo. Antes de desligar uma cópia, ele espera as visitas em curso terminarem. Não sobe cópias com o Postgres perto do limite de conexões, e se um passo falha (sem espaço nos ajudantes, cópia que não responde), tenta de novo mais tarde, esperando cada vez mais. Ligar pede confirmação, porque cada ajudante recebe a imagem e as variáveis do app.",
-          "btnAutoOn": "Ligar a escala automática",
-          "btnAutoOff": "Desligar",
+          "scaleAutoTitle": "Escala automática",
+          "scaleAutoDesc": "Ligada, o PaaSMCP põe uma cópia num PC ajudante quando o app passa do alvo da regra abaixo e tira quando ele acalma, sem sair do mínimo e do máximo. Antes de desligar uma cópia, ele espera as visitas em curso terminarem. Não sobe cópias com o Postgres perto do limite de conexões, e se um passo falha (sem espaço nos ajudantes, cópia que não responde), tenta de novo mais tarde, esperando cada vez mais. Ligar pede confirmação, porque cada ajudante recebe a imagem e as variáveis do app.",
+          "btnScaleAutoOn": "Ligar a escala automática",
+          "btnScaleAutoOff": "Desligar",
           "autoOn": "Ligada",
           "autoWaiting": "Ligada, mas em espera: o app está parado ou este servidor não serve os dados agora",
           "autoOff": "Desligada: você escolhe o número de cópias e a regra só é ensaiada.",
@@ -3822,10 +3488,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "copiesStarted": "Setting the copies. Follow along here or on the Helpers screen.",
           "copiesAutoNote": "With automatic scaling on, the number of copies is decided by itself. To change it, adjust the rule's minimum and maximum below.",
           "poolJob_auto": "turn on automatic scaling for {s}",
-          "autoTitle": "Automatic scaling",
-          "autoDesc": "On, PaaSMCP puts a copy on a helper PC when the app goes over the rule's target below and removes it when the app calms down, never past the minimum and maximum. Before stopping a copy, it lets the visits in progress finish. It adds no copy while Postgres is near its connection limit, and when a step fails (no room on helpers, a copy that does not answer) it tries again later, waiting longer each time. Turning it on asks for confirmation, since each helper receives the app's image and variables.",
-          "btnAutoOn": "Turn on automatic scaling",
-          "btnAutoOff": "Turn off",
+          "scaleAutoTitle": "Automatic scaling",
+          "scaleAutoDesc": "On, PaaSMCP puts a copy on a helper PC when the app goes over the rule's target below and removes it when the app calms down, never past the minimum and maximum. Before stopping a copy, it lets the visits in progress finish. It adds no copy while Postgres is near its connection limit, and when a step fails (no room on helpers, a copy that does not answer) it tries again later, waiting longer each time. Turning it on asks for confirmation, since each helper receives the app's image and variables.",
+          "btnScaleAutoOn": "Turn on automatic scaling",
+          "btnScaleAutoOff": "Turn off",
           "autoOn": "On",
           "autoWaiting": "On, but waiting: the app is stopped or this server does not serve the data now",
           "autoOff": "Off: you choose the number of copies and the rule is only rehearsed.",
@@ -3846,7 +3512,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
       'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
       'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navFederation', 'navDoctor', 'navAgents',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents',
       'topHealthBadge', 'btnRefresh', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -3859,16 +3525,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'doctorTitle', 'doctorDesc', 'btnRunDoctor',
       'presetSaas', 'presetCompose', 'presetSpa', 'chipSystemScope',
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
-      'archPillar1Title', 'archPillar1Desc', 'archPillar2Title', 'archPillar2Desc', 'archPillar3Title', 'archPillar3Desc', 'archPillar4Title', 'archPillar4Desc',
-      'agentsTitle', 'agentsDesc', 'archTitle', 'archDesc', 'logsTitle', 'btnCloseLogs',
-      'guideAppsTitle', 'guideAppsRollbackTitle', 'guideAppsRollbackDesc', 'guideAppsLimitsTitle', 'guideAppsLimitsDesc', 'guideAppsActionsTitle', 'guideAppsActionsDesc', 'guideAppsLoopbackTitle', 'guideAppsLoopbackDesc',
-      'guideExposeTitle', 'guideExposePublicTitle', 'guideExposePublicDesc', 'guideExposeZTTitle', 'guideExposeZTDesc', 'guideExposeTailscaleTitle', 'guideExposeTailscaleDesc',
-      'guideVaultTitle', 'guideVaultScopesTitle', 'guideVaultScopesDesc', 'guideVaultGcmTitle', 'guideVaultGcmDesc', 'guideVaultInjectionTitle', 'guideVaultInjectionDesc', 'guideVaultMasterKeyTitle', 'guideVaultMasterKeyDesc',
-      'guideDbTitle', 'guideDbIsolationTitle', 'guideDbIsolationDesc', 'guideDbInjectionTitle', 'guideDbInjectionDesc',
-      'guideBackupTitle', 'guideBackupDumpTitle', 'guideBackupDumpDesc', 'guideBackupCryptoTitle', 'guideBackupCryptoDesc', 'guideBackupIntegrityTitle', 'guideBackupIntegrityDesc', 'guideBackupRestoreTitle', 'guideBackupRestoreDesc',
-      'guideFedTitle', 'guideFedTokenTitle', 'guideFedTokenDesc', 'guideFedActiveTitle', 'guideFedActiveDesc', 'guideFedWarmTitle', 'guideFedWarmDesc',
-      'guideWhTitle', 'guideWhSigTitle', 'guideWhSigDesc', 'guideWhSshTitle', 'guideWhSshDesc',
-      'guideDoctorTitle', 'guideDoctorOomTitle', 'guideDoctorOomDesc', 'guideDoctorLoopTitle', 'guideDoctorLoopDesc', 'guideDoctorFixTitle', 'guideDoctorFixDesc'
+      'agentsTitle', 'agentsDesc', 'logsTitle', 'btnCloseLogs',
     ];
 
     function esc(str) {
@@ -4637,7 +4294,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       }
       const copies = a.rehearsalCopies;
       now += '<div style="margin-top:6px;">' + (a.auto
-        ? badge(a.auto.acting ? 'success' : 'warning', t('autoTitle') + ': ' + (a.auto.acting ? t('autoOn') : t('autoWaiting')))
+        ? badge(a.auto.acting ? 'success' : 'warning', t('scaleAutoTitle') + ': ' + (a.auto.acting ? t('autoOn') : t('autoWaiting')))
         : '<span class="badge' + (copies > a.rule.min ? ' warning' : '') + '">' + esc((copies === 1 ? t('scaleWould1') : t('scaleWouldN')).replace('{n}', copies)) + '</span>') + '</div>';
       if (a.lastEvent) now += '<div style="margin-top:6px;font-size:12.5px;color:var(--muted);">' + esc(fmtDate(a.lastEvent.t)) + ' · ' + esc(a.lastEvent.text) + '</div>';
       document.getElementById('scaleNow').innerHTML = card(now);
@@ -4711,10 +4368,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         html = '<span style="font-size:12.5px;">' + esc(t('autoOff')) + '</span>';
       }
       box.innerHTML = '<div style="margin-bottom:8px;">' + html + '</div>';
-      const on = document.getElementById('btnAutoOn');
+      const on = document.getElementById('btnScaleAutoOn');
       on.style.display = a.auto ? 'none' : '';
       on.disabled = Boolean(ready && !ready.ok);
-      document.getElementById('btnAutoOff').style.display = a.auto ? '' : 'none';
+      document.getElementById('btnScaleAutoOff').style.display = a.auto ? '' : 'none';
     }
     async function setAuto(enabled) {
       const a = scaleData && scaleData.app;
