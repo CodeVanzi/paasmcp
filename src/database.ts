@@ -91,18 +91,36 @@ networks:
     stdio: "pipe",
   });
 
-  // Wait up to 30s for pg_isready
+  // Wait up to 30s for postgres to finish initialization and be ready to accept connections.
+  // Note: During initial startup on an empty directory, the official docker entrypoint runs
+  // a temporary bootstrap instance (where PID 1 is still sh/bash) before shutting it down
+  // and exec'ing the final postgres PID 1.
   for (let i = 0; i < 30; i++) {
     try {
-      execFileSync(
-        "docker",
-        ["exec", "paasmcp-postgres", "pg_isready", "-U", "paasmcp_admin", "-d", "postgres"],
-        { stdio: "ignore" }
-      );
-      break;
+      let isFinalProcess = true;
+      try {
+        const comm = execFileSync(
+          "docker",
+          ["exec", "paasmcp-postgres", "cat", "/proc/1/comm"],
+          { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }
+        ).trim();
+        isFinalProcess = comm === "postgres";
+      } catch {
+        // Fall back to checking pg_isready directly if /proc/1/comm is inaccessible
+      }
+
+      if (isFinalProcess) {
+        execFileSync(
+          "docker",
+          ["exec", "paasmcp-postgres", "pg_isready", "-U", "paasmcp_admin", "-d", "postgres"],
+          { stdio: "ignore" }
+        );
+        break;
+      }
     } catch {
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+      // not ready yet
     }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
   }
 
   return { adminUser: "paasmcp_admin", adminPass };
