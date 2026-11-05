@@ -134,8 +134,8 @@ waitFor() {
   while [ "$(eval "$1")" != "$2" ]; do [ $((SECONDS - t0)) -ge "$3" ] && { echo "timeout"; return 1; }; sleep 2; done
   echo $((SECONDS - t0))
 }
-sleep 25
-a=$(owner "$BUSY"); b=$(owner "$OTHER")
+# A copy start makes the first window unsure (Docker's CPU); the next ones give numbers.
+for _ in $(seq 30); do a=$(owner "$BUSY"); b=$(owner "$OTHER"); [ -n "$a" ] && [ -n "$b" ] && break; sleep 2; done
 check "both PCs report their owner's CPU while idle ($BUSY $a%, $OTHER $b%)" "$([ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$LIMIT" ] && [ "$b" -lt "$LIMIT" ] && echo 1 || echo 0)"
 check "the worker keeps its last reading in a private file" "$(docker exec "$BUSYC" stat -c %a /var/lib/paasmcp-worker/owner.json 2>/dev/null | grep -qx 600 && echo 1 || echo 0)"
 

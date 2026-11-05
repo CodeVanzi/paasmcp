@@ -181,8 +181,11 @@ const ownerFile = () => path.join(workerHome(), "owner.json");
 interface OwnerFile {
   prev?: OwnerSnapshot;
   last?: OwnerReading & { at: number };
-  /** An image load or a copy start (CPU spent by Docker, not by the owner): open while it runs. */
-  heavy?: { at: number; open: boolean };
+  /**
+   * The last image load or copy start (CPU spent by Docker, not by the owner): when it began or ended,
+   * and the worker processes still running one (a worker killed halfway leaves its pid, ignored once gone).
+   */
+  heavy?: { at: number; pids: number[] };
 }
 
 function readNumberFile(file: string): number | undefined {
@@ -323,11 +326,28 @@ function writeOwnerFile(f: OwnerFile): void {
   }
 }
 
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 /** Marks an image load or a copy start as running (or finished): the owner's reading skips that window. */
 function markHeavy(open: boolean): void {
   const f = readOwnerFile();
-  f.heavy = { at: Date.now(), open };
+  const pids = (Array.isArray(f.heavy?.pids) ? f.heavy!.pids : []).filter((p) => Number.isInteger(p) && p !== process.pid && processAlive(p));
+  f.heavy = { at: Date.now(), pids: open ? [...pids, process.pid] : pids };
   writeOwnerFile(f);
+}
+
+/** The heavy mark as ownerShare reads it: open only while a worker that set it still runs. */
+function heavyOf(f: OwnerFile): { at: number; open: boolean } | undefined {
+  if (!f.heavy || !Number.isFinite(f.heavy.at)) return undefined;
+  const pids = Array.isArray(f.heavy.pids) ? f.heavy.pids : [];
+  return { at: f.heavy.at, open: pids.some((p) => Number.isInteger(p) && p > 0 && processAlive(p)) };
 }
 
 const QUICK_SAMPLE_MS = 3000;
@@ -349,7 +369,7 @@ export async function ownerReading(): Promise<OwnerReading> {
   const f = readOwnerFile();
   const age = f.prev ? cur.at - f.prev.at : -1;
   if (f.prev && age >= OWNER_MIN_WINDOW_MS && age <= OWNER_MAX_WINDOW_MS) {
-    const r = ownerShare(f.prev, cur, f.heavy);
+    const r = ownerShare(f.prev, cur, heavyOf(f));
     writeOwnerFile({ ...f, prev: cur, ...(r.cpuPct !== null ? { last: { ...r, at: cur.at } } : {}) });
     return r;
   }
@@ -364,7 +384,7 @@ export async function ownerReading(): Promise<OwnerReading> {
     next = undefined;
   }
   if (!next) return { cpuPct: null, seconds: 0, why: "unreadable" };
-  const r = ownerShare(cur, next, f.heavy, QUICK_SAMPLE_MS - 500);
+  const r = ownerShare(cur, next, heavyOf(f), QUICK_SAMPLE_MS - 500);
   writeOwnerFile({ ...f, prev: next, ...(r.cpuPct !== null ? { last: { ...r, at: next.at } } : {}) });
   return r;
 }
