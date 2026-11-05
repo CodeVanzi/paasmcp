@@ -854,6 +854,7 @@ volumes:
       ["go", "go", 8080, [/go build -o \/app\/server \.$/m]],
       ["go-cmd", "go", 8080, [/go build -o \/app\/server \.\/cmd\/server/]],
       ["static", "static-html", 80, [/FROM nginx:alpine/]],
+      ["dotnet", "dotnet", 8080, [/sdk:8\.0 AS build/, /dotnet publish "src\/Hello\/Hello\.csproj"/, /ENTRYPOINT \["dotnet", "Hello\.dll"\]/]],
     ];
     for (const [dir, runtime, port, patterns] of cases) {
       const work = fs.mkdtempSync(path.join(tempRoot, `fx-${dir}-`));
@@ -864,6 +865,25 @@ volumes:
       const df = fs.readFileSync(path.join(work, plan.dockerfilePath), "utf-8");
       for (const re of patterns) assert.match(df, re, `${dir}: ${re}`);
     }
+    // A Django project that also lists uvicorn (ASGI) is still served as Django, not as FastAPI's main:app.
+    const asgi = fs.mkdtempSync(path.join(tempRoot, "fx-django-asgi-"));
+    fs.cpSync(path.join(fixtures, "django"), asgi, { recursive: true });
+    fs.appendFileSync(path.join(asgi, "requirements.txt"), "\nuvicorn==0.30.6\n");
+    const asgiDf = fs.readFileSync(path.join(asgi, github.detectOrGenerateDockerfile(asgi).dockerfilePath), "utf-8");
+    assert.match(asgiDf, /"gunicorn", "-b", "0.0.0.0:8000", "site1.wsgi"/);
+    // C#: a root .csproj wins, <AssemblyName> and the target framework pick the dll and image tag;
+    // two web projects is ambiguous and asks for a Dockerfile.
+    const cs = fs.mkdtempSync(path.join(tempRoot, "fx-dotnet-root-"));
+    fs.writeFileSync(path.join(cs, "Shop.csproj"), '<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup><TargetFramework>net9.0</TargetFramework><AssemblyName>Shop.Api</AssemblyName></PropertyGroup></Project>');
+    const csDf = fs.readFileSync(path.join(cs, github.detectOrGenerateDockerfile(cs).dockerfilePath), "utf-8");
+    assert.match(csDf, /aspnet:9\.0/);
+    assert.match(csDf, /ENTRYPOINT \["dotnet", "Shop\.Api\.dll"\]/);
+    const two = fs.mkdtempSync(path.join(tempRoot, "fx-dotnet-two-"));
+    for (const n of ["A", "B"]) {
+      fs.mkdirSync(path.join(two, "src", n), { recursive: true });
+      fs.writeFileSync(path.join(two, "src", n, `${n}.csproj`), '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>');
+    }
+    assert.throws(() => github.detectOrGenerateDockerfile(two), /Several ASP\.NET projects/);
   });
 
   await t.test("25. Git polling: redeploys only when the branch moved; opt-in per git app", async () => {

@@ -226,6 +226,38 @@ export interface DetectedBuildPlan {
   serviceNames?: string[];
 }
 
+const SAFE_NAME = /^[a-zA-Z0-9_.-]+$/;
+
+/** Finds the ASP.NET project to publish: root *.csproj first, else one web project one folder down. */
+function findDotnetProject(repoDir: string): { csproj: string; assembly: string; version: string } | undefined {
+  const csprojIn = (dir: string) =>
+    fs.readdirSync(path.join(repoDir, dir)).filter((f) => f.endsWith(".csproj") && SAFE_NAME.test(f)).sort();
+  const candidates = csprojIn(".");
+  if (candidates.length === 0) {
+    for (const top of ["src", "."]) {
+      if (!fs.existsSync(path.join(repoDir, top))) continue;
+      for (const d of fs.readdirSync(path.join(repoDir, top)).sort()) {
+        if (!SAFE_NAME.test(d) || d.startsWith(".")) continue;
+        const rel = top === "." ? d : `${top}/${d}`;
+        if (!fs.statSync(path.join(repoDir, rel)).isDirectory()) continue;
+        candidates.push(...csprojIn(rel).map((f) => `${rel}/${f}`));
+      }
+      if (candidates.length > 0) break;
+    }
+  }
+  if (candidates.length === 0) return undefined;
+  const read = (c: string) => fs.readFileSync(path.join(repoDir, c), "utf-8");
+  const web = candidates.filter((c) => /Sdk="Microsoft\.NET\.Sdk\.Web"/.test(read(c)));
+  if (web.length > 1) throw new Error(`Several ASP.NET projects found (${web.join(", ")}); add a Dockerfile to pick one.`);
+  const csproj = web[0] || (candidates.length === 1 ? candidates[0] : undefined);
+  if (!csproj) throw new Error(`Several .csproj files found (${candidates.join(", ")}); add a Dockerfile to pick one.`);
+  const xml = read(csproj);
+  const asm = xml.match(/<AssemblyName>\s*([^<]+?)\s*<\/AssemblyName>/)?.[1];
+  const assembly = asm && SAFE_NAME.test(asm) ? asm : path.basename(csproj, ".csproj");
+  const tfm = xml.match(/<TargetFrameworks?>\s*net(\d+\.\d+)/)?.[1];
+  return { csproj, assembly, version: tfm && Number(tfm) >= 6 ? tfm : "8.0" };
+}
+
 export function detectOrGenerateDockerfile(
   repoDir: string,
   overridePort?: number
@@ -361,15 +393,16 @@ CMD ${startCmd}
     let cmd = `["python", "main.py"]`;
     let extraInstall = "";
     const reqContent = fs.existsSync(reqTxt) ? fs.readFileSync(reqTxt, "utf-8") : "";
-    if (reqContent.includes("uvicorn") || reqContent.includes("fastapi")) {
-      const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
-      cmd = `["uvicorn", "${entry}", "--host", "0.0.0.0", "--port", "${port}"]`;
-    } else if (fs.existsSync(path.join(repoDir, "manage.py"))) {
+    // Django first: many Django projects also list uvicorn (ASGI), and manage.py is the stronger signal.
+    if (fs.existsSync(path.join(repoDir, "manage.py"))) {
       // Django: serve the project's WSGI app with gunicorn (never the dev server).
       const wsgiDir = fs.readdirSync(repoDir).find((d) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(d) && fs.existsSync(path.join(repoDir, d, "wsgi.py")));
       if (!wsgiDir) throw new Error("Django project found (manage.py) but no <project>/wsgi.py; add a Dockerfile.");
       cmd = `["gunicorn", "-b", "0.0.0.0:${port}", "${wsgiDir}.wsgi"]`;
       if (!/gunicorn/i.test(reqContent)) extraInstall = "RUN pip install --no-cache-dir gunicorn\n";
+    } else if (reqContent.includes("uvicorn") || reqContent.includes("fastapi")) {
+      const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
+      cmd = `["uvicorn", "${entry}", "--host", "0.0.0.0", "--port", "${port}"]`;
     } else if (reqContent.includes("gunicorn")) {
       const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
       cmd = `["gunicorn", "-b", "0.0.0.0:${port}", "${entry}"]`;
@@ -420,6 +453,31 @@ CMD ["/app/server"]
     };
   }
 
+  // 5b. C# / .NET (ASP.NET Core): a *.csproj at the root, or a single web project one folder down (e.g. src/Api/).
+  const dotnet = findDotnetProject(repoDir);
+  if (dotnet) {
+    const port = overridePort || 8080;
+    const df = `FROM mcr.microsoft.com/dotnet/sdk:${dotnet.version} AS build
+WORKDIR /src
+COPY . .
+RUN dotnet publish "${dotnet.csproj}" -c Release -o /app/publish
+
+FROM mcr.microsoft.com/dotnet/aspnet:${dotnet.version}
+WORKDIR /app
+COPY --from=build /app/publish .
+ENV ASPNETCORE_URLS=http://+:${port}
+ENV PORT=${port}
+EXPOSE ${port}
+ENTRYPOINT ["dotnet", "${dotnet.assembly}.dll"]
+`;
+    fs.writeFileSync(path.join(repoDir, "Dockerfile.paasmcp"), df);
+    return {
+      runtimeType: "dotnet",
+      dockerfilePath: "Dockerfile.paasmcp",
+      detectedPort: port,
+    };
+  }
+
   // 6. Static HTML
   if (fs.existsSync(path.join(repoDir, "index.html"))) {
     const port = 80; // nginx listens on 80 whatever the override
@@ -437,6 +495,6 @@ CMD ["nginx", "-g", "daemon off;"]
   }
 
   throw new Error(
-    "Could not auto-detect stack in repository (no docker-compose.yml, Dockerfile, package.json, requirements.txt, pyproject.toml, go.mod, or index.html found)."
+    "Could not auto-detect stack in repository (no docker-compose.yml, Dockerfile, package.json, requirements.txt, pyproject.toml, go.mod, *.csproj, or index.html found)."
   );
 }
