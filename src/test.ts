@@ -114,6 +114,10 @@ volumes:
     });
 
     const parsed = YAML.parse(sanitizedYaml);
+    // Watchtower must leave every PaaSMCP-managed service alone.
+    for (const svc of Object.values(parsed.services) as { labels?: string[] }[]) {
+      assert.ok(svc.labels?.includes(config.WATCHTOWER_OFF_LABEL));
+    }
     // Verify privileged, network_mode, and host bind mount (/etc/shadow) were stripped
     assert.equal(parsed.services.web.privileged, undefined);
     assert.equal(parsed.services.web.network_mode, undefined);
@@ -2070,6 +2074,7 @@ volumes:
     assert.throws(() => proto.validateCopySpec({ ...spec, env: { "A B": "x" } }), /variable name/);
     assert.throws(() => proto.validateCopySpec({ ...spec, env: { BIG: "x".repeat(300 * 1024) } }), /too large/);
     const runArgs = proto.buildRunArgs(okSpec, "100.64.0.7", "/run/paasmcp-worker/pool-a-0a1b2c.env", ["docker-entrypoint.sh"], ["node", "server.js"]);
+    assert.ok(runArgs.includes(proto.WATCHTOWER_OFF_LABEL));
     assert.equal(runArgs.some((a) => a.includes("s3cr3t")), false);
     assert.equal(runArgs.some((a) => a.includes("0.0.0.0") || a === "--env-file" || a === "-e" || a === "--env"), false);
     assert.equal(runArgs[runArgs.indexOf("--publish") + 1], "100.64.0.7:4100:3000");
@@ -2633,7 +2638,44 @@ volumes:
     scale.forgetScaleData("auto-a");
   });
 
-  await t.test("36. Courteous mode: the owner's CPU outside the copies, busy after two readings, free after a calm while, copies move away or stay with a warning", async () => {
+  await t.test("36. Homelab neighbours: Watchtower label, reserved ports, Docker networks over the LAN", async () => {
+    const hostcheck = await import("./hostcheck.js");
+
+    // Label helper keeps the service's own labels, in either compose form.
+    assert.deepEqual(config.withWatchtowerOff(undefined), [config.WATCHTOWER_OFF_LABEL]);
+    assert.deepEqual(config.withWatchtowerOff(["a=b", "com.centurylinklabs.watchtower.enable=true"]), ["a=b", config.WATCHTOWER_OFF_LABEL]);
+    assert.deepEqual(config.withWatchtowerOff({ a: "b" }), { a: "b", "com.centurylinklabs.watchtower.enable": "false" });
+    assert.ok(config.WATCHTOWER_OFF_COMPOSE.includes(config.WATCHTOWER_OFF_LABEL));
+
+    // The dashboard (4099) and arbiter (4097) ports are never given to an app.
+    const st = config.loadState();
+    const apps: typeof st.apps = {};
+    for (let p = 4000; p <= 4098; p++) {
+      if (config.RESERVED_PORTS.includes(p)) continue;
+      apps[`p${p}`] = { localPort: p } as (typeof st.apps)[string];
+    }
+    assert.equal(config.allocateAppPort({ ...st, apps }), 4100);
+    delete apps.p4098;
+    assert.equal(config.allocateAppPort({ ...st, apps }), 4098);
+
+    // Subnet math.
+    assert.deepEqual(hostcheck.cidrRange("192.168.31.8/24"), [3232243456, 3232243711]);
+    assert.equal(hostcheck.cidrRange("fd00::/64"), undefined);
+    assert.equal(hostcheck.cidrsOverlap("192.168.16.0/20", "192.168.31.0/24"), true);
+    assert.equal(hostcheck.cidrsOverlap("192.168.0.0/20", "192.168.31.0/24"), false);
+    assert.equal(hostcheck.cidrsOverlap("172.18.0.0/16", "100.64.0.0/10"), false);
+    assert.deepEqual(hostcheck.overlappingSubnets(["172.18.0.0/16", "192.168.16.0/20"], ["192.168.31.8/24"]), [
+      { docker: "192.168.16.0/20", host: "192.168.31.8/24" },
+    ]);
+    const nine = Array.from({ length: 9 }, (_, i) => `172.${17 + i}.0.0/16`);
+    assert.deepEqual(hostcheck.defaultPoolUse([...nine, "10.200.0.0/24"]), { used: 9, total: 15 });
+
+    // Offline: no probes run.
+    assert.deepEqual(hostcheck.checkHost(), []);
+    assert.ok(deployer.runPaaSDoctor().diagnostics.every((d) => d.target !== "server"));
+  });
+
+  await t.test("37. Courteous mode: the owner's CPU outside the copies, busy after two readings, free after a calm while, copies move away or stay with a warning", async () => {
     const proto = await import("./poolproto.js");
     const pool = await import("./pool.js");
     const courtesy = await import("./courtesy.js");

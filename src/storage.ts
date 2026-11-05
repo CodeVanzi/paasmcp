@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { ensureDockerNetwork } from "./database.js";
 import { imageFor } from "./updater.js";
 import { getSecrets, setSecretEntries } from "./vault.js";
@@ -74,7 +74,7 @@ admin_token = "${adminToken}"
     image: ${imageFor("garage")}
     container_name: paasmcp-garage
     restart: unless-stopped
-    ports:
+${WATCHTOWER_OFF_COMPOSE}    ports:
       - "127.0.0.1:3900:3900"
       - "127.0.0.1:3903:3903"${mirrorBind ? `\n      - "${mirrorBind}:3900:3900"` : ""}
     volumes:

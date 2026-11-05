@@ -22,6 +22,7 @@ import {
   saveState,
   tailnetBindIp,
   writeFileAtomic,
+  WATCHTOWER_OFF_COMPOSE,
 } from "./config.js";
 import { audit } from "./guard.js";
 import { appendDiary } from "./scale.js";
@@ -1132,7 +1133,7 @@ const lbCompose = (image: string) => `services:
     image: ${image}
     container_name: ${POOL_BALANCER}
     restart: unless-stopped
-    mem_limit: 128m
+${WATCHTOWER_OFF_COMPOSE}    mem_limit: 128m
     # No published port: Cloudflare Tunnel reaches it by name on the Docker network.
     volumes:
       - ./conf:/etc/caddy:ro

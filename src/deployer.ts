@@ -16,7 +16,10 @@ import {
   saveState,
   validateBranchName,
   validateResourceLimit,
+  WATCHTOWER_OFF_COMPOSE,
+  withWatchtowerOff,
 } from "./config.js";
+import { checkHost } from "./hostcheck.js";
 import { ensureDockerNetwork, provisionDatabase } from "./database.js";
 import { cloneOrUpdateRepo, DetectedBuildPlan, detectOrGenerateDockerfile } from "./github.js";
 import { getSecrets, setSecretEntries, writeRuntimeEnvFile } from "./vault.js";
@@ -195,6 +198,7 @@ export function generateSanitizedComposeFromRepo(opts: {
     // Inject encrypted Vault runtime environment and homelab-network into every service
     cleanSvc.env_file = [".env.runtime"];
     cleanSvc.restart = "unless-stopped";
+    cleanSvc.labels = withWatchtowerOff(cleanSvc.labels);
     if (cleanSvc.network_mode === undefined) cleanSvc.networks = [DOCKER_NETWORK];
 
     if (opts.extraHosts?.length) {
@@ -501,7 +505,7 @@ export async function deployApp(opts: DeployOptions): Promise<{
     image: ${currentImg}
     container_name: ${containerName}
     restart: unless-stopped
-${memLine}${cpuLine}    env_file:
+${WATCHTOWER_OFF_COMPOSE}${memLine}${cpuLine}    env_file:
       - .env.runtime
     ports:
       - "127.0.0.1:${localPort}:${internalPort}"${extraPortLines}
@@ -990,6 +994,9 @@ export function runPaaSDoctor(appName?: string): {
       });
     }
   }
+
+  // Without an app, also look at the server around PaaSMCP (DNS, Watchtower, Docker networks, tunnel).
+  if (!appName) diagnostics.push(...checkHost());
 
   let overallHealth: "healthy" | "warning" | "critical" = "healthy";
   if (diagnostics.some((d) => d.severity === "critical")) {
