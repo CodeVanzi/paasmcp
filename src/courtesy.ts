@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { loadState, saveState, StateLockBusyError, withStateLock, writeFileAtomic } from "./config.js";
+import { ensureDataDir, loadState, saveState, StateLockBusyError, withStateLock, writeFileAtomic } from "./config.js";
 import { audit } from "./guard.js";
 import { courtesyOf, Listing, POOL_DIR, pooledApps, probeHelpers, reconcilePool } from "./pool.js";
 import type { PoolHelperRecord } from "./config.js";
@@ -85,7 +85,7 @@ function readFile(): CourtesyFile {
 }
 
 function writeFile(f: CourtesyFile): void {
-  fs.mkdirSync(POOL_DIR, { recursive: true, mode: 0o700 });
+  ensureDataDir(POOL_DIR);
   writeFileAtomic(FILE, JSON.stringify(f));
 }
 

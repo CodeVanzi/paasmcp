@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, validateBranchName, writeFileAtomic } from "./config.js";
+import { DOCKER_NETWORK, ensureDataDir, HOMELAB_ROOT, PAAS_DATA_DIR, validateBranchName, writeFileAtomic } from "./config.js";
 import { audit, DASHBOARD_APP_NAME } from "./guard.js";
 import { cleanText, continueDeployRun, DeployCommit, DeployTracker, DeployTrigger, shortCommit, startDeployRun } from "./deploys.js";
 
@@ -53,8 +53,7 @@ function keepOwner(p: string, recursive = false): void {
 }
 
 function writeFollow(st: FollowState): void {
-  fs.mkdirSync(CONTROL_PLANE_DIR, { recursive: true, mode: 0o700 });
-  keepOwner(CONTROL_PLANE_DIR);
+  ensureDataDir(CONTROL_PLANE_DIR);
   writeFileAtomic(FOLLOW_FILE, JSON.stringify(st, null, 2));
   keepOwner(FOLLOW_FILE);
 }
@@ -160,7 +159,7 @@ export class StepError extends Error {
 }
 
 function takeLock(): (() => void) | null {
-  fs.mkdirSync(CONTROL_PLANE_DIR, { recursive: true, mode: 0o700 });
+  ensureDataDir(CONTROL_PLANE_DIR);
   for (let i = 0; i < 2; i++) {
     try {
       fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: "wx", mode: 0o600 });
@@ -223,8 +222,7 @@ export async function controlPlaneTick(
     const run = startDeployRun({ app: DASHBOARD_APP_NAME, trigger: opts.trigger || "poll", branch: st.branch, commit: shortCommit(sha), phase: "detected" });
     const dir = releaseDir(sha);
     if (!fs.existsSync(path.join(dir, "dist", "cli.js"))) {
-      fs.mkdirSync(RELEASES_DIR, { recursive: true, mode: 0o700 });
-      keepOwner(RELEASES_DIR);
+      ensureDataDir(RELEASES_DIR);
       const tmp = path.join(RELEASES_DIR, `.tmp-${sha.slice(0, 12)}-${process.pid}`);
       fs.rmSync(tmp, { recursive: true, force: true });
       try {

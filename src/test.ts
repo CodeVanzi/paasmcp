@@ -3452,5 +3452,14 @@ volumes:
     deploys.forgetDeploys("paasmcp-dashboard");
   });
 
+  await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
+    const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
+    config.ensureDataDir(dir);
+    assert.ok(fs.statSync(dir).isDirectory());
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    config.ensureDataDir(dir);
+    fs.rmSync(path.join(config.PAAS_DATA_DIR, "owner-test"), { recursive: true, force: true });
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

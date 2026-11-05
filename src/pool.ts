@@ -7,6 +7,7 @@ import {
   AppRecord,
   appServiceUrl,
   DOCKER_NETWORK,
+  ensureDataDir,
   HOMELAB_ROOT,
   loadState,
   PAAS_DATA_DIR,
@@ -108,7 +109,7 @@ function patchApp(slug: string, update: (a: AppRecord) => void): AppRecord | und
 }
 
 function ensurePoolDir(): void {
-  fs.mkdirSync(POOL_DIR, { recursive: true, mode: 0o700 });
+  ensureDataDir(POOL_DIR);
 }
 
 // ---------- keys and invites ----------
