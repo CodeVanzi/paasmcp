@@ -1414,6 +1414,127 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .dep-msg { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
     .dep-err summary { cursor: pointer; font-size: 11px; color: var(--muted); }
     .dep-err pre { max-width: 420px; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 10.5px; margin: 4px 0 0; }
+    .apps-card-list {
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--card);
+    }
+    .app-entry-row {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: background 0.12s ease;
+    }
+    .app-entry-row:last-child {
+      border-bottom: none;
+    }
+    .app-entry-row:hover {
+      background: var(--card-hover);
+    }
+    .app-row-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .app-row-main-identity {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .app-row-name-link {
+      font-size: 16px;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      color: var(--accent-text);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .app-row-name-link:hover {
+      text-decoration: underline;
+    }
+    .app-badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11.5px;
+      font-weight: 500;
+      line-height: 16px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      background: var(--bg-subtle);
+    }
+    .app-badge-pill.status-live {
+      background: var(--success-soft);
+      color: var(--success);
+      border-color: rgba(63, 185, 80, 0.35);
+      font-weight: 600;
+    }
+    .app-badge-pill.status-deploying {
+      background: var(--warning-soft);
+      color: var(--warning);
+      border-color: rgba(210, 153, 34, 0.35);
+      font-weight: 600;
+    }
+    .app-badge-pill.status-stopped {
+      background: var(--danger-soft);
+      color: var(--danger);
+      border-color: rgba(248, 81, 73, 0.35);
+      font-weight: 600;
+    }
+    .app-actions-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .app-actions-group button {
+      padding: 4px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      font-weight: 500;
+    }
+    .app-row-commit-bar {
+      font-size: 13px;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      line-height: 1.45;
+    }
+    .app-row-meta-bar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .runtime-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .lang-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      display: inline-block;
+    }
     .arch-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
@@ -1598,22 +1719,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </h2>
               <p class="card-desc" id="appsDesc">Containers isolados em <code>127.0.0.1:4000-4998</code> com suporte a Rollback em 1s, limites de CPU/RAM e Docker Compose multi-serviço.</p>
             </div>
-            <div style="overflow-x:auto;">
-              <table>
-                <thead>
-                  <tr>
-                    <th id="thApp">Aplicação</th>
-                    <th id="thStack">Stack / Commit</th>
-                    <th id="thMetrics">CPU / RAM (Live)</th>
-                    <th id="thPort">Porta / DBs</th>
-                    <th id="thDomains">Domínios HTTPS</th>
-                    <th id="thActions">Ações Rápidas</th>
-                  </tr>
-                </thead>
-                <tbody id="appsTable">
-                  <tr><td colspan="6">...</td></tr>
-                </tbody>
-              </table>
+            <div class="apps-card-list" id="appsTable">
+              <div style="padding: 24px; text-align: center; color: var(--muted);">...</div>
             </div>
           </div>
 
@@ -4049,76 +4156,124 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const pendingRows = Object.entries(deploys)
         .filter(([name, d]) => d.active && !(s.apps || {})[name])
         .map(([name, d]) => \`
-            <tr>
-              <td><span class="status-dot deploying"></span><strong>\${esc(name)}</strong>\${deployStatusHtml(d, false)}</td>
-              <td colspan="5" style="color:var(--muted);font-size:11.5px;">\${d.source ? \`🐙 <a href="\${esc(d.source.url)}" target="_blank" rel="noopener noreferrer">\${esc(d.source.name)}</a>\` : ''}</td>
-            </tr>\`).join('');
+            <div class="app-entry-row">
+              <div class="app-row-top">
+                <div class="app-row-main-identity">
+                  <span class="status-dot deploying"></span>
+                  <span class="app-row-name-link">\${esc(name)}</span>
+                  <span class="app-badge-pill status-deploying">● \${esc(t('depPhase_' + d.active.phase) || 'Deploying...')}</span>
+                </div>
+                <div style="color:var(--muted);font-size:12px;">\${d.source ? \`🐙 <a href="\${esc(d.source.url)}" target="_blank" rel="noopener noreferrer">\${esc(d.source.name)}</a>\` : ''}</div>
+              </div>
+              <div style="font-size:12px;">\${deployStatusHtml(d, false)}</div>
+            </div>\`).join('');
+
       if (apps.length === 0 && !pendingRows) {
-        tbody.innerHTML = \`<tr><td colspan="6" style="color:var(--muted)">\${esc(t('emptyApps'))}</td></tr>\`;
+        tbody.innerHTML = \`<div style="padding:28px;text-align:center;color:var(--muted);font-size:13px;">\${esc(t('emptyApps'))}</div>\`;
       } else {
         tbody.innerHTML = pendingRows + apps.map(a => {
           const d = deploys[a.name];
           const dotClass = a.status === 'stopped' ? 'stopped' : d && d.active ? 'deploying' : d && !d.active && d.last && d.last.phase === 'failed' ? 'failed' : '';
+          const statusText = a.status === 'stopped' ? t('stoppedStatus') : (d && d.active ? t('depPhase_' + d.active.phase) : (d && d.last && d.last.phase === 'failed' ? t('depPhase_failed') : t('depPhase_live')));
+          const statusBadgeClass = a.status === 'stopped' ? 'status-stopped' : (d && d.active ? 'status-deploying' : (d && d.last && d.last.phase === 'failed' ? 'status-stopped' : 'status-live'));
+
+          // Main domain / access link
+          const mainDomain = (a.domains || [])[0];
+          const appLink = mainDomain ? mainDomain.url : \`http://127.0.0.1:\${a.localPort}\`;
+
+          // Language dot color
+          let langColor = '#8b949e';
+          const rt = (a.runtimeType || '').toLowerCase();
+          if (rt.includes('python') || rt.includes('django') || rt.includes('fastapi')) langColor = '#3572A5';
+          else if (rt.includes('node') || rt.includes('next') || rt.includes('ts') || rt.includes('express')) langColor = '#3178c6';
+          else if (rt.includes('go')) langColor = '#00ADD8';
+          else if (rt.includes('dotnet') || rt.includes('c#')) langColor = '#512BD4';
+          else if (rt.includes('docker') || rt.includes('compose')) langColor = '#384d54';
+          else if (rt.includes('control-plane')) langColor = '#2f81f7';
+          else if (rt.includes('spa') || rt.includes('static')) langColor = '#e34c26';
+
           const src = d && d.source;
           const sourceHtml = src
-            ? \`<div class="dep-line">🐙 <a href="\${esc(src.url)}" target="_blank" rel="noopener noreferrer">\${esc(src.name)}</a> · <a href="\${esc(src.branchUrl)}" target="_blank" rel="noopener noreferrer">\${esc(a.branch)}</a></div>\`
+            ? \`<span>🐙 <a href="\${esc(src.url)}" target="_blank" rel="noopener noreferrer">\${esc(src.name)}</a> · <a href="\${esc(src.branchUrl)}" target="_blank" rel="noopener noreferrer">\${esc(a.branch)}</a></span>\`
             : '';
           const running = d && d.running;
           const commitLine = running
-            ? \`<div class="dep-line">\${commitHtml(running, running.commitUrl)}</div>\`
-            : (a.lastCommit ? \`<div class="dep-line">commit: <code>\${esc(a.lastCommit)}</code></div>\` : '');
+            ? \`<span>\${commitHtml(running, running.commitUrl)}</span>\`
+            : (a.lastCommit ? \`<span>commit: <code>\${esc(a.lastCommit)}</code></span>\` : '');
           const m = metricsMap[a.containerName];
           const metricHtml = m
-            ? \`<div><code>CPU: \${esc(m.cpuPercent)}</code></div><div style="margin-top:3px;"><code>RAM: \${esc(m.memUsage)}</code></div>\`
-            : \`<span style="color:var(--muted);font-size:11.5px;">\${esc(a.status === 'stopped' ? t('stoppedStatus') : t('onDemandStatus'))}</span>\`;
+            ? \`<span><strong>CPU:</strong> \${esc(m.cpuPercent)}</span> · <span><strong>RAM:</strong> \${esc(m.memUsage)}</span>\`
+            : \`<span style="color:var(--muted);">\${esc(a.status === 'stopped' ? t('stoppedStatus') : t('onDemandStatus'))}</span>\`;
           const limitsHtml = (a.memoryLimit || a.cpuLimit)
-            ? \`<div style="margin-top:3px;font-size:11px;color:var(--muted);">Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU</div>\`
+            ? \`<span>(Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU)</span>\`
             : '';
           const cp = s.controlPlane || {};
           const followBtn = a.runtimeType === 'paasmcp-control-plane'
-            ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
+            ? \`<button class="secondary" style="\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
             : '';
           const followErr = a.runtimeType === 'paasmcp-control-plane' && cp.enabled && cp.lastError
-            ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:3px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
+            ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:2px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
             : '';
           const rollbackBtn = a.previousImageTag
-            ? \`<button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${esc(t('actionRollback'))}</button>\`
+            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${esc(t('actionRollback'))}</button>\`
             : '';
 
+          const domainPills = (a.domains || []).map(dom => \`
+            <span class="app-badge-pill">
+              <a href="\${esc(dom.url)}" target="_blank" rel="noopener noreferrer">🌐 \${esc(dom.url)}</a>
+              <span class="badge" style="padding:1px 5px;font-size:9.5px;">\${esc(dom.mode)}</span>
+            </span>
+          \`).join('') || \`<span class="app-badge-pill">🔒 127.0.0.1:\${esc(a.localPort)}</span>\`;
+
+          const dbPills = (a.databases || []).map(db => \`
+            <span class="app-badge-pill" style="font-size:11px;">🗄️ \${esc(db)}</span>
+          \`).join('');
+
           return \`
-            <tr>
-              <td>
-                <span class="status-dot \${dotClass}"></span>
-                <strong>\${esc(a.name)}</strong>
-                \${deployStatusHtml(d, true)}
-                \${a.lastWebhookAt ? \`<div style="font-size:10.5px;color:var(--muted);">⚡ Webhook: \${esc(a.lastWebhookAt.slice(0,19))}</div>\` : ''}
-              </td>
-              <td>
-                <code>\${esc(a.runtimeType)}</code>
+            <div class="app-entry-row">
+              <div class="app-row-top">
+                <div class="app-row-main-identity">
+                  <a href="\${esc(appLink)}" target="_blank" rel="noopener noreferrer" class="app-row-name-link">
+                    <span class="status-dot \${dotClass}"></span>
+                    <span>\${esc(a.name)}</span>
+                  </a>
+                  <span class="app-badge-pill \${statusBadgeClass}">● \${esc(statusText)}</span>
+                  \${domainPills}
+                  \${dbPills}
+                </div>
+                <div class="app-actions-group">
+                  <button class="secondary" onclick="selectAppForExpose('\${esc(a.name)}')">\${esc(t('actionExpose'))}</button>
+                  <button class="secondary" onclick="setVaultScope('\${esc(a.name)}')">\${esc(t('actionEnv'))}</button>
+                  <button class="secondary" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
+                  <button class="secondary" onclick="appAction('\${esc(a.name)}','restart')">\${esc(t('actionRestart'))}</button>
+                  \${rollbackBtn}
+                  \${followBtn}
+                  \${a.trashedAt
+                    ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10))}</span>
+                       <button class="secondary" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
+                       <button class="danger" onclick="appAction('\${esc(a.name)}','purge')">\${esc(t('actionPurge'))}</button>\`
+                    : \`<button class="danger" onclick="appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>\`}
+                </div>
+              </div>
+
+              \${(sourceHtml || commitLine || followErr) ? \`
+              <div class="app-row-commit-bar">
                 \${sourceHtml}
-                \${commitLine}
+                \${commitLine ? '· ' + commitLine : ''}
                 \${followErr}
-              </td>
-              <td>\${metricHtml}\${limitsHtml}</td>
-              <td>
-                <div><code>127.0.0.1:\${esc(a.localPort)}</code></div>
-                <div style="margin-top:3px;">\${(a.databases || []).map(d => \`<span class="badge" style="font-size:10px;padding:1px 6px;">\${esc(d)}</span>\`).join(' ') || ''}</div>
-              </td>
-              <td>\${(a.domains || []).map(d => \`<div style="margin-bottom:3px;"><a href="\${esc(d.url)}" target="_blank" rel="noopener noreferrer">🔗 \${esc(d.url)}</a> <span class="badge" style="padding:1px 6px;font-size:10px;">\${esc(d.mode)}</span></div>\`).join('') || '<span style="color:var(--muted)">Local only</span>'}</td>
-              <td><div class="actions">
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="selectAppForExpose('\${esc(a.name)}')">\${esc(t('actionExpose'))}</button>
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="setVaultScope('\${esc(a.name)}')">\${esc(t('actionEnv'))}</button>
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
-                <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restart')">\${esc(t('actionRestart'))}</button>
-                \${rollbackBtn}
-                \${followBtn}
-                \${a.trashedAt
-                  ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10))}</span>
-                     <button class="secondary" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
-                     <button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','purge')">\${esc(t('actionPurge'))}</button>\`
-                  : \`<button class="danger" style="padding:4px 9px;font-size:11.5px;" onclick="appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>\`}
-              </div></td>
-            </tr>
+              </div>\` : ''}
+
+              <div class="app-row-meta-bar">
+                <span class="runtime-tag">
+                  <span class="lang-dot" style="background:\${langColor};"></span>
+                  <code>\${esc(a.runtimeType)}</code>
+                </span>
+                <span>Porta: <code>\${esc(a.localPort)}</code></span>
+                <span>\${metricHtml} \${limitsHtml}</span>
+                \${deployStatusHtml(d, true)}
+                \${a.lastWebhookAt ? \`<span style="color:var(--muted)">⚡ Webhook: \${esc(a.lastWebhookAt.slice(0,19))}</span>\` : ''}
+              </div>
+            </div>
           \`;
         }).join('');
       }
