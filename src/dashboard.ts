@@ -890,54 +890,54 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
   const sharedCss = `
     :root, [data-theme="dark"] {
-      --bg: #090a0f;
-      --bg-elevated: #0e1017;
-      --bg-subtle: #141722;
-      --card: #11131c;
-      --card-hover: #181b28;
-      --border: rgba(255, 255, 255, 0.08);
-      --border-strong: rgba(255, 255, 255, 0.15);
-      --text: #f3f4f6;
-      --muted: #8e95a9;
-      --input-bg: #07080c;
-      --accent: #6366f1;
-      --accent-hover: #4f46e5;
-      --accent-soft: rgba(99, 102, 241, 0.14);
-      --accent-text: #a5b4fc;
-      --success: #10b981;
-      --success-soft: rgba(16, 185, 129, 0.14);
-      --warning: #f59e0b;
-      --warning-soft: rgba(245, 158, 11, 0.14);
-      --danger: #ef4444;
-      --danger-soft: rgba(239, 68, 68, 0.14);
-      --code-bg: #07080c;
-      --code-text: #c7d2fe;
-      --shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+      --bg: #0d1117;
+      --bg-elevated: #161b22;
+      --bg-subtle: #1f242c;
+      --card: #161b22;
+      --card-hover: #1c2128;
+      --border: #30363d;
+      --border-strong: #484f58;
+      --text: #f0f6fc;
+      --muted: #8b949e;
+      --input-bg: #0d1117;
+      --accent: #2f81f7;
+      --accent-hover: #388bfd;
+      --accent-soft: rgba(47, 129, 247, 0.15);
+      --accent-text: #58a6ff;
+      --success: #3fb950;
+      --success-soft: rgba(63, 185, 80, 0.15);
+      --warning: #d29922;
+      --warning-soft: rgba(210, 153, 34, 0.15);
+      --danger: #f85149;
+      --danger-soft: rgba(248, 81, 73, 0.15);
+      --code-bg: #161b22;
+      --code-text: #79c0ff;
+      --shadow: 0 8px 24px rgba(1, 4, 9, 0.4);
     }
     [data-theme="light"] {
-      --bg: #f8fafc;
-      --bg-elevated: #ffffff;
-      --bg-subtle: #f1f5f9;
+      --bg: #ffffff;
+      --bg-elevated: #f6f8fa;
+      --bg-subtle: #eaeef2;
       --card: #ffffff;
-      --card-hover: #f8fafc;
-      --border: #e2e8f0;
-      --border-strong: #cbd5e1;
-      --text: #0f172a;
-      --muted: #64748b;
-      --input-bg: #f8fafc;
-      --accent: #4f46e5;
-      --accent-hover: #4338ca;
-      --accent-soft: rgba(79, 70, 229, 0.09);
-      --accent-text: #4338ca;
-      --success: #059669;
-      --success-soft: rgba(5, 150, 105, 0.12);
-      --warning: #d97706;
-      --warning-soft: rgba(217, 119, 6, 0.12);
-      --danger: #dc2626;
-      --danger-soft: rgba(220, 38, 38, 0.1);
-      --code-bg: #f1f5f9;
-      --code-text: #312e81;
-      --shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      --card-hover: #f6f8fa;
+      --border: #d0d7de;
+      --border-strong: #afb8c1;
+      --text: #1f2328;
+      --muted: #656d76;
+      --input-bg: #ffffff;
+      --accent: #0969da;
+      --accent-hover: #0860ca;
+      --accent-soft: rgba(9, 105, 218, 0.1);
+      --accent-text: #0969da;
+      --success: #1a7f37;
+      --success-soft: rgba(26, 127, 55, 0.12);
+      --warning: #9a6700;
+      --warning-soft: rgba(154, 103, 0, 0.12);
+      --danger: #cf222e;
+      --danger-soft: rgba(207, 34, 46, 0.1);
+      --code-bg: #f6f8fa;
+      --code-text: #0550ae;
+      --shadow: 0 4px 16px rgba(31, 35, 40, 0.08);
     }
     * { box-sizing: border-box; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body {
@@ -1108,7 +1108,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         <button class="secondary" onclick="toggleTheme()" id="themeBtn" style="padding:5px 10px;font-size:11.5px;">☀️ Light</button>
       </div>
     </div>
-    <h1>🚀 PaaSMCP</h1>
+    <h1 style="display:flex;align-items:center;gap:10px;">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="3" width="20" height="14" rx="2" style="stroke: var(--accent); fill: var(--accent-soft); fill-opacity: 0.3;"></rect>
+        <circle cx="7" cy="10" r="1.5" fill="var(--accent)"></circle>
+        <path d="M12 7l3 3-3 3"></path>
+        <path d="M7 17v4"></path>
+        <path d="M17 17v4"></path>
+      </svg>
+      <span>PaaSMCP</span>
+    </h1>
     <p id="loginDesc"></p>
     ${safeCfEmail ? `<div style="margin-bottom:16px;"><span class="badge success">✓ Cloudflare Zero Trust: ${safeCfEmail}</span></div>` : ""}
     <input type="password" id="token" placeholder="Token..." autofocus style="margin-bottom: 14px;" />
@@ -1203,12 +1212,22 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       border-bottom: 1px solid var(--border);
     }
     .brand-title {
-      font-size: 17px;
+      font-size: 16px;
       font-weight: 700;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      letter-spacing: -0.02em;
+      letter-spacing: -0.01em;
+    }
+    .brand-mark {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+    }
+    .brand-icon-svg {
+      width: 22px;
+      height: 22px;
+      flex-shrink: 0;
     }
     .brand-sub {
       font-size: 11.5px;
@@ -1218,28 +1237,30 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .nav-list {
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 3px;
       margin-top: 12px;
     }
     .nav-btn {
       background: transparent;
       color: var(--muted);
       border: 1px solid transparent;
+      border-left: 3px solid transparent;
       justify-content: flex-start;
-      padding: 9px 12px;
+      padding: 8px 12px;
       font-size: 13px;
       font-weight: 500;
-      border-radius: 8px;
+      border-radius: 6px;
       width: 100%;
+      transition: all 0.12s ease;
     }
     .nav-btn:hover {
       background: var(--bg-subtle);
       color: var(--text);
     }
     .nav-btn.active {
-      background: var(--accent-soft);
-      color: var(--accent-text);
-      border-color: rgba(99, 102, 241, 0.28);
+      background: var(--bg-subtle);
+      color: var(--text);
+      border-left-color: var(--accent);
       font-weight: 600;
     }
     .sidebar-footer {
@@ -1425,7 +1446,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       <div>
         <div class="brand-box">
           <div class="brand-title">
-            <span>🚀 PaaSMCP</span>
+            <span class="brand-mark">
+              <svg class="brand-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="3" width="20" height="14" rx="2" style="stroke: var(--accent); fill: var(--accent-soft); fill-opacity: 0.3;"></rect>
+                <circle cx="7" cy="10" r="1.5" fill="var(--accent)"></circle>
+                <path d="M12 7l3 3-3 3"></path>
+                <path d="M7 17v4"></path>
+                <path d="M17 17v4"></path>
+              </svg>
+              <span>PaaSMCP</span>
+            </span>
             <span class="badge" style="font-size:10px;padding:2px 7px;">v1.1</span>
           </div>
           <div class="brand-sub" id="sidebarSubtitle">Agent-First Micro-PaaS</div>
