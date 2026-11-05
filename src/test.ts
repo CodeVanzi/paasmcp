@@ -864,6 +864,12 @@ volumes:
       const df = fs.readFileSync(path.join(work, plan.dockerfilePath), "utf-8");
       for (const re of patterns) assert.match(df, re, `${dir}: ${re}`);
     }
+    // A Django project that also lists uvicorn (ASGI) is still served as Django, not as FastAPI's main:app.
+    const asgi = fs.mkdtempSync(path.join(tempRoot, "fx-django-asgi-"));
+    fs.cpSync(path.join(fixtures, "django"), asgi, { recursive: true });
+    fs.appendFileSync(path.join(asgi, "requirements.txt"), "\nuvicorn==0.30.6\n");
+    const asgiDf = fs.readFileSync(path.join(asgi, github.detectOrGenerateDockerfile(asgi).dockerfilePath), "utf-8");
+    assert.match(asgiDf, /"gunicorn", "-b", "0.0.0.0:8000", "site1.wsgi"/);
   });
 
   await t.test("25. Git polling: redeploys only when the branch moved; opt-in per git app", async () => {

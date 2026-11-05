@@ -361,15 +361,16 @@ CMD ${startCmd}
     let cmd = `["python", "main.py"]`;
     let extraInstall = "";
     const reqContent = fs.existsSync(reqTxt) ? fs.readFileSync(reqTxt, "utf-8") : "";
-    if (reqContent.includes("uvicorn") || reqContent.includes("fastapi")) {
-      const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
-      cmd = `["uvicorn", "${entry}", "--host", "0.0.0.0", "--port", "${port}"]`;
-    } else if (fs.existsSync(path.join(repoDir, "manage.py"))) {
+    // Django first: many Django projects also list uvicorn (ASGI), and manage.py is the stronger signal.
+    if (fs.existsSync(path.join(repoDir, "manage.py"))) {
       // Django: serve the project's WSGI app with gunicorn (never the dev server).
       const wsgiDir = fs.readdirSync(repoDir).find((d) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(d) && fs.existsSync(path.join(repoDir, d, "wsgi.py")));
       if (!wsgiDir) throw new Error("Django project found (manage.py) but no <project>/wsgi.py; add a Dockerfile.");
       cmd = `["gunicorn", "-b", "0.0.0.0:${port}", "${wsgiDir}.wsgi"]`;
       if (!/gunicorn/i.test(reqContent)) extraInstall = "RUN pip install --no-cache-dir gunicorn\n";
+    } else if (reqContent.includes("uvicorn") || reqContent.includes("fastapi")) {
+      const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
+      cmd = `["uvicorn", "${entry}", "--host", "0.0.0.0", "--port", "${port}"]`;
     } else if (reqContent.includes("gunicorn")) {
       const entry = fs.existsSync(path.join(repoDir, "app.py")) ? "app:app" : "main:app";
       cmd = `["gunicorn", "-b", "0.0.0.0:${port}", "${entry}"]`;
