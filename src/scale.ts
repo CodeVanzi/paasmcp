@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   AppRecord,
   CapacityResult,
+  ensureDataDir,
   HOMELAB_ROOT,
   loadState,
   PAAS_DATA_DIR,
@@ -174,7 +175,7 @@ export interface DiaryEntry {
 // ---------- small helpers ----------
 
 function ensureScaleDir(): void {
-  fs.mkdirSync(SCALE_DIR, { recursive: true, mode: 0o700 });
+  ensureDataDir(SCALE_DIR);
 }
 
 function appFile(slug: string): string {

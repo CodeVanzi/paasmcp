@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { AppRecord, PAAS_DATA_DIR, sanitizeSlug, writeFileAtomic } from "./config.js";
+import { AppRecord, ensureDataDir, PAAS_DATA_DIR, sanitizeSlug, writeFileAtomic } from "./config.js";
 import { DASHBOARD_APP_NAME } from "./guard.js";
 import { readFollow } from "./selfupdate.js";
 
@@ -77,7 +77,7 @@ function readFile(app: string): DeployFile {
 
 function writeRun(run: DeployRun): void {
   try {
-    fs.mkdirSync(DEPLOYS_DIR, { recursive: true, mode: 0o700 });
+    ensureDataDir(DEPLOYS_DIR);
     const file = readFile(run.app);
     const runs = [run, ...file.runs.filter((r) => r.id !== run.id)]
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt))

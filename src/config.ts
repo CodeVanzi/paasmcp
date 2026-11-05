@@ -402,17 +402,33 @@ export function withWatchtowerOff(labels: unknown): string[] | Record<string, st
 export const WATCHTOWER_OFF_COMPOSE = `    labels:\n      - "${WATCHTOWER_OFF_LABEL}"\n`;
 
 export function ensureDirectories(): void {
-  for (const dir of [
-    PAAS_DATA_DIR,
-    PAAS_APPS_DIR,
-    PAAS_VAULT_DIR,
-    PAAS_SSH_DIR,
-    PAAS_BACKUPS_DIR,
-    PAAS_TRASH_DIR,
-  ]) {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (!fs.existsSync(PAAS_DATA_DIR)) fs.mkdirSync(PAAS_DATA_DIR, { recursive: true, mode: 0o700 });
+  if (!fs.existsSync(PAAS_APPS_DIR)) fs.mkdirSync(PAAS_APPS_DIR, { recursive: true, mode: 0o700 });
+  for (const dir of [PAAS_VAULT_DIR, PAAS_SSH_DIR, PAAS_BACKUPS_DIR, PAAS_TRASH_DIR]) ensureDataDir(dir);
+}
+
+/**
+ * Creates a folder inside the data folder (paasmcp/...). Created as root (the dashboard container, a
+ * root timer), it gets the data folder's owner, so the person's own CLI can still use it.
+ */
+export function ensureDataDir(dir: string): void {
+  if (fs.existsSync(dir)) return;
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+  const rel = path.relative(PAAS_DATA_DIR, dir);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return;
+  try {
+    const owner = fs.statSync(PAAS_DATA_DIR);
+    if (owner.uid === 0) return;
+    // Every folder this call created, from the first missing one down to `dir`.
+    let p = PAAS_DATA_DIR;
+    for (const part of rel.split(path.sep)) {
+      p = path.join(p, part);
+      const st = fs.statSync(p);
+      if (st.uid === 0) fs.chownSync(p, owner.uid, owner.gid);
     }
+  } catch {
+    // Ownership is a convenience: never fail because of it.
   }
 }
 
