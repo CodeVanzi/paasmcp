@@ -3,7 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { liveCopyOf } from "./active.js";
-import { EdgeConfig, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic } from "./config.js";
+import { EdgeConfig, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { audit } from "./guard.js";
 
 // Self-hosted entry, the alternative to Cloudflare Tunnel: a Caddy container on a server with a
@@ -89,7 +89,7 @@ const COMPOSE = `services:
     image: ${CADDY_IMAGE}
     container_name: ${EDGE_CONTAINER}
     restart: unless-stopped
-    # Host network: Caddy answers on ports 80/443 and reaches the apps on 127.0.0.1 and over Tailscale.
+${WATCHTOWER_OFF_COMPOSE}    # Host network: Caddy answers on ports 80/443 and reaches the apps on 127.0.0.1 and over Tailscale.
     network_mode: host
     volumes:
       - ./conf:/etc/caddy:ro

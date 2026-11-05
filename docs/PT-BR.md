@@ -120,8 +120,19 @@ A interface é dividida em 6 abas rápidas na barra lateral:
 - **🔐 Cofre AES-256-GCM:** Gerenciamento visual de segredos por escopo (`system` ou por aplicação).
 - **🗄️ Bancos & Backups:** Provisionamento 1-click de PostgreSQL/Redis e criação/restauração de snapshots `.enc.bak`.
 - **🌐 Multi-Server HA & Webhook:** Gerador de Join Token `paasmcp-join://`, exportação de bundle criptografado e URL/Secret do Webhook do GitHub.
-- **🩺 Doctor & Diagnóstico:** Inspeção de saúde dos containers e alertas de `OOMKilled`.
+- **🩺 Doctor & Diagnóstico:** Inspeção de saúde dos containers e alertas de `OOMKilled`, mais uma conferência do servidor em volta (DNS, Watchtower, redes do Docker e túnel).
 - **🤖 Studio IA (MCP) & Guia:** Configuração pronta para copiar em clientes MCP e explicação visual da arquitetura de segurança.
+
+### Instalar num homelab que já tem outros serviços
+
+O PaaSMCP convive com o resto do servidor. Depois de instalar, rode `paasmcp doctor` (ou abra **Diagnóstico** no painel): além dos apps, ele confere o servidor em volta e diz o que ajustar. As armadilhas mais comuns:
+
+- **DNS na mesma máquina.** Se o AdGuard Home ou o Pi-hole roda como contêiner neste servidor e o host usa só ele, o host fica sem DNS quando o contêiner não volta, e junto param o Cloudflare Tunnel, os downloads de imagem e os deploys. Dê ao host uma reserva: `FallbackDNS=1.1.1.1 9.9.9.9` em `/etc/systemd/resolved.conf`, com o `/etc/resolv.conf` apontando para o systemd-resolved.
+- **Watchtower.** Ele reinicia contêineres quando a imagem muda no registro. Todo contêiner criado pelo PaaSMCP leva `com.centurylinklabs.watchtower.enable=false`, porque o PaaSMCP fixa e atualiza as próprias imagens. Os contêineres criados antes ganham o rótulo na próxima recriação; o Watchtower com `WATCHTOWER_LABEL_ENABLE=true` resolve na hora. Pause o Watchtower enquanto testa o ativo-ativo ou a escala.
+- **Redes do Docker.** O Docker usa primeiro 172.17 a 172.31 e depois 192.168.x.0/20, que pode cobrir uma rede de casa como 192.168.31.0/24. Ponha `"default-address-pools": [{"base": "10.200.0.0/16", "size": 24}]` em `/etc/docker/daemon.json` antes de chegar lá.
+- **Portas.** Os apps usam portas de loopback 4000-4998, pulando 4097 (juiz), 4099 (painel) e qualquer porta já em uso. A entrada própria (`paasmcp edge on`) precisa das portas 80 e 443 livres; com Nginx Proxy Manager ou outro proxy nelas, fique no Cloudflare Tunnel ou ponha a entrada em outra máquina.
+- **Seu próprio contêiner do Cloudflare Tunnel.** O PaaSMCP manda os endereços públicos para os apps pelo nome do contêiner na rede Docker `homelab-network`, então o contêiner `cloudflared` precisa estar nela.
+- **Servidor no cabo.** O ativo-ativo e o juiz julgam um servidor por ele responder; Wi-Fi instável gera falsos alarmes.
 
 ### Primeira configuração e credenciais
 

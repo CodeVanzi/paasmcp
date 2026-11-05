@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { audit } from "./guard.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
 
@@ -186,7 +186,7 @@ const composeFor = () => `services:
     image: ${CLOUDFLARED_IMAGE}
     container_name: ${TUNNEL_CONTAINER}
     restart: unless-stopped
-    command: ["tunnel", "--no-autoupdate", "run"]
+${WATCHTOWER_OFF_COMPOSE}    command: ["tunnel", "--no-autoupdate", "run"]
     # The token stays in .env (0600), not in this file.
     env_file: .env
     networks:
