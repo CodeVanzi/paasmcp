@@ -155,7 +155,10 @@ export type DiaryKind =
   | "auto_on"
   | "auto_off"
   | "stopped_all"
-  | "repaired";
+  | "repaired"
+  // Courteous mode (courtesy.ts): the owner of a helper PC started or stopped using it.
+  | "owner_busy"
+  | "owner_calm";
 
 export interface DiaryEntry {
   t: string;
@@ -659,6 +662,8 @@ const DIARY_KINDS = new Set<DiaryKind>([
   "auto_off",
   "stopped_all",
   "repaired",
+  "owner_busy",
+  "owner_calm",
 ]);
 
 /** Diary entries, oldest first (last 7 days), optionally for one app. */
@@ -847,6 +852,36 @@ export function renderDiary(e: DiaryEntry, lang: DiaryLang): string {
         ? `Uma mudança de cópias foi interrompida no meio (o servidor reiniciou?). Conferi os ajudantes: ${what}.`
         : `A change of copies was interrupted halfway (did the server restart?). Checked the helpers: ${what}.`;
     }
+    case "owner_busy": {
+      const pc = name("helper");
+      const using = pt
+        ? `O dono de ${pc} está usando o PC (CPU fora das cópias em ${n("cpu")}%, limite ${n("limit")}%).`
+        : `The owner of ${pc} is using it (CPU outside the copies at ${n("cpu")}%, limit ${n("limit")}%).`;
+      if (p.mode === "warn") {
+        return pt
+          ? `${using} Modo com aviso: a cópia fica lá, mas nenhuma nova vai para esse PC até ele liberar.`
+          : `${using} Warn mode: the copy stays there, but no new one goes to that PC until it is free.`;
+      }
+      if (name("to")) {
+        return pt
+          ? `${using} A cópia saiu de lá depois de terminar as visitas em curso e foi para ${name("to")}.`
+          : `${using} The copy left after finishing the visits in progress and went to ${name("to")}.`;
+      }
+      return pt
+        ? `${using} A cópia saiu de lá depois de terminar as visitas em curso. Nenhum outro PC tinha espaço, então o app segue com ${n("running")} de ${copies("wanted")} até ele liberar.`
+        : `${using} The copy left after finishing the visits in progress. No other PC had room, so the app runs ${n("running")} of ${copies("wanted")} until it is free.`;
+    }
+    case "owner_calm": {
+      const free = pt
+        ? `${name("helper")} está livre de novo (CPU do dono abaixo de ${n("below")}% por ${n("minutes")} min).`
+        : `${name("helper")} is free again (the owner's CPU below ${n("below")}% for ${n("minutes")} min).`;
+      if (num("started") > 0) {
+        return pt
+          ? `${free} ${num("started") === 1 ? "Voltou 1 cópia" : `Voltaram ${n("started")} cópias`} que faltavam.`
+          : `${free} ${num("started") === 1 ? "1 missing copy is back" : `${n("started")} missing copies are back`}.`;
+      }
+      return pt ? `${free} Ele volta a receber cópias.` : `${free} It takes copies again.`;
+    }
   }
   return e.kind;
 }
@@ -1021,6 +1056,8 @@ export interface TickResult {
     string,
     { cpu: number | null; mem: number | null; lat: number | null; ok: boolean | null; rps?: number | null; copies: number; auto?: boolean; event?: string; step?: string }
   >;
+  /** Courteous mode: helpers whose owner started or stopped using them in this round. */
+  courtesy?: { helper: string; change: "busy" | "calm"; cpuPct: number; done: boolean; held?: string; apps: { app: string; started: string[]; stopped: number; running: number }[] }[];
 }
 
 /** Rounds in a row a helper copy must look unhealthy to the balancer before the helpers are checked. */
@@ -1039,6 +1076,7 @@ export async function scaleTick(
     probe?: (url: string) => Promise<{ ok: boolean; ms: number | null }>;
     log?: (line: string) => void;
     auto?: AutoHooks;
+    courtesy?: (o: { now?: number; log?: (l: string) => void; note: (app: string, kind: "owner_busy" | "owner_calm", p: Record<string, number | string>) => string }) => Promise<NonNullable<TickResult["courtesy"]>>;
   } = {}
 ): Promise<TickResult> {
   const now = opts.now ?? Date.now();
@@ -1193,6 +1231,18 @@ export async function scaleTick(
       if (result.apps[d.app]) {
         result.apps[d.app].copies = outcome.running;
         if (text) result.apps[d.app].step = text;
+      }
+    }
+
+    // Courteous mode: once a minute, the helpers say how much their owner uses them (courtesy.ts).
+    if (Object.keys(loadState().pool?.helpers || {}).length) {
+      try {
+        const { courtesyRound } = await (opts.courtesy ? Promise.resolve({ courtesyRound: opts.courtesy }) : import("./courtesy.js"));
+        const changes = await courtesyRound({ now, log, note });
+        if (changes.length) result.courtesy = changes;
+        for (const c of changes) for (const a of c.apps) if (result.apps[a.app]) result.apps[a.app].copies = a.running;
+      } catch (err) {
+        log(`courteous mode: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     return result;
