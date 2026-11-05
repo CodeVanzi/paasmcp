@@ -926,30 +926,31 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       --code-text: #00f0ff;
       --shadow: 0 4px 24px -2px rgba(0, 0, 0, 0.55);
     }
+    /* Light theme: soft blue-grey tones, never plain white (easier on the eyes), with readable contrast */
     [data-theme="light"] {
-      --bg: #f8fafc;
-      --bg-elevated: #ffffff;
-      --bg-subtle: #f1f5f9;
-      --card: #ffffff;
-      --card-hover: #f8fafc;
-      --border: #e2e8f0;
-      --border-strong: #cbd5e1;
-      --text: #0f172a;
-      --muted: #64748b;
-      --input-bg: #ffffff;
-      --accent: #0284c7;
-      --accent-hover: #0369a1;
-      --accent-soft: rgba(2, 132, 199, 0.08);
-      --accent-text: #0284c7;
-      --success: #059669;
-      --success-soft: rgba(5, 150, 105, 0.08);
-      --warning: #d97706;
-      --warning-soft: rgba(217, 119, 6, 0.08);
-      --danger: #dc2626;
-      --danger-soft: rgba(220, 38, 38, 0.08);
-      --code-bg: #f1f5f9;
-      --code-text: #0369a1;
-      --shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
+      --bg: #e3e8ee;
+      --bg-elevated: #ecf0f4;
+      --bg-subtle: #dbe1e8;
+      --card: #ecf0f4;
+      --card-hover: #e6ebf0;
+      --border: #c7d0db;
+      --border-strong: #a9b5c3;
+      --text: #141d28;
+      --muted: #4b5a6b;
+      --input-bg: #f2f4f7;
+      --accent: #0369a1;
+      --accent-hover: #075985;
+      --accent-soft: rgba(3, 105, 161, 0.11);
+      --accent-text: #035a8a;
+      --success: #047857;
+      --success-soft: rgba(4, 120, 87, 0.11);
+      --warning: #a16207;
+      --warning-soft: rgba(161, 98, 7, 0.11);
+      --danger: #b91c1c;
+      --danger-soft: rgba(185, 28, 28, 0.10);
+      --code-bg: #dce3ea;
+      --code-text: #075985;
+      --shadow: 0 1px 3px rgba(20, 29, 40, 0.08);
     }
     * { box-sizing: border-box; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body {
@@ -1300,95 +1301,119 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       flex-shrink: 0;
     }
 
-    /* Horizontal Subnav Tabs */
-    .console-subnav {
-      background: var(--card);
-      border-bottom: 1px solid var(--border);
-      padding: 0 24px;
+    /* Left side navigation (collapsible), like GitHub: sections, items, nested pages */
+    .console-header { position: sticky; top: 0; z-index: 30; }
+    button.nav-toggle-mobile { display: none; padding: 6px; background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .console-sidenav {
+      position: sticky;
+      top: 64px;
+      align-self: start;
+      max-height: calc(100vh - 80px);
+      overflow-y: auto;
+      scrollbar-width: thin;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      padding: 4px 2px 12px;
+    }
+    .sidenav-head { display: flex; justify-content: flex-end; padding: 0 4px 4px; }
+    button.sidenav-collapse {
+      padding: 5px; background: transparent; border: 1px solid transparent; color: var(--muted); border-radius: 6px; display: inline-flex;
+    }
+    button.sidenav-collapse:hover { color: var(--text); background: var(--accent-soft); transform: none; filter: none; }
+    .nav-section {
+      font-size: 11px;
+      font-weight: 650;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 14px 10px 4px;
+    }
+    button.nav-item {
+      position: relative;
       display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 10px;
+      width: 100%;
+      padding: 7px 10px;
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--text);
+      background: transparent;
+      border: 0;
+      border-radius: 7px;
+      text-align: left;
+      justify-content: flex-start;
+      cursor: pointer;
+      white-space: nowrap;
+      box-shadow: none;
+    }
+    button.nav-item:hover { background: var(--accent-soft); color: var(--text); transform: none; filter: none; }
+    button.nav-item.active { background: var(--accent-soft); font-weight: 650; color: var(--text); }
+    button.nav-item.active::before {
+      content: ""; position: absolute; left: -2px; top: 6px; bottom: 6px; width: 3px; border-radius: 0 3px 3px 0; background: var(--accent);
+    }
+    .nav-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+    .nav-icon { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 2; color: var(--muted); }
+    button.nav-item:hover .nav-icon, button.nav-item.active .nav-icon { color: var(--accent); }
+    .nav-counter {
+      padding: 0 7px;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 18px;
+      border-radius: 10px;
+      border: 1px solid var(--border-strong);
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      cursor: help;
+    }
+    .nav-counter:empty, .nav-counter[hidden] { display: none; }
+    button.nav-item.active .nav-counter { color: var(--accent-text); border-color: var(--accent); }
+    .nav-subs { display: none; flex-direction: column; margin: 2px 0 6px 25px; border-left: 1px solid var(--border); }
+    button.nav-item.active + .nav-subs { display: flex; }
+    button.nav-sub {
+      background: transparent; border: 0; border-radius: 0 6px 6px 0; box-shadow: none;
+      text-align: left; justify-content: flex-start; display: flex; padding: 5px 10px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer;
+    }
+    button.nav-sub:hover { color: var(--text); background: var(--accent-soft); transform: none; filter: none; }
+    button.nav-sub.active { color: var(--accent-text); font-weight: 650; }
+
+    .page-head { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }
+    .page-head h1 { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -0.015em; display: flex; align-items: center; gap: 10px; }
+    .page-head .nav-icon { width: 20px; height: 20px; color: var(--accent); }
+    /* Folder tabs at the top of a page that has more than one part */
+    .page-tabs {
+      display: flex;
+      gap: 2px;
+      border-bottom: 1px solid var(--border);
+      margin: 0 0 18px;
       overflow-x: auto;
       scrollbar-width: thin;
     }
-    .nav-tab {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      padding: 12px 13px;
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--muted);
-      border-bottom: 2px solid transparent;
-      text-decoration: none;
-      cursor: pointer;
-      background: transparent;
-      border-top: none;
-      border-left: none;
-      border-right: none;
-      border-radius: 0;
-      white-space: nowrap;
-      transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.15s cubic-bezier(0.4, 0, 0.2, 1), transform 0.15s ease;
+    button.page-tab {
+      background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0; box-shadow: none;
+      padding: 9px 14px; margin-bottom: -1px; font-size: 13.5px; font-weight: 500; color: var(--muted); white-space: nowrap; cursor: pointer;
     }
-    .nav-tab:hover {
-      color: var(--text);
-      background: transparent;
-      transform: translateY(-1px);
-    }
-    .nav-tab.active {
-      color: var(--accent);
-      font-weight: 600;
-      border-bottom-color: var(--accent);
-      background: transparent;
-      transform: none;
-    }
-    .nav-icon {
-      width: 14px;
-      height: 14px;
-      flex-shrink: 0;
-      stroke-width: 2;
-      color: var(--muted);
-      transition: color 0.15s ease, stroke 0.15s ease;
-    }
-    .nav-tab:hover .nav-icon {
-      color: var(--text);
-    }
-    .nav-tab.active .nav-icon {
-      color: var(--accent);
-    }
-    .nav-counter {
-      padding: 1px 7px;
-      font-size: 11px;
-      font-weight: 600;
-      line-height: 16px;
-      border-radius: 10px;
-      background: var(--bg-subtle);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      transition: all 0.15s ease;
-    }
-    .nav-tab.active .nav-counter {
-      color: var(--accent);
-      border-color: var(--accent);
-      background: var(--accent-soft);
-    }
+    button.page-tab:hover { color: var(--text); background: transparent; transform: none; filter: none; }
+    button.page-tab.active { color: var(--text); font-weight: 650; border-bottom-color: var(--accent); }
+    .tab-pane [data-sub].sub-hidden { display: none !important; }
 
-    /* Two-Column Workspace Container */
+    /* Three-column workspace: navigation | page | telemetry */
     .console-container {
-      max-width: 1400px;
-      margin: 22px auto;
-      padding: 0 24px;
+      max-width: 1560px;
+      margin: 18px auto;
+      padding: 0 20px;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 300px;
-      gap: 24px;
+      grid-template-columns: 228px minmax(0, 1fr) 290px;
+      gap: 22px;
       align-items: start;
     }
-    @media (max-width: 980px) {
-      .console-container {
-        grid-template-columns: minmax(0, 1fr);
-        padding: 0 16px;
-      }
-    }
+    .console-container.nav-collapsed { grid-template-columns: 52px minmax(0, 1fr) 290px; }
+    .nav-collapsed .nav-label, .nav-collapsed .nav-counter, .nav-collapsed .nav-subs { display: none !important; }
+    .nav-collapsed .nav-section { font-size: 0; padding: 10px 8px 4px; }
+    .nav-collapsed .nav-section::after { content: ""; display: block; border-top: 1px solid var(--border); }
+    .nav-collapsed button.nav-item { justify-content: center; padding: 9px 0; }
+    .nav-collapsed .sidenav-head { justify-content: center; }
     .console-main {
       min-width: 0;
       display: flex;
@@ -1398,7 +1423,43 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       display: flex;
       flex-direction: column;
       gap: 16px;
+      min-width: 0;
     }
+    .nav-scrim { display: none; }
+    @media (max-width: 1240px) {
+      .console-container, .console-container.nav-collapsed { grid-template-columns: 52px minmax(0, 1fr); }
+      .console-container .nav-label, .console-container .nav-counter, .console-container .nav-subs { display: none !important; }
+      .console-container .nav-section { font-size: 0; padding: 10px 8px 4px; }
+      .console-container .nav-section::after { content: ""; display: block; border-top: 1px solid var(--border); }
+      .console-container button.nav-item { justify-content: center; padding: 9px 0; }
+      .console-container .sidenav-head { display: none; }
+      .console-sidebar { grid-column: 2; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; align-items: start; }
+      .console-sidebar .telemetry-card { margin-bottom: 0; }
+      #statsGrid { display: contents; }
+    }
+    @media (max-width: 720px) {
+      .console-header { padding: 10px 16px; gap: 8px; }
+      .console-header .hide-sm, .console-header .btn-text { display: none !important; }
+      .header-actions { gap: 6px !important; flex-wrap: nowrap !important; }
+      .header-actions button { padding: 6px 9px; }
+      button.nav-toggle-mobile { display: inline-flex; }
+      .console-container, .console-container.nav-collapsed { grid-template-columns: minmax(0, 1fr); padding: 0 16px; margin-top: 14px; }
+      .console-sidebar { grid-column: 1; }
+      .console-sidenav {
+        position: fixed; z-index: 40; top: 0; left: 0; bottom: 0; width: 272px; max-height: none; height: 100%;
+        background: var(--bg-elevated); border-right: 1px solid var(--border); padding: 16px 10px;
+        transform: translateX(-100%); transition: transform 0.2s ease;
+      }
+      .console-container.nav-open .console-sidenav { transform: none; }
+      .console-container.nav-open .nav-scrim { display: block; position: fixed; inset: 0; z-index: 39; background: rgba(0, 0, 0, 0.45); }
+      .console-container .nav-label, .console-container .nav-counter { display: initial !important; }
+      .console-container .nav-counter:empty, .console-container .nav-counter[hidden] { display: none !important; }
+      .console-container button.nav-item.active + .nav-subs { display: flex !important; }
+      .console-container .nav-section { font-size: 11px; padding: 14px 10px 4px; }
+      .console-container .nav-section::after { display: none; }
+      .console-container button.nav-item { justify-content: flex-start; padding: 8px 10px; }
+    }
+    @media (prefers-reduced-motion: reduce) { .console-sidenav { transition: none; } }
 
     /* Right Column Telemetry & Resource Cards */
     .telemetry-card {
@@ -1457,6 +1518,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       background: var(--danger);
     }
 
+    .telemetry-card button.health-row {
+      width: 100%; background: transparent; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; box-shadow: none;
+      padding: 6px 0; margin: 0; cursor: pointer; text-align: left; font-weight: 400; gap: 10px; color: var(--muted);
+    }
+    .telemetry-card button.health-row:last-child { border-bottom: none; }
+    .telemetry-card button.health-row:hover { background: transparent; transform: none; filter: none; color: var(--text); }
+    .telemetry-card button.health-row .telemetry-val { text-align: right; }
     /* Search & Filter Bar */
     .console-search-bar {
       display: flex;
@@ -1735,6 +1803,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   <!-- Top Console Header -->
   <header class="console-header">
     <div class="console-header-left">
+      <button class="nav-toggle-mobile" id="navToggleMobile" onclick="toggleNavDrawer(true)" aria-label="Menu" aria-controls="sideNav" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"></path></svg>
+      </button>
       <a href="#" class="console-logo-link" onclick="location.reload(); return false;">
         <svg class="brand-icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="2" y="3" width="20" height="14" rx="2" style="stroke: var(--accent); fill: var(--accent-soft); fill-opacity: 0.3;"></rect>
@@ -1745,21 +1816,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         </svg>
         <span style="font-weight:700;font-size:15px;letter-spacing:-0.01em;">PaaSMCP</span>
       </a>
-      <span class="host-badge-capsule" id="topHostCapsule">
+      <span class="host-badge-capsule hide-sm" id="topHostCapsule">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
         <span>Host: <strong id="topHostname" style="font-weight:600;">-</strong></span>
       </span>
-      <span class="engine-status-pill">
+      <span class="engine-status-pill hide-sm">
         <span class="engine-status-dot"></span>
         <span id="topHealthBadge">Sistema Online</span>
       </span>
-      <span class="host-badge-capsule" id="topDomainBadge">
+      <span class="host-badge-capsule hide-sm" id="topDomainBadge">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
         <span>Domínio: -</span>
       </span>
-      ${safeCfEmail ? `<span class="engine-status-pill" style="color:var(--accent-text);border-color:rgba(0,240,255,0.35);background:var(--accent-soft);"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg> Zero Trust: ${safeCfEmail}</span>` : ""}
+      ${safeCfEmail ? `<span class="engine-status-pill hide-sm" style="color:var(--accent-text);border-color:rgba(0,240,255,0.35);background:var(--accent-soft);"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg> Zero Trust: ${safeCfEmail}</span>` : ""}
     </div>
-    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <div class="header-actions" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <span id="sidebarSubtitle" style="display:none;">Agent-First Micro-PaaS</span>
       <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
       <button class="secondary" onclick="toggleTheme()" id="themeBtn">🌙 Escuro</button>
@@ -1771,76 +1842,94 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     </div>
   </header>
 
-  <!-- Horizontal Subnav Tabs with Counters -->
-  <nav class="console-subnav" id="subnavTabs">
-    <button class="nav-tab nav-btn" onclick="switchTab('home', this)" id="navHome">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
-      <span class="nav-label">Início</span>
-    </button>
-    <button class="nav-tab nav-btn active" onclick="switchTab('overview', this)" id="navOverview">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
-      <span class="nav-label">Aplicações</span>
-      <span class="nav-counter" id="tabCountApps">0</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('databases', this)" id="navDatabases">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
-      <span class="nav-label">Bancos de Dados</span>
-      <span class="nav-counter" id="tabCountDbs">0</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('vault', this)" id="navVault">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-      <span class="nav-label">Cofre &amp; Chaves</span>
-      <span class="nav-counter" id="tabCountVault">0</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('agents', this)" id="navAgents">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
-      <span class="nav-label">MCP &amp; IA</span>
-      <span class="nav-counter" id="tabCountAgents">15</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('mirror', this)" id="navMirror">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
-      <span class="nav-label">Segundo Servidor</span>
-      <span class="nav-counter" id="tabCountMirror">0</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('pool', this)" id="navPool">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-      <span class="nav-label">Ajudantes</span>
-      <span class="nav-counter" id="tabCountPool">0</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-      <span class="nav-label">Diagnóstico</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('email', this)" id="navEmail">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
-      <span class="nav-label">E-mail</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('updates', this)" id="navUpdates">
-      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-      <span class="nav-label">Atualizações</span>
-    </button>
-  </nav>
-
-  <!-- Two-Column Workspace Container -->
-  <div class="console-container">
+  <!-- Three-column workspace: side navigation | page | telemetry -->
+  <div class="console-container" id="consoleContainer">
+    <nav class="console-sidenav" id="sideNav" aria-label="Menu">
+      <div class="sidenav-head">
+        <button class="sidenav-collapse" id="navCollapseBtn" onclick="toggleNavCollapsed()" aria-label="Menu">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M9 3v18"></path></svg>
+        </button>
+      </div>
+      <button class="nav-item nav-btn" onclick="goTo('home')" id="navHome">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+        <span class="nav-label"></span>
+      </button>
+      <div class="nav-subs" data-subs-for="home"></div>
+      <div class="nav-section" data-i18n="navSecApps"></div>
+      <button class="nav-item nav-btn" onclick="goTo('overview')" id="navOverview">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
+        <span class="nav-label"></span>
+        <span class="nav-counter" id="tabCountApps" hidden></span>
+      </button>
+      <div class="nav-subs" data-subs-for="overview"></div>
+      <button class="nav-item nav-btn" onclick="goTo('databases')" id="navDatabases">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+        <span class="nav-label"></span>
+        <span class="nav-counter" id="tabCountDbs" hidden></span>
+      </button>
+      <div class="nav-subs" data-subs-for="databases"></div>
+      <button class="nav-item nav-btn" onclick="goTo('vault')" id="navVault">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+        <span class="nav-label"></span>
+        <span class="nav-counter" id="tabCountVault" hidden></span>
+      </button>
+      <div class="nav-subs" data-subs-for="vault"></div>
+      <div class="nav-section" data-i18n="navSecServers"></div>
+      <button class="nav-item nav-btn" onclick="goTo('mirror')" id="navMirror">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+        <span class="nav-label"></span>
+        <span class="nav-counter" id="tabCountMirror" hidden></span>
+      </button>
+      <div class="nav-subs" data-subs-for="mirror"></div>
+      <button class="nav-item nav-btn" onclick="goTo('pool')" id="navPool">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+        <span class="nav-label"></span>
+        <span class="nav-counter" id="tabCountPool" hidden></span>
+      </button>
+      <div class="nav-subs" data-subs-for="pool"></div>
+      <div class="nav-section" data-i18n="navSecIntegrations"></div>
+      <button class="nav-item nav-btn" onclick="goTo('agents')" id="navAgents">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
+        <span class="nav-label"></span>
+        <span class="nav-counter" id="tabCountAgents" hidden></span>
+      </button>
+      <div class="nav-subs" data-subs-for="agents"></div>
+      <button class="nav-item nav-btn" onclick="goTo('email')" id="navEmail">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
+        <span class="nav-label"></span>
+      </button>
+      <div class="nav-subs" data-subs-for="email"></div>
+      <div class="nav-section" data-i18n="navSecSystem"></div>
+      <button class="nav-item nav-btn" onclick="goTo('doctor')" id="navDoctor">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+        <span class="nav-label"></span>
+      </button>
+      <div class="nav-subs" data-subs-for="doctor"></div>
+      <button class="nav-item nav-btn" onclick="goTo('updates')" id="navUpdates">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+        <span class="nav-label"></span>
+      </button>
+      <div class="nav-subs" data-subs-for="updates"></div>
+    </nav>
+    <div class="nav-scrim" onclick="toggleNavDrawer(false)"></div>
     <div class="console-main">
       <!-- TAB: HOME / SETUP -->
       <div class="tab-pane" id="tab-home">
-        <div class="card">
+        <div class="card" data-sub="start">
           <div class="card-header">
-            <h2 id="homeTitle">🏠 Início</h2>
+            <h2 id="homeTitle">Resumo do servidor</h2>
             <p class="card-desc" data-i18n="homeDesc"></p>
           </div>
           <div class="grid-2" id="homeTiles"></div>
         </div>
-        <div class="card">
+        <div class="card" data-sub="start">
           <div class="card-header">
             <h2 data-i18n="stepsTitle"></h2>
             <p class="card-desc" data-i18n="stepsDesc"></p>
           </div>
           <div id="homeSteps"></div>
         </div>
-        <div class="card">
+        <div class="card" data-sub="setup">
           <div class="card-header">
             <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
             <p class="card-desc" id="setupDesc">Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.</p>
@@ -1871,7 +1960,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
 
       <!-- TAB 2: OVERVIEW, APPS, DEPLOY & EXPOSE -->
       <div class="tab-pane active" id="tab-overview">
-        <div class="card" style="margin-bottom:20px;">
+        <div class="card" data-sub="list" style="margin-bottom:20px;">
           <div class="card-header" style="margin-bottom:14px;">
             <h2>
               <span id="appsTitle">📦 Aplicações Hospedadas &amp; Métricas</span>
@@ -1881,15 +1970,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
           <div class="console-search-bar">
             <input class="console-search-input" id="appSearchInput" placeholder="Buscar aplicações por nome, stack ou porta..." oninput="filterApps(this.value)" />
-            <button class="secondary" onclick="fillDeployPreset('saas', document.getElementById('presetSaas')); const depEl = document.getElementById('depApp'); if (depEl) { depEl.scrollIntoView({behavior:'smooth'}); depEl.focus(); }" style="padding:6px 12px;font-size:12.5px;">+ Novo Deploy</button>
+            <button class="secondary" onclick="fillDeployPreset('saas', document.getElementById('presetSaas')); const depEl = revealEl('depApp'); if (depEl) depEl.focus();" style="padding:6px 12px;font-size:12.5px;">+ Novo Deploy</button>
           </div>
           <div class="apps-card-list" id="appsTable">
             <div style="padding: 24px; text-align: center; color: var(--muted);">...</div>
           </div>
         </div>
 
-          <div class="row">
-            <div class="card">
+          
+            <div class="card" data-sub="deploy">
               <div class="card-header">
                 <h2 id="deployTitle">➕ Novo Deploy (GitHub, Multi-Service Compose ou Local)</h2>
                 <p class="card-desc" id="deployDesc">Detecta automaticamente Node, Next.js, Python, Go, SPA, Dockerfile ou <code>docker-compose.yml</code> (injetando segredos do Vault com segurança).</p>
@@ -1964,7 +2053,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
             </div>
 
-            <div class="card">
+            <div class="card" data-sub="expose">
               <div class="card-header">
                 <h2 id="exposeTitle">🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)</h2>
                 <p class="card-desc" id="exposeDesc">Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.</p>
@@ -1996,9 +2085,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </div>
               <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
             </div>
-          </div>
+          
 
-          <div class="card" id="scaleCard">
+          <div class="card" data-sub="scale" id="scaleCard">
             <div class="card-header">
               <h2 data-i18n="scaleTitle"></h2>
               <p class="card-desc" data-i18n="scaleDesc"></p>
@@ -2053,7 +2142,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             </div>
           </div>
 
-          <div class="card">
+          <div class="card" data-sub="webhook">
             <div class="card-header">
               <h2 id="whTitle">⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
               <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
@@ -2113,7 +2202,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
 
         <!-- TAB 3: DATABASES & ENCRYPTED BACKUPS -->
         <div class="tab-pane" id="tab-databases">
-          <div class="card">
+          <div class="card" data-sub="offsite">
             <div class="card-header">
               <h2 data-i18n="offsiteTitle"></h2>
               <p class="card-desc" data-i18n="offsiteDesc"></p>
@@ -2123,7 +2212,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             </div>
             <details style="margin-top:10px;font-size:12.5px;color:var(--muted);"><summary data-i18n="detailsTech"></summary><p data-i18n="offsiteTech"></p></details>
           </div>
-          <div class="card">
+          <div class="card" data-sub="files">
             <div class="card-header">
               <h2 data-i18n="storageTitle"></h2>
               <p class="card-desc" data-i18n="storageDesc"></p>
@@ -2133,8 +2222,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <input id="stoApp" placeholder="ex: meu-saas" />
             <div style="margin-top:10px;"><button onclick="provisionStorageUi()" data-i18n="btnStorage"></button></div>
           </div>
-          <div class="row">
-            <div class="card">
+          
+            <div class="card" data-sub="dbs">
               <div class="card-header">
                 <h2 id="dbTitle">🗄️ Provisionar Banco Multi-Tenant Isolado</h2>
                 <p class="card-desc" id="dbDesc">Cria banco, role exclusiva e injeta <code>DATABASE_URL</code> / <code>REDIS_URL</code> diretamente no Cofre do app.</p>
@@ -2156,7 +2245,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div id="dbList"></div>
             </div>
 
-            <div class="card">
+            <div class="card" data-sub="backups">
               <div class="card-header">
                 <h2 id="backupsTitle">🛡️ Snapshots & Restore Criptografados (AES-256-GCM)</h2>
                 <p class="card-desc" id="backupsDesc">Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.</p>
@@ -2178,7 +2267,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Criar Snapshot Criptografado</button>
               <div id="backupsList"></div>
             </div>
-          </div>
+          
         </div>
 
 
@@ -2218,14 +2307,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         </div>
 
         <div class="tab-pane" id="tab-mirror">
-          <div class="card">
+          <div class="card" data-sub="copy">
             <div class="card-header">
               <h2 data-i18n="mirrorTitle"></h2>
               <p class="card-desc" data-i18n="mirrorDesc"></p>
             </div>
             <div id="mirrorStatusBox"></div>
           </div>
-          <div class="card" id="pairCard">
+          <div class="card" data-sub="connect" id="pairCard">
             <div class="card-header">
               <h2 id="fedTitle">🌐 Handshake Multi-Servidor & Redundância (HA Federation)</h2>
               <p class="card-desc" id="fedDesc">Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.</p>
@@ -2256,7 +2345,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             </div>
             <div id="fedPeersList"></div>
           </div>
-          <div class="grid-2">
+          <div class="grid-2" data-sub="copy">
             <div class="card">
               <div class="card-header"><h2 data-i18n="mirrorOfferTitle"></h2><p class="card-desc" data-i18n="mirrorOfferDesc"></p></div>
               <label class="field-label" for="mOfferPeer" data-i18n="lblPeerName"></label>
@@ -2279,7 +2368,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div style="margin-top:10px;"><button onclick="mirrorAccept()" data-i18n="btnMirrorAccept"></button></div>
             </div>
           </div>
-          <div class="card">
+          <div class="card" data-sub="auto">
             <div class="card-header"><h2 data-i18n="autoTitle"></h2><p class="card-desc" data-i18n="autoDesc"></p></div>
             <div id="arbStatusBox" style="margin-bottom:6px;"></div>
             <p class="card-desc" data-i18n="autoBefore"></p>
@@ -2327,7 +2416,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <p class="card-desc" data-i18n="autoStep7Desc"></p>
             <button class="secondary" onclick="loadArbiterStatus(true)" data-i18n="btnArbRefresh"></button>
           </div>
-          <div class="card" id="activeCard">
+          <div class="card" data-sub="aa" id="activeCard">
             <div class="card-header"><h2 data-i18n="aaTitle"></h2><p class="card-desc" data-i18n="aaDesc"></p><p class="card-desc" data-i18n="hostReadyNote"></p></div>
             <div id="activeStatusBox" style="margin-bottom:6px;"></div>
 
@@ -2358,7 +2447,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div style="margin-top:10px;"><button onclick="edgeAddSite()" data-i18n="btnAaSite"></button></div>
             <div id="edgeStatusBox" style="margin-top:10px;"></div>
           </div>
-          <div class="card">
+          <div class="card" data-sub="back">
             <div class="card-header"><h2 data-i18n="failbackTitle"></h2></div>
             <ol style="margin:0;padding-left:20px;font-size:13px;line-height:1.7;">
               <li data-i18n="failback1"></li>
@@ -2371,7 +2460,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         </div>
 
         <div class="tab-pane" id="tab-pool">
-          <div class="card">
+          <div class="card" data-sub="list">
             <div class="card-header">
               <h2 data-i18n="poolTitle"></h2>
               <p class="card-desc" data-i18n="poolDesc"></p>
@@ -2386,7 +2475,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <p class="card-desc" data-i18n="poolAppsDesc"></p>
             <div id="poolApps"></div>
           </div>
-          <div class="card">
+          <div class="card" data-sub="add">
             <div class="card-header"><h2 data-i18n="poolAddTitle"></h2><p class="card-desc" data-i18n="poolAddDesc"></p></div>
 
             <h3 data-i18n="poolStep1" style="margin-top:12px;"></h3>
@@ -2424,7 +2513,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <pre id="poolAcl" style="user-select:all;white-space:pre-wrap;word-break:break-all;font-size:11.5px;max-height:320px;overflow:auto;"></pre>
             <button class="secondary" onclick="copyText(document.getElementById('poolAcl').textContent)" data-i18n="aiCopy"></button>
           </div>
-          <div class="card">
+          <div class="card" data-sub="how">
             <div class="card-header"><h2 data-i18n="poolHowTitle"></h2></div>
             <p class="card-desc" data-i18n="poolHow1"></p>
             <p class="card-desc" data-i18n="poolHow2"></p>
@@ -2461,7 +2550,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
         <!-- TAB 6: AI AGENT STUDIO & ARCHITECTURE -->
         <div class="tab-pane" id="tab-agents">
-          <div class="card">
+          <div class="card" data-sub="connect">
             <div class="card-header">
               <h2 id="agentsTitle">🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)</h2>
               <p class="card-desc" id="agentsDesc">O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:</p>
@@ -2507,7 +2596,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <h3 data-i18n="aiStep4" style="margin-top:18px;"></h3>
             <p class="card-desc" data-i18n="aiStep4Desc"></p>
             <p class="card-desc" data-i18n="aiWebNote" style="margin-top:10px;"></p>
-            <div class="arch-grid" style="margin-top:16px;">
+
+          </div>
+
+          <div class="card" data-sub="examples">
+            <div class="card-header"><h2 data-i18n="aiExamplesTitle"></h2><p class="card-desc" data-i18n="aiExamplesDesc"></p></div>
+            <div class="arch-grid" >
               <div class="arch-box">
                 <h3 id="promptEx1Title">💬 Deploy & Banco 1-Click</h3>
                 <p id="promptEx1Desc">"Faça o deploy do repositório <code>usuario/meu-saas</code> com PostgreSQL, limite de 512m de RAM e publique em <code>saas.{domain}</code>"</p>
@@ -2696,8 +2790,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_spa: "Vite, React ou Astro sem script <code>start</code>: o painel faz o build e serve os arquivos com nginx. Um <code>index.html</code> na raiz também funciona.",
         presetHint_dockerfile: "Para Rails, Laravel, Java ou qualquer outra stack: deixe um <code>Dockerfile</code> na raiz do repositório. A porta vem do <code>EXPOSE</code>.",
         chipSystemScope: "⚙️ system (Tokens Globais)",
-        followOn: "🔁 Atualiza sozinho",
-        followOff: "🔁 Atualizar sozinho",
+        followOn: "Atualiza sozinho",
+        followOff: "Atualizar sozinho",
         followOnTitle: "Segue a branch {branch}: cada commit novo é compilado e testado antes de entrar. Clique para parar.",
         followOffTitle: "Passa a seguir a main do repositório: cada commit novo é compilado e testado antes de entrar, e volta sozinho se falhar.",
         followFailed: "Última atualização falhou ({step}) no commit {commit}; o painel segue na versão anterior.",
@@ -2713,11 +2807,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         emptyPeers: "Nenhum servidor secundário pareado ainda.",
         emptySecrets: "Nenhuma variável salva neste escopo.",
         emptyDoctor: "Nenhum container registrado para diagnóstico.",
-        actionExpose: "🌐 Expor",
-        actionEnv: "🔐 ENV",
-        actionLogs: "📜 Logs",
-        actionRestart: "🔄 Restart",
-        actionRollback: "⏪ Rollback",
+        actionExpose: "Expor",
+        actionEnv: "Senhas",
+        actionLogs: "Logs",
+        actionRestart: "Reiniciar",
+        actionRollback: "Versão anterior",
         actionDelete: "Excluir",
         btnRestartContainer: "🔄 Reiniciar Container",
         lastCheck: "Última checagem:",
@@ -2909,8 +3003,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_spa: "Vite, React or Astro without a <code>start</code> script: the dashboard builds it and serves the files with nginx. A root <code>index.html</code> works too.",
         presetHint_dockerfile: "For Rails, Laravel, Java or any other stack: put a <code>Dockerfile</code> at the repository root. The port comes from <code>EXPOSE</code>.",
         chipSystemScope: "⚙️ system (Global Tokens)",
-        followOn: "🔁 Auto-updates",
-        followOff: "🔁 Auto-update",
+        followOn: "Auto-updates",
+        followOff: "Auto-update",
         followOnTitle: "Follows branch {branch}: each new commit is built and tested before it goes live. Click to stop.",
         followOffTitle: "Follow the repository's main branch: each new commit is built and tested before it goes live, and rolls back by itself if it fails.",
         followFailed: "Last update failed ({step}) at commit {commit}; the dashboard stays on the previous version.",
@@ -2926,11 +3020,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         emptyPeers: "No secondary servers paired yet.",
         emptySecrets: "No variables stored in this scope.",
         emptyDoctor: "No containers registered for diagnostics.",
-        actionExpose: "🌐 Expose",
-        actionEnv: "🔐 ENV",
-        actionLogs: "📜 Logs",
-        actionRestart: "🔄 Restart",
-        actionRollback: "⏪ Rollback",
+        actionExpose: "Expose",
+        actionEnv: "Secrets",
+        actionLogs: "Logs",
+        actionRestart: "Restart",
+        actionRollback: "Previous version",
         actionDelete: "Delete",
         btnRestartContainer: "🔄 Restart Container",
         lastCheck: "Last checked:",
@@ -2995,15 +3089,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sidebarSubtitle": "Seu servidor de apps",
           "navHome": "Início",
           "navOverview": "Aplicações",
-          "navDatabases": "Bancos de Dados",
-          "navVault": "Cofre & Chaves",
+          "navDatabases": "Bancos de dados",
+          "navVault": "Senhas e chaves",
           "navEmail": "E-mail",
-          "navMirror": "Segundo Servidor",
+          "navMirror": "Segundo servidor",
           "navUpdates": "Atualizações",
           "navDoctor": "Diagnóstico",
-          "navAgents": "MCP & IA",
+          "navAgents": "Conectar IA",
           "navPool": "Ajudantes",
-          "homeTitle": "Início",
+          "homeTitle": "Resumo do servidor",
           "setupTitle": "🧭 Integrações opcionais",
           "appsTitle": "📦 Seus apps",
           "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app. Quando chega um commit novo, a linha do app mostra a nova versão sendo montada e testada; a versão atual continua no ar até a nova passar no teste.",
@@ -3018,7 +3112,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "backupsTitle": "🛡️ Cópias de segurança",
           "backupsDesc": "Cópias cifradas dos bancos e dos arquivos dos apps. Use “Testar” para conferir que a cópia abre antes de precisar dela.",
           "fedTitle": "🔗 Conectar outro servidor",
-          "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use os quadros abaixo para a cópia ao vivo dos dados.",
+          "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use a aba “Cópia ao vivo” para copiar os dados.",
           "optFedActive": "Os dois atendem juntos (apps sem dados próprios)",
           "optFedWarm": "Reserva: copia apps e senhas para o outro servidor",
           "btnGenInvite": "🔑 Gerar convite (vale 15 min)",
@@ -3104,10 +3198,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnEmailApp": "Liberar",
           "emailAppDone": "Pronto. Remetente:",
           "mirrorTitle": "🔁 Segundo servidor",
-          "mirrorDesc": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro pode assumir os apps dele com os dados até o último segundo. Antes, conecte os dois no quadro “Conectar outro servidor”, logo abaixo.",
+          "mirrorDesc": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro pode assumir os apps dele com os dados até o último segundo. Antes, conecte os dois na aba “Conectar”.",
           "mirrorNone": "Nenhuma cópia configurada ainda. Use os dois quadros abaixo: um servidor oferece, o outro recebe.",
           "aaTitle": "⚖️ App nos dois servidores",
-          "aaDesc": "O app roda aqui e no outro servidor ao mesmo tempo, e os dois recebem visitas. Os dados continuam gravados num banco só, o deste servidor: o outro grava nele pela Tailscale. Se este servidor cair, a troca automática acima faz o outro seguir sozinho.",
+          "aaDesc": "O app roda aqui e no outro servidor ao mesmo tempo, e os dois recebem visitas. Os dados continuam gravados num banco só, o deste servidor: o outro grava nele pela Tailscale. Se este servidor cair, a troca automática (aba “Troca automática”) faz o outro seguir sozinho.",
           "hostReadyNote": "Antes de testar, abra o Diagnóstico: ele avisa se este servidor está sem DNS de reserva, se o Watchtower pode reiniciar os contêineres do PaaSMCP no meio do teste ou se as redes do Docker estão chegando perto da sua rede de casa.",
           "aaNone": "Nenhum app rodando nos dois servidores ainda.",
           "aaOrigin": "criado aqui, roda nos dois",
@@ -3115,7 +3209,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aaRunning": "versão aqui",
           "aaWanted": "versão pedida",
           "aaStep1": "1. Antes: cópia e vigia",
-          "aaStep1Desc": "Este servidor precisa mandar cópia para o outro (quadro “Oferecer cópia” acima, com o IP do Tailscale), e o vigia precisa rodar no outro servidor (passo 6 da troca automática). É o vigia que mantém o app do outro servidor na mesma versão deste, em até 15 segundos.",
+          "aaStep1Desc": "Este servidor precisa mandar cópia para o outro (aba “Cópia ao vivo”, quadro “Oferecer cópia”, com o IP do Tailscale), e o vigia precisa rodar no outro servidor (passo 6 da troca automática). É o vigia que mantém o app do outro servidor na mesma versão deste, em até 15 segundos.",
           "aaStep2": "2. Escolha o app e confira",
           "aaStep2Desc": "Só aparecem apps criados neste servidor. O quadro diz o que falta e o que vale ajustar antes de ligar.",
           "aaReady": "Pronto para rodar nos dois",
@@ -3157,7 +3251,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aaP_fromPeer": "Este app veio do outro servidor: ligue lá, onde ele foi criado.",
           "aaP_localSource": "O app foi publicado de uma pasta local. O outro servidor precisa de um repositório git para montar a mesma versão.",
           "aaP_noCommit": "Faça o deploy do app mais uma vez, para este servidor guardar o commit exato que está no ar.",
-          "aaP_noMirror": "Nenhum servidor recebe cópia deste ainda. Configure a cópia primeiro, nos quadros acima.",
+          "aaP_noMirror": "Nenhum servidor recebe cópia deste ainda. Configure a cópia primeiro, na aba “Cópia ao vivo”.",
           "aaP_noBindIp": "A cópia foi oferecida sem o IP do Tailscale, então o outro servidor não alcança este banco. Ofereça de novo pelo terminal com --advertise <IP do Tailscale deste servidor>.",
           "aaP_fenced": "Este servidor está bloqueado: outro servidor serve os dados dele agora.",
           "aaP_noHealthcheck": "O app não tem verificação de saúde por HTTP, e a entrada precisa dela para parar de mandar visitas a um servidor que caiu.",
@@ -3184,7 +3278,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorBehindDesc": "Esta cópia não recebe mais nada e nunca assume sozinha. Para refazê-la, peça uma nova oferta a quem guarda os dados agora: {peer}, se voltar, ou o servidor que assumiu, com --from-copy-of {peer} (a cópia antiga fica guardada no disco).",
           "mirrorLostDesc": "Este servidor tinha assumido os dados de {peer}, ficou fora por mais de um minuto e outro assumiu no lugar. Os apps de {peer} pararam aqui e não sobem mais. Para voltar a ter uma cópia, peça uma nova oferta a quem assumiu, com --from-copy-of {peer} (os dados daqui ficam guardados no disco).",
           "mirrorVia": "pelo servidor {who}",
-          "mirrorPromotedDesc": "Os apps dele estão rodando aqui. Quando ele voltar, siga a devolução abaixo.",
+          "mirrorPromotedDesc": "Os apps dele estão rodando aqui. Quando ele voltar, siga a aba “Devolver apps”.",
           "btnPromote": "Assumir os apps",
           "btnHandback": "Devolver os apps",
           "mirrorFenced": "Bloqueado",
@@ -3205,7 +3299,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorHandedBack": "Apps devolvidos. Agora assuma-os no outro servidor.",
           "autoTitle": "Troca automática",
           "autoDesc": "Se o outro servidor sumir por mais de 1 minuto, este assume os apps dele sozinho. Para isso precisa de um juiz: um terceiro aparelho que dá o voto de desempate. Sem juiz, se só a conexão entre os dois cair, cada um acharia que o outro morreu e os dois gravariam dados diferentes.",
-          "autoBefore": "Antes de começar: a cópia já precisa estar funcionando (aparece “Cópia de …” no topo desta página) e os três aparelhos precisam estar na mesma rede Tailscale. Faça os passos abaixo uma vez, nesta ordem.",
+          "autoBefore": "Antes de começar: a cópia já precisa estar funcionando (aparece “Cópia de …” na aba “Cópia ao vivo”) e os três aparelhos precisam estar na mesma rede Tailscale. Faça os passos abaixo uma vez, nesta ordem.",
           "autoStep1": "1. Escolha o aparelho do juiz",
           "autoStep1Desc": "Qualquer aparelho ligado 24 horas que não seja nenhum dos dois servidores: um Raspberry Pi, uma VPS barata ou um PC velho. De preferência em outro lugar ou outra internet. Ele precisa de Node.js 20 ou mais novo e do Tailscale ligado na mesma conta. Não precisa de Docker e quase não usa memória.",
           "autoStep2": "2. Pegue a chave do juiz (neste servidor)",
@@ -3223,7 +3317,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "autoStep5": "5. Escolha qual servidor este pode substituir",
           "autoStep5Desc": "É o servidor cujos apps este vai assumir se ele cair. A lista mostra só os servidores dos quais este já guarda uma cópia. Ao ligar, o painel pede para digitar o nome para confirmar. Se a cópia é nos dois sentidos e você quer que qualquer um assuma o outro, faça este passo também no outro servidor.",
           "lblAutoPeer": "Servidor que este pode substituir",
-          "autoNoCopy": "Nenhuma cópia recebida ainda (use “Receber cópia” acima)",
+          "autoNoCopy": "Nenhuma cópia recebida ainda (use “Receber cópia”, na aba “Cópia ao vivo”)",
           "autoNoPeer": "Escolha o servidor na lista. Se ela estiver vazia, este servidor ainda não guarda cópia de nenhum outro.",
           "autoStep6": "6. Ligue o vigia (nos dois servidores)",
           "autoStep6Desc": "O vigia conversa com o juiz a cada 15 segundos. É ele que avisa o juiz que o servidor está vivo, troca sozinho quando precisa e bloqueia o servidor que volta depois de ter sido substituído. Rode o comando abaixo no terminal de cada um dos dois servidores.",
@@ -3246,7 +3340,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "arbErr_badUrl": "Endereço inválido. Use http://<IP do Tailscale do juiz>:4097",
           "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Reinstale o juiz com a chave do passo 2.",
           "arbErr_clock": "O juiz respondeu, mas o relógio dele está mais de 1 minuto diferente. Ligue o horário automático nos aparelhos.",
-          "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso no quadro “Conectar outro servidor”, no topo da tela Segundo servidor.",
+          "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso em Segundo servidor, aba “Conectar”.",
           "arbErr_notArbiter": "Algo respondeu nesse endereço, mas não é o juiz. Confira a porta (padrão 4097).",
           "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 3), se o IP é o do Tailscale dele e se a porta é 4097.",
           "lblArbiter": "Endereço do juiz",
@@ -3277,14 +3371,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navHome": "Home",
           "navOverview": "Applications",
           "navDatabases": "Databases",
-          "navVault": "Vault & Secrets",
+          "navVault": "Secrets & keys",
           "navEmail": "Email",
           "navMirror": "Second Server",
           "navUpdates": "Updates",
           "navDoctor": "Diagnostics",
-          "navAgents": "MCP & AI",
+          "navAgents": "Connect AI",
           "navPool": "Helpers",
-          "homeTitle": "Home",
+          "homeTitle": "Server summary",
           "setupTitle": "🧭 Optional integrations",
           "appsTitle": "📦 Your apps",
           "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app. When a new commit arrives, the app's row shows the new version being built and tested; the current version stays live until the new one passes the test.",
@@ -3299,7 +3393,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "backupsTitle": "🛡️ Backups",
           "backupsDesc": "Encrypted copies of app databases and files. Use “Test” to check a backup opens before you need it.",
           "fedTitle": "🔗 Connect another server",
-          "fedDesc": "First step to a second server: both exchange a trust key. Then use the boxes below for the live copy of the data.",
+          "fedDesc": "First step to a second server: both exchange a trust key. Then use the “Live copy” tab to copy the data.",
           "optFedActive": "Both serve together (apps without their own data)",
           "optFedWarm": "Standby: copy apps and passwords to the other server",
           "btnGenInvite": "🔑 Create invite (valid 15 min)",
@@ -3385,10 +3479,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnEmailApp": "Allow",
           "emailAppDone": "Done. Sender:",
           "mirrorTitle": "🔁 Second server",
-          "mirrorDesc": "Both servers keep a live copy of each other. If one goes down, the other can take over its apps with data up to the last second. First connect both in the “Connect another server” box just below.",
+          "mirrorDesc": "Both servers keep a live copy of each other. If one goes down, the other can take over its apps with data up to the last second. First connect both in the “Connect” tab.",
           "mirrorNone": "No copy set up yet. Use the two boxes below: one server offers, the other receives.",
           "aaTitle": "⚖️ App on both servers",
-          "aaDesc": "The app runs here and on the other server at the same time, and both take visits. Data is still written to one database, this server's: the other one writes to it over Tailscale. If this server goes down, the automatic failover above keeps the other one going alone.",
+          "aaDesc": "The app runs here and on the other server at the same time, and both take visits. Data is still written to one database, this server's: the other one writes to it over Tailscale. If this server goes down, automatic takeover (“Automatic takeover” tab) keeps the other one going alone.",
           "hostReadyNote": "Before testing, open Diagnostics: it warns if this server has no fallback DNS, if Watchtower may restart PaaSMCP's containers in the middle of the test, or if Docker's networks are getting close to your home network.",
           "aaNone": "No app runs on both servers yet.",
           "aaOrigin": "created here, runs on both",
@@ -3396,7 +3490,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aaRunning": "version here",
           "aaWanted": "version asked",
           "aaStep1": "1. First: copy and watchdog",
-          "aaStep1Desc": "This server must send a copy to the other one (“Offer a copy” above, with the Tailscale IP), and the watchdog must run on the other server (step 6 of automatic failover). The watchdog keeps the other server's app on this server's version within 15 seconds.",
+          "aaStep1Desc": "This server must send a copy to the other one (“Offer a copy” in the “Live copy” tab, with the Tailscale IP), and the watchdog must run on the other server (step 6 of automatic failover). The watchdog keeps the other server's app on this server's version within 15 seconds.",
           "aaStep2": "2. Pick the app and check it",
           "aaStep2Desc": "Only apps created on this server are listed. The box says what is missing and what is worth fixing before turning it on.",
           "aaReady": "Ready to run on both",
@@ -3454,7 +3548,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorBehindDesc": "This copy receives nothing more and never takes over on its own. To rebuild it, ask for a new offer from whoever holds the data now: {peer}, if it comes back, or the server that took over, with --from-copy-of {peer} (the old copy stays on disk).",
           "mirrorLostDesc": "This server had taken over the data of {peer}, was away for over a minute, and another one took over instead. The apps of {peer} stopped here and won't start again. To hold a copy again, ask the server that took over for a new offer, with --from-copy-of {peer} (the data here stays on disk).",
           "mirrorVia": "through server {who}",
-          "mirrorPromotedDesc": "Its apps run here. When it comes back, follow the hand-back steps below.",
+          "mirrorPromotedDesc": "Its apps run here. When it comes back, follow the “Give apps back” tab.",
           "btnPromote": "Take over the apps",
           "btnHandback": "Hand the apps back",
           "mirrorFenced": "Blocked",
@@ -3475,7 +3569,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorHandedBack": "Apps handed back. Now take them over on the other server.",
           "autoTitle": "Automatic takeover",
           "autoDesc": "If the other server disappears for more than 1 minute, this one takes over its apps. That needs an arbiter: a third device that casts the deciding vote. Without it, if only the link between the two breaks, each would think the other died and both would write different data.",
-          "autoBefore": "Before you start: the copy must already work (“Copy of …” shows at the top of this page) and all three devices must be on the same Tailscale network. Do the steps below once, in this order.",
+          "autoBefore": "Before you start: the copy must already work (“Copy of …” shows in the “Live copy” tab) and all three devices must be on the same Tailscale network. Do the steps below once, in this order.",
           "autoStep1": "1. Pick the arbiter device",
           "autoStep1Desc": "Any device that stays on 24/7 and is neither of the two servers: a Raspberry Pi, a cheap VPS or an old PC. Ideally somewhere else or on another internet link. It needs Node.js 20 or newer and Tailscale on the same account. No Docker, and it barely uses memory.",
           "autoStep2": "2. Get the arbiter key (on this server)",
@@ -3493,7 +3587,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "autoStep5": "5. Choose which server this one may replace",
           "autoStep5Desc": "The server whose apps this one takes over if it goes down. The list only shows servers this one already holds a copy of. Turning it on asks you to type the name to confirm. If the copy goes both ways and either should replace the other, do this step on the other server too.",
           "lblAutoPeer": "Server this one may replace",
-          "autoNoCopy": "No copy received yet (use “Receive a copy” above)",
+          "autoNoCopy": "No copy received yet (use “Receive a copy”, in the “Live copy” tab)",
           "autoNoPeer": "Pick the server in the list. If it is empty, this server holds no copy of another one yet.",
           "autoStep6": "6. Turn on the watchdog (on both servers)",
           "autoStep6Desc": "The watchdog talks to the arbiter every 15 seconds. It tells the arbiter the server is alive, takes over when needed and blocks a server that comes back after being replaced. Run the command below in the terminal of each of the two servers.",
@@ -3516,7 +3610,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "arbErr_badUrl": "Invalid address. Use http://<arbiter Tailscale IP>:4097",
           "arbErr_badKey": "The arbiter answered but refused the key. Reinstall it with the key from step 2.",
           "arbErr_clock": "The arbiter answered but its clock is more than 1 minute off. Turn on automatic time on the devices.",
-          "arbErr_notPaired": "This server is not paired with the other one yet: do it in the “Connect another server” box at the top of the Second server screen.",
+          "arbErr_notPaired": "This server is not paired with the other one yet: do it under Second server, in the “Connect” tab.",
           "arbErr_notArbiter": "Something answered at that address, but it is not the arbiter. Check the port (default 4097).",
           "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 3), that the IP is its Tailscale IP and that the port is 4097.",
           "lblArbiter": "Arbiter address",
@@ -3752,12 +3846,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
 
     Object.assign(I18N.pt, {
-          "navPool": "🖥️ Ajudantes",
           "aaP_pool": "O app usa PCs ajudantes (cópias ou escala automática): use “Parar tudo” na escala dele primeiro. Por enquanto, um app usa ajudantes ou os dois servidores, não as duas coisas.",
           "poolTitle": "🖥️ PCs ajudantes",
           "poolDesc": "Seus próprios computadores podem rodar cópias extras dos apps deste servidor. Este servidor continua dono de tudo: guarda as senhas, monta a imagem, recebe as visitas e as divide entre a cópia daqui e as dos ajudantes. Num ajudante sem cópias, nenhum programa do PaaSMCP fica ligado.",
           "btnPoolCheck": "🔄 Verificar agora",
-          "poolNone": "Nenhum PC ajudante ainda. Siga os passos abaixo para adicionar o primeiro.",
+          "poolNone": "Nenhum PC ajudante ainda. Para adicionar o primeiro, veja a aba “Adicionar um PC”.",
           "poolSt_available": "disponível",
           "poolSt_working": "trabalhando",
           "poolSt_paused": "pausado",
@@ -3804,7 +3897,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnPoolResume": "Retomar",
           "btnPoolRemove": "Remover",
           "poolAppsTitle": "Apps com cópias em ajudantes",
-          "poolAppsDesc": "O número de cópias de cada app se escolhe na tela Apps, no quadro de uso e escala, à mão ou pela escala automática.",
+          "poolAppsDesc": "O número de cópias de cada app se escolhe em Aplicações, aba “Escala automática”, à mão ou pela escala automática.",
           "poolAutoBadge": "escala automática",
           "poolAppsNone": "Nenhum app usa ajudantes ainda.",
           "poolAppLine": "{running} de {wanted} cópias rodando",
@@ -3884,12 +3977,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolW_noHelpers": "Nenhum PC ajudante ainda: adicione um na tela Ajudantes."
     });
     Object.assign(I18N.en, {
-          "navPool": "🖥️ Helpers",
           "aaP_pool": "The app uses helper PCs (copies or automatic scaling): use “Stop everything” in its scaling first. For now an app uses either helpers or both servers, not both.",
           "poolTitle": "🖥️ Helper PCs",
           "poolDesc": "Your own computers can run extra copies of this server's apps. This server stays in charge of everything: it keeps the passwords, builds the image, receives the visits and splits them between its own copy and the helpers'. A helper with no copies runs no PaaSMCP program at all.",
           "btnPoolCheck": "🔄 Check now",
-          "poolNone": "No helper PC yet. Follow the steps below to add the first one.",
+          "poolNone": "No helper PC yet. To add the first one, see the “Add a PC” tab.",
           "poolSt_available": "available",
           "poolSt_working": "working",
           "poolSt_paused": "paused",
@@ -3936,7 +4028,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "btnPoolResume": "Resume",
           "btnPoolRemove": "Remove",
           "poolAppsTitle": "Apps with copies on helpers",
-          "poolAppsDesc": "Each app's number of copies is set on the Apps screen, in the usage and scaling card, by hand or by automatic scaling.",
+          "poolAppsDesc": "Each app's number of copies is set under Applications, in the “Automatic scaling” tab, by hand or by automatic scaling.",
           "poolAutoBadge": "automatic scaling",
           "poolAppsNone": "No app uses helpers yet.",
           "poolAppLine": "{running} of {wanted} copies running",
@@ -4003,6 +4095,108 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolW_localRefs": "These variables point at this machine or at containers that only exist here, so they will not work on a helper: {v}."
     });
 
+    // Side menu, folder tabs, counter tips and the quick health box.
+    Object.assign(I18N.pt, {
+          "navSecApps": "Apps",
+          "navSecServers": "Servidores",
+          "navSecIntegrations": "Integrações",
+          "navSecSystem": "Sistema",
+          "navCollapse": "Recolher menu",
+          "navExpand": "Expandir menu",
+          "sub_home_start": "Primeiros passos",
+          "sub_home_setup": "Primeira configuração",
+          "sub_overview_list": "Seus apps",
+          "sub_overview_deploy": "Publicar um app",
+          "sub_overview_expose": "Deixar acessível",
+          "sub_overview_scale": "Escala automática",
+          "sub_overview_webhook": "Publicar a cada push",
+          "sub_databases_dbs": "Bancos",
+          "sub_databases_backups": "Cópias de segurança",
+          "sub_databases_offsite": "Cópias fora do servidor",
+          "sub_databases_files": "Arquivos dos apps",
+          "sub_mirror_connect": "Conectar",
+          "sub_mirror_copy": "Cópia ao vivo",
+          "sub_mirror_auto": "Troca automática",
+          "sub_mirror_aa": "App nos dois",
+          "sub_mirror_back": "Devolver apps",
+          "sub_pool_list": "PCs ajudantes",
+          "sub_pool_add": "Adicionar um PC",
+          "sub_pool_how": "Como funciona",
+          "sub_agents_connect": "Conectar",
+          "sub_agents_examples": "Exemplos de pedidos",
+          "aiExamplesTitle": "💬 Exemplos de pedidos",
+          "aiExamplesDesc": "Depois de conectar, peça em linguagem comum. Alguns pedidos que funcionam:",
+          "cntApps": "{n} apps publicados",
+          "cntAppsOne": "1 app publicado",
+          "cntDbs": "{n} bancos criados",
+          "cntDbsOne": "1 banco criado",
+          "cntVault": "{n} chaves do sistema guardadas",
+          "cntVaultOne": "1 chave do sistema guardada",
+          "cntMirror": "{n} servidores conectados",
+          "cntMirrorOne": "1 servidor conectado",
+          "cntPool": "{n} PCs ajudantes",
+          "cntPoolOne": "1 PC ajudante",
+          "cntAgents": "{n} ferramentas MCP disponíveis",
+          "cntAgentsOne": "1 ferramenta MCP disponível",
+          "healthTitle": "Saúde rápida",
+          "healthBackup": "Última cópia",
+          "healthOffsite": "Cópia fora do servidor",
+          "healthMirror": "Segundo servidor",
+          "healthEmail": "E-mail",
+          "healthOn": "Ligado",
+          "healthOff": "Não usado"
+    });
+    Object.assign(I18N.en, {
+          "navSecApps": "Apps",
+          "navSecServers": "Servers",
+          "navSecIntegrations": "Integrations",
+          "navSecSystem": "System",
+          "navCollapse": "Collapse menu",
+          "navExpand": "Expand menu",
+          "sub_home_start": "First steps",
+          "sub_home_setup": "First setup",
+          "sub_overview_list": "Your apps",
+          "sub_overview_deploy": "Publish an app",
+          "sub_overview_expose": "Make reachable",
+          "sub_overview_scale": "Automatic scaling",
+          "sub_overview_webhook": "Publish on every push",
+          "sub_databases_dbs": "Databases",
+          "sub_databases_backups": "Backups",
+          "sub_databases_offsite": "Off-server backups",
+          "sub_databases_files": "App files",
+          "sub_mirror_connect": "Connect",
+          "sub_mirror_copy": "Live copy",
+          "sub_mirror_auto": "Automatic takeover",
+          "sub_mirror_aa": "App on both",
+          "sub_mirror_back": "Give apps back",
+          "sub_pool_list": "Helper PCs",
+          "sub_pool_add": "Add a PC",
+          "sub_pool_how": "How it works",
+          "sub_agents_connect": "Connect",
+          "sub_agents_examples": "Example requests",
+          "aiExamplesTitle": "💬 Example requests",
+          "aiExamplesDesc": "Once connected, ask in plain words. A few requests that work:",
+          "cntApps": "{n} published apps",
+          "cntAppsOne": "1 published app",
+          "cntDbs": "{n} databases",
+          "cntDbsOne": "1 database",
+          "cntVault": "{n} system keys stored",
+          "cntVaultOne": "1 system key stored",
+          "cntMirror": "{n} connected servers",
+          "cntMirrorOne": "1 connected server",
+          "cntPool": "{n} helper PCs",
+          "cntPoolOne": "1 helper PC",
+          "cntAgents": "{n} MCP tools available",
+          "cntAgentsOne": "1 MCP tool available",
+          "healthTitle": "Quick health",
+          "healthBackup": "Last backup",
+          "healthOffsite": "Off-server backup",
+          "healthMirror": "Second server",
+          "healthEmail": "Email",
+          "healthOn": "On",
+          "healthOff": "Not used"
+    });
+
     function t(key) {
       const dict = I18N[currentLang] || I18N.pt;
       return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
@@ -4013,7 +4207,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
       'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
       'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents',
-      'topHealthBadge', 'btnRefresh', 'btnLogout',
+      'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
       'exposeTitle', 'exposeDesc', 'lblQuickFillExpose', 'chipModePublic', 'chipModeZT', 'chipModeTS', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
@@ -4065,12 +4259,169 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       copyText(document.getElementById('sshKeyBox').textContent);
     }
 
+    // Pages with more than one part get folder tabs on top and nested items in the side menu.
+    const PAGE_SUBS = {
+      home: ['start', 'setup'],
+      overview: ['list', 'deploy', 'expose', 'scale', 'webhook'],
+      databases: ['dbs', 'backups', 'offsite', 'files'],
+      mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
+      pool: ['list', 'add', 'how'],
+      agents: ['connect', 'examples'],
+    };
+    let activeSubs = {};
+    try { activeSubs = JSON.parse(localStorage.getItem('paasmcp_active_subs') || '{}') || {}; } catch { activeSubs = {}; }
+    let currentTab = '';
+    let navInitDone = false;
+
+    function navBtnFor(tab) { return document.getElementById('nav' + tab.charAt(0).toUpperCase() + tab.slice(1)); }
+    function currentSub(tab) {
+      const subs = PAGE_SUBS[tab];
+      if (!subs) return '';
+      return subs.indexOf(activeSubs[tab]) !== -1 ? activeSubs[tab] : subs[0];
+    }
+
+    function renderSubNav() {
+      Object.keys(PAGE_SUBS).forEach(function (tab) {
+        const subs = PAGE_SUBS[tab];
+        const cur = currentSub(tab);
+        const holder = document.querySelector('.nav-subs[data-subs-for="' + tab + '"]');
+        if (holder) {
+          holder.innerHTML = subs.map(function (sub) {
+            return '<button class="nav-sub' + (sub === cur ? ' active' : '') + '" data-go-tab="' + tab + '" data-go-sub="' + sub + '">' + esc(t('sub_' + tab + '_' + sub)) + '</button>';
+          }).join('');
+        }
+        const pane = document.getElementById('tab-' + tab);
+        if (!pane) return;
+        let bar = pane.querySelector(':scope > .page-tabs');
+        if (!bar) {
+          bar = document.createElement('div');
+          bar.className = 'page-tabs';
+          bar.setAttribute('role', 'tablist');
+          pane.prepend(bar);
+          const head = pane.querySelector(':scope > .page-head');
+          if (head) head.after(bar);
+        }
+        bar.innerHTML = subs.map(function (sub) {
+          const on = sub === cur;
+          return '<button class="page-tab' + (on ? ' active' : '') + '" role="tab" aria-selected="' + on + '" data-go-tab="' + tab + '" data-go-sub="' + sub + '">' + esc(t('sub_' + tab + '_' + sub)) + '</button>';
+        }).join('');
+        pane.querySelectorAll('[data-sub]').forEach(function (el) {
+          el.classList.toggle('sub-hidden', el.getAttribute('data-sub') !== cur);
+        });
+      });
+      // Page title (same icon and name as the menu item), like a repository page on GitHub.
+      document.querySelectorAll('.console-main > .tab-pane').forEach(function (pane) {
+        const tab = pane.id.replace(/^tab-/, '');
+        const btn = navBtnFor(tab);
+        if (!btn) return;
+        let head = pane.querySelector(':scope > .page-head');
+        if (!head) {
+          head = document.createElement('div');
+          head.className = 'page-head';
+          pane.prepend(head);
+        }
+        const icon = btn.querySelector('.nav-icon');
+        const label = btn.querySelector('.nav-label');
+        head.innerHTML = '<h1>' + (icon ? icon.outerHTML : '') + '<span></span></h1>';
+        head.querySelector('span').textContent = label ? label.textContent : '';
+      });
+      // Icon-only menu (collapsed or narrow screen): the name shows on hover.
+      document.querySelectorAll('.console-sidenav .nav-item').forEach(function (btn) {
+        const label = btn.querySelector('.nav-label');
+        const counter = btn.querySelector('.nav-counter');
+        btn.title = (label ? label.textContent : '') + (counter && !counter.hidden && counter.title ? ' · ' + counter.title : '');
+      });
+    }
+
+    function goTo(tab, sub, mode) {
+      if (!document.getElementById('tab-' + tab)) tab = 'overview';
+      const subs = PAGE_SUBS[tab];
+      const prevSub = currentSub(tab);
+      if (subs && sub && subs.indexOf(sub) !== -1) {
+        activeSubs[tab] = sub;
+        try { localStorage.setItem('paasmcp_active_subs', JSON.stringify(activeSubs)); } catch {}
+      }
+      const moved = tab !== currentTab || currentSub(tab) !== prevSub;
+      if (tab !== currentTab) switchTab(tab, navBtnFor(tab));
+      currentTab = tab;
+      renderSubNav();
+      const hash = '#' + tab + (subs ? '/' + currentSub(tab) : '');
+      if (mode !== 'hash' && location.hash !== hash) {
+        try {
+          if (mode === 'init') history.replaceState(null, '', hash);
+          else history.pushState(null, '', hash);
+        } catch {}
+      }
+      toggleNavDrawer(false);
+      if (moved && mode !== 'init' && mode !== 'keep-scroll') window.scrollTo(0, 0);
+    }
+
+    function routeFromHash() {
+      const m = (location.hash || '').match(/^#([a-z]+)(?:\\/([a-z]+))?$/);
+      return m ? { tab: m[1], sub: m[2] || '' } : null;
+    }
+    window.addEventListener('popstate', function () { const r = routeFromHash(); if (r) goTo(r.tab, r.sub, 'hash'); });
+    window.addEventListener('hashchange', function () { const r = routeFromHash(); if (r) goTo(r.tab, r.sub, 'hash'); });
+    document.addEventListener('click', function (e) {
+      const b = e.target.closest ? e.target.closest('[data-go-tab]') : null;
+      if (b) goTo(b.getAttribute('data-go-tab'), b.getAttribute('data-go-sub') || '');
+    });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') toggleNavDrawer(false); });
+
+    // Shows the element's page and part, then scrolls to it.
+    function revealEl(id) {
+      const el = document.getElementById(id);
+      if (!el) return null;
+      const pane = el.closest('.tab-pane');
+      const part = el.closest('[data-sub]');
+      if (pane) goTo(pane.id.replace(/^tab-/, ''), part ? part.getAttribute('data-sub') : '', 'keep-scroll');
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      return el;
+    }
+
+    function toggleNavCollapsed() {
+      const box = document.getElementById('consoleContainer');
+      const on = !box.classList.contains('nav-collapsed');
+      box.classList.toggle('nav-collapsed', on);
+      try { localStorage.setItem('paasmcp_nav_collapsed', on ? '1' : '0'); } catch {}
+      applyNavCollapseLabel();
+    }
+    function applyNavCollapseLabel() {
+      const box = document.getElementById('consoleContainer');
+      const btn = document.getElementById('navCollapseBtn');
+      if (!box || !btn) return;
+      const label = box.classList.contains('nav-collapsed') ? t('navExpand') : t('navCollapse');
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+    }
+    function toggleNavDrawer(open) {
+      const box = document.getElementById('consoleContainer');
+      if (!box) return;
+      box.classList.toggle('nav-open', Boolean(open));
+      const btn = document.getElementById('navToggleMobile');
+      if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    try { if (localStorage.getItem('paasmcp_nav_collapsed') === '1') document.getElementById('consoleContainer').classList.add('nav-collapsed'); } catch {}
+
+    // Menu counters: hidden at zero; hovering says what is being counted.
+    function setNavCounter(id, n, tipKey) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const num = Number(n) || 0;
+      el.textContent = num > 0 ? String(num) : '';
+      el.hidden = num <= 0;
+      const tip = t(tipKey + (num === 1 ? 'One' : '')).replace('{n}', String(num));
+      el.title = tip;
+      el.setAttribute('aria-label', tip);
+    }
+
     function switchTab(tabName, btnEl) {
       document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.nav-btn').forEach(b => { b.classList.remove('active'); b.removeAttribute('aria-current'); });
       const pane = document.getElementById('tab-' + tabName);
       if (pane) pane.classList.add('active');
-      if (btnEl) btnEl.classList.add('active');
+      if (btnEl) { btnEl.classList.add('active'); btnEl.setAttribute('aria-current', 'page'); }
+      currentTab = tabName;
       try { localStorage.setItem('paasmcp_active_tab', tabName); } catch {}
       if (tabName === 'doctor') runDoctor();
       if (tabName === 'email') loadEmail();
@@ -4106,13 +4457,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function applyPreferences() {
       const isPt = currentLang === 'pt';
       document.documentElement.setAttribute('data-theme', currentTheme);
-      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? (isPt ? '☀️ Claro' : '☀️ Light') : (isPt ? '🌙 Escuro' : '🌙 Dark');
-      document.getElementById('langBtn').textContent = isPt ? '🇧🇷 PT-BR' : '🇺🇸 EN';
+      document.getElementById('themeBtn').innerHTML = currentTheme === 'dark' ? '☀️ <span class="btn-text">' + (isPt ? 'Claro' : 'Light') + '</span>' : '🌙 <span class="btn-text">' + (isPt ? 'Escuro' : 'Dark') + '</span>';
+      document.getElementById('themeBtn').title = currentTheme === 'dark' ? (isPt ? 'Tema claro' : 'Light theme') : (isPt ? 'Tema escuro' : 'Dark theme');
+      document.getElementById('langBtn').innerHTML = isPt ? '🇧🇷 <span class="btn-text">PT-BR</span>' : '🇺🇸 <span class="btn-text">EN</span>';
+      document.getElementById('langBtn').title = isPt ? 'Idioma' : 'Language';
       const btnLogout = document.getElementById('btnLogout');
       if (btnLogout) btnLogout.textContent = isPt ? 'Sair' : 'Log out';
       const refreshBtn = document.getElementById('btnRefresh');
       if (refreshBtn) {
-        refreshBtn.innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> <span>\${isPt ? 'Atualizar' : 'Refresh'}</span>\`;
+        refreshBtn.innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> <span class="btn-text">\${isPt ? 'Atualizar' : 'Refresh'}</span>\`;
+        refreshBtn.title = isPt ? 'Atualizar' : 'Refresh';
       }
       document.getElementById('webhookUrlBox').textContent = window.location.origin + '/api/webhooks/github';
       const fedUrlEl = document.getElementById('fedUrl');
@@ -4142,10 +4496,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         }
       }
 
-      // Restore active tab
-      const savedTab = localStorage.getItem('paasmcp_active_tab') || 'overview';
-      const targetBtn = document.getElementById('nav' + savedTab.charAt(0).toUpperCase() + savedTab.slice(1));
-      if (targetBtn && !targetBtn.classList.contains('active')) switchTab(savedTab, targetBtn);
+      // Side menu: page names, nested parts, collapse button and counter tips follow the language.
+      applyNavCollapseLabel();
+      setNavCounter('tabCountAgents', (lastStatus && lastStatus.mcpToolCount) || 0, 'cntAgents');
+      if (!navInitDone) {
+        navInitDone = true;
+        let savedTab = 'overview';
+        try { savedTab = localStorage.getItem('paasmcp_active_tab') || 'overview'; } catch {}
+        const r = routeFromHash();
+        goTo(r ? r.tab : savedTab, r ? r.sub : '', 'init');
+      } else {
+        renderSubNav();
+      }
 
 
       const placeholders = {
@@ -4232,14 +4594,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function setVaultScope(scope) {
       document.getElementById('secScope').value = scope;
       loadSecrets();
-      const vaultBtn = document.getElementById('navVault');
-      switchTab('vault', vaultBtn);
+      goTo('vault');
     }
 
     function selectAppForExpose(appName) {
       document.getElementById('expApp').value = appName;
       document.getElementById('expSub').value = appName.replace(/^paasmcp-/, '');
-      document.getElementById('expApp').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      revealEl('expApp');
     }
 
     // Deploy progress: /api/deploys is read every few seconds (faster while a deploy runs).
@@ -4318,6 +4679,41 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
     setInterval(refreshRelTimes, 20000);
 
+    // Line icons for buttons, same stroke style as the side menu (no emoji mixed in).
+    const BTN_ICONS = {
+      globe: '<circle cx="12" cy="12" r="10"></circle><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>',
+      lock: '<rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path>',
+      logs: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><path d="M14 2v6h6M8 13h8M8 17h5"></path>',
+      restart: '<path d="M23 4v6h-6"></path><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>',
+      back: '<path d="M1 4v6h6"></path><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>',
+      sync: '<path d="M17 1l4 4-4 4"></path><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><path d="M7 23l-4-4 4-4"></path><path d="M21 13v2a4 4 0 0 1-4 4H3"></path>',
+    };
+    function btnIcon(name) {
+      return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (BTN_ICONS[name] || '') + '</svg>';
+    }
+
+    // "Quick health" box in the telemetry column: one line per thing that needs care, each opens its page.
+    function healthCardHtml(s) {
+      const backups = (s.backups || []).slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
+      const last = backups[0];
+      const offsiteOn = Boolean((s.systemSecretsConfigured || {}).BACKUP_S3_ENDPOINT);
+      const m = s.mirror || {};
+      const hasMirror = Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0;
+      const row = function (label, value, tone, tab, sub) {
+        const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : 'var(--text)';
+        return '<button class="telemetry-item health-row" data-go-tab="' + tab + '" data-go-sub="' + sub + '">' +
+          '<span>' + esc(label) + '</span><span class="telemetry-val" style="color:' + color + ';">' + esc(value) + '</span></button>';
+      };
+      const lastAge = last ? relTime(last.createdAt) : '';
+      return '<div class="telemetry-card">' +
+        '<div class="telemetry-title"><span>' + esc(t('healthTitle')) + '</span></div>' +
+        row(t('healthBackup'), last ? (lastAge || new Date(last.createdAt).toLocaleString()) : t('never'), last ? 'ok' : 'warn', 'databases', 'backups') +
+        row(t('healthOffsite'), offsiteOn ? t('healthOn') : t('notConfigured'), offsiteOn ? 'ok' : 'warn', 'databases', 'offsite') +
+        row(t('healthMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('healthOn') : t('healthOff'), m.fenced ? 'warn' : hasMirror ? 'ok' : '', 'mirror', hasMirror ? 'copy' : 'connect') +
+        row(t('healthEmail'), emailRelay ? t('healthOn') : t('notConfigured'), emailRelay ? 'ok' : '', 'email', '') +
+        '</div>';
+    }
+
     function renderStatusData(s) {
       const isPt = currentLang === 'pt';
       const domain = getBaseDomain();
@@ -4353,26 +4749,19 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const usedMem = Math.max(0, +(totalMem - freeMem).toFixed(1));
       const ramPercent = Math.min(100, Math.max(0, Math.round((usedMem / totalMem) * 100)));
 
-      // Update counters in subnav tabs
-      const elTabApps = document.getElementById('tabCountApps');
-      if (elTabApps) elTabApps.textContent = Object.keys(s.apps || {}).length;
-
-      const elTabDbs = document.getElementById('tabCountDbs');
-      if (elTabDbs) elTabDbs.textContent = Object.keys(s.databases || {}).length;
-
-      const elTabVault = document.getElementById('tabCountVault');
-      if (elTabVault) elTabVault.textContent = (s.systemSecretsConfigured || []).length;
-
-      const elTabMirror = document.getElementById('tabCountMirror');
-      if (elTabMirror) elTabMirror.textContent = peersCount;
-
-      const elTabPool = document.getElementById('tabCountPool');
-      if (elTabPool) elTabPool.textContent = Object.keys(s.pool || {}).length;
+      // Counters in the side menu
+      setNavCounter('tabCountApps', Object.keys(s.apps || {}).length, 'cntApps');
+      setNavCounter('tabCountDbs', Object.keys(s.databases || {}).length, 'cntDbs');
+      // systemSecretsConfigured is an object (key -> masked value), not a list.
+      setNavCounter('tabCountVault', Object.keys(s.systemSecretsConfigured || {}).length, 'cntVault');
+      setNavCounter('tabCountMirror', peersCount, 'cntMirror');
+      setNavCounter('tabCountPool', Object.keys(s.pool || {}).length, 'cntPool');
+      setNavCounter('tabCountAgents', s.mcpToolCount || 0, 'cntAgents');
+      renderSubNav();
 
       const roleBadge = role === 'standalone' ? (isPt ? 'AUTÔNOMO' : 'STANDALONE') : role.toUpperCase();
       const tailscaleVal = s.tailscaleDomain || (s.federation?.peers ? (isPt ? 'Rede Ativa' : 'Tailnet Active') : '127.0.0.1');
-      const dockerVal = isPt ? 'Ativo (27.x)' : 'Live (27.x)';
-      const daemonOverheadVal = isPt ? '0 MB Ocioso' : '0 MB Idle';
+      const dockerVal = isPt ? 'Ativo' : 'Running';
       const backupsCount = s.backupsCount || 0;
       const backupsUnit = isPt ? (backupsCount === 1 ? 'cópia' : 'cópias') : (backupsCount === 1 ? 'backup' : 'backups');
 
@@ -4434,14 +4823,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <span class="telemetry-val">\${esc(s.cpus)} vCPUs</span>
           </div>
           <div class="telemetry-item">
-            <span>\${isPt ? 'Sobrecarga do Daemon' : 'Daemon Overhead'}</span>
-            <span class="telemetry-val" style="color:var(--success);font-weight:600;">\${daemonOverheadVal}</span>
-          </div>
-          <div class="telemetry-item">
             <span>\${isPt ? 'Instantâneos' : 'Snapshots'}</span>
             <span class="telemetry-val">\${esc(backupsCount)} \${backupsUnit}</span>
           </div>
         </div>
+        \${healthCardHtml(s)}
       \`;
 
       document.getElementById('sshKeyBox').textContent = s.sshPublicKey || '';
@@ -4513,18 +4899,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             : '';
           const cp = s.controlPlane || {};
           const followBtn = a.runtimeType === 'paasmcp-control-plane'
-            ? \`<button class="secondary" style="\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
+            ? \`<button class="secondary" style="\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${btnIcon('sync')}\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
             : '';
           const followErr = a.runtimeType === 'paasmcp-control-plane' && cp.enabled && cp.lastError
             ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:2px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
             : '';
           const rollbackBtn = a.previousImageTag
-            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${esc(t('actionRollback'))}</button>\`
+            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${btnIcon('back')}\${esc(t('actionRollback'))}</button>\`
             : '';
 
           const domainPills = (a.domains || []).map(dom => \`
             <span class="app-badge-pill">
-              <a href="\${esc(dom.url)}" target="_blank" rel="noopener noreferrer">🌐 \${esc(dom.url)}</a>
+              <a href="\${esc(dom.url)}" target="_blank" rel="noopener noreferrer">\${btnIcon('globe')} \${esc(dom.url)}</a>
               <span class="badge" style="padding:1px 5px;font-size:9.5px;">\${esc(dom.mode)}</span>
             </span>
           \`).join('') || \`<span class="app-badge-pill">🔒 127.0.0.1:\${esc(a.localPort)}</span>\`;
@@ -4546,10 +4932,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   \${dbPills}
                 </div>
                 <div class="app-actions-group">
-                  <button class="secondary" onclick="selectAppForExpose('\${esc(a.name)}')">\${esc(t('actionExpose'))}</button>
-                  <button class="secondary" onclick="setVaultScope('\${esc(a.name)}')">\${esc(t('actionEnv'))}</button>
-                  <button class="secondary" onclick="appAction('\${esc(a.name)}','logs')">\${esc(t('actionLogs'))}</button>
-                  <button class="secondary" onclick="appAction('\${esc(a.name)}','restart')">\${esc(t('actionRestart'))}</button>
+                  <button class="secondary" onclick="selectAppForExpose('\${esc(a.name)}')">\${btnIcon('globe')}\${esc(t('actionExpose'))}</button>
+                  <button class="secondary" onclick="setVaultScope('\${esc(a.name)}')">\${btnIcon('lock')}\${esc(t('actionEnv'))}</button>
+                  <button class="secondary" onclick="appAction('\${esc(a.name)}','logs')">\${btnIcon('logs')}\${esc(t('actionLogs'))}</button>
+                  <button class="secondary" onclick="appAction('\${esc(a.name)}','restart')">\${btnIcon('restart')}\${esc(t('actionRestart'))}</button>
                   \${rollbackBtn}
                   \${followBtn}
                   \${a.trashedAt
@@ -4676,7 +5062,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     let updatesLoaded = false;
     const card = (inner) => '<div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;">' + inner + '</div>';
     const badge = (cls, text) => '<span class="badge ' + cls + '">' + esc(text) + '</span>';
-    function goTab(name) { switchTab(name, document.getElementById('nav' + name.charAt(0).toUpperCase() + name.slice(1))); }
+    function goTab(name, sub) { goTo(name, sub || ''); }
     async function postJson(url, body) {
       const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
       const data = await res.json().catch(() => ({}));
@@ -4701,17 +5087,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         tile(t('tileMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('tileMirrorOn') : t('tileMirrorOff'), t('tileMirrorNote')) +
         tile(t('tileEmail'), emailRelay ? emailRelay.host : t('notConfigured'), emailRelay ? emailRelay.fromDomain : t('tileEmailNote'));
       const steps = [
-        ['step1', apps.length > 0, 'overview', false],
-        ['step2', offsiteOn, 'databases', false],
+        ['step1', apps.length > 0, 'overview', false, 'deploy'],
+        ['step2', offsiteOn, 'databases', false, 'offsite'],
         ['step3', Boolean(emailRelay), 'email', false],
-        ['step4', hasMirror, 'mirror', true],
-        ['step5', false, 'agents', true],
+        ['step4', hasMirror, 'mirror', true, 'connect'],
+        ['step5', false, 'agents', true, 'connect'],
       ];
       document.getElementById('homeSteps').innerHTML = steps.map((st, i) => card(
         '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
         '<div><strong>' + (i + 1) + '. ' + esc(t(st[0] + 'Title')) + '</strong>' + (st[3] ? ' <span style="color:var(--muted)">(' + esc(t('optional')) + ')</span>' : '') +
         '<div style="color:var(--muted);margin-top:4px;">' + esc(t(st[0] + 'Desc')) + '</div></div>' +
-        (st[1] ? badge('success', t('done')) : '<button class="secondary" onclick="goTab(&#39;' + st[2] + '&#39;)">' + esc(t('openStep')) + '</button>') +
+        (st[1] ? badge('success', t('done')) : '<button class="secondary" onclick="goTab(&#39;' + st[2] + '&#39;, &#39;' + (st[4] || '') + '&#39;)">' + esc(t('openStep')) + '</button>') +
         '</div>')).join('');
     }
 
