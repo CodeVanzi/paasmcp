@@ -463,11 +463,31 @@ export function saveState(state: PaaSState): void {
   writeFileAtomic(STATE_FILE_PATH, JSON.stringify(state, null, 2));
 }
 
-/** Writes via a temp file + rename so a crash never leaves a half-written file. */
+/**
+ * Writes via a temp file + rename so a crash never leaves a half-written file. Run as root (the
+ * dashboard container, a root timer), the new file keeps the owner of the one it replaces (or of its
+ * folder), so the person's own CLI can still read it.
+ */
 export function writeFileAtomic(filePath: string, content: string): void {
   const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   fs.writeFileSync(tmp, content, { mode: 0o600 });
+  keepOwnerOf(tmp, filePath);
   fs.renameSync(tmp, filePath);
+}
+
+function keepOwnerOf(tmp: string, filePath: string): void {
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return;
+  try {
+    let owner: fs.Stats;
+    try {
+      owner = fs.statSync(filePath);
+    } catch {
+      owner = fs.statSync(path.dirname(filePath));
+    }
+    if (owner.uid !== 0) fs.chownSync(tmp, owner.uid, owner.gid);
+  } catch {
+    // Ownership is a convenience: never fail a write because of it.
+  }
 }
 
 const LOCK_PATH = path.join(PAAS_DATA_DIR, ".lock");
