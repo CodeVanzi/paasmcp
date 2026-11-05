@@ -14,6 +14,7 @@ import {
   sanitizeSlug,
   saveState,
   tailnetBindIp,
+  WATCHTOWER_OFF_COMPOSE,
 } from "./config.js";
 import {
   encryptBinaryPayload,
@@ -62,7 +63,7 @@ export function ensureSharedPostgresCluster(): { adminUser: string; adminPass: s
     image: ${imageFor("postgres")}
     container_name: paasmcp-postgres
     restart: unless-stopped
-    env_file:
+${WATCHTOWER_OFF_COMPOSE}    env_file:
       - .env
     environment:
       - POSTGRES_USER=paasmcp_admin
@@ -128,7 +129,7 @@ export function ensureSharedRedisCluster(): { redisPass: string } {
     image: ${imageFor("redis")}
     container_name: paasmcp-redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${redisPass}"]
+${WATCHTOWER_OFF_COMPOSE}    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${redisPass}"]
     ports:
       - "127.0.0.1:6379:6379"${mirrorBind ? `\n      - "${mirrorBind}:6379:6379"` : ""}
     volumes:

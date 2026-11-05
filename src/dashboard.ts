@@ -17,7 +17,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock } from "./config.js";
+import { DOCKER_NETWORK, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
@@ -2073,7 +2073,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <button class="secondary" onclick="loadArbiterStatus(true)" data-i18n="btnArbRefresh"></button>
           </div>
           <div class="card" id="activeCard">
-            <div class="card-header"><h2 data-i18n="aaTitle"></h2><p class="card-desc" data-i18n="aaDesc"></p></div>
+            <div class="card-header"><h2 data-i18n="aaTitle"></h2><p class="card-desc" data-i18n="aaDesc"></p><p class="card-desc" data-i18n="hostReadyNote"></p></div>
             <div id="activeStatusBox" style="margin-bottom:6px;"></div>
 
             <h3 data-i18n="aaStep1" style="margin-top:16px;"></h3>
@@ -2120,6 +2120,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div class="card-header">
               <h2 data-i18n="poolTitle"></h2>
               <p class="card-desc" data-i18n="poolDesc"></p>
+              <p class="card-desc" data-i18n="hostReadyNote"></p>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
               <button class="secondary" onclick="loadPool(true)" data-i18n="btnPoolCheck"></button>
@@ -2840,7 +2841,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "whTitle": "⚡ Publicar sozinho a cada git push (webhook)",
           "whDesc": "Opcional, e precisa que o painel seja acessível pela internet. Sem isso, marque “Atualizar sozinho” ao publicar o app: o servidor confere o GitHub a cada 2 minutos.",
           "doctorTitle": "🩺 Diagnóstico",
-          "doctorDesc": "Procura apps sem memória, reiniciando sem parar ou parados com erro, e diz o que fazer.",
+          "doctorDesc": "Procura apps sem memória, reiniciando sem parar ou parados com erro, e confere o servidor em volta: DNS, Watchtower, redes do Docker e túnel. Diz o que fazer em cada caso.",
+          "doctorServer": "🖥️ Este servidor",
           "agentsTitle": "🤖 Conectar sua IA",
           "agentsDesc": "Qualquer IA compatível com MCP (Claude Code, Codex, Gemini CLI, Cursor, VS Code, modelos locais) pode cuidar do servidor por você: publicar apps, fazer cópias, ver o que deu errado. Ações arriscadas sempre esperam a sua aprovação no Início.",
           "homeDesc": "Resumo do servidor, pedidos esperando você e os próximos passos.",
@@ -2921,6 +2923,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorNone": "Nenhuma cópia configurada ainda. Use os dois quadros abaixo: um servidor oferece, o outro recebe.",
           "aaTitle": "⚖️ App nos dois servidores",
           "aaDesc": "O app roda aqui e no outro servidor ao mesmo tempo, e os dois recebem visitas. Os dados continuam gravados num banco só, o deste servidor: o outro grava nele pela Tailscale. Se este servidor cair, a troca automática acima faz o outro seguir sozinho.",
+          "hostReadyNote": "Antes de testar, abra o Diagnóstico: ele avisa se este servidor está sem DNS de reserva, se o Watchtower pode reiniciar os contêineres do PaaSMCP no meio do teste ou se as redes do Docker estão chegando perto da sua rede de casa.",
           "aaNone": "Nenhum app rodando nos dois servidores ainda.",
           "aaOrigin": "criado aqui, roda nos dois",
           "aaCopy": "vem de {peer}, roda aqui também",
@@ -3121,7 +3124,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "whTitle": "⚡ Publish on every git push (webhook)",
           "whDesc": "Optional, and the dashboard must be reachable from the internet. Without that, tick “Update by itself” when publishing: the server checks GitHub every 2 minutes.",
           "doctorTitle": "🩺 Diagnostics",
-          "doctorDesc": "Looks for apps out of memory, restarting in a loop or stopped with an error, and says what to do.",
+          "doctorDesc": "Looks for apps out of memory, restarting in a loop or stopped with an error, and checks the server around them: DNS, Watchtower, Docker networks and the tunnel. Says what to do in each case.",
+          "doctorServer": "🖥️ This server",
           "agentsTitle": "🤖 Connect your AI",
           "agentsDesc": "Any MCP-compatible AI (Claude Code, Codex, Gemini CLI, Cursor, VS Code, local models) can run the server for you: publish apps, make backups, find what went wrong. Risky actions always wait for your approval on Home.",
           "homeDesc": "Server summary, requests waiting for you and next steps.",
@@ -3202,6 +3206,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorNone": "No copy set up yet. Use the two boxes below: one server offers, the other receives.",
           "aaTitle": "⚖️ App on both servers",
           "aaDesc": "The app runs here and on the other server at the same time, and both take visits. Data is still written to one database, this server's: the other one writes to it over Tailscale. If this server goes down, the automatic failover above keeps the other one going alone.",
+          "hostReadyNote": "Before testing, open Diagnostics: it warns if this server has no fallback DNS, if Watchtower may restart PaaSMCP's containers in the middle of the test, or if Docker's networks are getting close to your home network.",
           "aaNone": "No app runs on both servers yet.",
           "aaOrigin": "created here, runs on both",
           "aaCopy": "comes from {peer}, also runs here",
@@ -5054,10 +5059,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             items.map(d => \`
             <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
-                <strong>\${esc(d.target)}</strong>
+                <strong>\${esc(d.target === 'server' ? t('doctorServer') : d.target)}</strong>
                 <div style="display:flex;gap:6px;align-items:center;">
                   <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(d.severity.toUpperCase())}</span>
-                  \${d.severity !== 'healthy' ? \`<button class="secondary" style="padding:3px 9px;font-size:11px;" onclick="appAction('\${esc(d.target)}','restart')">\${esc(t('btnRestartContainer'))}</button>\` : ''}
+                  \${d.severity !== 'healthy' && d.target !== 'server' ? \`<button class="secondary" style="padding:3px 9px;font-size:11px;" onclick="appAction('\${esc(d.target)}','restart')">\${esc(t('btnRestartContainer'))}</button>\` : ''}
                 </div>
               </div>
               <div style="font-size:13px;margin-top:6px;">\${esc(d.summary)}</div>
@@ -5198,7 +5203,7 @@ export function ensureDashboardBackgroundService(port = 4099): {
     image: ${image}
     container_name: paasmcp-dashboard
     restart: unless-stopped
-    working_dir: /app
+${WATCHTOWER_OFF_COMPOSE}    working_dir: /app
     command: ["node", "dist/cli.js", "dashboard", "serve", "--port", "${port}", "--host", "0.0.0.0"]
     ports:
       - "127.0.0.1:${port}:${port}"

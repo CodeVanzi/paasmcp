@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
 
+/** Keeps Watchtower away from PaaSMCP's containers (re-exported by config.ts; kept here so the worker stays dependency-free). */
+export const WATCHTOWER_OFF_LABEL = "com.centurylinklabs.watchtower.enable=false";
+
 // Shared, side-effect-free pieces of the helper pool (scale phase 3). Imported by the origin
 // (pool.ts), by the helper's one-time setup (pooljoin.ts) and by the forced SSH command that runs on
 // the helper for each order (worker.ts). Nothing here touches the disk, Docker or the network, so it is
@@ -270,6 +273,7 @@ export function buildRunArgs(spec: CopySpec, bindIp: string, envFile: string, en
     "--label", `paasmcp.app=${spec.app}`,
     "--label", `paasmcp.copy=${spec.copyId}`,
     "--label", `paasmcp.fingerprint=${spec.fingerprint}`,
+    "--label", WATCHTOWER_OFF_LABEL,
     "--restart", "no",
     "--memory", spec.memory,
     "--cpus", spec.cpus,

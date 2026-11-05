@@ -12,6 +12,7 @@ import {
   PAAS_DB_DIR,
   sanitizeSlug,
   saveState,
+  WATCHTOWER_OFF_COMPOSE,
 } from "./config.js";
 import { ensureDockerNetwork, ensureSharedPostgresCluster, ensureSharedRedisCluster } from "./database.js";
 import { deployApp, manageAppLifecycle } from "./deployer.js";
@@ -116,7 +117,7 @@ function writeCopyCompose(rec: { container: string; localPort: number; dataDir: 
     image: ${PG_IMAGE_NOW()}
     container_name: ${rec.container}
     restart: unless-stopped
-    ports:
+${WATCHTOWER_OFF_COMPOSE}    ports:
       - "127.0.0.1:${rec.localPort}:5432"${bindIp ? `\n      - "${bindIp}:${rec.localPort}:5432"` : ""}
     volumes:
       - ./data:/var/lib/postgresql/data

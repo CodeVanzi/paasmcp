@@ -637,7 +637,7 @@ async function listTools() {
       {
         name: "paas_doctor",
         description:
-          "Runs automated diagnostics across deployed applications: detects OOMKilled containers, crash-loops, non-zero exit codes, resource pressure, and returns actionable remediation advice.",
+          "Runs automated diagnostics across deployed applications: detects OOMKilled containers, crash-loops, non-zero exit codes, resource pressure, and returns actionable remediation advice. Without appName it also checks the server around PaaSMCP (DNS resolution, Watchtower restarting PaaSMCP containers, Docker networks near the LAN, Cloudflare Tunnel container network).",
         inputSchema: {
           type: "object",
           properties: {

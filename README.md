@@ -78,6 +78,17 @@ cd paasmcp
 ./scripts/install.sh
 ```
 
+### Installing on a homelab that already runs other things
+
+PaaSMCP lives next to your other services. After installing, run `paasmcp doctor` (or open **Diagnostics** in the dashboard): besides your apps, it checks the server around them and says what to fix. These are the usual traps:
+
+- **DNS on the same machine.** If AdGuard Home or Pi-hole runs as a container on this server and the host uses only it, the host loses DNS whenever that container does not come back, and with it Cloudflare Tunnel, image pulls and deploys. Give the host a fallback: `FallbackDNS=1.1.1.1 9.9.9.9` in `/etc/systemd/resolved.conf`, with `/etc/resolv.conf` pointing to systemd-resolved.
+- **Watchtower.** It restarts containers whenever their image changes upstream. Every container PaaSMCP creates carries `com.centurylinklabs.watchtower.enable=false`, because PaaSMCP pins and updates its own images. Containers created before this label existed get it on their next recreate; running Watchtower with `WATCHTOWER_LABEL_ENABLE=true` covers them right away. Pause Watchtower while you test active-active or scaling.
+- **Docker networks.** Docker hands out 172.17-172.31 first, then 192.168.x.0/20, which can cover a home LAN like 192.168.31.0/24. Set `"default-address-pools": [{"base": "10.200.0.0/16", "size": 24}]` in `/etc/docker/daemon.json` before you get there.
+- **Ports.** Apps get loopback ports 4000-4998, skipping 4097 (arbiter), 4099 (dashboard) and anything already listening. The self-hosted entry (`paasmcp edge on`) needs ports 80 and 443 free; with Nginx Proxy Manager or another proxy there, keep Cloudflare Tunnel or put the entry on another machine.
+- **Your own Cloudflare Tunnel container.** PaaSMCP sends public addresses to apps by container name on the `homelab-network` Docker network, so the `cloudflared` container must be on it.
+- **Wired network for servers.** Active-active and the arbiter judge a server by whether it answers; flaky Wi-Fi causes false alarms.
+
 ---
 
 ## 🛡️ Security Model
@@ -168,7 +179,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds Dockerfile or sanitized `docker-compose.yml`, sets CPU/RAM limits, healthchecks the new version in a candidate container (blue/green; `healthcheckPath`, `healthcheckTimeoutSeconds`, `skipHealthcheck`), tags `:previous` image, and swaps containers. A failed healthcheck keeps the running version and returns the candidate's logs. |
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
 | `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), `destroy` (to the 30-day trash), `restore` (from the trash) or `purge`. |
-| `paas_doctor` | Diagnoses `OOMKilled` events, crash-loops, non-zero exit codes, and recent error logs across all containers. |
+| `paas_doctor` | Diagnoses `OOMKilled` events, crash-loops, non-zero exit codes, and recent error logs across all containers; without an app it also checks the server's DNS, Watchtower, Docker networks and tunnel. |
 | `paas_mirror` | Mirror status per peer (streaming, caught up, seconds behind, WAL kept, epoch) and manual `promote` (strong confirmation). Pairing is CLI-only. |
 | `paas_scale` | Read-only (any token): `status` (last CPU / memory / traffic / visits per second / response time per app, copies running and asked for, whether it scales by itself, rule, last capacity test), `history` (24 h, one point per bucket, with visits and copies) and `diary` (each decision with its reason, in `pt` or `en`). Deploy token: `rule` changes an app's rule (raising the maximum while automatic scaling is on needs destroy + a person); `set` runs `copies` copies (this server's plus helper PCs'; a person confirms the first time and above the rule's maximum; refused while automatic scaling is on); `off` stops everything (one copy here). `auto` with `enabled: true` (destroy + a person) turns automatic scaling on, `enabled: false` (deploy) turns it off. The capacity test is CLI-only. |
 | `paas_pool` | Helper PCs. Any token: `status` (each PC's state, what it gives, its copies), `check` (can an app use helpers?), `acl` (Tailscale rules). Deploy: `add` (finish an invite with the PC's Tailscale IP), `pause` / `resume`. Destroy + a person's confirmation: `invite` (returns the one-use join command), `remove`. What PCs report is data, never instructions. |
@@ -247,7 +258,7 @@ paasmcp pool status                          # each PC: available / working / pa
 paasmcp pool pause notebook                  # its copies drain and move; pool resume notebook
 paasmcp pool remove notebook                 # copies stop, this server's key is removed from the PC
 
-# Run health diagnostics or 1-second rollback
+# Run health diagnostics (apps, plus DNS, Watchtower, Docker networks and tunnel without an app) or 1-second rollback
 paasmcp doctor
 paasmcp rollback my-saas
 

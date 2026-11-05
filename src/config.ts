@@ -1,7 +1,9 @@
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { WATCHTOWER_OFF_LABEL } from "./poolproto.js";
 
 export interface AppMetrics {
   cpuPercent: string;
@@ -367,6 +369,24 @@ export const DEFAULT_CF_TUNNEL_ID = process.env.PAASMCP_CF_TUNNEL_ID || "";
 export const DEFAULT_BASE_DOMAIN = process.env.PAASMCP_BASE_DOMAIN || "example.com";
 export const DOCKER_NETWORK = process.env.PAASMCP_DOCKER_NETWORK || "homelab-network";
 
+/**
+ * Every container PaaSMCP creates carries this label so Watchtower (common in homelabs) leaves it alone:
+ * PaaSMCP pins and updates its own images, and a surprise restart of Postgres or an app copy looks
+ * like an outage to the active-active watch and the scale decider.
+ */
+export { WATCHTOWER_OFF_LABEL };
+/** Adds the label to a compose service's own `labels` (list or map form). */
+export function withWatchtowerOff(labels: unknown): string[] | Record<string, string> {
+  const [key, value] = WATCHTOWER_OFF_LABEL.split("=");
+  if (labels && typeof labels === "object" && !Array.isArray(labels)) {
+    return { ...(labels as Record<string, string>), [key]: value };
+  }
+  const list = Array.isArray(labels) ? labels.map(String).filter((l) => !l.startsWith(`${key}=`)) : [];
+  return [...list, WATCHTOWER_OFF_LABEL];
+}
+/** The same label as a compose `labels:` block, indented for a service at the usual 4 spaces. */
+export const WATCHTOWER_OFF_COMPOSE = `    labels:\n      - "${WATCHTOWER_OFF_LABEL}"\n`;
+
 export function ensureDirectories(): void {
   for (const dir of [
     PAAS_DATA_DIR,
@@ -523,14 +543,51 @@ export function updatePlatformConfig(opts: {
   return state;
 }
 
+/** 4097: the arbiter's default port; 4099: the dashboard. Never handed to an app. */
+export const RESERVED_PORTS = [4097, 4099];
+
+/**
+ * TCP ports something already listens on in this host's network namespace (best effort, from /proc).
+ * A homelab often has other services; a port they hold would make the app's container fail to start.
+ */
+export function hostListeningPorts(): number[] {
+  if (process.env.PAASMCP_OFFLINE_TEST === "1") return [];
+  const ports = new Set<number>();
+  for (const f of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text = "";
+    try {
+      text = fs.readFileSync(f, "utf-8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n").slice(1)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length > 3 && cols[3] === "0A") {
+        const port = parseInt(cols[1].split(":").pop() || "", 16);
+        if (Number.isInteger(port)) ports.add(port);
+      }
+    }
+  }
+  // The dashboard runs in a container, where /proc shows only its own sockets: add Docker's published ports.
+  try {
+    const out = execFileSync("docker", ["ps", "--format", "{{.Ports}}"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 });
+    for (const m of out.matchAll(/:(\d+)->/g)) ports.add(Number(m[1]));
+  } catch {
+    // no Docker access: /proc is all we have
+  }
+  return [...ports];
+}
+
 export function allocateAppPort(state: PaaSState, existingAppName?: string): number {
   if (existingAppName && state.apps[existingAppName]) {
     return state.apps[existingAppName].localPort;
   }
-  const usedPorts = new Set<number>(
-    Object.values(state.apps).map((a) => a.localPort)
-  );
-  // Reserve 4099 for paasmcp-dashboard; allocate 4000-4998 for user apps
+  const usedPorts = new Set<number>([
+    ...Object.values(state.apps).map((a) => a.localPort),
+    ...RESERVED_PORTS,
+    ...hostListeningPorts(),
+  ]);
+  // Allocate 4000-4998 for user apps, skipping PaaSMCP's own ports and anything already listening here
   for (let port = 4000; port <= 4998; port++) {
     if (!usedPorts.has(port)) {
       return port;
