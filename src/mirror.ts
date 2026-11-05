@@ -160,12 +160,13 @@ function dirHasEntries(dir: string): boolean {
   try {
     return fs.readdirSync(dir).length > 0;
   } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException)?.code === "EACCES") {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "EACCES" || code === "EPERM") {
       // Postgres data dir is mode 0700 owned by container postgres (UID 70).
-      // If we get EACCES reading it, it exists and has content.
+      // If we can't read it, it exists and has content.
       return true;
     }
-    return false;
+    throw err; // anything else: don't guess the folder is empty
   }
 }
 
