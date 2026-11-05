@@ -67,3 +67,64 @@ export function installPollTimer(minutes = 2): { service: string; timer: string 
   execFileSync("systemctl", ["enable", "--now", "paasmcp-poll.timer"]);
   return { service, timer };
 }
+
+/** True when the dashboard container is up: it runs the checks itself (see pollloop.ts). */
+export function dashboardRunning(): boolean {
+  try {
+    return execFileSync("docker", ["inspect", "-f", "{{.State.Running}}", "paasmcp-dashboard"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim() === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Makes sure something runs the checks, with no extra step for the person:
+ * the dashboard when it is running; otherwise a systemd timer (system-wide as root, the user's own
+ * timer otherwise, which needs no sudo).
+ */
+export function ensurePollSchedule(minutes = 2): { by: "dashboard" | "systemd" | "systemd-user" | "none"; note?: string } {
+  if (process.env.PAASMCP_IN_DASHBOARD === "1" || dashboardRunning()) return { by: "dashboard" };
+  try {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      installPollTimer(minutes);
+      return { by: "systemd" };
+    }
+    installUserPollTimer(minutes);
+    return { by: "systemd-user", ...lingerNote() };
+  } catch (err) {
+    return { by: "none", note: `Could not set up a timer (${err instanceof Error ? err.message.split("\n")[0] : String(err)}). Start the dashboard (paasmcp dashboard start) or run: sudo paasmcp poll install-timer` };
+  }
+}
+
+export function installUserPollTimer(minutes = 2): { service: string; timer: string } {
+  const home = process.env.HOME;
+  if (!home) throw new Error("HOME is not set.");
+  const dir = path.join(home, ".config", "systemd", "user");
+  fs.mkdirSync(dir, { recursive: true });
+  const service = path.join(dir, "paasmcp-poll.service");
+  const timer = path.join(dir, "paasmcp-poll.timer");
+  fs.writeFileSync(
+    service,
+    `[Unit]\nDescription=PaaSMCP git polling (auto-deploy without a public webhook)\n\n[Service]\nType=oneshot\nEnvironment=PAASMCP_ROOT=${process.env.PAASMCP_ROOT || "/opt/homelab"}\nExecStart=${process.execPath} ${path.resolve(process.argv[1])} poll\n`
+  );
+  fs.writeFileSync(
+    timer,
+    `[Unit]\nDescription=Run PaaSMCP git polling every ${minutes} min\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=${minutes}min\n\n[Install]\nWantedBy=timers.target\n`
+  );
+  execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "pipe" });
+  execFileSync("systemctl", ["--user", "enable", "--now", "paasmcp-poll.timer"], { stdio: "pipe" });
+  return { service, timer };
+}
+
+/** A user timer stops at logout unless lingering is on; turning it on for oneself needs no sudo. */
+function lingerNote(): { note?: string } {
+  const user = process.env.USER || "";
+  try {
+    const out = execFileSync("loginctl", ["show-user", user, "-p", "Linger"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    if (out.includes("Linger=yes")) return {};
+    execFileSync("loginctl", ["enable-linger", user], { stdio: "ignore" });
+    return {};
+  } catch {
+    return { note: `Checks run while you are logged in. To keep them after logout: loginctl enable-linger ${user}` };
+  }
+}

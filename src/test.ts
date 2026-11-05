@@ -3354,5 +3354,103 @@ volumes:
     for (const a of ["dep-a", "dep-b", "dep-c", "dep-d"]) deploys.forgetDeploys(a);
   });
 
+  await t.test("40. Dashboard follows a branch: build + tests first, failed commit not retried, rollback when it does not answer", async () => {
+    const su = await import("./selfupdate.js");
+    const guard = await import("./guard.js");
+    const deploys = await import("./deploys.js");
+    const runs = () => deploys.deployRuns("paasmcp-dashboard");
+    const A = "a".repeat(40);
+    const B = "b".repeat(40);
+    const C = "c".repeat(40);
+    let tip = A;
+    let running: string | undefined = "/somewhere/dev-checkout";
+    let answers = true;
+    const builds: string[] = [];
+    const deps = {
+      head: () => tip,
+      build: (_r: string, _b: string, sha: string, dir: string, onStep?: (s: string) => void) => {
+        builds.push(sha);
+        onStep?.("clone");
+        onStep?.("test");
+        if (sha === B) throw new su.StepError("test", "1 failing");
+        fs.mkdirSync(path.join(dir, "dist"), { recursive: true });
+        fs.writeFileSync(path.join(dir, "dist", "cli.js"), "");
+        return { message: "Make it faster", author: "Dev" };
+      },
+      restart: (dir: string) => {
+        running = dir;
+      },
+      runningDir: () => running,
+      healthy: async () => answers,
+    };
+
+    assert.deepEqual(await su.controlPlaneTick(deps), { status: "off" }, "opt-in: nothing happens until followed");
+    assert.throws(() => su.setFollow(true, { repoUrl: "/home/me/paasmcp" }), /remote git URL/, "never a local folder");
+    assert.throws(() => su.setFollow(true, { repoUrl: "https://example.com/o/r.git", branch: "--upload-pack=x" }));
+    su.setFollow(true, { repoUrl: "https://github.com/owner/paasmcp.git" });
+    assert.equal(guard.assessRisk("dashboard.follow", { repoUrl: "https://example.com/owner/paasmcp.git", branch: "main" })?.level, "confirm");
+
+    const first = await su.controlPlaneTick(deps);
+    assert.deepEqual(first, { status: "updated", commit: A, previous: undefined });
+    assert.equal(running, su.releaseDir(A));
+    assert.equal(su.followedCode()?.commit, A);
+    assert.equal(runs()[0].phase, "live");
+    assert.equal(runs()[0].commit?.message, "Make it faster");
+    assert.deepEqual(await su.controlPlaneTick(deps), { status: "up-to-date" });
+    assert.equal(runs().length, 1, "a round with nothing new records nothing");
+    const s1 = config.loadState();
+    s1.apps["paasmcp-dashboard"] = { name: "paasmcp-dashboard", branch: "main", localPort: 4099, internalPort: 4099, containerName: "paasmcp-dashboard", appDir: "/x", runtimeType: "paasmcp-control-plane", databases: [], domains: [], createdAt: "", updatedAt: "", status: "running", lastCommit: A.slice(0, 7), lastCommitSha: A } as never;
+    const summary = deploys.deploySummary(s1.apps)["paasmcp-dashboard"];
+    assert.equal(summary.source?.name, "owner/paasmcp", "the followed repository shows without a repoUrl on the record");
+    assert.equal(summary.running?.message, "Make it faster");
+    assert.equal(s1.apps["paasmcp-dashboard"].repoUrl, undefined, "webhooks, mirrors and polling never see the dashboard as a git app");
+
+    tip = B;
+    const broken = await su.controlPlaneTick(deps);
+    assert.equal(broken.status, "failed");
+    assert.equal(running, su.releaseDir(A), "a failed build never touches the running dashboard");
+    assert.equal(su.followStatus().lastError?.step, "test");
+    assert.equal(runs()[0].phase, "failed");
+    assert.equal((await su.controlPlaneTick(deps)).status, "skipped", "the same broken commit is not rebuilt every round");
+    assert.equal(builds.filter((b) => b === B).length, 1);
+
+    tip = C;
+    answers = false;
+    const dead = await su.controlPlaneTick(deps);
+    assert.equal(dead.status, "failed");
+    assert.equal(running, su.releaseDir(A), "rolled back to the release that worked");
+    assert.match(runs()[0].error || "", /did not answer/);
+    assert.equal(su.followedCode()?.commit, A);
+
+    answers = true;
+    const forced = await su.controlPlaneTick(deps, { force: true });
+    assert.deepEqual(forced, { status: "updated", commit: C, previous: A });
+    assert.deepEqual(fs.readdirSync(su.RELEASES_DIR).sort(), [A, C], "keeps only the running and the previous release");
+
+    let helped = "";
+    tip = A;
+    fs.rmSync(su.releaseDir(A), { recursive: true });
+    let helpedRun = "";
+    const viaHelper = await su.controlPlaneTick({ ...deps, swapViaHelper: (sha: string, runId: string) => { helped = sha; helpedRun = runId; } });
+    assert.deepEqual(viaHelper, { status: "swapping", commit: A });
+    assert.equal(helped, A);
+    assert.equal(running, su.releaseDir(C), "inside the dashboard the helper container swaps, not this process");
+    assert.equal(runs()[0].phase, "checking");
+    assert.deepEqual(await su.swapTo(A, deps, helpedRun), { status: "updated", commit: A, previous: C });
+    assert.equal(runs()[0].id, helpedRun, "the helper finishes the same progress record");
+    assert.equal(runs()[0].phase, "live");
+    tip = A;
+
+    const compose = path.join(tempRoot, "compose-cp.yaml");
+    fs.writeFileSync(compose, "    volumes:\n      - /opt/x/releases/abc:/app:ro\n      - /opt/homelab:/opt/homelab\n");
+    assert.equal(su.composeCodeDir(compose), "/opt/x/releases/abc");
+
+    su.setFollow(false);
+    assert.deepEqual(await su.controlPlaneTick(deps), { status: "off" });
+    assert.equal(su.followedCode()?.commit, A, "turning it off keeps the dashboard on its last release");
+    fs.rmSync(su.CONTROL_PLANE_DIR, { recursive: true, force: true });
+    deploys.forgetDeploys("paasmcp-dashboard");
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

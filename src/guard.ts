@@ -235,6 +235,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `Removes ${String(params.keyName)} from '${subject}'. The app may stop working; the previous value is kept in the vault's deleted archive.`,
         `Remove ${String(params.keyName)} de '${subject}'. O app pode parar; o valor anterior fica guardado no arquivo de apagados do cofre.`,
         params);
+    case "dashboard.follow":
+      return risk(action, "dashboard", "confirm",
+        `The dashboard will update itself to each new commit on '${String(params.branch)}' of ${String(params.repoUrl)}. Each version is built and tested in a separate folder first; if the new dashboard does not answer within 60 s, the previous one comes back. Whoever can push to that branch controls this server.`,
+        `O painel vai se atualizar sozinho a cada commit novo na branch '${String(params.branch)}' de ${String(params.repoUrl)}. Cada versão é compilada e testada antes numa pasta separada; se o painel novo não responder em 60 s, o anterior volta. Quem pode enviar commits para essa branch controla este servidor.`,
+        params);
     case "dashboard.2fa-off":
       if (loadState().apps[DASHBOARD_APP_NAME]?.domains.some((d) => d.mode === "public")) {
         throw new ForbiddenActionError(
