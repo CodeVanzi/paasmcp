@@ -47,7 +47,7 @@ import {
   testRestore,
 } from "./backup.js";
 import { assessRisk, authorizeHuman, decideApproval, listApprovals } from "./guard.js";
-import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies } from "./pool.js";
+import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy } from "./pool.js";
 import { joinPool, leavePool, previewJoin, updateWorker } from "./pooljoin.js";
 import { validateHelperName } from "./poolproto.js";
 import {
@@ -663,6 +663,8 @@ async function runCli() {
         console.log(JSON.stringify(await poolStatus({ probe: !rest.includes("--no-probe") && sub !== "list" }), null, 2));
       } else if ((sub === "pause" || sub === "resume") && arg1) {
         console.log(JSON.stringify(await pauseHelper(arg1, sub === "pause", { by, log }), null, 2));
+      } else if (sub === "courtesy" && arg1 && arg2) {
+        console.log(JSON.stringify(await setCourtesy(arg1, arg2, getFlagValue(rest, "--cpu"), { by, log }), null, 2));
       } else if (sub === "remove" && arg1) {
         const name = validateHelperName(arg1);
         await confirmInCli("pool.remove", { helper: name }, rest);
@@ -676,7 +678,7 @@ async function runCli() {
         for (const st of a.steps) console.error(`- ${st}`);
       } else {
         throw new Error(
-          "Usage: paasmcp pool status [--no-probe]|list|invite <name> [--advertise <ip>] [--yes]|add <name> <tailscale-ip> [--ssh-port 22]|pause <name>|resume <name>|remove <name> [--yes]|check <app>|acl\n       On a helper PC: sudo paasmcp pool join '<invite>' [--cpus n] [--memory 2g] [--ip <tailscale-ip>] [--yes] | sudo paasmcp pool update-worker (after updating PaaSMCP there) | sudo paasmcp pool leave [--yes]"
+          "Usage: paasmcp pool status [--no-probe]|list|invite <name> [--advertise <ip>] [--yes]|add <name> <tailscale-ip> [--ssh-port 22]|pause <name>|resume <name>|courtesy <name> <auto|warn|off> [--cpu 50]|remove <name> [--yes]|check <app>|acl\n       On a helper PC: sudo paasmcp pool join '<invite>' [--cpus n] [--memory 2g] [--ip <tailscale-ip>] [--yes] | sudo paasmcp pool update-worker (after updating PaaSMCP there) | sudo paasmcp pool leave [--yes]"
         );
       }
       break;

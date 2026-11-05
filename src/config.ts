@@ -125,7 +125,16 @@ export interface PoolHelperRecord {
   addedAt: string;
   /** Paused by a person or the AI: gets no copies, and its copies move away. */
   paused?: { at: string; by: string };
+  /**
+   * Courteous mode (courtesy.ts). auto: when the owner uses the PC, its copies move away; warn: they stay,
+   * but no new copy goes there; off: the owner's use is not watched. Absent = auto at 50%.
+   */
+  courtesy?: { mode: CourtesyMode; cpuPct: number };
+  /** Set by the scale round while the owner uses the PC (CPU outside the copies above `courtesy.cpuPct`). */
+  ownerBusy?: { since: string; cpuPct: number };
 }
+
+export type CourtesyMode = "auto" | "warn" | "off";
 
 export interface PoolConfig {
   /** This server's Tailscale IP: Postgres, Redis and S3 are also published there for the copies. */

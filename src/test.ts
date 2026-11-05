@@ -2633,5 +2633,234 @@ volumes:
     scale.forgetScaleData("auto-a");
   });
 
+  await t.test("36. Courteous mode: the owner's CPU outside the copies, busy after two readings, free after a calm while, copies move away or stay with a warning", async () => {
+    const proto = await import("./poolproto.js");
+    const pool = await import("./pool.js");
+    const courtesy = await import("./courtesy.js");
+    const scale = await import("./scale.js");
+    const mcp = await import("./mcp-server.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    type PoolHelperRecord = import("./config.js").PoolHelperRecord;
+
+    // The owner's share between two snapshots: 4 CPUs, 20 s, 2.5 CPUs busy of which 0.5 are the copy's → 50%.
+    const snap = (at: number, totalUs: number, copies: Record<string, number>, cores = 4) => ({ at, totalUs, cores, copies });
+    const t0 = 1_000_000;
+    assert.deepEqual(proto.ownerShare(snap(t0, 0, { "a-0a1b2c": 0 }), snap(t0 + 20_000, 50e6, { "a-0a1b2c": 10e6 })), { cpuPct: 50, seconds: 20 });
+    // A copy that started inside the window counts with all its CPU time (it is the copy's, not the owner's).
+    assert.equal(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 20_000, 50e6, { "a-0a1b2c": 40e6 })).cpuPct, 13);
+    // Copies busier than the whole PC (counters read a moment apart) never give a negative share.
+    assert.equal(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 20_000, 1e6, { "a-0a1b2c": 2e6 })).cpuPct, 0);
+    assert.equal(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 20_000, 1e9, {})).cpuPct, 100);
+    const why = (r: { why?: string }) => r.why;
+    assert.equal(why(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 5_000, 1e6, {}))), "short");
+    assert.equal(why(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 16 * 60_000, 1e6, {}))), "stale");
+    assert.equal(why(proto.ownerShare(snap(t0, 0, { "a-0a1b2c": 0 }), snap(t0 + 20_000, 1e6, {}))), "copy_left");
+    assert.equal(why(proto.ownerShare(snap(t0, 5e6, {}), snap(t0 + 20_000, 1e6, {}))), "counter_reset");
+    assert.equal(why(proto.ownerShare(snap(t0, 0, { "a-0a1b2c": 9 }), snap(t0 + 20_000, 1e6, { "a-0a1b2c": 1 }))), "counter_reset");
+    // An image load or a copy start (Docker's CPU, not the owner's) in the window, or one still running: unsure.
+    assert.equal(why(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 20_000, 1e6, {}), { at: t0 + 1000, open: false })), "busy_order");
+    assert.equal(why(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 20_000, 1e6, {}), { at: t0 - 1000, open: true })), "busy_order");
+    assert.equal(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 20_000, 1e6, {}), { at: t0 - 1000, open: false }).cpuPct, 1);
+    assert.equal(proto.ownerShare(snap(t0, 0, {}), snap(t0 + 3_000, 6e6, {}), undefined, 2500).cpuPct, 50);
+
+    // Where the counters are read: cgroup v2, v1 (also on hybrid systems), /proc/stat.
+    assert.equal(proto.cpuCgroupPath("0::/system.slice/docker-abc.scope\n", true), "/system.slice/docker-abc.scope");
+    const hybrid = "12:cpu,cpuacct:/docker/abc\n0::/system.slice/containerd.service\n";
+    assert.equal(proto.cpuCgroupPath(hybrid, false), "/docker/abc");
+    assert.equal(proto.cpuCgroupPath("0::/x\n", false), undefined);
+    assert.equal(proto.parseCpuStatUsage("usage_usec 123456\nuser_usec 1\n"), 123456);
+    assert.equal(proto.procStatBusyUs("cpu  100 0 50 9999 7 1 2 3 0 0\ncpu0 1 2 3\n"), 156 * 10_000);
+    assert.equal(proto.procStatBusyUs("garbage"), undefined);
+
+    // What a helper reports about its owner is untrusted: clamped, unknown codes become "unreadable".
+    const fBase = { name: "notebook", arch: "amd64", cpus: 4, memMb: 8192, give: { cpus: 2, memMb: 2048 } };
+    assert.deepEqual(proto.validateFacts({ ...fBase, owner: { cpuPct: 250, seconds: 61.4 } }).owner, { cpuPct: 100, seconds: 61 });
+    assert.deepEqual(proto.validateFacts({ ...fBase, owner: { cpuPct: null, seconds: 3, why: "<img src=x>" } }).owner, { cpuPct: null, seconds: 3, why: "unreadable" });
+    assert.deepEqual(proto.validateFacts({ ...fBase, owner: { cpuPct: "x", why: "short" } }).owner, { cpuPct: null, seconds: 0, why: "short" });
+    assert.equal("owner" in proto.validateFacts(fBase), false, "an older worker sends no reading");
+
+    // The decision (pure): two readings at or above the limit → busy; unsure readings change nothing; free
+    // only below 80% of the limit for the calm while; in between, the calm count starts over.
+    const obs = courtesy.courtesyObserve;
+    let tr: import("./courtesy.js").CourtesyTrack = { high: 0 };
+    let o = obs(tr, 60, 50, false, 0, 300_000);
+    assert.equal(o.change, undefined);
+    o = obs(o.track, null, 50, false, 60_000, 300_000);
+    assert.equal(o.track.high, 1, "an unsure reading keeps the count");
+    o = obs(o.track, 55, 50, false, 120_000, 300_000);
+    assert.equal(o.change, "busy");
+    o = obs({ high: 1 }, 45, 50, false, 0, 300_000);
+    assert.equal(o.track.high, 0);
+    tr = { high: 2 };
+    o = obs(tr, 30, 50, true, 0, 300_000);
+    assert.equal(o.track.calmSince, 0);
+    o = obs(o.track, 45, 50, true, 120_000, 300_000);
+    assert.equal(o.track.calmSince, undefined, "between 40% and 50% the calm while starts over");
+    o = obs(o.track, 20, 50, true, 180_000, 300_000);
+    o = obs(o.track, 20, 50, true, 420_000, 300_000);
+    assert.equal(o.change, undefined);
+    o = obs(o.track, 20, 50, true, 480_000, 300_000);
+    assert.equal(o.change, "calm");
+
+    assert.throws(() => pool.validateCourtesy("polite"), /auto .* warn .* off/);
+    assert.throws(() => pool.validateCourtesy("auto", 5), /10 to 95/);
+    assert.throws(() => pool.validateCourtesy("auto", "50; rm"), /10 to 95/);
+    assert.deepEqual(pool.validateCourtesy("WARN", "60%"), { mode: "warn", cpuPct: 60 });
+    assert.deepEqual(pool.courtesyOf({}), { mode: "auto", cpuPct: 50 });
+    assert.deepEqual(pool.courtesyOf({ courtesy: { mode: "bogus" as "auto", cpuPct: 50 } }), { mode: "auto", cpuPct: 50 });
+
+    // Three helpers: notebook (auto), desk (warn), lab (off). An app with copies on notebook and desk.
+    const st = config.loadState();
+    const helper = (name: string, ip: string, extra: Partial<PoolHelperRecord> = {}): PoolHelperRecord => ({
+      name, ip, sshPort: 22, tier: "own", arch: "amd64", cpus: 4, memMb: 8192, diskFreeGb: 50, give: { cpus: 2, memMb: 2048 }, addedAt: new Date().toISOString(), ...extra,
+    });
+    st.pool = {
+      bindIp: "100.64.0.1",
+      invites: {},
+      helpers: {
+        notebook: helper("notebook", "100.64.0.7"),
+        desk: helper("desk", "100.64.0.8", { courtesy: { mode: "warn", cpuPct: 50 } }),
+        lab: helper("lab", "100.64.0.9", { courtesy: { mode: "off", cpuPct: 50 } }),
+      },
+    };
+    const anyApp = st.apps[Object.keys(st.apps)[0]];
+    const placed = (id: string, h: string) => ({ id, helper: h, port: 4300, fingerprint: "f".repeat(64), configHash: "x", cpus: 0.5, memMb: 256, startedAt: new Date().toISOString() });
+    st.apps["court-a"] = {
+      ...anyApp, name: "court-a", containerName: "paasmcp-court-a", localPort: 4300, internalPort: 3000, healthcheckPath: "/healthz", cpuLimit: "0.5", memoryLimit: "256m",
+      domains: [], status: "running", pool: { enabled: true, copies: 2, enabledAt: new Date().toISOString(), placed: [placed("court-a-0a0a0a", "notebook")] },
+    } as import("./config.js").AppRecord;
+    delete st.apps["court-a"].scale;
+    delete st.apps["court-a"].trashedAt;
+    st.apps["court-b"] = { ...st.apps["court-a"], name: "court-b", containerName: "paasmcp-court-b", localPort: 4301, pool: { enabled: true, copies: 2, enabledAt: new Date().toISOString(), placed: [{ ...placed("court-b-0b0b0b", "desk"), port: 4301 }] } };
+    config.saveState(st);
+
+    // Placement: a PC marked busy (auto or warn) or busy right now by its last answer gets no new copy.
+    const s1 = config.loadState();
+    s1.pool!.helpers.lab.ownerBusy = { since: new Date().toISOString(), cpuPct: 90 };
+    const pickNone = pool.pickHelpers(s1, { ...s1.apps["court-a"], pool: { ...s1.apps["court-a"].pool!, placed: [] } }, "amd64", new Set(["notebook", "desk", "lab"]), 3, new Set(["notebook"]));
+    assert.deepEqual(pickNone.picked.map((h) => h.name).sort(), ["desk", "lab"], "mode off ignores the owner");
+    assert.equal(pickNone.skipped.find((x) => x.helper === "notebook")?.why, "its owner is using it");
+    s1.pool!.helpers.desk.ownerBusy = { since: new Date().toISOString(), cpuPct: 90 };
+    assert.deepEqual(pool.pickHelpers(s1, { ...s1.apps["court-a"], pool: { ...s1.apps["court-a"].pool!, placed: [] } }, "amd64", new Set(["desk"]), 3).picked, []);
+
+    // The round: readings come from a fake probe (no SSH offline). Checks at most every 5 s here.
+    process.env.PAASMCP_COURTESY_EVERY_SECONDS = "5";
+    process.env.PAASMCP_COURTESY_CALM_SECONDS = "60";
+    const readings: Record<string, number | null> = { notebook: 80, desk: 70, lab: 99 };
+    const asked: string[][] = [];
+    const probe = async (hs: PoolHelperRecord[]) => {
+      asked.push(hs.map((h) => h.name).sort());
+      return Object.fromEntries(hs.map((h) => [h.name, { ok: true as const, facts: { ...proto.validateFacts({ ...fBase, name: h.name }), owner: { cpuPct: readings[h.name], seconds: 60 } }, copies: [] }]));
+    };
+    const notes: string[] = [];
+    const note = (app: string, kind: "owner_busy" | "owner_calm", p: Record<string, number | string>) => {
+      const e = { t: new Date().toISOString(), app, kind, p };
+      scale.appendDiary(e);
+      const text = scale.renderDiary(e, "pt");
+      notes.push(text);
+      return text;
+    };
+    const base = Date.now();
+    assert.deepEqual(await courtesy.courtesyRound({ now: base, note, probe }), []);
+    assert.deepEqual(asked[0], ["desk", "notebook"], "a PC in mode off is not asked");
+    assert.deepEqual(await courtesy.courtesyRound({ now: base + 1000, note, probe }), [], "not again within the interval");
+    assert.equal(asked.length, 1);
+    const busy = await courtesy.courtesyRound({ now: base + 6000, note, probe });
+    assert.deepEqual(busy.map((c) => [c.helper, c.change, c.done]).sort(), [["desk", "busy", true], ["notebook", "busy", true]]);
+    let s2 = config.loadState();
+    assert.equal(s2.pool!.helpers.notebook.ownerBusy?.cpuPct, 80);
+    assert.equal(s2.pool!.helpers.desk.ownerBusy?.cpuPct, 70);
+    // auto: the copy on notebook left (offline, no other PC answers, so it is not replaced); warn: desk keeps its copy.
+    assert.deepEqual(s2.apps["court-a"].pool!.placed, []);
+    assert.equal(s2.apps["court-a"].pool!.copies, 2, "the copies asked for stay: they come back when the owner is done");
+    assert.deepEqual(s2.apps["court-b"].pool!.placed.map((c) => c.helper), ["desk"]);
+    assert.ok(notes.includes("O dono de desk está usando o PC (CPU fora das cópias em 70%, limite 50%). Modo com aviso: a cópia fica lá, mas nenhuma nova vai para esse PC até ele liberar."), notes.join("\n"));
+    assert.ok(notes.some((n) => n.startsWith("O dono de notebook está usando o PC (CPU fora das cópias em 80%, limite 50%). A cópia saiu de lá depois de terminar as visitas em curso. Nenhum outro PC tinha espaço, então o app segue com")), notes.join("\n"));
+    // The diary keeps them (and shows them in the CLI, MCP and dashboard).
+    assert.deepEqual(scale.scaleDiary({ app: "court-b", lang: "pt", limit: 5 }).map((e) => e.kind), ["owner_busy"]);
+    const en = scale.renderDiary({ t: "", app: "court-a", kind: "owner_busy", p: { helper: "notebook", cpu: 80, limit: 50, mode: "auto", to: "desk", running: 3, wanted: 3 } }, "en");
+    assert.equal(en, "The owner of notebook is using it (CPU outside the copies at 80%, limit 50%). The copy left after finishing the visits in progress and went to desk.");
+    const status = await pool.poolStatus({ probe: false });
+    const nb = status.helpers.find((h) => h.name === "notebook")!;
+    // (offline, the reconcile above found no PC answering: "gone" wins over "busy" in the state shown)
+    assert.deepEqual([nb.courtesy.mode, nb.ownerBusy?.cpuPct], ["auto", 80]);
+    assert.equal(status.helpers.find((h) => h.name === "lab")!.ownerBusy, null, "mode off never shows the owner as busy");
+
+    // Free again: below 40% for the calm while (60 s here); a reading in between starts over.
+    readings.notebook = 10;
+    readings.desk = 45;
+    await courtesy.courtesyRound({ now: base + 12_000, note, probe });
+    readings.desk = 10;
+    await courtesy.courtesyRound({ now: base + 18_000, note, probe });
+    assert.ok(config.loadState().pool!.helpers.notebook.ownerBusy, "not free before the calm while");
+    const calm = await courtesy.courtesyRound({ now: base + 73_000, note, probe });
+    assert.deepEqual(calm.map((c) => [c.helper, c.change]), [["notebook", "calm"]]);
+    const calm2 = await courtesy.courtesyRound({ now: base + 79_000, note, probe });
+    assert.deepEqual(calm2.map((c) => [c.helper, c.change]), [["desk", "calm"]]);
+    s2 = config.loadState();
+    assert.equal(s2.pool!.helpers.notebook.ownerBusy, undefined);
+    assert.equal(s2.pool!.helpers.desk.ownerBusy, undefined);
+    assert.ok(notes.includes("desk está livre de novo (CPU do dono abaixo de 40% por 1 min). Ele volta a receber cópias."), notes.join("\n"));
+    // The app whose copy left notebook hears that it is free again too, even with no copy there now.
+    assert.deepEqual(scale.scaleDiary({ app: "court-a", lang: "pt", limit: 5 }).map((e) => e.kind), ["owner_busy", "owner_calm"]);
+    assert.equal(
+      scale.renderDiary({ t: "", app: "court-a", kind: "owner_calm", p: { helper: "notebook", below: 40, minutes: 5, started: 1 } }, "en"),
+      "notebook is free again (the owner's CPU below 40% for 5 min). 1 missing copy is back."
+    );
+    const audit = fs.readFileSync(path.join(config.PAAS_DATA_DIR, "audit.log"), "utf-8");
+    assert.ok(audit.includes('"pool.owner.busy"') && audit.includes('"pool.owner.free"'));
+    // The round's file is private to this server.
+    assert.equal(fs.statSync(path.join(pool.POOL_DIR, "courtesy.json")).mode & 0o777, 0o600);
+
+    // A person (or the AI) changes the mode: off forgets the owner's state; bad values are refused.
+    const s3 = config.loadState();
+    s3.pool!.helpers.notebook.ownerBusy = { since: new Date().toISOString(), cpuPct: 90 };
+    config.saveState(s3);
+    const set = await pool.setCourtesy("notebook", "off", undefined, { by: "test" });
+    assert.deepEqual([set.courtesy, set.ownerBusy], [{ mode: "off", cpuPct: 50 }, null]);
+    await assert.rejects(pool.setCourtesy("ghost", "auto"), /not found/);
+    const mcpCall = async (args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => (await mcp.handleToolCall("paas_pool", args, level)).content[0].text;
+    assert.match(await mcpCall({ action: "courtesy", name: "notebook", mode: "auto" }, "read"), /level 'deploy'/);
+    assert.deepEqual(JSON.parse(await mcpCall({ action: "courtesy", name: "notebook", mode: "auto", cpuPct: 60 }, "deploy")).courtesy, { mode: "auto", cpuPct: 60 });
+    assert.match(await mcpCall({ action: "courtesy", name: "notebook", mode: "never" }, "deploy"), /auto .* warn .* off/);
+
+    // Dashboard: the setting is checked before the job starts, and the page's script compiles.
+    const dashToken = dashboard.getOrCreateDashboardToken();
+    const srv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((res) => srv.once("listening", res));
+    const baseUrl = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (url: string, body: unknown) => fetch(`${baseUrl}${url}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const code of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(code);
+      assert.ok(page.includes("poolCourtesy(") && page.includes('"courtesyHint"'));
+      const bad = await post("/api/pool/courtesy", { name: "notebook", mode: "auto", cpuPct: 200 });
+      assert.equal(bad.ok, false);
+      assert.match(JSON.stringify(await bad.json()), /10 to 95/);
+      const okRes = await post("/api/pool/courtesy", { name: "notebook", mode: "warn", cpuPct: 70 });
+      assert.ok(okRes.ok);
+      for (let i = 0; i < 50 && !(await (await fetch(`${baseUrl}/api/pool/job`, { headers: { cookie } })).json()).job?.done; i++) await new Promise((r) => setTimeout(r, 50));
+      const poolRes = await (await fetch(`${baseUrl}/api/pool`, { headers: { cookie } })).json();
+      assert.deepEqual(poolRes.helpers.find((h: { name: string }) => h.name === "notebook").courtesy, { mode: "warn", cpuPct: 70 });
+    } finally {
+      srv.close();
+    }
+
+    delete process.env.PAASMCP_COURTESY_EVERY_SECONDS;
+    delete process.env.PAASMCP_COURTESY_CALM_SECONDS;
+    const s4 = config.loadState();
+    delete s4.apps["court-a"];
+    delete s4.apps["court-b"];
+    delete s4.pool;
+    config.saveState(s4);
+    scale.forgetScaleData("court-a");
+    scale.forgetScaleData("court-b");
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

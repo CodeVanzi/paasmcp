@@ -77,6 +77,11 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
      - se o servidor reinicia no meio de um passo, a próxima medição pergunta aos PCs o que eles rodam e para as cópias que ninguém conhece.
      - Cada passo vai para o diário com o motivo, por exemplo “Subi de 1 para 2 cópias: as visitas por cópia ficaram em 25/s (alvo 20/s) por 2 rodadas seguidas (10 s). A nova cópia roda em notebook.”. Subir e descer dentro dos limites é livre; ligar a escala automática e aumentar o máximo com ela ligada pedem confirmação; tudo vai para o `audit.log`.
      - `scale auto off <app>` desliga e deixa as cópias como estão. `scale off <app>` (**Parar tudo** no painel) desliga a escala automática e volta o app a uma cópia, só aqui. Precisa da medição ligada (`scale install-timer`). Testado com Docker real em `scripts/autoscale-lab.sh` (dois PCs simulados: carga em degrau e de volta, ondas rápidas, Postgres perto do limite, servidor derrubado no meio de um passo).
+   - **Modo cortês (o dono do PC vem primeiro):** a cada minuto, cada PC ajudante diz quanto da CPU dele foi usada fora das cópias desde a última pergunta (nada fica rodando no PC: o PaaSMCP lê os contadores de CPU do PC e das cópias a cada ordem). Se isso passa do limite do PC (50% das CPUs dele, por padrão) duas vezes seguidas, o dono está usando o PC:
+     - no modo **automático** (o padrão), as cópias saem do balanceador, terminam as visitas em curso, param e vão para outro PC com espaço (ou esperam o dono liberar);
+     - no modo **com aviso**, as cópias ficam e o diário avisa;
+     - nos dois, nenhuma cópia nova vai para esse PC. Depois de 5 minutos abaixo de 80% do limite, ele volta a receber cópias.
+     - `paasmcp pool courtesy <nome> auto|warn|off [--cpu 50]`, ou o seletor no cartão de cada PC na tela **Ajudantes**. Precisa da medição ligada e do PaaSMCP atualizado no PC (`sudo paasmcp pool update-worker`). Só a CPU conta (memória não). Testado com Docker real em `scripts/courtesy-lab.sh`.
 10. **Confirmações e lixeira (segurança sem cortar funções):** veja a seção abaixo.
 
 ---

@@ -4,7 +4,7 @@ import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, 
 import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
-import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies } from "./pool.js";
+import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy, validateCourtesy } from "./pool.js";
 import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
@@ -661,6 +661,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const name = validateHelperName(String(body.name || ""));
           const paused = body.paused === true;
           return reply({ job: startPoolJob(paused ? "pause" : "resume", name, (log) => pauseHelper(name, paused, { by: actor, log })) });
+        }
+        if (pathname === "/api/pool/courtesy" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = validateHelperName(String(body.name || ""));
+          // Checked before the job starts, so a bad value answers at once.
+          validateCourtesy(body.mode, body.cpuPct);
+          return reply({ job: startPoolJob("courtesy", name, (log) => setCourtesy(name, body.mode, body.cpuPct, { by: actor, log })) });
         }
         if (pathname === "/api/pool/remove" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -3588,6 +3595,19 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolNoCopies": "Sem cópias agora.",
           "poolSecretsDisk": "A pasta em memória das variáveis não está pronta neste PC, então ele recusa cópias. Rode <code>sudo systemd-tmpfiles --create</code> nele.",
           "poolPausedNote": "Pausado: não recebe cópias. As que tinha foram para outros ajudantes ou pararam.",
+          "poolSt_busy": "dono usando",
+          "poolOwnerCpu": "dono usa {p}% da CPU",
+          "poolOwnerOld": "Este PC ainda não mede o uso do dono. Para o modo cortês funcionar, atualize o PaaSMCP nele e rode <code>sudo paasmcp pool update-worker</code>.",
+          "poolBusyAuto": "O dono está usando este PC desde {date} (CPU fora das cópias em {p}%). As cópias saíram dele e foram para outros PCs, ou esperam ele liberar. Voltam depois de {m} min com o PC livre.",
+          "poolBusyWarn": "O dono está usando este PC desde {date} (CPU fora das cópias em {p}%). Modo com aviso: as cópias ficam, mas nenhuma nova vai para lá.",
+          "lblCourtesy": "Modo cortês",
+          "courtesy_auto": "automático",
+          "courtesy_warn": "com aviso",
+          "courtesy_off": "desligado",
+          "lblCourtesyCpu": "limite (%)",
+          "btnCourtesySave": "Salvar",
+          "courtesyHint": "Conta como uso do dono a CPU do PC fora das cópias, medida a cada minuto. Acima do limite duas vezes seguidas, as cópias saem (automático) ou só ficam avisadas no diário (com aviso).",
+          "poolJob_courtesy": "mudar o modo cortês de {s}",
           "btnPoolPause": "Pausar",
           "btnPoolResume": "Retomar",
           "btnPoolRemove": "Remover",
@@ -3619,7 +3639,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolHowTitle": "O que fica no PC e o que acontece quando ele some",
           "poolHow1": "O PC recebe a imagem do app e as variáveis dele, inclusive senhas. As variáveis ficam só na memória do PC e somem quando a cópia para ou o PC desliga. Mesmo assim, quem controla o PC consegue lê-las enquanto a cópia roda: use como ajudante só um PC em que você confia tanto quanto neste servidor.",
           "poolHow2": "Este servidor confere cada cópia a cada 3 segundos. Se um ajudante dorme, desliga ou perde a rede, as visitas param de ir para ele em uns 6 segundos, e as que estavam a caminho são reenviadas para outra cópia.",
-          "poolHow3": "Antes de usar o PC para algo pesado, pause-o aqui: as cópias dele terminam as visitas em curso e vão para outro ajudante, se houver. Remover também apaga a chave deste servidor no PC.",
+          "poolHow3": "Quando o dono usa o PC para algo pesado, o modo cortês automático tira as cópias dele sozinho, em 1 ou 2 minutos: elas terminam as visitas em curso e vão para outro ajudante, se houver. Pausar aqui faz o mesmo na hora. Remover também apaga a chave deste servidor no PC.",
           "poolHow4": "Só vão para ajudantes os apps de um contêiner só, com verificação de saúde por HTTP e que rodam só neste servidor. O banco continua aqui: mais cópias aliviam a CPU do app, não o banco.",
           "poolJobRunning": "Em andamento: {what}",
           "poolJobDone": "Concluído: {what}",
@@ -3692,6 +3712,19 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolNoCopies": "No copies now.",
           "poolSecretsDisk": "The in-memory folder for app variables is not ready on this PC, so it refuses copies. Run <code>sudo systemd-tmpfiles --create</code> there.",
           "poolPausedNote": "Paused: it takes no copies. The ones it had moved to other helpers or stopped.",
+          "poolSt_busy": "owner using it",
+          "poolOwnerCpu": "owner uses {p}% of the CPU",
+          "poolOwnerOld": "This PC does not measure its owner's use yet. For courteous mode to work, update PaaSMCP there and run <code>sudo paasmcp pool update-worker</code>.",
+          "poolBusyAuto": "The owner has been using this PC since {date} (CPU outside the copies at {p}%). Its copies left for other PCs, or wait for it to be free. They come back after {m} min with the PC free.",
+          "poolBusyWarn": "The owner has been using this PC since {date} (CPU outside the copies at {p}%). Warn mode: the copies stay, but no new one goes there.",
+          "lblCourtesy": "Courteous mode",
+          "courtesy_auto": "automatic",
+          "courtesy_warn": "warn only",
+          "courtesy_off": "off",
+          "lblCourtesyCpu": "limit (%)",
+          "btnCourtesySave": "Save",
+          "courtesyHint": "The owner's use is the PC's CPU outside the copies, measured every minute. Above the limit twice in a row, the copies leave (automatic) or it is only noted in the diary (warn only).",
+          "poolJob_courtesy": "change the courteous mode of {s}",
           "btnPoolPause": "Pause",
           "btnPoolResume": "Resume",
           "btnPoolRemove": "Remove",
@@ -3723,7 +3756,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "poolHowTitle": "What stays on the PC and what happens when it goes away",
           "poolHow1": "The PC receives the app's image and its variables, passwords included. The variables stay only in the PC's memory and are gone when the copy stops or the PC turns off. Even so, whoever controls the PC can read them while the copy runs: only use a PC you trust as much as this server.",
           "poolHow2": "This server checks each copy every 3 seconds. If a helper sleeps, shuts down or loses the network, visits stop going to it within about 6 seconds, and those on their way are retried on another copy.",
-          "poolHow3": "Before using the PC for something heavy, pause it here: its copies finish the visits in progress and move to another helper, if there is one. Removing also deletes this server's key from the PC.",
+          "poolHow3": "When the owner uses the PC for something heavy, automatic courteous mode takes its copies off by itself within 1 or 2 minutes: they finish the visits in progress and move to another helper, if there is one. Pausing here does the same at once. Removing also deletes this server's key from the PC.",
           "poolHow4": "Only single-container apps with an HTTP health check that run only on this server go to helpers. The database stays here: more copies relieve the app's CPU, not the database.",
           "poolJobRunning": "In progress: {what}",
           "poolJobDone": "Done: {what}",
@@ -4720,7 +4753,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!d) return;
       document.getElementById('poolAcl').textContent = d.acl ? d.acl.acl : '';
       renderPoolJob(d.job, 'poolJobBox');
-      const stateCls = { available: 'success', working: 'success', paused: 'warning', gone: 'danger', unknown: '' };
+      const stateCls = { available: 'success', working: 'success', paused: 'warning', busy: 'warning', gone: 'danger', unknown: '' };
       const hs = d.helpers || [];
       document.getElementById('poolHelpers').innerHTML = hs.length ? hs.map(h => {
         const facts = [
@@ -4729,11 +4762,22 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           t('poolUsing').replace('{cpus}', fmtNum(h.used.cpus, 2)).replace('{mem}', fmtNum(h.used.memMb)),
           h.diskFreeGb !== null && h.diskFreeGb !== undefined ? t('poolDisk').replace('{gb}', fmtNum(h.diskFreeGb)) : '',
           h.load1 !== null && h.load1 !== undefined ? t('poolLoad').replace('{l}', fmtNum(h.load1, 2)) : '',
+          h.owner && typeof h.owner.cpuPct === 'number' ? t('poolOwnerCpu').replace('{p}', fmtNum(h.owner.cpuPct)) : '',
         ].filter(Boolean).map(esc).join(' · ');
+        const cm = (h.courtesy && h.courtesy.mode) || 'auto';
+        const courtesy = '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:flex-end;margin-top:8px;">'
+          + '<div><label class="field-label" for="court_' + esc(h.name) + '">' + esc(t('lblCourtesy')) + '</label>'
+          + '<select id="court_' + esc(h.name) + '">' + ['auto', 'warn', 'off'].map(m => '<option value="' + m + '"' + (m === cm ? ' selected' : '') + '>' + esc(t('courtesy_' + m)) + '</option>').join('') + '</select></div>'
+          + '<div><label class="field-label" for="courtCpu_' + esc(h.name) + '">' + esc(t('lblCourtesyCpu')) + '</label>'
+          + '<input id="courtCpu_' + esc(h.name) + '" type="number" min="10" max="95" step="5" style="width:80px;" value="' + esc(String((h.courtesy && h.courtesy.cpuPct) || 50)) + '" /></div>'
+          + '<button class="secondary" data-helper="' + esc(h.name) + '" onclick="poolCourtesy(this.dataset.helper)">' + esc(t('btnCourtesySave')) + '</button>'
+          + '</div><div style="color:var(--muted);font-size:12px;margin-top:4px;">' + esc(t('courtesyHint')) + '</div>';
         const copies = h.copies.length ? t('poolCopiesOn').replace('{list}', h.copies.map(c => c.app).join(', ')) : t('poolNoCopies');
         const seen = h.lastSeenAt ? ' · <span style="color:var(--muted)">' + esc(t('poolSeen').replace('{date}', fmtDate(h.lastSeenAt))) + '</span>' : '';
         const extra = (h.secretsInMemory === false ? '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + t('poolSecretsDisk') + '</div>' : '')
           + (h.paused ? '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + esc(t('poolPausedNote')) + '</div>' : '')
+          + (h.ownerBusy ? '<div style="color:var(--warning);font-size:12.5px;margin-top:4px;">' + esc(t(cm === 'warn' ? 'poolBusyWarn' : 'poolBusyAuto').replace('{date}', fmtDate(h.ownerBusy.since)).replace('{p}', fmtNum(h.ownerBusy.cpuPct)).replace('{m}', '5')) + '</div>' : '')
+          + (h.owner && h.owner.why === 'old_worker' && cm !== 'off' ? '<div style="color:var(--muted);font-size:12.5px;margin-top:4px;">' + t('poolOwnerOld') + '</div>' : '')
           + (h.lastError ? '<div style="color:var(--danger);font-size:12px;margin-top:4px;white-space:pre-wrap;">' + esc(h.lastError) + '</div>' : '');
         const btns = '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">'
           + '<button class="secondary" data-helper="' + esc(h.name) + '" onclick="poolPause(this.dataset.helper, ' + (h.paused ? 'false' : 'true') + ')">' + esc(t(h.paused ? 'btnPoolResume' : 'btnPoolPause')) + '</button>'
@@ -4742,7 +4786,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         return card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><strong>🖥️ ' + esc(h.name) + '</strong>' + badge(stateCls[h.state] || '', t('poolSt_' + h.state)) + '</div>'
           + '<div style="color:var(--muted);font-size:12.5px;margin-top:4px;">' + facts + '</div>'
           + '<div style="font-size:12.5px;margin-top:4px;">' + esc(copies) + seen + '</div>'
-          + extra + btns);
+          + extra + courtesy + btns);
       }).join('') : '<p class="card-desc">' + esc(t('poolNone')) + '</p>';
       const apps = d.apps || [];
       document.getElementById('poolApps').innerHTML = apps.length ? apps.map(a => card('<strong>' + esc(a.app) + '</strong>' + (a.auto ? ' ' + badge('success', t('poolAutoBadge')) : '') + ' · '
@@ -4775,6 +4819,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
     async function poolPause(name, paused) {
       const r = await postJson('/api/pool/pause', { name, paused });
+      if (r) watchPoolJob();
+    }
+    async function poolCourtesy(name) {
+      const mode = document.getElementById('court_' + name).value;
+      const cpuPct = Number(document.getElementById('courtCpu_' + name).value);
+      const r = await postJson('/api/pool/courtesy', { name, mode, cpuPct });
       if (r) watchPoolJob();
     }
     async function poolRemove(name) {

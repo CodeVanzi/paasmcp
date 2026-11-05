@@ -16,6 +16,7 @@ import {
   PoolConfig,
   PoolCopyRecord,
   PoolHelperRecord,
+  CourtesyMode,
   POOL_BALANCER,
   sanitizeSlug,
   saveState,
@@ -335,10 +336,10 @@ function noteCopy(helper: string, copyId: string, app: string, fingerprint: stri
   });
 }
 
-type Listing = { ok: true; facts: WorkerFacts; copies: WorkerCopy[] } | { ok: false; error: string };
+export type Listing = { ok: true; facts: WorkerFacts; copies: WorkerCopy[] } | { ok: false; error: string };
 
 /** Asks helpers what they run (in parallel) and records the answers. */
-async function probeHelpers(helpers: PoolHelperRecord[]): Promise<Record<string, Listing>> {
+export async function probeHelpers(helpers: PoolHelperRecord[]): Promise<Record<string, Listing>> {
   const results = await Promise.all(
     helpers.map(async (h): Promise<[string, Listing]> => {
       try {
@@ -356,6 +357,75 @@ async function probeHelpers(helpers: PoolHelperRecord[]): Promise<Record<string,
     }
   });
   return Object.fromEntries(results);
+}
+
+// ---------- courteous mode (the decision itself is in courtesy.ts) ----------
+
+export const COURTESY_DEFAULT: { mode: CourtesyMode; cpuPct: number } = { mode: "auto", cpuPct: 50 };
+export const COURTESY_MODES: readonly CourtesyMode[] = ["auto", "warn", "off"];
+
+/** The helper's courteous mode, with the default for PCs that never set it. */
+export function courtesyOf(h: Pick<PoolHelperRecord, "courtesy">): { mode: CourtesyMode; cpuPct: number } {
+  const c = h.courtesy;
+  return c && COURTESY_MODES.includes(c.mode) && Number.isFinite(c.cpuPct) ? { mode: c.mode, cpuPct: c.cpuPct } : { ...COURTESY_DEFAULT };
+}
+
+/** The owner is using the PC and asked for it to be left alone: no new copies (warn and auto). */
+export function ownerBusy(h: Pick<PoolHelperRecord, "courtesy" | "ownerBusy">): boolean {
+  return Boolean(h.ownerBusy) && courtesyOf(h).mode !== "off";
+}
+
+/** ...and its copies move away (auto only). */
+export function ownerWantsOut(h: Pick<PoolHelperRecord, "courtesy" | "ownerBusy">): boolean {
+  return Boolean(h.ownerBusy) && courtesyOf(h).mode === "auto";
+}
+
+/** Helpers whose owner is using them right now by their last answer (before the round decides): no new copy goes there. */
+function ownerHighNow(state: PaaSState, listings: Record<string, Listing>): Set<string> {
+  const out = new Set<string>();
+  for (const [name, l] of Object.entries(listings)) {
+    const h = state.pool?.helpers[name];
+    const pct = l.ok ? l.facts.owner?.cpuPct : null;
+    if (h && typeof pct === "number" && courtesyOf(h).mode !== "off" && pct >= courtesyOf(h).cpuPct) out.add(name);
+  }
+  return out;
+}
+
+export function validateCourtesy(modeIn: unknown, cpuIn?: unknown): { mode: CourtesyMode; cpuPct?: number } {
+  const mode = String(modeIn ?? "").trim().toLowerCase() as CourtesyMode;
+  if (!COURTESY_MODES.includes(mode)) throw new Error("Courteous mode must be auto (copies leave when the owner uses the PC), warn (they stay, no new ones go there) or off.");
+  if (cpuIn === undefined || cpuIn === null || cpuIn === "") return { mode };
+  const cpuPct = Number(String(cpuIn).replace(/%$/, ""));
+  if (!Number.isInteger(cpuPct) || cpuPct < 10 || cpuPct > 95) throw new Error("--cpu must be a whole percentage from 10 to 95 (the owner's share of the whole PC's CPU).");
+  return { mode, cpuPct };
+}
+
+/**
+ * Sets a helper's courteous mode (free, like pause: it only ever takes load off the PC or gives back what
+ * the owner's settings allow). The copies follow at once: moving to auto while the owner is busy moves
+ * them away; off, or the owner no longer busy, lets missing copies come back.
+ */
+export async function setCourtesy(nameIn: string, modeIn: unknown, cpuIn?: unknown, opts: { by?: string; log?: (l: string) => void } = {}) {
+  const name = validateHelperName(nameIn);
+  const want = validateCourtesy(modeIn, cpuIn);
+  const before = loadState().pool?.helpers[name];
+  if (!before) throw new Error(`Helper '${name}' not found.`);
+  const next = { mode: want.mode, cpuPct: want.cpuPct ?? courtesyOf(before).cpuPct };
+  savePool((p) => {
+    p.helpers[name].courtesy = next;
+    // Off: nothing is watched, so nothing is known about the owner any more.
+    if (next.mode === "off") delete p.helpers[name].ownerBusy;
+  });
+  audit({ event: "pool.courtesy", helper: name, mode: next.mode, cpuPct: next.cpuPct, by: opts.by || "cli" });
+  const after = loadState().pool!.helpers[name];
+  const reports: ReconcileReport[] = [];
+  for (const app of pooledApps(loadState())) {
+    const there = app.pool!.placed.some((c) => c.helper === name);
+    if ((ownerWantsOut(after) && there) || (!ownerBusy(after) && ownerBusy(before) && app.pool!.placed.length < app.pool!.copies - 1)) {
+      reports.push(await reconcilePool(app.name, { log: opts.log }));
+    }
+  }
+  return { helper: name, courtesy: next, ownerBusy: after.ownerBusy || null, apps: reports };
 }
 
 // ---------- helpers: add, pause, remove ----------
@@ -623,15 +693,16 @@ export function usedOnHelpers(state: PaaSState): Record<string, { cpus: number; 
 }
 
 /**
- * Where new copies go (pure): reachable, not paused, same CPU architecture as the image, no copy of
- * this app yet, and room for its limits. The one with the most free CPU first, so copies spread out.
+ * Where new copies go (pure): reachable, not paused, its owner not using it (courteous mode), same CPU
+ * architecture as the image, no copy of this app yet, and room for its limits. The one with the most free CPU first, so copies spread out.
  */
 export function pickHelpers(
   state: PaaSState,
   app: AppRecord,
   arch: string,
   reachable: Set<string>,
-  count: number
+  count: number,
+  ownerHigh: Set<string> = new Set()
 ): { picked: PoolHelperRecord[]; skipped: { helper: string; why: string }[] } {
   const used = usedOnHelpers(state);
   const skipped: { helper: string; why: string }[] = [];
@@ -639,6 +710,8 @@ export function pickHelpers(
   const candidates = Object.values(state.pool?.helpers || {}).filter((h) => {
     const why = h.paused
       ? "paused"
+      : ownerBusy(h) || (ownerHigh.has(h.name) && !has.has(h.name))
+        ? "its owner is using it"
       : !reachable.has(h.name)
         ? "not answering"
         : h.arch !== arch
@@ -742,6 +815,7 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
   const helpers = state.pool?.helpers || {};
   const listings = await probeHelpers(Object.values(helpers));
   const reachable = new Set(Object.entries(listings).filter(([, l]) => l.ok).map(([n]) => n));
+  const ownerHigh = ownerHighNow(state, listings);
 
   let img: OriginImage | undefined;
   const needImage = wantHelpers > 0 || pool.placed.length > 0;
@@ -775,7 +849,7 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
       // Not answering now (asleep, rebooting, network). A current copy stays listed: the balancer's
       // health checks decide whether it gets visits. Any other leaves the balancer now and stops when
       // the PC answers again (a later round sees it as unknown).
-      if (wantHelpers > 0 && !h.paused && isCurrent(rec, h)) keep.push(rec);
+      if (wantHelpers > 0 && !h.paused && !ownerWantsOut(h) && isCurrent(rec, h)) keep.push(rec);
       else dropSilent(rec, "helper not answering");
       report.warnings.push(`${rec.helper} does not answer now (${l?.ok === false ? l.error : "no answer"}).`);
       continue;
@@ -787,6 +861,10 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
     }
     if (h.paused) {
       toStop.push({ rec, why: "helper paused" });
+      continue;
+    }
+    if (ownerWantsOut(h)) {
+      toStop.push({ rec, why: "its owner is using the PC" });
       continue;
     }
     if (!isCurrent(rec, h)) {
@@ -863,7 +941,7 @@ export async function reconcilePool(appName: string, opts: { log?: (l: string) =
   while (missing > 0 && img && bindIp) {
     const s = loadState();
     const ok = new Set([...reachable].filter((n) => !tried.has(n)));
-    const { picked, skipped } = pickHelpers(s, s.apps[slug], img.arch, ok, 1);
+    const { picked, skipped } = pickHelpers(s, s.apps[slug], img.arch, ok, 1, ownerHigh);
     if (!picked.length) {
       const left = skipped.filter((x) => !tried.has(x.helper)).map((x) => `${x.helper}: ${x.why}`);
       report.warnings.push(`Only ${(s.apps[slug].pool?.placed.length || 0) + 1} of ${pool.copies} copies could run.${left.length ? ` Other helpers: ${left.join("; ")}.` : Object.keys(helpers).length ? "" : " No helper PC was added yet."}`);
@@ -1180,7 +1258,7 @@ export async function routeTunnel(slug: string, viaBalancer: boolean): Promise<{
 
 // ---------- reading ----------
 
-export type HelperState = "available" | "working" | "paused" | "gone" | "unknown";
+export type HelperState = "available" | "working" | "paused" | "busy" | "gone" | "unknown";
 
 export async function poolStatus(opts: { probe?: boolean } = {}) {
   let state = loadState();
@@ -1201,7 +1279,7 @@ export async function poolStatus(opts: { probe?: boolean } = {}) {
       .map((h) => {
         const s = seen[h.name];
         const copies = placedOn(h.name);
-        const st: HelperState = h.paused ? "paused" : !s ? "unknown" : !s.ok ? "gone" : copies.length ? "working" : "available";
+        const st: HelperState = h.paused ? "paused" : !s ? "unknown" : !s.ok ? "gone" : ownerBusy(h) ? "busy" : copies.length ? "working" : "available";
         return {
           name: h.name,
           ip: h.ip,
@@ -1218,6 +1296,10 @@ export async function poolStatus(opts: { probe?: boolean } = {}) {
           lastSeenAt: s?.at || null,
           ...(s && !s.ok ? { lastError: s.error, failedAt: s.failedAt } : {}),
           ...(h.paused ? { paused: h.paused } : {}),
+          courtesy: courtesyOf(h),
+          ownerBusy: ownerBusy(h) ? h.ownerBusy : null,
+          // The owner's CPU at the last answer; null when that answer could not tell, absent on an old worker.
+          ...(s?.ok && s.facts ? { owner: s.facts.owner ?? { cpuPct: null, seconds: 0, why: "old_worker" } } : {}),
           addedAt: h.addedAt,
         };
       }),

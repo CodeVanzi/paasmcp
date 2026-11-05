@@ -427,8 +427,41 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   (by `decider`), `pool.reconcile`, `scale.off`.
 - **Diary:** `up`, `down` (with the signal, the numbers and the helper), `held` (with the reason and the
   wait), `repaired`, `auto_on`, `auto_off`, `stopped_all`; same codes-and-numbers format as phase 1.
-- **Not in this phase:** asking the PC's owner before using it ("courteous mode") and waking sleeping PCs
-  (Wake-on-LAN); a step is one copy at a time, so a sudden peak takes a few rounds to cover.
+- **Not in this phase:** waking sleeping PCs (Wake-on-LAN); a step is one copy at a time, so a sudden peak
+  takes a few rounds to cover. Courteous mode: section 10d.
+
+## 10d. Courteous mode: the PC's owner comes first (`src/courtesy.ts`, `src/worker.ts`, `src/poolproto.ts`)
+
+- **What the helper measures:** nothing runs on the PC between orders, so the worker measures with two
+  counters at each `facts` or `list` order: the whole PC's busy CPU time (the cgroup v2 root's `cpu.stat`,
+  the cgroup v1 `cpuacct.usage`, or `/proc/stat`) and each running copy's (its main process's cgroup, from
+  `/proc/<pid>/cgroup`; a PC that is itself a container sees the host's path, so leading parts are dropped
+  until the file is found). The last snapshot stays in `owner.json` (0600) in the worker's home. The owner's
+  share (`ownerShare`, pure) = (PC time − copies' time) / (window × CPUs), in % of the PC's CPUs (a CPU
+  quota on the PC's own cgroup counts). Unsure, and reported as a code instead of a number: a window under
+  10 s (the previous reading is repeated) or over 15 min (the worker measures 3 s instead), an image load or
+  a copy start in it (`load`/`run` mark `heavy`: that CPU is Docker's), a copy that left during it (its last
+  time is unknown), a counter that went back. A copy that started inside the window counts with all its
+  time. Older workers send no reading; the dashboard asks for `pool update-worker` there.
+- **What the origin decides** (`courtesyRound`, called by every scale round, so it needs the timer): at
+  most once a minute (`PAASMCP_COURTESY_EVERY_SECONDS`), only while some app uses the pool (or a PC is still
+  marked busy), it asks every helper not paused and not in mode off (`probeHelpers`). `courtesyObserve`
+  (pure, streaks in `pool/courtesy.json`): the owner's share at or above the PC's limit (`courtesy.cpuPct`,
+  50% by default, 10-95) for 2 readings in a row → `ownerBusy = {since, cpuPct}`; below 80% of the limit
+  for 5 minutes (`PAASMCP_COURTESY_CALM_SECONDS`) → cleared; in between, the calm while starts over; unsure
+  readings and PCs that do not answer change nothing. The change is made under the state lock (2 s wait;
+  busy → the next check redoes it), audited (`pool.owner.busy`, `pool.owner.free`) and written to the
+  diary for each app with a copy there (`owner_busy`, `owner_calm`).
+- **Modes** (`pool courtesy <name> auto|warn|off [--cpu 50]`, MCP `paas_pool action=courtesy`, dashboard;
+  free, audited `pool.courtesy`): `auto` (default): a busy PC is treated like a paused one by
+  `reconcilePool` (its copies leave the balancer, drain and stop, then placement looks for another PC with
+  room; the copies asked for stay, so they come back when it is free). `warn`: the copies stay, the diary
+  says so. Both: `pickHelpers` gives no new copy to a busy PC, nor to one whose last answer is at or above
+  its limit. `off`: not asked, any mark cleared. Copies still leave the busy PC before a replacement
+  starts elsewhere: the owner gets the PC back first; this server's copy keeps serving meanwhile.
+- **Limits:** CPU only (memory pressure and a full disk are not watched); the reaction takes 2 readings,
+  so about 1-2 minutes plus the drain; a PC that is itself busy with something that is not its owner (a
+  backup, an update) counts as its owner.
 
 ## 11. Environment variables
 
@@ -447,6 +480,7 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
 | `PAASMCP_ARBITER_ENV_FILE` | `/etc/paasmcp-arbiter.env` | Where the arbiter device keeps its keys (0600). |
 | `PAASMCP_MIRROR_NAME_SUFFIX`, `PAASMCP_MIRROR_PORT_BASE` | —, `5433` | Labs only: copy container name suffix and first local port, so several copies of one server fit on one Docker host. |
 | `PAASMCP_POOL_DRAIN_SECONDS` | `30` | Seconds a helper copy keeps its visits in progress after it leaves the balancer, before it stops. |
+| `PAASMCP_COURTESY_EVERY_SECONDS`, `PAASMCP_COURTESY_CALM_SECONDS` | `60`, `300` | Labs only: how often the courteous check asks the helpers, and how long a PC must stay free before it takes copies again. |
 | `PAASMCP_WORKER_HOME`, `PAASMCP_WORKER_RUN_DIR` | `/var/lib/paasmcp-worker`, `/run/paasmcp-worker` | Tests only: where the helper's worker keeps its settings and the in-memory variables folder. |
 | `PAASMCP_WORKER_ALLOW_DISK` | — | Tests only: `1` lets the worker write variables outside tmpfs. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
@@ -474,6 +508,12 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   (the diary says why) until they close; a round killed while its new copy warms up on a helper leaves a
   `step.json`, and the next round stops the orphan and leaves the helpers with exactly the copies this
   server knows; "stop everything" leaves one copy here and nothing on the helpers.
+- `scripts/courtesy-lab.sh`: courteous mode with real Docker, on the same kind of helper PCs, checks every
+  10 s and a 30 s calm while. An app runs 2 copies by hand under 20 visits/s. Both PCs report their owner's
+  CPU; two busy loops on the PC with the copy move it to the other PC (which does not count that CPU as its
+  owner's), the diary says why and where, and the PC is free again after the calm while; in warn mode the
+  copy stays and a third copy goes to the other PC; mode off clears the mark and watches nothing; no visit
+  fails and no round errors.
 - `scripts/bluegreen-lab.sh`: real Docker run of the blue/green deploy (healthy version goes live, crashing and HTTP 500
   versions are refused while the old one keeps serving, swap under load on the Docker network, rollback).
 - `scripts/dockerfile-lab.sh`: builds and runs each fixture in `test/fixtures/` (Node, Vite, CRA, FastAPI,

@@ -10,7 +10,15 @@ import {
   helloProof,
   imageFingerprint,
   normalizeArch,
+  cpuCgroupPath,
+  OWNER_MAX_WINDOW_MS,
+  OWNER_MIN_WINDOW_MS,
+  OwnerReading,
+  OwnerSnapshot,
+  ownerShare,
+  parseCpuStatUsage,
   parseOrder,
+  procStatBusyUs,
   POOL_IMAGE_REPO,
   renderEnvFile,
   validateCopySpec,
@@ -163,6 +171,202 @@ export function facts(cfg: WorkerConfig): WorkerFacts {
     load1: Math.round(os.loadavg()[0] * 100) / 100,
     secretsInMemory: secretsInMemory(),
   };
+}
+
+// ---------- courteous mode: how much the owner uses this PC ----------
+
+const CGROUP_ROOT = () => "/sys/fs/cgroup";
+const ownerFile = () => path.join(workerHome(), "owner.json");
+
+interface OwnerFile {
+  prev?: OwnerSnapshot;
+  last?: OwnerReading & { at: number };
+  /** An image load or a copy start (CPU spent by Docker, not by the owner): open while it runs. */
+  heavy?: { at: number; open: boolean };
+}
+
+function readNumberFile(file: string): number | undefined {
+  try {
+    const n = Number(fs.readFileSync(file, "utf-8").trim().split(/\s+/)[0]);
+    return Number.isFinite(n) ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+type CpuSource = { kind: "v2" } | { kind: "v1"; dir: string } | { kind: "proc" };
+
+/** Where this PC's CPU time is read: the cgroup v2 root, the cgroup v1 cpuacct root, or /proc/stat. */
+function cpuSource(): CpuSource {
+  const root = CGROUP_ROOT();
+  if (fs.existsSync(path.join(root, "cpu.stat")) && fs.existsSync(path.join(root, "cgroup.controllers"))) return { kind: "v2" };
+  for (const dir of ["cpuacct", "cpu,cpuacct", "cpuacct,cpu"]) if (fs.existsSync(path.join(root, dir, "cpuacct.usage"))) return { kind: "v1", dir };
+  return { kind: "proc" };
+}
+
+/** The whole PC's busy CPU time, in microseconds. */
+function pcCpuUs(src: CpuSource): number | undefined {
+  const root = CGROUP_ROOT();
+  if (src.kind === "v2") {
+    try {
+      return parseCpuStatUsage(fs.readFileSync(path.join(root, "cpu.stat"), "utf-8"));
+    } catch {
+      return undefined;
+    }
+  }
+  if (src.kind === "v1") {
+    const ns = readNumberFile(path.join(root, src.dir, "cpuacct.usage"));
+    return ns === undefined ? undefined : Math.round(ns / 1000);
+  }
+  try {
+    return procStatBusyUs(fs.readFileSync("/proc/stat", "utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/** CPUs this PC has: all of them, or fewer when its own cgroup has a CPU quota (a PC that is a container). */
+function pcCores(src: CpuSource): number {
+  const all = typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length;
+  const root = CGROUP_ROOT();
+  let quota: number | undefined;
+  if (src.kind === "v2") {
+    try {
+      const [q, p] = fs.readFileSync(path.join(root, "cpu.max"), "utf-8").trim().split(/\s+/);
+      if (q !== "max" && Number(q) > 0 && Number(p) > 0) quota = Number(q) / Number(p);
+    } catch {
+      // no quota file at the root
+    }
+  } else if (src.kind === "v1") {
+    for (const dir of ["cpu", "cpu,cpuacct", "cpuacct,cpu"]) {
+      const q = readNumberFile(path.join(root, dir, "cpu.cfs_quota_us"));
+      const p = readNumberFile(path.join(root, dir, "cpu.cfs_period_us"));
+      if (q !== undefined && p !== undefined) {
+        if (q > 0 && p > 0) quota = q / p;
+        break;
+      }
+    }
+  }
+  return Math.max(0.01, quota ? Math.min(all, quota) : all);
+}
+
+/**
+ * A copy's CPU time from its main process's cgroup. The path in /proc/<pid>/cgroup is seen from the
+ * host's root, which a PC inside a container (the labs) does not see: the leading parts are dropped
+ * until a file is found (the last part is the container's own id, so a match is always that copy).
+ */
+function copyCpuUs(src: CpuSource, pid: number): number | undefined {
+  if (src.kind === "proc" || !(pid > 0)) return undefined;
+  let text: string;
+  try {
+    text = fs.readFileSync(`/proc/${pid}/cgroup`, "utf-8");
+  } catch {
+    return undefined;
+  }
+  const cg = cpuCgroupPath(text, src.kind === "v2");
+  if (!cg) return undefined;
+  const parts = cg.split("/").filter(Boolean);
+  const base = src.kind === "v2" ? CGROUP_ROOT() : path.join(CGROUP_ROOT(), src.dir);
+  for (let i = 0; i < parts.length; i++) {
+    const dir = path.join(base, ...parts.slice(i));
+    if (src.kind === "v2") {
+      try {
+        const us = parseCpuStatUsage(fs.readFileSync(path.join(dir, "cpu.stat"), "utf-8"));
+        if (us !== undefined) return us;
+      } catch {
+        // try a shorter path
+      }
+    } else {
+      const ns = readNumberFile(path.join(dir, "cpuacct.usage"));
+      if (ns !== undefined) return Math.round(ns / 1000);
+    }
+  }
+  return undefined;
+}
+
+/** Reads the counters now: the PC's CPU time and each running copy's. Undefined when they cannot be read. */
+export function ownerSnapshot(): OwnerSnapshot | undefined {
+  const src = cpuSource();
+  const at = Date.now();
+  const copies: Record<string, number> = {};
+  const ids = docker(["ps", "-q", "--filter", "label=paasmcp.pool"], { timeout: 15_000 }).split("\n").filter(Boolean);
+  if (ids.length) {
+    const lines = docker(["inspect", "--format", '{{.State.Pid}} {{index .Config.Labels "paasmcp.copy"}}', ...ids], { timeout: 15_000 }).split("\n").filter(Boolean);
+    for (const line of lines) {
+      const [pid, copy] = line.split(" ");
+      const us = copyCpuUs(src, Number(pid));
+      if (us === undefined) return undefined;
+      copies[copy] = us;
+    }
+  }
+  const totalUs = pcCpuUs(src);
+  if (totalUs === undefined) return undefined;
+  return { at, totalUs, cores: pcCores(src), copies };
+}
+
+function readOwnerFile(): OwnerFile {
+  try {
+    const f = JSON.parse(fs.readFileSync(ownerFile(), "utf-8"));
+    return f && typeof f === "object" ? f : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeOwnerFile(f: OwnerFile): void {
+  try {
+    const tmp = `${ownerFile()}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(f), { mode: 0o600 });
+    fs.renameSync(tmp, ownerFile());
+  } catch {
+    // the reading is only lost; orders still work
+  }
+}
+
+/** Marks an image load or a copy start as running (or finished): the owner's reading skips that window. */
+function markHeavy(open: boolean): void {
+  const f = readOwnerFile();
+  f.heavy = { at: Date.now(), open };
+  writeOwnerFile(f);
+}
+
+const QUICK_SAMPLE_MS = 3000;
+const LAST_READING_MAX_AGE_MS = 2 * 60 * 1000;
+
+/**
+ * How much CPU the PC used outside the copies since the origin last asked. When the last question was
+ * too recent, the previous reading is repeated; when there was none for a long time, the worker measures
+ * for 3 s before answering.
+ */
+export async function ownerReading(): Promise<OwnerReading> {
+  let cur: OwnerSnapshot | undefined;
+  try {
+    cur = ownerSnapshot();
+  } catch {
+    cur = undefined;
+  }
+  if (!cur) return { cpuPct: null, seconds: 0, why: "unreadable" };
+  const f = readOwnerFile();
+  const age = f.prev ? cur.at - f.prev.at : -1;
+  if (f.prev && age >= OWNER_MIN_WINDOW_MS && age <= OWNER_MAX_WINDOW_MS) {
+    const r = ownerShare(f.prev, cur, f.heavy);
+    writeOwnerFile({ ...f, prev: cur, ...(r.cpuPct !== null ? { last: { ...r, at: cur.at } } : {}) });
+    return r;
+  }
+  if (f.prev && age >= 0 && age < OWNER_MIN_WINDOW_MS && f.last && cur.at - f.last.at >= 0 && cur.at - f.last.at < LAST_READING_MAX_AGE_MS) {
+    return { cpuPct: f.last.cpuPct, seconds: f.last.seconds };
+  }
+  await new Promise((r) => setTimeout(r, QUICK_SAMPLE_MS));
+  let next: OwnerSnapshot | undefined;
+  try {
+    next = ownerSnapshot();
+  } catch {
+    next = undefined;
+  }
+  if (!next) return { cpuPct: null, seconds: 0, why: "unreadable" };
+  const r = ownerShare(cur, next, f.heavy, QUICK_SAMPLE_MS - 500);
+  writeOwnerFile({ ...f, prev: next, ...(r.cpuPct !== null ? { last: { ...r, at: next.at } } : {}) });
+  return r;
 }
 
 export function listCopies(): WorkerCopy[] {
@@ -387,19 +591,29 @@ export async function handleOrder(raw: string | undefined): Promise<unknown> {
       return { name: cfg.name, proof, facts: facts(cfg) };
     }
     case "facts":
-      return facts(cfg);
+      return { ...facts(cfg), owner: await ownerReading() };
     case "list": {
       const copies = listCopies();
       cleanOrphanEnv(copies);
-      return { facts: facts(cfg), copies };
+      return { facts: { ...facts(cfg), owner: await ownerReading() }, copies };
     }
     case "has-image":
       return { present: localFingerprint(args[0]) === args[1] };
     case "load":
-      return loadImage(args[0], args[1]);
+      markHeavy(true);
+      try {
+        return await loadImage(args[0], args[1]);
+      } finally {
+        markHeavy(false);
+      }
     case "run": {
       const spec = validateCopySpec(await readStdinJson());
-      return runCopy(cfg, spec, bindIpFromSsh());
+      markHeavy(true);
+      try {
+        return runCopy(cfg, spec, bindIpFromSsh());
+      } finally {
+        markHeavy(false);
+      }
     }
     case "stop":
       return stopCopy(args[0]);

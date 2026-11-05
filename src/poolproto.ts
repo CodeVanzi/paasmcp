@@ -337,6 +337,8 @@ export interface WorkerFacts {
   /** 1-minute load average of the whole PC (the owner's use included). */
   load1: number;
   secretsInMemory: boolean;
+  /** Courteous mode: how much CPU the PC used outside the copies (absent on workers older than it). */
+  owner?: OwnerReading;
 }
 
 export interface WorkerCopy {
@@ -371,7 +373,105 @@ export function validateFacts(raw: unknown): WorkerFacts {
     workerVersion: text(r.workerVersion, 40),
     load1: Math.round(num(r.load1, 0, 10_000) * 100) / 100,
     secretsInMemory: r.secretsInMemory === true,
+    ...(r.owner && typeof r.owner === "object" ? { owner: validateOwnerReading(r.owner) } : {}),
   };
+}
+
+/** The owner's CPU reading a helper sends: a number from 0 to 100, or the code of why there is none. */
+export function validateOwnerReading(raw: unknown): OwnerReading {
+  const r = (raw || {}) as Record<string, unknown>;
+  const seconds = Math.round(num(r.seconds, 0, 3600));
+  const pct = Number(r.cpuPct);
+  if (r.cpuPct !== null && r.cpuPct !== undefined && Number.isFinite(pct)) return { cpuPct: Math.round(Math.min(100, Math.max(0, pct))), seconds };
+  const why = String(r.why ?? "");
+  return { cpuPct: null, seconds, why: (OWNER_UNSURE as readonly string[]).includes(why) ? (why as OwnerUnsure) : "unreadable" };
+}
+
+// ---------- courteous mode: the owner's use of the PC ----------
+//
+// A helper PC belongs to someone who also uses it. The worker reports how much CPU the PC used outside
+// the copies since the origin last asked (the owner's programs, mostly); the origin decides whether the
+// owner is using the PC and moves the copies away (courtesy.ts). Nothing runs on the PC in between: each
+// order reads two counters, the whole PC's CPU time and each copy's, and keeps the last reading in a file.
+
+/** Counters read at one moment on the helper: CPU time in microseconds, for the whole PC and per copy. */
+export interface OwnerSnapshot {
+  at: number;
+  totalUs: number;
+  /** CPUs the PC has (a CPU quota on the PC's own cgroup counts, as inside a container). */
+  cores: number;
+  copies: Record<string, number>;
+}
+
+export const OWNER_UNSURE = ["short", "stale", "busy_order", "copy_left", "unreadable", "counter_reset"] as const;
+export type OwnerUnsure = (typeof OWNER_UNSURE)[number];
+
+export interface OwnerReading {
+  /** CPU the PC used outside the copies, in % of all its CPUs; null when this window cannot tell. */
+  cpuPct: number | null;
+  /** Length of the window measured. */
+  seconds: number;
+  why?: OwnerUnsure;
+}
+
+/** A window shorter than this says little (the worker answers the previous one instead). */
+export const OWNER_MIN_WINDOW_MS = 10_000;
+/** A window longer than this is too old to describe now. */
+export const OWNER_MAX_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * The owner's share of the PC's CPU between two snapshots (pure). Unsure (null) when the window is too
+ * short or too old, when an image load or a copy start ran in it (that CPU belongs to Docker, not to the
+ * owner), when a copy left during it (its last CPU time is unknown) or when a counter went back.
+ * A copy that started in the window counts with all its CPU time, which is all inside the window.
+ */
+export function ownerShare(prev: OwnerSnapshot, cur: OwnerSnapshot, heavy?: { at: number; open: boolean }, minMs = OWNER_MIN_WINDOW_MS): OwnerReading {
+  const ms = cur.at - prev.at;
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  const unsure = (why: OwnerUnsure): OwnerReading => ({ cpuPct: null, seconds, why });
+  if (ms < minMs) return unsure("short");
+  if (ms > OWNER_MAX_WINDOW_MS) return unsure("stale");
+  if (heavy && (heavy.at > prev.at || (heavy.open && cur.at - heavy.at < 2 * 60 * 60 * 1000))) return unsure("busy_order");
+  if (Object.keys(prev.copies).some((id) => !(id in cur.copies))) return unsure("copy_left");
+  const total = cur.totalUs - prev.totalUs;
+  let copies = 0;
+  for (const [id, us] of Object.entries(cur.copies)) {
+    const d = us - (prev.copies[id] ?? 0);
+    if (d < 0) return unsure("counter_reset");
+    copies += d;
+  }
+  if (total < 0 || !(cur.cores > 0)) return unsure("counter_reset");
+  const ownerCores = Math.max(0, total - copies) / (ms * 1000);
+  return { cpuPct: Math.round(Math.min(100, (ownerCores / cur.cores) * 100)), seconds };
+}
+
+/**
+ * The path of a process's CPU accounting cgroup in /proc/<pid>/cgroup: the "0::" line on cgroup v2,
+ * the "cpuacct" controller's line on cgroup v1 (also on hybrid systems, where v2 has no CPU controller).
+ */
+export function cpuCgroupPath(procCgroup: string, v2: boolean): string | undefined {
+  for (const line of String(procCgroup).split("\n")) {
+    const m = /^(\d+):([^:]*):(\/.*)$/.exec(line.trim());
+    if (!m) continue;
+    if (v2 ? m[1] === "0" && m[2] === "" : m[2].split(",").includes("cpuacct")) return m[3];
+  }
+  return undefined;
+}
+
+/** `usage_usec` from a cgroup v2 cpu.stat file. */
+export function parseCpuStatUsage(text: string): number | undefined {
+  const m = /^usage_usec (\d+)$/m.exec(String(text));
+  return m ? Number(m[1]) : undefined;
+}
+
+/** Busy CPU time of the whole PC from /proc/stat's first line, in microseconds (USER_HZ 100). */
+export function procStatBusyUs(text: string): number | undefined {
+  const line = String(text).split("\n").find((l) => /^cpu\s/.test(l));
+  if (!line) return undefined;
+  // user nice system idle iowait irq softirq steal (guest time is already inside user)
+  const f = line.trim().split(/\s+/).slice(1).map(Number);
+  if (f.length < 8 || f.some((x) => !Number.isFinite(x))) return undefined;
+  return (f[0] + f[1] + f[2] + f[5] + f[6] + f[7]) * 10_000;
 }
 
 /** A helper's list of copies: only well-formed entries survive. */
