@@ -902,54 +902,54 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
   const sharedCss = `
     :root, [data-theme="dark"] {
-      --bg: #0d1117;
-      --bg-elevated: #161b22;
-      --bg-subtle: #1f242c;
-      --card: #161b22;
-      --card-hover: #1c2128;
-      --border: #30363d;
-      --border-strong: #484f58;
-      --text: #f0f6fc;
-      --muted: #8b949e;
-      --input-bg: #0d1117;
-      --accent: #2f81f7;
-      --accent-hover: #388bfd;
-      --accent-soft: rgba(47, 129, 247, 0.15);
-      --accent-text: #58a6ff;
-      --success: #3fb950;
-      --success-soft: rgba(63, 185, 80, 0.15);
-      --warning: #d29922;
-      --warning-soft: rgba(210, 153, 34, 0.15);
-      --danger: #f85149;
-      --danger-soft: rgba(248, 81, 73, 0.15);
-      --code-bg: #161b22;
-      --code-text: #79c0ff;
-      --shadow: 0 8px 24px rgba(1, 4, 9, 0.4);
+      --bg: #07090e;
+      --bg-elevated: #0d1117;
+      --bg-subtle: #131924;
+      --card: #0d1117;
+      --card-hover: #131926;
+      --border: #1e2638;
+      --border-strong: #2d384e;
+      --text: #f1f5f9;
+      --muted: #8896aa;
+      --input-bg: #07090e;
+      --accent: #00f0ff;
+      --accent-hover: #38bdf8;
+      --accent-soft: rgba(0, 240, 255, 0.12);
+      --accent-text: #00f0ff;
+      --success: #00f59b;
+      --success-soft: rgba(0, 245, 155, 0.12);
+      --warning: #f59e0b;
+      --warning-soft: rgba(245, 158, 11, 0.12);
+      --danger: #ff4757;
+      --danger-soft: rgba(255, 71, 87, 0.12);
+      --code-bg: #05070b;
+      --code-text: #00f0ff;
+      --shadow: 0 4px 24px -2px rgba(0, 0, 0, 0.55);
     }
     [data-theme="light"] {
-      --bg: #ffffff;
-      --bg-elevated: #f6f8fa;
-      --bg-subtle: #eaeef2;
+      --bg: #f8fafc;
+      --bg-elevated: #ffffff;
+      --bg-subtle: #f1f5f9;
       --card: #ffffff;
-      --card-hover: #f6f8fa;
-      --border: #d0d7de;
-      --border-strong: #afb8c1;
-      --text: #1f2328;
-      --muted: #656d76;
+      --card-hover: #f8fafc;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #0f172a;
+      --muted: #64748b;
       --input-bg: #ffffff;
-      --accent: #0969da;
-      --accent-hover: #0860ca;
-      --accent-soft: rgba(9, 105, 218, 0.1);
-      --accent-text: #0969da;
-      --success: #1a7f37;
-      --success-soft: rgba(26, 127, 55, 0.12);
-      --warning: #9a6700;
-      --warning-soft: rgba(154, 103, 0, 0.12);
-      --danger: #cf222e;
-      --danger-soft: rgba(207, 34, 46, 0.1);
-      --code-bg: #f6f8fa;
-      --code-text: #0550ae;
-      --shadow: 0 4px 16px rgba(31, 35, 40, 0.08);
+      --accent: #0284c7;
+      --accent-hover: #0369a1;
+      --accent-soft: rgba(2, 132, 199, 0.08);
+      --accent-text: #0284c7;
+      --success: #059669;
+      --success-soft: rgba(5, 150, 105, 0.08);
+      --warning: #d97706;
+      --warning-soft: rgba(217, 119, 6, 0.08);
+      --danger: #dc2626;
+      --danger-soft: rgba(220, 38, 38, 0.08);
+      --code-bg: #f1f5f9;
+      --code-text: #0369a1;
+      --shadow: 0 2px 14px rgba(0, 0, 0, 0.06);
     }
     * { box-sizing: border-box; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body {
@@ -996,7 +996,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       border-radius: 8px;
       border: 1px solid transparent;
       background: var(--accent);
-      color: #ffffff;
+      color: #07090e;
       font-weight: 600;
       font-size: 12.5px;
       cursor: pointer;
@@ -1004,17 +1004,33 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       align-items: center;
       justify-content: center;
       gap: 6px;
-      transition: all 0.14s ease;
+      transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
       white-space: nowrap;
     }
-    button:hover { background: var(--accent-hover); }
+    [data-theme="light"] button {
+      color: #ffffff;
+    }
+    button:hover:not(:disabled) {
+      filter: brightness(1.1);
+      transform: translateY(-1px);
+    }
+    button:active:not(:disabled) {
+      transform: translateY(0);
+    }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
     button.secondary {
       background: var(--bg-subtle);
       border-color: var(--border);
       color: var(--text);
     }
-    button.secondary:hover { background: var(--card-hover); border-color: var(--border-strong); }
+    [data-theme="light"] button.secondary {
+      color: var(--text);
+    }
+    button.secondary:hover:not(:disabled) {
+      background: var(--card-hover);
+      border-color: var(--border-strong);
+      color: var(--text);
+    }
     button.danger {
       background: var(--danger-soft);
       border-color: rgba(239, 68, 68, 0.3);
@@ -1029,7 +1045,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       border: 1px solid rgba(99, 102, 241, 0.25);
       font-weight: 500;
     }
-    button.chip:hover, button.chip.selected { background: var(--accent); color: #fff; }
+    button.chip:hover, button.chip.selected { background: var(--accent); color: #07090e; }
+    [data-theme="light"] button.chip:hover, [data-theme="light"] button.chip.selected { color: #ffffff; }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -1161,9 +1178,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     let currentLang = localStorage.getItem('paasmcp_lang') || ((navigator.language || '').toLowerCase().startsWith('pt') ? 'pt' : 'en');
     let currentTheme = localStorage.getItem('paasmcp_theme') || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     function applyPrefs() {
+      const isPt = currentLang === 'pt';
       document.documentElement.setAttribute('data-theme', currentTheme);
-      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌙 Dark';
-      document.getElementById('langBtn').textContent = currentLang === 'pt' ? '🇧🇷 PT-BR' : '🇺🇸 EN';
+      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? (isPt ? '☀️ Claro' : '☀️ Light') : (isPt ? '🌙 Escuro' : '🌙 Dark');
+      document.getElementById('langBtn').textContent = isPt ? '🇧🇷 PT-BR' : '🇺🇸 EN';
       const t = I18N_LOGIN[currentLang];
       document.getElementById('loginDesc').textContent = t.desc;
       document.getElementById('token').placeholder = t.placeholder;
@@ -1254,15 +1272,32 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       font-size: 12px;
       font-weight: 600;
       background: var(--success-soft);
-      border: 1px solid rgba(63, 185, 80, 0.35);
+      border: 1px solid rgba(0, 245, 155, 0.35);
       color: var(--success);
     }
-    .engine-status-dot {
+    @keyframes radar-ping {
+      0% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(0, 245, 155, 0.7);
+      }
+      70% {
+        transform: scale(1);
+        box-shadow: 0 0 0 6px rgba(0, 245, 155, 0);
+      }
+      100% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(0, 245, 155, 0);
+      }
+    }
+    .engine-status-dot, .telemetry-title .status-dot {
       width: 7px;
       height: 7px;
       border-radius: 50%;
       background: var(--success);
-      box-shadow: 0 0 8px rgba(63, 185, 80, 0.6);
+      box-shadow: 0 0 8px rgba(0, 245, 155, 0.6);
+      animation: radar-ping 2.2s cubic-bezier(0, 0, 0.2, 1) infinite;
+      display: inline-block;
+      flex-shrink: 0;
     }
 
     /* Horizontal Subnav Tabs */
@@ -1274,13 +1309,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       align-items: center;
       gap: 4px;
       overflow-x: auto;
+      scrollbar-width: thin;
     }
     .nav-tab {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 12px 14px;
-      font-size: 13.5px;
+      gap: 7px;
+      padding: 12px 13px;
+      font-size: 13px;
       font-weight: 500;
       color: var(--muted);
       border-bottom: 2px solid transparent;
@@ -1292,34 +1328,49 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       border-right: none;
       border-radius: 0;
       white-space: nowrap;
-      transition: color 0.15s ease, border-color 0.15s ease;
+      transition: color 0.15s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.15s cubic-bezier(0.4, 0, 0.2, 1), transform 0.15s ease;
     }
     .nav-tab:hover {
       color: var(--text);
       background: transparent;
+      transform: translateY(-1px);
     }
     .nav-tab.active {
-      color: var(--text);
+      color: var(--accent);
       font-weight: 600;
-      border-bottom-color: #f78166;
+      border-bottom-color: var(--accent);
       background: transparent;
+      transform: none;
     }
-    [data-theme="light"] .nav-tab.active {
-      border-bottom-color: #fd8c73;
+    .nav-icon {
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
+      stroke-width: 2;
+      color: var(--muted);
+      transition: color 0.15s ease, stroke 0.15s ease;
+    }
+    .nav-tab:hover .nav-icon {
+      color: var(--text);
+    }
+    .nav-tab.active .nav-icon {
+      color: var(--accent);
     }
     .nav-counter {
       padding: 1px 7px;
-      font-size: 11.5px;
+      font-size: 11px;
       font-weight: 600;
       line-height: 16px;
       border-radius: 10px;
       background: var(--bg-subtle);
       border: 1px solid var(--border);
       color: var(--muted);
+      transition: all 0.15s ease;
     }
     .nav-tab.active .nav-counter {
-      color: var(--text);
-      border-color: var(--border-strong);
+      color: var(--accent);
+      border-color: var(--accent);
+      background: var(--accent-soft);
     }
 
     /* Two-Column Workspace Container */
@@ -1700,57 +1751,73 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       </span>
       <span class="engine-status-pill">
         <span class="engine-status-dot"></span>
-        <span id="topHealthBadge">Engine Online</span>
+        <span id="topHealthBadge">Sistema Online</span>
       </span>
-      <span class="host-badge-capsule" id="topDomainBadge">Domain: -</span>
-      ${safeCfEmail ? `<span class="engine-status-pill" style="color:var(--accent-text);border-color:rgba(47,129,247,0.35);background:var(--accent-soft);">🛡️ Zero Trust: ${safeCfEmail}</span>` : ""}
+      <span class="host-badge-capsule" id="topDomainBadge">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+        <span>Domínio: -</span>
+      </span>
+      ${safeCfEmail ? `<span class="engine-status-pill" style="color:var(--accent-text);border-color:rgba(0,240,255,0.35);background:var(--accent-soft);"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg> Zero Trust: ${safeCfEmail}</span>` : ""}
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <span id="sidebarSubtitle" style="display:none;">Agent-First Micro-PaaS</span>
       <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
-      <button class="secondary" onclick="toggleTheme()" id="themeBtn">☀️ Light</button>
-      <button class="secondary" onclick="loadAll()" id="btnRefresh">🔄 Atualizar</button>
+      <button class="secondary" onclick="toggleTheme()" id="themeBtn">🌙 Escuro</button>
+      <button class="secondary" onclick="loadAll()" id="btnRefresh">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+        <span>Atualizar</span>
+      </button>
       <button class="danger" onclick="logout()" id="btnLogout">Sair</button>
     </div>
   </header>
 
   <!-- Horizontal Subnav Tabs with Counters -->
   <nav class="console-subnav" id="subnavTabs">
+    <button class="nav-tab nav-btn" onclick="switchTab('home', this)" id="navHome">
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+      <span class="nav-label">Início</span>
+    </button>
     <button class="nav-tab nav-btn active" onclick="switchTab('overview', this)" id="navOverview">
-      <span>📦 Aplicações</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
+      <span class="nav-label">Aplicações</span>
       <span class="nav-counter" id="tabCountApps">0</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('databases', this)" id="navDatabases">
-      <span>🗄️ Bancos de Dados</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+      <span class="nav-label">Bancos de Dados</span>
       <span class="nav-counter" id="tabCountDbs">0</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('vault', this)" id="navVault">
-      <span>🔐 Cofre &amp; Chaves</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+      <span class="nav-label">Cofre &amp; Chaves</span>
       <span class="nav-counter" id="tabCountVault">0</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('agents', this)" id="navAgents">
-      <span>🤖 MCP Server &amp; IA</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
+      <span class="nav-label">MCP &amp; IA</span>
       <span class="nav-counter" id="tabCountAgents">15</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('mirror', this)" id="navMirror">
-      <span>🔁 Failover &amp; Espelhos</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+      <span class="nav-label">Segundo Servidor</span>
       <span class="nav-counter" id="tabCountMirror">0</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('pool', this)" id="navPool">
-      <span>🖥️ Ajudantes</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+      <span class="nav-label">Ajudantes</span>
       <span class="nav-counter" id="tabCountPool">0</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('doctor', this)" id="navDoctor">
-      <span>🩺 Diagnóstico</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+      <span class="nav-label">Diagnóstico</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('email', this)" id="navEmail">
-      <span>✉️ E-mail</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
+      <span class="nav-label">E-mail</span>
     </button>
     <button class="nav-tab nav-btn" onclick="switchTab('updates', this)" id="navUpdates">
-      <span>⬆️ Atualizações</span>
-    </button>
-    <button class="nav-tab nav-btn" onclick="switchTab('home', this)" id="navHome">
-      <span>🏠 Início &amp; Setup</span>
+      <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+      <span class="nav-label">Atualizações</span>
     </button>
   </nav>
 
@@ -2512,13 +2579,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupAppDesc: "Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.",
         setupWebhookNote: "Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
-        navOverview: "📦 Aplicações & Deploy",
-        navVault: "🔐 Cofre AES-256-GCM",
-        navDatabases: "🗄️ Bancos & Backups",
-        navDoctor: "🩺 Doctor & Diagnóstico",
-        navAgents: "🤖 Studio IA (MCP) & Guia",
-        topHealthBadge: "● System Online",
-        btnRefresh: "🔄 Atualizar",
+        navHome: "Início",
+        navOverview: "Aplicações",
+        navVault: "Cofre & Chaves",
+        navDatabases: "Bancos de Dados",
+        navDoctor: "Diagnóstico",
+        navAgents: "MCP & IA",
+        navMirror: "Segundo Servidor",
+        navPool: "Ajudantes",
+        navEmail: "E-mail",
+        navUpdates: "Atualizações",
+        topHealthBadge: "Sistema Online",
+        btnRefresh: "Atualizar",
         btnLogout: "Sair",
         appsTitle: "📦 Aplicações Hospedadas & Métricas em Tempo Real",
         appsDesc: "Containers isolados em <code>127.0.0.1:4000-4998</code> com suporte a Rollback em 1s, limites de CPU/RAM e Docker Compose multi-serviço.",
@@ -2720,13 +2792,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupAppDesc: "Save application keys in the scope named after its slug (for example <code>STRIPE_SECRET_KEY</code> or <code>API_KEY</code>), never in <code>system</code>. Select PostgreSQL/Redis during deployment if needed. Then check Logs and run Doctor; expose as Public only services with their own login. Use Zero Trust or Tailscale for admin tools.",
         setupWebhookNote: "Webhook auto-deploy is optional: add the URL shown at the end of the Apps screen to GitHub, select Push events, and use the secret shown by the dashboard. Do not paste tokens into chat; enter them in the Vault.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
-        navOverview: "📦 Applications & Deploy",
-        navVault: "🔐 AES-256-GCM Vault",
-        navDatabases: "🗄️ Databases & Backups",
-        navDoctor: "🩺 Doctor & Diagnostics",
-        navAgents: "🤖 AI Studio (MCP) & Guide",
-        topHealthBadge: "● System Online",
-        btnRefresh: "🔄 Refresh",
+        navHome: "Home",
+        navOverview: "Applications",
+        navVault: "Vault & Secrets",
+        navDatabases: "Databases",
+        navDoctor: "Diagnostics",
+        navAgents: "MCP & AI",
+        navMirror: "Second Server",
+        navPool: "Helpers",
+        navEmail: "Email",
+        navUpdates: "Updates",
+        topHealthBadge: "System Online",
+        btnRefresh: "Refresh",
         btnLogout: "Log out",
         appsTitle: "📦 Hosted Applications & Live Metrics",
         appsDesc: "Isolated containers on <code>127.0.0.1:4000-4998</code> with 1s Rollback, CPU/RAM limits, and multi-service Docker Compose.",
@@ -2916,16 +2993,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     // Plain-language texts (override the older technical ones and add the new screens).
     Object.assign(I18N.pt, {
           "sidebarSubtitle": "Seu servidor de apps",
-          "navHome": "🏠 Início",
-          "navOverview": "📦 Apps",
-          "navDatabases": "🗄️ Dados e cópias",
-          "navVault": "🔐 Senhas e chaves",
-          "navEmail": "✉️ E-mail",
-          "navMirror": "🔁 Segundo servidor",
-          "navUpdates": "⬆️ Atualizações",
-          "navDoctor": "🩺 Diagnóstico",
-          "navAgents": "🤖 Conectar IA",
-          "homeTitle": "🏠 Início",
+          "navHome": "Início",
+          "navOverview": "Aplicações",
+          "navDatabases": "Bancos de Dados",
+          "navVault": "Cofre & Chaves",
+          "navEmail": "E-mail",
+          "navMirror": "Segundo Servidor",
+          "navUpdates": "Atualizações",
+          "navDoctor": "Diagnóstico",
+          "navAgents": "MCP & IA",
+          "navPool": "Ajudantes",
+          "homeTitle": "Início",
           "setupTitle": "🧭 Integrações opcionais",
           "appsTitle": "📦 Seus apps",
           "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app. Quando chega um commit novo, a linha do app mostra a nova versão sendo montada e testada; a versão atual continua no ar até a nova passar no teste.",
@@ -3196,16 +3274,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
     Object.assign(I18N.en, {
           "sidebarSubtitle": "Your app server",
-          "navHome": "🏠 Home",
-          "navOverview": "📦 Apps",
-          "navDatabases": "🗄️ Data & backups",
-          "navVault": "🔐 Passwords & keys",
-          "navEmail": "✉️ Email",
-          "navMirror": "🔁 Second server",
-          "navUpdates": "⬆️ Updates",
-          "navDoctor": "🩺 Diagnostics",
-          "navAgents": "🤖 Connect AI",
-          "homeTitle": "🏠 Home",
+          "navHome": "Home",
+          "navOverview": "Applications",
+          "navDatabases": "Databases",
+          "navVault": "Vault & Secrets",
+          "navEmail": "Email",
+          "navMirror": "Second Server",
+          "navUpdates": "Updates",
+          "navDoctor": "Diagnostics",
+          "navAgents": "MCP & AI",
+          "navPool": "Helpers",
+          "homeTitle": "Home",
           "setupTitle": "🧭 Optional integrations",
           "appsTitle": "📦 Your apps",
           "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app. When a new commit arrives, the app's row shows the new version being built and tested; the current version stays live until the new one passes the test.",
@@ -4025,9 +4104,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     function applyPreferences() {
+      const isPt = currentLang === 'pt';
       document.documentElement.setAttribute('data-theme', currentTheme);
-      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? '☀️ Light' : '🌘 Dark';
-      document.getElementById('langBtn').textContent = currentLang === 'pt' ? '🇧🇷 PT-BR' : '🇺🇸 EN';
+      document.getElementById('themeBtn').textContent = currentTheme === 'dark' ? (isPt ? '☀️ Claro' : '☀️ Light') : (isPt ? '🌙 Escuro' : '🌙 Dark');
+      document.getElementById('langBtn').textContent = isPt ? '🇧🇷 PT-BR' : '🇺🇸 EN';
+      const btnLogout = document.getElementById('btnLogout');
+      if (btnLogout) btnLogout.textContent = isPt ? 'Sair' : 'Log out';
+      const refreshBtn = document.getElementById('btnRefresh');
+      if (refreshBtn) {
+        refreshBtn.innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> <span>\${isPt ? 'Atualizar' : 'Refresh'}</span>\`;
+      }
       document.getElementById('webhookUrlBox').textContent = window.location.origin + '/api/webhooks/github';
       const fedUrlEl = document.getElementById('fedUrl');
       if (fedUrlEl && !fedUrlEl.value) fedUrlEl.value = window.location.origin;
@@ -4040,13 +4126,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const el = document.getElementById(k);
         if (el) {
           const val = t(k);
-          const counter = el.querySelector('.nav-counter');
-          if (counter) {
-            el.innerHTML = '<span>' + esc(val) + '</span> ' + counter.outerHTML;
-          } else if (val.indexOf('<') !== -1 && val.indexOf('>') !== -1) {
-            el.innerHTML = val;
+          const labelSpan = el.querySelector('.nav-label');
+          if (labelSpan) {
+            labelSpan.textContent = val;
           } else {
-            el.textContent = val;
+            const counter = el.querySelector('.nav-counter');
+            if (counter) {
+              el.innerHTML = '<span>' + esc(val) + '</span> ' + counter.outerHTML;
+            } else if (val.indexOf('<') !== -1 && val.indexOf('>') !== -1) {
+              el.innerHTML = val;
+            } else {
+              el.textContent = val;
+            }
           }
         }
       }
@@ -4228,14 +4319,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     setInterval(refreshRelTimes, 20000);
 
     function renderStatusData(s) {
+      const isPt = currentLang === 'pt';
       const domain = getBaseDomain();
-      document.getElementById('topDomainBadge').textContent = '🌐 ' + domain;
+      document.getElementById('topDomainBadge').innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> <span>\${isPt ? 'Domínio' : 'Domain'}: <strong>\${esc(domain)}</strong></span>\`;
       const role = s.federation?.role || 'standalone';
       const peersCount = Object.keys(s.federation?.peers || {}).length;
-      document.getElementById('nodeRoleFooter').textContent = 'Node: ' + role + ' (' + peersCount + ' peers)';
+      const roleLabel = role === 'standalone' ? (isPt ? 'autônomo' : 'standalone') : role;
+      const peersLabel = isPt ? (peersCount === 1 ? '1 par' : peersCount + ' pares') : (peersCount === 1 ? '1 peer' : peersCount + ' peers');
+      document.getElementById('nodeRoleFooter').textContent = (isPt ? 'Nó: ' : 'Node: ') + roleLabel + ' (' + peersLabel + ')';
 
       const elHostname = document.getElementById('topHostname');
       if (elHostname) elHostname.textContent = s.hostname || '-';
+
+      const elHealth = document.getElementById('topHealthBadge');
+      if (elHealth) elHealth.textContent = isPt ? 'Sistema Online' : 'System Online';
 
       // Parse disk info
       let diskTotal = '-';
@@ -4272,10 +4369,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const elTabPool = document.getElementById('tabCountPool');
       if (elTabPool) elTabPool.textContent = Object.keys(s.pool || {}).length;
 
+      const roleBadge = role === 'standalone' ? (isPt ? 'AUTÔNOMO' : 'STANDALONE') : role.toUpperCase();
+      const tailscaleVal = s.tailscaleDomain || (s.federation?.peers ? (isPt ? 'Rede Ativa' : 'Tailnet Active') : '127.0.0.1');
+      const dockerVal = isPt ? 'Ativo (27.x)' : 'Live (27.x)';
+      const daemonOverheadVal = isPt ? '0 MB Ocioso' : '0 MB Idle';
+      const backupsCount = s.backupsCount || 0;
+      const backupsUnit = isPt ? (backupsCount === 1 ? 'cópia' : 'cópias') : (backupsCount === 1 ? 'backup' : 'backups');
+
       document.getElementById('statsGrid').innerHTML = \`
         <div class="telemetry-card">
           <div class="telemetry-title">
-            <span>Host Telemetry</span>
+            <span>\${isPt ? 'Telemetria do Host' : 'Host Telemetry'}</span>
             <span class="status-dot"></span>
           </div>
           <div class="telemetry-item">
@@ -4284,29 +4388,29 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           </div>
           <div class="telemetry-item">
             <span>Tailscale</span>
-            <span class="telemetry-val">\${esc(s.tailscaleDomain || (s.federation?.peers ? 'Tailnet Active' : '127.0.0.1'))}</span>
+            <span class="telemetry-val">\${esc(tailscaleVal)}</span>
           </div>
           <div class="telemetry-item">
-            <span>Docker Engine</span>
-            <span class="telemetry-val">Live (27.x)</span>
+            <span>\${isPt ? 'Motor Docker' : 'Docker Engine'}</span>
+            <span class="telemetry-val" style="color:var(--success);font-weight:600;">\${dockerVal}</span>
           </div>
           <div class="telemetry-item">
-            <span>Platform</span>
+            <span>\${isPt ? 'Plataforma' : 'Platform'}</span>
             <span class="telemetry-val" style="font-size:11px;" title="\${esc(s.platform)}">\${esc((s.platform || '').split(' ')[0])}</span>
           </div>
           <div class="telemetry-item">
-            <span>SSH Fingerprint</span>
+            <span>\${isPt ? 'Impressão SSH' : 'SSH Fingerprint'}</span>
             <span class="telemetry-val" style="font-size:11px;">\${esc((s.sshKeyFingerprint || '').slice(0, 16))}...</span>
           </div>
           <div class="telemetry-item">
-            <span>Cluster Role</span>
-            <span class="badge" style="font-size:10px;padding:1px 6px;">\${esc(role.toUpperCase())}</span>
+            <span>\${isPt ? 'Papel no Cluster' : 'Cluster Role'}</span>
+            <span class="badge" style="font-size:10px;padding:2px 7px;">\${esc(roleBadge)}</span>
           </div>
         </div>
 
         <div class="telemetry-card">
           <div class="telemetry-title">
-            <span>Resource Usage</span>
+            <span>\${isPt ? 'Uso de Recursos' : 'Resource Usage'}</span>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
           </div>
           <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
@@ -4318,7 +4422,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           </div>
 
           <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
-            <span>Disk (\${diskTotal === '-' ? '-' : diskUsed + ' / ' + diskTotal})</span>
+            <span>\${isPt ? 'Disco' : 'Disk'} (\${diskTotal === '-' ? '-' : diskUsed + ' / ' + diskTotal})</span>
             <span class="telemetry-val">\${diskPercent}%</span>
           </div>
           <div class="progress-track">
@@ -4330,12 +4434,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <span class="telemetry-val">\${esc(s.cpus)} vCPUs</span>
           </div>
           <div class="telemetry-item">
-            <span>Daemon Overhead</span>
-            <span class="telemetry-val" style="color:var(--success);">0 MB Idle</span>
+            <span>\${isPt ? 'Sobrecarga do Daemon' : 'Daemon Overhead'}</span>
+            <span class="telemetry-val" style="color:var(--success);font-weight:600;">\${daemonOverheadVal}</span>
           </div>
           <div class="telemetry-item">
-            <span>Snapshots</span>
-            <span class="telemetry-val">\${esc(s.backupsCount || 0)} backups</span>
+            <span>\${isPt ? 'Instantâneos' : 'Snapshots'}</span>
+            <span class="telemetry-val">\${esc(backupsCount)} \${backupsUnit}</span>
           </div>
         </div>
       \`;
