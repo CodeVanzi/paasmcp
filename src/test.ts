@@ -432,7 +432,8 @@ volumes:
     assert.match(token, /^pmcp_[0-9a-f]{8}_/);
     assert.equal(tokens.verifyToken(token)?.level, "read");
     assert.equal(tokens.verifyToken(token + "x"), null);
-    assert.equal(JSON.stringify(tokens.listTokens()).includes(token.split("_")[2]), false);
+    // The secret is base64url and may itself contain "_": take everything after "pmcp_<id>_".
+    assert.equal(JSON.stringify(tokens.listTokens()).includes(token.slice("pmcp_".length + 9)), false);
     assert.equal(tokens.levelAllows("deploy", "read"), true);
     assert.equal(tokens.levelAllows("deploy", "destroy"), false);
     assert.equal(tokens.revokeToken(record.id), true);
