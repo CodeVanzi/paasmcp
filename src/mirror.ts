@@ -156,6 +156,19 @@ function moveAside(dir: string, why: string): string {
   return dest;
 }
 
+function dirHasEntries(dir: string): boolean {
+  try {
+    return fs.readdirSync(dir).length > 0;
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code === "EACCES") {
+      // Postgres data dir is mode 0700 owned by container postgres (UID 70).
+      // If we get EACCES reading it, it exists and has content.
+      return true;
+    }
+    return false;
+  }
+}
+
 /** Primary side: lets `peerName` stream this server's Postgres and store its backups here. Returns a one-hour token. */
 export async function offerMirror(opts: {
   peerName: string;
@@ -286,7 +299,7 @@ export function acceptMirror(
       ensureSharedPostgresCluster();
     }
   } else {
-    if (fs.existsSync(dataDir) && fs.readdirSync(dataDir).length > 0) {
+    if (fs.existsSync(dataDir) && dirHasEntries(dataDir)) {
       // Only a copy that was promoted and then handed back, or that another server's takeover left
       // behind, is stale; any other copy may be the last one.
       // (A takeover that another server took over in turn may hold this server's last writes: kept aside.)
