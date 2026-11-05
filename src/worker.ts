@@ -11,6 +11,9 @@ import {
   imageFingerprint,
   normalizeArch,
   cpuCgroupPath,
+  defaultRouteIface,
+  LanFacts,
+  normalizeMac,
   OWNER_MAX_WINDOW_MS,
   OWNER_MIN_WINDOW_MS,
   OwnerReading,
@@ -24,6 +27,7 @@ import {
   validateCopySpec,
   validateIpv4,
   WORKER_HOME,
+  WOL_MARKER,
   WORKER_RUN_DIR,
   WorkerCopy,
   WorkerFacts,
@@ -140,6 +144,7 @@ function envFileOf(copyId: string): string {
 }
 
 export function facts(cfg: WorkerConfig): WorkerFacts {
+  const lan = lanFacts();
   let arch = os.arch();
   let dockerVersion = "";
   let diskFreeGb = 0;
@@ -170,7 +175,36 @@ export function facts(cfg: WorkerConfig): WorkerFacts {
     workerVersion: workerVersion(),
     load1: Math.round(os.loadavg()[0] * 100) / 100,
     secretsInMemory: secretsInMemory(),
+    ...(lan ? { lan } : {}),
   };
+}
+
+const SYS_NET = () => process.env.PAASMCP_WORKER_SYS_NET || "/sys/class/net";
+
+/**
+ * Wake-on-LAN: the card of the default route, read without root (/proc/net/route, /sys/class/net and the
+ * marker `pool wake-setup` leaves). Nothing when the PC has no default route or the card has no IPv4.
+ */
+export function lanFacts(): LanFacts | undefined {
+  try {
+    const iface = defaultRouteIface(fs.readFileSync(process.env.PAASMCP_WORKER_PROC_ROUTE || "/proc/net/route", "utf-8"));
+    if (!iface) return undefined;
+    const dir = path.join(SYS_NET(), iface);
+    const mac = normalizeMac(fs.readFileSync(path.join(dir, "address"), "utf-8"));
+    const addr = (os.networkInterfaces()[iface] || []).find((a) => a.family === "IPv4" && !a.internal && a.cidr);
+    if (!addr?.cidr) return undefined;
+    const wired = !fs.existsSync(path.join(dir, "wireless")) && !fs.existsSync(path.join(dir, "phy80211"));
+    let armed = false;
+    try {
+      const m = JSON.parse(fs.readFileSync(process.env.PAASMCP_WORKER_WOL_MARKER || WOL_MARKER, "utf-8"));
+      armed = m?.iface === iface && m?.mac === mac;
+    } catch {
+      // never armed here
+    }
+    return { iface, mac, ip: addr.address, prefix: Number(addr.cidr.split("/")[1]), wired, armed };
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------- courteous mode: how much the owner uses this PC ----------

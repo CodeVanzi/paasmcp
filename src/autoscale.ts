@@ -200,11 +200,13 @@ export async function applyStep(d: StepDecision, opts: { log?: (l: string) => vo
         let running: number;
         let started: string[] = [];
         let stopped: string[] = [];
+        let waking: string[] = [];
         try {
           const r = await setCopies(slug, to, { by: "decider", log, fromDecider: true });
           running = r.running;
           started = "started" in r ? r.started.map((x) => x.helper) : [];
           stopped = "stopped" in r ? r.stopped.map((x) => x.helper) : [];
+          waking = "waking" in r ? r.waking : [];
         } catch (err) {
           log(msg(err));
           running = realCopies(loadState().apps[slug]);
@@ -212,9 +214,11 @@ export async function applyStep(d: StepDecision, opts: { log?: (l: string) => vo
           return { done: false, running, held: to > d.from ? "start_failed" : "stop_failed" };
         }
         if (to > d.from && running < to) {
-          // Fewer copies could run than asked: ask only for those, and try again after a wait.
+          // Fewer copies could run than asked: ask only for those, and try again after a wait (short when
+          // a sleeping PC is waking up for it: Wake-on-LAN).
           patchCopies(slug, Math.max(running, d.from));
           const last = loadState().apps[slug]?.pool?.lastError;
+          if (waking.length && !last) return { done: false, running: Math.max(running, d.from), held: "waking", started, p: { helper: waking[0] } };
           return { done: false, running: Math.max(running, d.from), held: last ? "start_failed" : "no_room", started };
         }
         return { done: true, running, started, stopped };
