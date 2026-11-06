@@ -254,7 +254,8 @@ paasmcp backup target                        # show it (no secret), 'test' or 'c
 # The other way round: let another computer keep ITS backups on this server's Garage, over Tailscale
 paasmcp backup grant laptop --max-gb 50      # one bucket + one key for it, shown once (code + fields)
 paasmcp backup grants                        # list with space used; 'paasmcp backup revoke laptop'
-sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
+sudo paasmcp backup install-timer --hour 3   # optional: the dashboard container already runs this every night from 3:30 (server time)
+                                             # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
 paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
 paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it
 

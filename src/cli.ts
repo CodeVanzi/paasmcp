@@ -874,7 +874,7 @@ async function runCli() {
       } else if (sub === "prune") {
         console.log(JSON.stringify(pruneLocalBackups(days), null, 2));
       } else if (sub === "nightly") {
-        console.log(JSON.stringify(await runNightlyBackup(days), null, 2));
+        console.log(JSON.stringify(await runNightlyBackup(days, { ifDue: rest.includes("--if-due") }), null, 2));
       } else if (sub === "install-timer") {
         console.log(JSON.stringify(installBackupTimer(Number(getFlagValue(rest, "--hour") || 3)), null, 2));
       } else if (sub === "target") {

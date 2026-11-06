@@ -4021,6 +4021,7 @@ volumes:
       for (const k of ["lifePoolUpdating", "lifePoolFailed", "lifeErrNoPrevious", "lifeErr", "logsEmpty", "logsHint", "actionRollbackTip"]) twice(k);
       assert.ok(!page.includes("showToast('✅ ' + data.output)"));
       // The app list speaks plainly: no bare 127.0.0.1 pill, no raw access mode, no English limits.
+      for (const k of ["nbNone", "nbRunning", "nbOk", "nbErr", "nbOffsiteOk", "nbOffsiteFailed", "nbOffsiteNone", "nbNext"]) twice(k);
       for (const k of ["sub_connect_alerts", "ntTitle", "ntDesc", "ntHowNtfy", "ntHowDiscord", "ntHowSlack", "ntSave", "ntOnDesc", "tut_alerts", "tut_alertsDesc"]) twice(k);
       for (const k of ["appNoAddressTip", "pillLocalOnly", "mode_public", "mode_zero-trust", "mode_tailscale", "limitsLabel"]) twice(k);
       assert.ok(!page.includes("(Limits: "));
@@ -4165,6 +4166,31 @@ volumes:
     const { dir } = tpl.prepareTemplate("it-tools");
     assert.ok(fs.existsSync(path.join(dir, "docker-compose.yml")));
     assert.ok(dir.startsWith(tpl.TEMPLATES_DIR));
+  });
+
+  await t.test("50. Nightly backup without a systemd timer: due once a day from 3h, a mark that stops a second run", async () => {
+    const nightly = await import("./nightly.js");
+    const backup = await import("./backup.js");
+    const at = (h: number, m = 0) => new Date(2026, 10, 6, h, m);
+    assert.equal(nightly.nightlyDue(at(2, 59), undefined), false, "not before 3h");
+    assert.equal(nightly.nightlyDue(at(3, 0), undefined), true);
+    assert.equal(nightly.nightlyDue(at(3, 10), undefined, 30), false, "the dashboard waits until 3:30");
+    assert.equal(nightly.nightlyDue(at(3, 30), undefined, 30), true);
+    assert.equal(nightly.nightlyDue(at(14, 0), "2026-11-05"), true, "a dashboard that was off at night catches up");
+    assert.equal(nightly.nightlyDue(at(23, 0), "2026-11-06"), false, "once a day");
+    assert.equal(nightly.localDate(at(1)), "2026-11-06");
+    fs.rmSync(nightly.NIGHTLY_MARK, { force: true });
+    const first = await backup.runNightlyBackup(7, { ifDue: true });
+    assert.ok(!("skipped" in first));
+    const mark = nightly.readNightlyMark()!;
+    assert.equal(mark.date, nightly.localDate(new Date()));
+    assert.ok(mark.finishedAt && typeof mark.created === "number");
+    assert.ok(["ok", "failed", "not-configured"].includes(String(mark.offsite)), "off-site state recorded");
+    const second = await backup.runNightlyBackup(7, { ifDue: true });
+    assert.match(String((second as { skipped?: string }).skipped), /already ran today/);
+    // Without --if-due (a person or the systemd timer asked for it) it runs anyway.
+    assert.ok(!("skipped" in (await backup.runNightlyBackup(7))));
+    fs.rmSync(nightly.NIGHTLY_MARK, { force: true });
   });
 
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {

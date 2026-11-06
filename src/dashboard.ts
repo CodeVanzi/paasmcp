@@ -64,6 +64,7 @@ import { getSystemStatusSummary } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
 import { startPollLoop } from "./pollloop.js";
 import { startAppWatch } from "./appwatch.js";
+import { startNightlyLoop } from "./nightly.js";
 import {
   deleteSecretKey,
   getSecrets,
@@ -1053,6 +1054,9 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   // ...and it notices apps that stop on their own (a notice only when Connections → Notices is set up).
   const stopWatch = startAppWatch();
   server.on("close", stopWatch);
+  // ...and it makes the nightly backup, so no systemd timer has to be installed by hand.
+  const stopNightly = startNightlyLoop();
+  server.on("close", stopNightly);
   return server;
 }
 
@@ -1252,6 +1256,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
     .dep-pick { margin: -4px 0 14px; max-width: 520px; }
     .nt-list { margin: 0 0 12px; padding-left: 18px; }
+    .bak-nightly { font-size: 12.5px; margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: var(--bg-subtle); border: 1px solid var(--border); line-height: 1.5; }
+    .bak-nightly.err { border-color: var(--danger); }
     .tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
     .tpl-item { border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
     .tpl-item strong { font-size: 13.5px; }
@@ -2594,6 +2600,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   </select>
                 </div>
               </div>
+              <div id="bakNightly" class="bak-nightly"></div>
               <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Fazer uma cópia agora</button>
               <div id="backupsList"></div>
             </div>
@@ -5426,6 +5433,48 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       }
     }
 
+    Object.assign(I18N.pt, {
+      "nbNone": "🌙 Cópia automática: uma por noite, a partir das 3h30 (horário do servidor), de todos os bancos e dados dos apps. Ainda não houve nenhuma.",
+      "nbRunning": "🌙 Cópia automática em andamento desde {when}.",
+      "nbOk": "🌙 Última cópia automática: {when}, {n} arquivo(s).",
+      "nbErr": "🌙 Última cópia automática: {when}, com {n} erro(s). Primeiro: {first}",
+      "nbOffsiteOk": "Enviada para fora do servidor.",
+      "nbOffsiteFailed": "O envio para fora do servidor falhou.",
+      "nbOffsiteNone": "Ficou só neste servidor: configure “Cópias fora do servidor” para não perder tudo se ele quebrar.",
+      "nbNext": "Próxima: toda noite, a partir das 3h30."
+    });
+    Object.assign(I18N.en, {
+      "nbNone": "🌙 Automatic copy: one per night, from 3:30 (server time), of every database and app data. None yet.",
+      "nbRunning": "🌙 Automatic copy running since {when}.",
+      "nbOk": "🌙 Last automatic copy: {when}, {n} file(s).",
+      "nbErr": "🌙 Last automatic copy: {when}, with {n} error(s). First: {first}",
+      "nbOffsiteOk": "Sent off the server.",
+      "nbOffsiteFailed": "Sending it off the server failed.",
+      "nbOffsiteNone": "It stayed only on this server: set up “Off-server backups” so a broken server does not take everything.",
+      "nbNext": "Next: every night, from 3:30."
+    });
+
+    function renderNightly(nb) {
+      const box = document.getElementById('bakNightly');
+      if (!box) return;
+      const when = function (iso) { try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return iso; } };
+      let html;
+      let err = false;
+      if (!nb) html = esc(t('nbNone'));
+      else if (!nb.finishedAt) html = esc(t('nbRunning').split('{when}').join(when(nb.startedAt)));
+      else {
+        const errs = nb.errors || [];
+        err = errs.length > 0 || nb.offsite === 'failed';
+        html = esc(errs.length
+          ? t('nbErr').split('{when}').join(when(nb.finishedAt)).split('{n}').join(String(errs.length)).split('{first}').join(String(errs[0]).slice(0, 200))
+          : t('nbOk').split('{when}').join(when(nb.finishedAt)).split('{n}').join(String(nb.created || 0)));
+        const off = nb.offsite === 'ok' ? t('nbOffsiteOk') : nb.offsite === 'failed' ? t('nbOffsiteFailed') : t('nbOffsiteNone');
+        html += ' ' + esc(off) + (nb.offsite === 'not-configured' ? ' <a href="#databases/offsite">→</a>' : '') + '<br><span style="color:var(--muted);">' + esc(t('nbNext')) + '</span>';
+      }
+      box.className = 'bak-nightly' + (err ? ' err' : '');
+      box.innerHTML = html;
+    }
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -6275,6 +6324,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">🗄️ <strong>\${esc(d.name)}</strong> (\${esc(d.engine)}) → DB: <code>\${esc(d.dbName)}</code> | User: <code>\${esc(d.dbUser)}</code></div>\`).join('')
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>';
 
+      renderNightly(s.nightlyBackup);
       const backups = s.backups || [];
       document.getElementById('backupsList').innerHTML = backups.length
         ? backups.map(b => \`

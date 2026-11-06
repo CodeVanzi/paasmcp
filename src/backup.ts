@@ -12,6 +12,8 @@ import {
   saveState,
 } from "./config.js";
 import { backupDatabase } from "./database.js";
+import { localDate, readNightlyMark, writeNightlyMark } from "./nightly.js";
+import { sendNotice } from "./notify.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets } from "./vault.js";
 
 export const VOLUME_HELPER_IMAGE = "alpine:3.20";
@@ -327,7 +329,12 @@ export function pruneLocalBackups(retentionDays = 7, now = Date.now()): { pruned
 // Nightly run and systemd timer
 // ---------------------------------------------------------------------------
 
-export async function runNightlyBackup(retentionDays = 7): Promise<Record<string, unknown>> {
+export async function runNightlyBackup(retentionDays = 7, opts: { ifDue?: boolean } = {}): Promise<Record<string, unknown>> {
+  // The mark is written first, so a systemd timer and the dashboard never both run on the same day.
+  const today = localDate(new Date());
+  if (opts.ifDue && readNightlyMark()?.date === today) return { skipped: `already ran today (${today})` };
+  const startedAt = new Date().toISOString();
+  writeNightlyMark({ date: today, startedAt });
   const state = loadState();
   const created: string[] = [];
   const errors: string[] = [];
@@ -347,6 +354,20 @@ export async function runNightlyBackup(retentionDays = 7): Promise<Record<string
   }
   const offsite = getOffsiteConfig() ? await syncOffsite() : "not configured: backups stay only on this server";
   const prune = getOffsiteConfig() ? pruneLocalBackups(retentionDays) : { pruned: [], keptNotOffsite: 0 };
+  const offsiteState =
+    typeof offsite === "string" ? "not-configured" : offsite.failed.length ? "failed" : "ok";
+  const failures = [...errors, ...(typeof offsite === "string" ? [] : offsite.failed.map((f) => `${f.id}: ${f.error}`))];
+  writeNightlyMark({ date: today, startedAt, finishedAt: new Date().toISOString(), created: created.length, errors: failures.slice(0, 20), offsite: offsiteState });
+  if (failures.length) {
+    await sendNotice(
+      (lang) =>
+        lang === "en"
+          ? { title: "Nightly backup had errors", text: `⚠️ The nightly backup had ${failures.length} error(s). First: ${failures[0].slice(0, 300)}\nSee Databases → Backups on the dashboard.` }
+          : { title: "Backup da noite com erros", text: `⚠️ O backup da noite teve ${failures.length} erro(s). Primeiro: ${failures[0].slice(0, 300)}\nVeja Bancos → Backups no painel.` },
+      "backup.nightly",
+      "backup"
+    );
+  }
   return { created, errors, offsite, prune };
 }
 
