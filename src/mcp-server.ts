@@ -48,6 +48,7 @@ import {
   deployApp,
   getContainerMetrics,
   manageAppLifecycle,
+  readDockerStats,
   runPaaSDoctor,
 } from "./deployer.js";
 import { exposeApplication, releaseAddresses } from "./exposure.js";
@@ -61,7 +62,8 @@ import {
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { levelAllows, TokenLevel } from "./tokens.js";
-import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setScaleRule } from "./scale.js";
+import { cpuSample, hostResources } from "./resources.js";
+import { DiaryLang, parseDockerStats, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setScaleRule } from "./scale.js";
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy } from "./pool.js";
 import { setWake } from "./wake.js";
@@ -77,12 +79,22 @@ import {
   setSecretFromFile,
 } from "./vault.js";
 
+/** One `docker stats` call feeds both the per-app numbers and the server split; CPU is read around it. */
+export function resourceSnapshot(includeMetrics = true) {
+  const cpuBefore = cpuSample();
+  const out = includeMetrics ? readDockerStats() : "";
+  return {
+    containerMetrics: includeMetrics ? getContainerMetrics(out) : {},
+    resources: hostResources({ cpuBefore, stats: parseDockerStats(out), statsRan: includeMetrics && out.trim() !== "" }),
+  };
+}
+
 export function getSystemStatusSummary(includeMetrics = true) {
   ensureDirectories();
   const state = loadState();
   const keyInfo = getOrCreateSshDeployKey();
   const sysSecrets = listMaskedSecrets("system");
-  const containerMetrics = includeMetrics ? getContainerMetrics() : {};
+  const { containerMetrics, resources } = resourceSnapshot(includeMetrics);
 
   let diskFree = "unknown";
   try {
@@ -102,6 +114,8 @@ export function getSystemStatusSummary(includeMetrics = true) {
     totalMemGb: +(os.totalmem() / 1024 ** 3).toFixed(2),
     freeMemGb: +(os.freemem() / 1024 ** 3).toFixed(2),
     rootDisk: diskFree,
+    /** Whole server vs. PaaSMCP's containers vs. everything else (resources.ts). */
+    resources,
     paasDataDir: PAAS_DATA_DIR,
     paasAppsDir: PAAS_APPS_DIR,
     paasBackupsDir: PAAS_BACKUPS_DIR,

@@ -588,6 +588,15 @@ with the menu counter and a one-line lead (`lead_<tab>`); anything with `data-ti
 Opening and closing the menu, its sections and the phone drawer are animated (off with reduced motion). The light theme uses blue-grey tones, not
 white.
 
+The **Resource usage** card (`src/resources.ts`) shows the whole server split in two: **PaaSMCP** (every `paasmcp-*`
+container: apps, copies, shared databases, the dashboard) and **Others** (the system, other programs and other
+containers), plus what is free. CPU is the share of all cores, read from `os.cpus()` around the same `docker stats`
+call that feeds the per-app numbers (`resourceSnapshot` in mcp-server.ts), so both describe the same second; memory
+uses `MemAvailable`; the disk is the one holding `PAASMCP_ROOT` (`statfs`, no `df` parsing). `/proc/stat`,
+`/proc/meminfo` and the bind-mounted data folder describe the host, so the numbers are the same inside the dashboard
+container. The card refreshes every 15 s from `GET /api/resources` while the page is visible. PaaSMCP's share is
+capped at the server's total, since the two readings come from different sources a moment apart.
+
 ## 11. Environment variables
 
 | Variable | Default | Purpose |

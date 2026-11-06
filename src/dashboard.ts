@@ -61,7 +61,7 @@ import {
   registerFederationPeer,
   verifyGitHubWebhookSignature,
 } from "./federation.js";
-import { getSystemStatusSummary } from "./mcp-server.js";
+import { getSystemStatusSummary, resourceSnapshot } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
 import { startPollLoop } from "./pollloop.js";
 import { startAppWatch } from "./appwatch.js";
@@ -381,6 +381,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
+          return true;
+        }
+
+        // Live numbers for the Resource usage card (polled while the page is open), lighter than /api/status.
+        if (pathname === "/api/resources" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(resourceSnapshot(true)));
           return true;
         }
 
@@ -1842,6 +1849,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .progress-fill.danger {
       background: var(--danger);
     }
+    .progress-track.stacked { display: flex; }
+    .progress-track .seg { height: 100%; transition: width 0.3s ease; }
+    .progress-track .seg.paas { background: var(--accent); }
+    .progress-track .seg.other { background: var(--muted); opacity: 0.55; }
+    .res-legend { font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; margin: -4px 0 10px; }
+    .res-legend .res-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -0.5px; }
+    .res-legend .res-dot.paas { background: var(--accent); }
+    .res-legend .res-dot.other { background: var(--muted); opacity: 0.55; }
+    .res-hint { font-size: 11px; color: var(--muted); line-height: 1.45; margin: 2px 0 8px; }
 
     .telemetry-card button.health-row {
       width: 100%; background: transparent; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; box-shadow: none;
@@ -4569,6 +4585,22 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "cntPoolOne": "1 PC ajudante",
           "cntAgents": "{n} ferramentas MCP disponíveis",
           "cntAgentsOne": "1 ferramenta MCP disponível",
+          "resTitle": "Uso de Recursos",
+          "resCpu": "Processador agora",
+          "resMem": "Memória",
+          "resDisk": "Disco",
+          "resPaas": "PaaSMCP",
+          "resOthers": "Outros",
+          "resFree": "{v} livres",
+          "resCores": "{n} núcleos",
+          "resCoreOne": "1 núcleo",
+          "resHint": "PaaSMCP soma seus apps, os bancos e o próprio painel. Outros é o resto do servidor: o sistema e programas fora do PaaSMCP.",
+          "resTopTip": "Quem mais usa memória:",
+          "resMeasuring": "Medindo o servidor...",
+          "resMeasuringShort": "medindo...",
+          "resSnapshots": "Instantâneos",
+          "resSnapshotsOne": "1 cópia",
+          "resSnapshotsN": "{n} cópias",
           "healthTitle": "Saúde rápida",
           "healthBackup": "Última cópia",
           "healthOffsite": "Cópia fora do servidor",
@@ -4628,6 +4660,22 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "cntPoolOne": "1 helper PC",
           "cntAgents": "{n} MCP tools available",
           "cntAgentsOne": "1 MCP tool available",
+          "resTitle": "Resource Usage",
+          "resCpu": "Processor now",
+          "resMem": "Memory",
+          "resDisk": "Disk",
+          "resPaas": "PaaSMCP",
+          "resOthers": "Others",
+          "resFree": "{v} free",
+          "resCores": "{n} cores",
+          "resCoreOne": "1 core",
+          "resHint": "PaaSMCP adds up your apps, the databases and the dashboard itself. Others is the rest of the server: the system and programs outside PaaSMCP.",
+          "resTopTip": "Using the most memory:",
+          "resMeasuring": "Measuring the server...",
+          "resMeasuringShort": "measuring...",
+          "resSnapshots": "Snapshots",
+          "resSnapshotsOne": "1 backup",
+          "resSnapshotsN": "{n} backups",
           "healthTitle": "Quick health",
           "healthBackup": "Last backup",
           "healthOffsite": "Off-server backup",
@@ -6276,6 +6324,96 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       return { state: down.length ? 'stopped' : 'on', names: names, copyNames: copyNames, down: down.filter(function (n, i) { return down.indexOf(n) === i; }) };
     }
 
+    // Resource usage card: whole server, split into PaaSMCP's containers and everything else.
+    // Live numbers come from /api/resources every 15 s while the page is visible.
+    let liveResources = null;
+    function fmtResBytes(b) {
+      if (b === null || b === undefined) return '-';
+      if (b >= 1e12) return fmtNum(b / 1e12, 1) + ' TB';
+      if (b >= 1e9) return fmtNum(b / 1e9, 1) + ' GB';
+      return fmtNum(b / 1e6, 0) + ' MB';
+    }
+    function pctNum(n) { return fmtNum(n, n < 10 ? 1 : 0) + '%'; }
+    function toneOf(pct) { return pct > 85 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--text)'; }
+    function stackedBar(paasPct, otherPct) {
+      const p = Math.max(0, Math.min(100, paasPct));
+      const o = Math.max(0, Math.min(100 - p, otherPct));
+      return '<div class="progress-track stacked"><div class="seg paas" style="width:' + p.toFixed(1) + '%;"></div>' +
+        '<div class="seg other" style="width:' + o.toFixed(1) + '%;"></div></div>';
+    }
+    function resourcesCardHtml(s) {
+      const r = (liveResources && liveResources.resources) || s.resources;
+      const backupsCount = s.backupsCount || 0;
+      const head = '<div class="telemetry-card" id="resourcesCard"><div class="telemetry-title"><span>' + esc(t('resTitle')) + '</span>' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg></div>';
+      const snapshots = '<div class="telemetry-item"><span>' + esc(t('resSnapshots')) + '</span><span class="telemetry-val">' +
+        esc(t(backupsCount === 1 ? 'resSnapshotsOne' : 'resSnapshotsN').replace('{n}', String(backupsCount))) + '</span></div>';
+      if (!r) return head + '<div class="res-hint">' + esc(t('resMeasuring')) + '</div>' + snapshots + '</div>';
+      const top = (r.top || []).filter(function (c) { return c.memBytes; })
+        .map(function (c) { return c.name.replace(/^paasmcp-/, '') + ': ' + fmtResBytes(c.memBytes); }).join(' · ');
+      const legend = function (paas, other, extra) {
+        return '<div class="res-legend">' +
+          '<span' + (top ? ' title="' + esc(t('resTopTip') + ' ' + top) + '"' : '') + '><span class="res-dot paas"></span>' + esc(t('resPaas')) + ' ' + esc(paas) + '</span>' +
+          '<span><span class="res-dot other"></span>' + esc(t('resOthers')) + ' ' + esc(other) + '</span>' +
+          (extra ? '<span>' + esc(extra) + '</span>' : '') + '</div>';
+      };
+      let html = head;
+
+      // Processor
+      const cpu = r.cpu || {};
+      const cpuPct = cpu.usedPercent;
+      html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resCpu')) + '</span>' +
+        '<span class="telemetry-val" style="color:' + (cpuPct === null || cpuPct === undefined ? 'var(--muted)' : toneOf(cpuPct)) + ';">' +
+        esc(cpuPct === null || cpuPct === undefined ? t('resMeasuringShort') : pctNum(cpuPct)) + '</span></div>';
+      const coresTxt = t(cpu.cores === 1 ? 'resCoreOne' : 'resCores').replace('{n}', String(cpu.cores || '-'));
+      if (cpu.split) {
+        html += stackedBar(cpu.split.paasmcp, cpu.split.others) + legend(pctNum(cpu.split.paasmcp), pctNum(cpu.split.others), coresTxt);
+      } else {
+        html += stackedBar(0, cpuPct || 0) + '<div class="res-legend"><span>' + esc(coresTxt) + '</span></div>';
+      }
+
+      // Memory
+      const mem = r.memory || {};
+      const memPct = mem.totalBytes ? (mem.usedBytes / mem.totalBytes) * 100 : 0;
+      html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resMem')) + ' (' + esc(fmtResBytes(mem.usedBytes)) + ' / ' + esc(fmtResBytes(mem.totalBytes)) + ')</span>' +
+        '<span class="telemetry-val" style="color:' + toneOf(memPct) + ';">' + esc(pctNum(memPct)) + '</span></div>';
+      const freeTxt = t('resFree').replace('{v}', fmtResBytes(mem.availableBytes));
+      if (mem.split && mem.totalBytes) {
+        html += stackedBar((mem.split.paasmcp / mem.totalBytes) * 100, (mem.split.others / mem.totalBytes) * 100) +
+          legend(fmtResBytes(mem.split.paasmcp), fmtResBytes(mem.split.others), freeTxt);
+      } else {
+        html += stackedBar(0, memPct) + '<div class="res-legend"><span>' + esc(freeTxt) + '</span></div>';
+      }
+
+      // Disk (the one holding the apps' data)
+      const d = r.disk;
+      if (d) {
+        html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resDisk')) + ' (' + esc(fmtResBytes(d.usedBytes)) + ' / ' + esc(fmtResBytes(d.totalBytes)) + ')</span>' +
+          '<span class="telemetry-val" style="color:' + toneOf(d.usedPercent) + ';">' + esc(d.usedPercent + '%') + '</span></div>' +
+          '<div class="progress-track"><div class="progress-fill ' + (d.usedPercent > 85 ? 'danger' : d.usedPercent > 70 ? 'warning' : '') + '" style="width:' + d.usedPercent + '%;"></div></div>' +
+          '<div class="res-legend"><span>' + esc(t('resFree').replace('{v}', fmtResBytes(d.freeBytes))) + '</span></div>';
+      }
+      if (cpu.split || mem.split) html += '<div class="res-hint">' + esc(t('resHint')) + '</div>';
+      return html + snapshots + '</div>';
+    }
+    let resourcesTimer = null;
+    async function pollResources() {
+      clearTimeout(resourcesTimer);
+      try {
+        if (document.visibilityState === 'visible' && lastStatus) {
+          const res = await rawFetch('/api/resources');
+          if (res.ok) {
+            liveResources = await res.json();
+            const card = document.getElementById('resourcesCard');
+            if (card) card.outerHTML = resourcesCardHtml(lastStatus);
+          }
+        }
+      } catch {
+        // offline for a moment: try again later
+      }
+      resourcesTimer = setTimeout(pollResources, 15000);
+    }
+
     // "Quick health" box in the telemetry column: one line per thing that needs care, each opens its page.
     function healthCardHtml(s) {
       const backups = (s.backups || []).slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
@@ -6313,25 +6451,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const elHealth = document.getElementById('topHealthBadge');
       if (elHealth) elHealth.textContent = isPt ? 'Sistema Online' : 'System Online';
 
-      // Parse disk info
-      let diskTotal = '-';
-      let diskUsed = '-';
-      let diskPercent = 0;
-      if (s.rootDisk && typeof s.rootDisk === 'string') {
-        const parts = s.rootDisk.trim().split(/\s+/);
-        if (parts.length >= 5) {
-          diskTotal = parts[1] || '-';
-          diskUsed = parts[2] || '-';
-          diskPercent = parseInt((parts[4] || '0').replace('%', ''), 10) || 0;
-        }
-      }
-
-      // Memory calculations
-      const totalMem = s.totalMemGb || 1;
-      const freeMem = s.freeMemGb || 0;
-      const usedMem = Math.max(0, +(totalMem - freeMem).toFixed(1));
-      const ramPercent = Math.min(100, Math.max(0, Math.round((usedMem / totalMem) * 100)));
-
       // Counters in the side menu
       setNavCounter('tabCountApps', Object.keys(s.apps || {}).length, 'cntApps');
       setNavCounter('tabCountDbs', Object.keys(s.databases || {}).length, 'cntDbs');
@@ -6344,8 +6463,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       const tailscaleVal = s.tailscaleDomain || (s.federation?.peers ? (isPt ? 'Rede Ativa' : 'Tailnet Active') : '127.0.0.1');
       const dockerVal = isPt ? 'Ativo' : 'Running';
-      const backupsCount = s.backupsCount || 0;
-      const backupsUnit = isPt ? (backupsCount === 1 ? 'cópia' : 'cópias') : (backupsCount === 1 ? 'backup' : 'backups');
 
       document.getElementById('statsGrid').innerHTML = \`
         <div class="telemetry-card">
@@ -6379,36 +6496,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           </div>
         </div>
 
-        <div class="telemetry-card">
-          <div class="telemetry-title">
-            <span>\${isPt ? 'Uso de Recursos' : 'Resource Usage'}</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-          </div>
-          <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
-            <span>RAM (\${usedMem} / \${s.totalMemGb} GB)</span>
-            <span class="telemetry-val">\${ramPercent}%</span>
-          </div>
-          <div class="progress-track">
-            <div class="progress-fill \${ramPercent > 85 ? 'danger' : ramPercent > 70 ? 'warning' : ''}" style="width: \${ramPercent}%;"></div>
-          </div>
-
-          <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
-            <span>\${isPt ? 'Disco' : 'Disk'} (\${diskTotal === '-' ? '-' : diskUsed + ' / ' + diskTotal})</span>
-            <span class="telemetry-val">\${diskPercent}%</span>
-          </div>
-          <div class="progress-track">
-            <div class="progress-fill \${diskPercent > 85 ? 'danger' : diskPercent > 70 ? 'warning' : ''}" style="width: \${diskPercent}%;"></div>
-          </div>
-
-          <div class="telemetry-item" style="margin-top:6px;">
-            <span>CPUs</span>
-            <span class="telemetry-val">\${esc(s.cpus)} vCPUs</span>
-          </div>
-          <div class="telemetry-item">
-            <span>\${isPt ? 'Instantâneos' : 'Snapshots'}</span>
-            <span class="telemetry-val">\${esc(backupsCount)} \${backupsUnit}</span>
-          </div>
-        </div>
+        \${resourcesCardHtml(s)}
         \${healthCardHtml(s)}
       \`;
 
@@ -8050,7 +8138,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const res = await fetch('/api/status');
       if (!res.ok) return;
       lastStatus = await res.json();
+      liveResources = null;
       applyPreferences();
+      if (!resourcesTimer) resourcesTimer = setTimeout(pollResources, 15000);
     }
 
     // Which app's variables: a list of apps instead of typing a "scope". "system" holds the dashboard's own keys.
