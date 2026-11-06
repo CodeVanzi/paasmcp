@@ -959,6 +959,9 @@ export interface DoctorDiagnosticItem {
   summary: string;
   recommendation?: string;
   details?: Record<string, unknown>;
+  /** Stable id of this finding plus its values, so the dashboard can say it in the screen's language. */
+  code?: string;
+  vars?: Record<string, string | number>;
 }
 
 export function runPaaSDoctor(appName?: string): {
@@ -981,6 +984,8 @@ export function runPaaSDoctor(appName?: string): {
         target: app.name,
         severity: "healthy",
         summary: `Container ${app.containerName} registered on 127.0.0.1:${app.localPort}.`,
+        code: "app_registered",
+        vars: { port: app.localPort },
       });
       continue;
     }
@@ -1013,6 +1018,7 @@ export function runPaaSDoctor(appName?: string): {
           summary: `Container ${app.containerName} was terminated by Linux OOMKiller (Out of Memory).`,
           recommendation: `Increase memoryLimit in paas_app_deploy or optimize memory usage in ${app.name}.`,
           details: { status: cState.Status, exitCode: cState.ExitCode, restartCount },
+          code: "app_oom",
         });
       } else if (!cState.Running && app.status !== "stopped") {
         let lastLogs = "";
@@ -1037,6 +1043,8 @@ export function runPaaSDoctor(appName?: string): {
             restartCount,
             lastLogs: lastLogs.slice(-1500),
           },
+          code: "app_down",
+          vars: { status: String(cState.Status ?? "?"), exitCode: String(cState.ExitCode ?? "?") },
         });
       } else if (restartCount > 3) {
         diagnostics.push({
@@ -1045,6 +1053,8 @@ export function runPaaSDoctor(appName?: string): {
           summary: `Container ${app.containerName} is running but has restarted ${restartCount} times.`,
           recommendation: "Check paas_app_lifecycle(action='logs') for intermittent crashes.",
           details: { restartCount, metrics: containerMetric },
+          code: "app_restarts",
+          vars: { count: restartCount },
         });
       } else {
         diagnostics.push({
@@ -1052,6 +1062,8 @@ export function runPaaSDoctor(appName?: string): {
           severity: "healthy",
           summary: `Container ${app.containerName} is healthy and bound to 127.0.0.1:${app.localPort}.`,
           details: { restartCount, metrics: containerMetric },
+          code: "app_ok",
+          vars: { port: app.localPort },
         });
       }
     } catch {
@@ -1060,6 +1072,7 @@ export function runPaaSDoctor(appName?: string): {
         severity: app.status === "stopped" ? "healthy" : "warning",
         summary: `Container ${app.containerName} not found in Docker engine.`,
         recommendation: `Re-run paas_app_deploy for '${app.name}' to recreate the container stack.`,
+        code: app.status === "stopped" ? "app_missing_stopped" : "app_missing",
       });
     }
   }
