@@ -15,7 +15,7 @@ import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
-import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
+import { createToken, listTokens, readMcpUse, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, ensureRepoHook, githubRepoOf, listGitHubRepos, listRepoHooks, saveCloudflare } from "./connections.js";
 import { explainDeployError } from "./deployhelp.js";
@@ -727,7 +727,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         };
 
-        if (pathname === "/api/tokens" && req.method === "GET") return reply({ tokens: listTokens() });
+        if (pathname === "/api/tokens" && req.method === "GET") return reply({ tokens: listTokens(), mcpUse: readMcpUse() });
         if (pathname === "/api/tokens" && req.method === "POST") {
           const body = await readJsonBody(req);
           const { token, record } = createToken(String(body.name || "ai"), String(body.level || "deploy") as TokenLevel);
@@ -4415,6 +4415,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aiTokenOnce": "Copie agora: este token aparece só uma vez (já foi copiado).",
           "aiTokensTitle": "Acessos criados",
           "aiLastUsed": "Último uso:",
+          "aiUsedStdio": "✅ Sua IA já usa o PaaSMCP neste servidor. Último uso:",
+          "aiUsedHttp": "✅ Sua IA já usa o PaaSMCP pela rede. Último uso:",
           "aiRevoke": "Revogar",
           "aiRevokeConfirm": "Revogar este acesso? A IA que o usa deixa de conectar.",
           "aiStep2": "2. Ligar o acesso pela rede (uma vez)",
@@ -4460,6 +4462,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aiTokenOnce": "Copy it now: this token is shown only once (already copied).",
           "aiTokensTitle": "Accesses",
           "aiLastUsed": "Last used:",
+          "aiUsedStdio": "✅ Your AI already uses PaaSMCP on this server. Last used:",
+          "aiUsedHttp": "✅ Your AI already uses PaaSMCP over the network. Last used:",
           "aiRevoke": "Revoke",
           "aiRevokeConfirm": "Revoke this access? The AI using it can no longer connect.",
           "aiStep2": "2. Turn on network access (once)",
@@ -7482,7 +7486,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const [p, k] = await Promise.all([fetch('/api/pool'), fetch('/api/tokens')]);
         const pool = p.ok ? await p.json() : {};
         const tok = k.ok ? await k.json() : {};
-        tutExtra = { pool: (pool.helpers || []).length, ai: (tok.tokens || []).length, loaded: true };
+        // Done when an access exists or an AI already called a tool (stdio on the server needs no access).
+        tutExtra = { pool: (pool.helpers || []).length, ai: (tok.tokens || []).length + (tok.mcpUse ? 1 : 0), loaded: true };
       } catch { tutExtra.loaded = true; }
       renderHome();
     }
@@ -9107,13 +9112,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function loadAiTokens() {
       const res = await fetch('/api/tokens');
       if (!res.ok) return;
-      const items = (await res.json()).tokens || [];
+      const data = await res.json();
+      const items = data.tokens || [];
+      const use = data.mcpUse;
+      const usedLine = use ? '<p style="margin:0 0 10px;">' + esc(t(use.via === 'http' ? 'aiUsedHttp' : 'aiUsedStdio')) + ' ' + esc(new Date(use.lastUsedAt).toLocaleString()) + '</p>' : '';
       const names = { read: t('aiLvlReadShort'), deploy: t('aiLvlDeployShort'), destroy: t('aiLvlDestroyShort') };
-      document.getElementById('aiTokens').innerHTML = items.length
+      document.getElementById('aiTokens').innerHTML = usedLine + (items.length
         ? '<div class="field-label">' + esc(t('aiTokensTitle')) + '</div>' + items.map(k => card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(k.name) + '</strong> ' + badge('', names[k.level] || k.level) +
           '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aiLastUsed')) + ' ' + esc(k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : t('never')) + '</div></div>' +
           '<button class="danger" onclick="revokeAiToken(&#39;' + esc(k.id) + '&#39;)">' + esc(t('aiRevoke')) + '</button></div>')).join('')
-        : '';
+        : '');
     }
     async function createAiToken() {
       const level = (document.querySelector('input[name="aiLevel"]:checked') || {}).value || 'deploy';
