@@ -66,8 +66,8 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         params);
     case "app.purge":
       return risk(action, subject, "strong",
-        `Permanently deletes app '${subject}': containers, volumes, images and files. This cannot be undone.`,
-        `Apaga de vez o app '${subject}': containers, volumes, imagens e arquivos. Não dá para desfazer.`,
+        `Permanently deletes app '${subject}': containers, volumes, images and files, and takes its addresses off the air. This cannot be undone.`,
+        `Apaga de vez o app '${subject}': containers, volumes, imagens e arquivos, e tira os endereços dele do ar. Não dá para desfazer.`,
         params);
     case "mirror.promote":
       return risk(action, subject, "strong",

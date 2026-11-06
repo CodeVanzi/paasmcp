@@ -50,7 +50,7 @@ import {
   manageAppLifecycle,
   runPaaSDoctor,
 } from "./deployer.js";
-import { exposeApplication } from "./exposure.js";
+import { exposeApplication, releaseAddresses } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -1222,11 +1222,12 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
         if (action === "destroy" || action === "purge") {
           authorize(`app.${action}`, { appName: String(args.appName) });
         }
+        const addressNote = action === "purge" && loadState().apps[sanitizeSlug(String(args.appName))]?.trashedAt ? await releaseAddresses(String(args.appName)) : "";
         const output = manageAppLifecycle(
           String(args.appName),
           action,
           args.tailLines ? Number(args.tailLines) : 80
-        );
+        ) + (addressNote ? `\n${addressNote}` : "");
         const poolNote = await poolAfterLifecycle(String(args.appName), action);
         return {
           content: [{ type: "text", text: poolNote ? `${output}\n${poolNote}` : output }],

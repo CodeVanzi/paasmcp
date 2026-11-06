@@ -77,10 +77,11 @@ import {
   AppLifecycleAction,
   deployApp,
   manageAppLifecycle,
+  expiredTrashApps,
   purgeExpiredTrash,
   runPaaSDoctor,
 } from "./deployer.js";
-import { exposeApplication } from "./exposure.js";
+import { exposeApplication, releaseAddresses } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -1022,7 +1023,9 @@ async function runCli() {
       const [appName] = rest;
       if (!appName) throw new Error(`Usage: paasmcp ${cmd} <appName>`);
       if (cmd === "destroy" || cmd === "purge") await confirmInCli(`app.${cmd}`, { appName }, rest);
+      const addressNote = cmd === "purge" && loadState().apps[sanitizeSlug(appName)]?.trashedAt ? await releaseAddresses(appName) : "";
       console.log(manageAppLifecycle(appName, cmd as AppLifecycleAction));
+      if (addressNote) console.log(addressNote);
       const poolNote = await poolAfterLifecycle(appName, cmd, (l) => console.error(l));
       if (poolNote) console.log(poolNote);
       break;
@@ -1064,7 +1067,9 @@ async function runCli() {
     case "trash": {
       // For a daily cron/systemd timer: deletes apps trashed more than 30 days ago.
       if (rest[0] !== "purge-expired") throw new Error("Usage: paasmcp trash purge-expired");
-      console.log(JSON.stringify({ purged: purgeExpiredTrash() }, null, 2));
+      const addressNotes: string[] = [];
+      for (const name of expiredTrashApps()) addressNotes.push(await releaseAddresses(name));
+      console.log(JSON.stringify({ purged: purgeExpiredTrash(), addresses: addressNotes.filter(Boolean) }, null, 2));
       break;
     }
 

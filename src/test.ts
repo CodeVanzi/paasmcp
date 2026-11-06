@@ -4308,6 +4308,19 @@ volumes:
       assert.ok(r.notes.some((n) => /TXT/.test(n)));
       assert.ok(calls.includes("DELETE /accounts/acc9/access/apps/a1") && !calls.includes("DELETE /accounts/acc9/access/apps/a2"), "only PaaSMCP's own email gate goes");
       assert.deepEqual(config.loadState().apps.shop.domains.map((d) => d.hostname), ["casa.tail1.ts.net:8460"], "the other address stays");
+
+      // Deleting the app for good first tries to take its addresses off; a failure is reported, never thrown.
+      const { releaseAddresses } = await import("./exposure.js");
+      assert.equal(await releaseAddresses("no-such-app"), "");
+      const pathBefore = process.env.PATH;
+      process.env.PATH = "/nonexistent";
+      try {
+        const note = await releaseAddresses("shop");
+        assert.match(note, /Could not take off the air: casa\.tail1\.ts\.net:8460/);
+      } finally {
+        process.env.PATH = pathBefore;
+      }
+      assert.equal(config.loadState().apps.shop.domains.length, 1, "an address that could not be removed stays listed");
     } finally {
       srv.close();
       if (apiBefore === undefined) delete process.env.PAASMCP_CF_API_URL; else process.env.PAASMCP_CF_API_URL = apiBefore;
