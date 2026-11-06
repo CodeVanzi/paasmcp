@@ -196,6 +196,12 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `As cópias vão passar a ir para ${String(params.target)} em vez de ${String(params.previous)}. O que já foi enviado continua lá; este servidor só para de mandar cópias novas para lá.`,
         params);
     }
+    case "connect.cloudflare":
+      // Free the first time; replacing a working domain or tunnel is confirmed.
+      return risk(action, "cloudflare", "confirm",
+        `New public addresses will use ${String(params.target)} and the chosen tunnel instead of ${String(params.previous)}. Addresses already published keep working only while the old tunnel runs.`,
+        `Os endereços novos vão usar ${String(params.target)} e o túnel escolhido no lugar de ${String(params.previous)}. Os endereços já publicados só continuam funcionando enquanto o túnel antigo estiver ligado.`,
+        params);
     case "backup.target.clear":
       return risk(action, "backup-target", "confirm",
         "This server stops sending backups off the server. Copies already sent stay there, and local copies are no longer pruned (they only are after reaching the destination).",

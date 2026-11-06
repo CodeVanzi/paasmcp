@@ -13,6 +13,8 @@ import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./a
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
+import { registerGitHubDeployKey } from "./github.js";
+import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, saveCloudflare } from "./connections.js";
 import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
@@ -771,6 +773,37 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return reply(await revokeBackupGrant(String(body.name || "")));
         }
 
+        // Connections (Cloudflare, GitHub): tokens come in to be tested or saved, never go back out.
+        if (pathname === "/api/connections" && req.method === "GET") return reply(connectionsSummary());
+        if (pathname === "/api/connections/cloudflare/discover" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await discoverCloudflare(body.token));
+        }
+        if (pathname === "/api/connections/cloudflare" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const r = await saveCloudflare(
+            {
+              token: typeof body.token === "string" ? body.token : undefined,
+              accountId: String(body.accountId || ""),
+              baseDomain: String(body.baseDomain || ""),
+              tunnelId: String(body.tunnelId || ""),
+              runHere: body.runHere === true,
+              zeroTrustEmails: typeof body.zeroTrustEmails === "string" || Array.isArray(body.zeroTrustEmails) ? (body.zeroTrustEmails as string | string[]) : undefined,
+            },
+            (params) => confirmFromBody("connect.cloudflare", params, body)
+          );
+          return reply({ ...r, summary: connectionsSummary() });
+        }
+        if (pathname === "/api/connections/github/key" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const r = await registerGitHubDeployKey(String(body.repo || ""));
+          return reply({ registered: r.registered, message: r.message });
+        }
+        if (pathname === "/api/connections/github" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await checkGitHub(body.token));
+        }
+
         if (pathname === "/api/storage" && req.method === "GET") return reply({ storage: listStorage() });
         if (pathname === "/api/storage" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -914,12 +947,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const status = err instanceof ForbiddenActionError ? 403 : err instanceof OffsiteError ? 400 : 500;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError;
+        const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(err instanceof OffsiteError ? { errorPt: err.pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError).pt } : {}),
           })
         );
         return;
@@ -2019,6 +2053,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       </div></div>
       <button class="nav-section" data-section="integrations" aria-expanded="true" aria-controls="navGroup-integrations" onclick="toggleNavSection('integrations')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecIntegrations"></span></button>
       <div class="nav-group" id="navGroup-integrations"><div class="nav-group-inner">
+        <button class="nav-item nav-btn" onclick="goTo('connect')" id="navConnect">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountConnect" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="connect"></div>
         <button class="nav-item nav-btn" onclick="goTo('agents')" id="navAgents">
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
           <span class="nav-label"></span>
@@ -2071,13 +2111,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <div class="grid-2">
             <div class="arch-box">
               <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
-              <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
-              <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" id="setupGithubLink">Criar fine-grained token ↗</a> · <a href="https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key" target="_blank" rel="noreferrer" id="setupGithubDocsLink">Permissões da API ↗</a></p>
+              <p id="setupGithubDesc">Só para código privado. Em Conexões → GitHub você copia a chave de leitura ou salva um token, e o painel diz se deu certo.</p>
+              <p><a href="#connect/github" id="setupGithubLink">Abrir Conexões → GitHub</a></p>
             </div>
             <div class="arch-box">
               <h3 id="setupCloudTitle">☁️ Cloudflare — opcional para publicar</h3>
-              <p id="setupCloudDesc">Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.</p>
-              <p><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" id="setupCloudLink">Criar API token ↗</a> · <a href="https://developers.cloudflare.com/fundamentals/api/get-started/create-token/" target="_blank" rel="noreferrer" id="setupCloudDocsLink">Guia de tokens ↗</a></p>
+              <p id="setupCloudDesc">Para abrir os apps no seu domínio, com HTTPS. Em Conexões → Domínio você cola um token, e o painel acha a conta, o domínio e o túnel sozinho (e cria o túnel se faltar).</p>
+              <p><a href="#connect/cloudflare" id="setupCloudLink">Abrir Conexões → Domínio</a></p>
             </div>
             <div class="arch-box">
               <h3 id="setupLocalTitle">🔐 Acesso e deploy local</h3>
@@ -2192,6 +2232,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <h2 id="exposeTitle">🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)</h2>
                 <p class="card-desc" id="exposeDesc">Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.</p>
               </div>
+              <div id="exposeCfHint"></div>
               <div class="examples-bar">
                 <span id="lblQuickFillExpose">⚡ Modos:</span>
                 <button class="chip" onclick="fillExposeMode('public')" id="chipModePublic">🌍 Público (HTTPS Aberto)</button>
@@ -2435,6 +2476,70 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           
         </div>
 
+
+        <div class="tab-pane" id="tab-connect">
+          <div class="card" data-sub="cloudflare">
+            <div class="card-header">
+              <h2 data-i18n="cnCfTitle"></h2>
+              <p class="card-desc" data-i18n="cnCfDesc"></p>
+            </div>
+            <div id="cfStatus"></div>
+            <div id="cfForm">
+              <h3 class="ofs-h" data-i18n="cnCfStep1"></h3>
+              <p class="ofs-note" data-i18n="cnCfStep1Desc"></p>
+              <p style="margin:0 0 6px;"><a id="cfTokenLink" target="_blank" rel="noreferrer" data-i18n="cnCfTokenLink"></a></p>
+              <h3 class="ofs-h" data-i18n="cnCfStep2"></h3>
+              <div class="form-grid" style="grid-template-columns:minmax(0,1fr) auto;align-items:end;">
+                <div><label class="field-label" for="cfToken" data-i18n="cnCfToken"></label><input id="cfToken" type="password" autocomplete="off" spellcheck="false" /></div>
+                <div><button class="secondary" onclick="cfDiscover()" id="btnCfDiscover" data-i18n="cnBtnCheck"></button></div>
+              </div>
+              <div class="ofs-msg" id="cfMsg" role="status" aria-live="polite"></div>
+              <div id="cfChoose" style="display:none;">
+                <h3 class="ofs-h" data-i18n="cnCfStep3"></h3>
+                <div class="form-grid">
+                  <div><label class="field-label" for="cfAccount" data-i18n="cnCfAccount"></label><select id="cfAccount" onchange="cfFillChoices()"></select></div>
+                  <div><label class="field-label" for="cfDomain" data-i18n="cnCfDomain"></label><select id="cfDomain"></select></div>
+                  <div><label class="field-label" for="cfTunnel" data-i18n="cnCfTunnel"></label><select id="cfTunnel" onchange="cfTunnelHint()"></select></div>
+                </div>
+                <p class="ofs-note" id="cfTunnelNote"></p>
+                <label id="cfRunHereRow" style="display:none;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;margin-bottom:10px;">
+                  <input type="checkbox" id="cfRunHere" style="width:auto;" /> <span data-i18n="cnCfRunHere"></span>
+                </label>
+                <label class="field-label" for="cfEmails" data-i18n="cnCfEmails"></label>
+                <input id="cfEmails" placeholder="voce@exemplo.com, socio@exemplo.com" autocomplete="off" />
+                <p class="ofs-note" data-i18n="cnCfEmailsHint" style="margin-top:4px;"></p>
+                <div class="ofs-msg" id="cfSaveMsg" role="status" aria-live="polite"></div>
+                <div style="margin-top:10px;"><button onclick="cfSave()" id="btnCfSave" data-i18n="cnBtnCfSave"></button></div>
+              </div>
+            </div>
+          </div>
+          <div class="card" data-sub="github">
+            <div class="card-header">
+              <h2 data-i18n="cnGhTitle"></h2>
+              <p class="card-desc" data-i18n="cnGhDesc"></p>
+            </div>
+            <div id="ghStatus"></div>
+            <h3 class="ofs-h" data-i18n="cnGhKeyTitle"></h3>
+            <p class="ofs-note" data-i18n="cnGhKeyDesc"></p>
+            <div class="ofs-secret" id="ghSshKey">...</div>
+            <button class="secondary" onclick="copyText(document.getElementById('ghSshKey').textContent)" data-i18n="cnBtnCopyKey"></button>
+            <h3 class="ofs-h" style="margin-top:20px;" data-i18n="cnGhTokenTitle"></h3>
+            <p class="ofs-note" data-i18n="cnGhTokenDesc"></p>
+            <p style="margin:0 0 8px;"><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" data-i18n="cnGhTokenLink"></a></p>
+            <div class="form-grid" style="grid-template-columns:minmax(0,1fr) auto;align-items:end;">
+              <div><label class="field-label" for="ghToken" data-i18n="cnGhToken"></label><input id="ghToken" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_..." /></div>
+              <div><button onclick="ghSave()" id="btnGhSave" data-i18n="cnBtnGhSave"></button></div>
+            </div>
+            <div class="ofs-msg" id="ghMsg" role="status" aria-live="polite"></div>
+            <div id="ghKeyBox" style="display:none;margin-top:12px;">
+              <div class="form-grid" style="grid-template-columns:minmax(0,1fr) auto;align-items:end;">
+                <div><label class="field-label" for="ghRepo" data-i18n="cnGhRepo"></label><input id="ghRepo" placeholder="voce/meu-app" autocomplete="off" /></div>
+                <div><button class="secondary" onclick="ghKey()" data-i18n="cnBtnGhKey"></button></div>
+              </div>
+              <div class="ofs-msg" id="ghKeyMsg" role="status" aria-live="polite"></div>
+            </div>
+          </div>
+        </div>
 
         <div class="tab-pane" id="tab-email">
           <div class="card">
@@ -2825,12 +2930,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupTitle: "🧭 Primeira configuração: o que você precisa?",
         setupDesc: "Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.",
         setupGithubTitle: "🐙 GitHub — opcional",
-        setupGithubDesc: "Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.",
-        setupGithubLink: "Criar fine-grained token ↗",
+        setupGithubDesc: "Só para código privado. Em Conexões → GitHub você copia a chave de leitura ou salva um token, e o painel diz se deu certo.",
+        setupGithubLink: "Abrir Conexões → GitHub",
         setupGithubDocsLink: "Permissões da API ↗",
         setupCloudTitle: "☁️ Cloudflare — opcional para publicar",
-        setupCloudDesc: "Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.",
-        setupCloudLink: "Criar API token ↗",
+        setupCloudDesc: "Para abrir os apps no seu domínio, com HTTPS. Em Conexões → Domínio você cola um token, e o painel acha a conta, o domínio e o túnel sozinho (e cria o túnel se faltar).",
+        setupCloudLink: "Abrir Conexões → Domínio",
         setupCloudDocsLink: "Guia de tokens ↗",
         setupLocalTitle: "🔐 Acesso e deploy local",
         setupLocalDesc: "O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.",
@@ -3038,12 +3143,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         setupTitle: "🧭 First-time setup: what do you need?",
         setupDesc: "Configure only the integrations you plan to use. PaaSMCP works locally without third-party tokens; secret values are stored in the Vault.",
         setupGithubTitle: "🐙 GitHub — optional",
-        setupGithubDesc: "For a private repository, use a read-only SSH Deploy Key. Copy the public key from the webhook box at the end of the Apps screen and add it under Settings → Deploy keys. To register it automatically or clone over HTTPS, save <code>GITHUB_TOKEN</code> in the <code>system</code> scope. A fine-grained token needs access only to the target repository and <em>Administration: read and write</em>; the created key remains read-only.",
-        setupGithubLink: "Create fine-grained token ↗",
+        setupGithubDesc: "Only for private code. Under Connections → GitHub you copy the read-only key or save a token, and the dashboard tells you whether it worked.",
+        setupGithubLink: "Open Connections → GitHub",
         setupGithubDocsLink: "API permissions ↗",
         setupCloudTitle: "☁️ Cloudflare — optional for publishing",
-        setupCloudDesc: "For Tunnel + DNS: create a token with Account → Cloudflare Tunnel: Edit and Zone → DNS: Edit, scoped to the required account and zone. For Zero Trust protection, also add Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domain, and allowed emails with <code>paasmcp config</code> or <code>paas_configure</code>, and save <code>CF_API_TOKEN</code> in <code>system</code> scope.",
-        setupCloudLink: "Create API token ↗",
+        setupCloudDesc: "To open apps on your own domain, with HTTPS. Under Connections → Domain you paste a token, and the dashboard finds the account, domain and tunnel by itself (and creates the tunnel if needed).",
+        setupCloudLink: "Open Connections → Domain",
         setupCloudDocsLink: "Token guide ↗",
         setupLocalTitle: "🔐 Dashboard access and local deploy",
         setupLocalDesc: "The dashboard token is generated automatically: retrieve it with <code>paasmcp dashboard token</code>. Public repositories, SSH access to private repositories, and local folders do not require a GitHub token if you add the public SSH key to the repository. Tailscale is a private alternative that does not require Cloudflare.",
@@ -4509,7 +4614,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
       'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
       'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect',
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -4524,6 +4629,153 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
       'agentsTitle', 'agentsDesc', 'logsTitle', 'btnCloseLogs',
     ];
+
+    Object.assign(I18N.pt, {
+      "navConnect": "Conexões",
+      "lead_connect": "Ligue a Cloudflare e o GitHub uma vez, aqui mesmo. Nada de terminal nem de IDs para copiar.",
+      "sub_connect_cloudflare": "Domínio (Cloudflare)",
+      "sub_connect_github": "GitHub",
+      "cntConnect": "{n} conexões ligadas",
+      "cntConnectOne": "1 conexão ligada",
+      "cnCfTitle": "Seu domínio pela Cloudflare",
+      "cnCfDesc": "Para abrir os apps num endereço como app.seudominio.com, com HTTPS e sem abrir portas no roteador. O domínio precisa estar na Cloudflare (o plano grátis serve).",
+      "cnCfStep1": "1. Crie um token na Cloudflare",
+      "cnCfStep1Desc": "O link abre a Cloudflare com as permissões já marcadas. Confira se aparecem Cloudflare Tunnel, DNS e Access: Apps and Policies, todos com Edit (inclua o que faltar). Clique em Continue to summary, depois em Create Token, e copie o valor.",
+      "cnCfTokenLink": "Abrir a Cloudflare com as permissões marcadas ↗",
+      "cnCfStep2": "2. Cole o token aqui",
+      "cnCfToken": "Token da Cloudflare",
+      "cnBtnCheck": "Verificar",
+      "cnCfStep3": "3. Confira o que o painel encontrou",
+      "cnCfAccount": "Conta",
+      "cnCfDomain": "Domínio",
+      "cnCfTunnel": "Túnel",
+      "cnCfRunHere": "Rodar este túnel neste servidor",
+      "cnCfEmails": "Quem pode abrir os apps protegidos (opcional)",
+      "cnCfEmailsHint": "Só vale para apps publicados no modo “Só e-mails autorizados”: a pessoa recebe um código no e-mail para entrar. Separe com vírgula.",
+      "cnBtnCfSave": "Salvar e conectar",
+      "cnChecking": "Verificando...",
+      "cnSaving": "Salvando... criar um túnel leva até um minuto.",
+      "cnFound": "Encontrei {a} conta(s) e {z} domínio(s).",
+      "cnMiss_account": "O token não enxerga nenhuma conta: inclua a conta em Account Resources.",
+      "cnMiss_zone": "O token não enxerga nenhum domínio: inclua o seu em Zone Resources (e confira se o domínio já está na Cloudflare).",
+      "cnMiss_tunnel": "Falta a permissão Cloudflare Tunnel: Edit.",
+      "cnMiss_access": "Sem a permissão Access: Apps and Policies, o modo “Só e-mails autorizados” não vai funcionar (o resto funciona).",
+      "cnNoZoneHere": "Nenhum domínio nesta conta",
+      "cnNewTunnel": "Criar um túnel novo (recomendado)",
+      "cnNewTunnelNote": "O painel cria o túnel na sua conta e o liga aqui. Ele volta sozinho depois de reiniciar o servidor.",
+      "cnTunLocal": "configurado por arquivo",
+      "cnTunLocalNote": "Este túnel é configurado por um arquivo no computador onde roda, então o PaaSMCP não consegue colocar endereços nele. Prefira criar um túnel novo.",
+      "cnTunIdleNote": "Este túnel não está ligado em lugar nenhum. Deixe marcado para o painel ligá-lo aqui.",
+      "cnTunLiveNote": "Este túnel já está ligado em algum computador. Se for este servidor, ou se você não sabe, deixe desmarcado.",
+      "cnTun_healthy": "ligado",
+      "cnTun_degraded": "ligado com falhas",
+      "cnTun_down": "desligado",
+      "cnTun_inactive": "nunca ligado",
+      "cnSaved": "Pronto. Agora publique um endereço em Apps → Deixar acessível.",
+      "cnSavedNew": "Pronto: túnel criado e ligado neste servidor. Agora publique um endereço em Apps → Deixar acessível.",
+      "cnCfReady": "Conectado",
+      "cnCfReadyDesc": "Os apps podem ganhar endereços em {domain}.",
+      "cnCfEmailsNow": "Podem entrar nos apps protegidos:",
+      "cnConnRunning": "O túnel roda neste servidor.",
+      "cnConnStopped": "O túnel deste servidor está parado: clique em Trocar e salve de novo para religar.",
+      "cnCfNone": "Sem isso, os apps abrem só pela Tailscale ou na rede de casa.",
+      "cnCfHalf": "O token está guardado, mas falta escolher domínio e túnel.",
+      "cnGoExpose": "Publicar um endereço",
+      "cnChange": "Trocar",
+      "cnGhTitle": "Código no GitHub",
+      "cnGhDesc": "Repositório público não precisa de nada. Para um privado, use uma das duas opções abaixo.",
+      "cnGhKeyTitle": "Opção 1: chave de leitura (mais segura)",
+      "cnGhKeyDesc": "No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole a chave abaixo e deixe “Allow write access” desmarcado. Repita em cada repositório privado.",
+      "cnBtnCopyKey": "Copiar chave",
+      "cnGhTokenTitle": "Opção 2: token (o painel cadastra a chave sozinho)",
+      "cnGhTokenDesc": "Crie um token “fine-grained”, escolha só os repositórios que vai publicar e dê a permissão Administration: Read and write. O painel usa o token só para cadastrar a chave de leitura nos repositórios que você indicar abaixo.",
+      "cnGhTokenLink": "Criar token no GitHub ↗",
+      "cnGhToken": "Token do GitHub",
+      "cnBtnGhSave": "Testar e salvar",
+      "cnGhOk": "Token salvo. Ele é da conta @{login}.",
+      "cnGhSaved": "Token salvo",
+      "cnGhSavedDesc": "Indique abaixo cada repositório privado e o painel cadastra a chave de leitura nele.",
+      "cnGhRepo": "Repositório privado (dono/nome)",
+      "cnBtnGhKey": "Cadastrar a chave",
+      "cnGhKeyOk": "Chave de leitura cadastrada em {repo}. Já dá para publicar.",
+      "cnGhNoToken": "Sem token",
+      "cnGhNoTokenDesc": "Tudo bem para código público ou com a chave de leitura (opção 1).",
+      "exposeNeedCf": "Para publicar com o seu domínio, ligue a Cloudflare em Conexões primeiro. O modo Tailscale funciona sem ela.",
+      "exposeOpenConnect": "Abrir Conexões"
+    });
+    Object.assign(I18N.en, {
+      "navConnect": "Connections",
+      "lead_connect": "Connect Cloudflare and GitHub once, right here. No terminal, no ids to copy.",
+      "sub_connect_cloudflare": "Domain (Cloudflare)",
+      "sub_connect_github": "GitHub",
+      "cntConnect": "{n} connections on",
+      "cntConnectOne": "1 connection on",
+      "cnCfTitle": "Your domain through Cloudflare",
+      "cnCfDesc": "To open apps at an address like app.yourdomain.com, with HTTPS and no router port opened. The domain must be on Cloudflare (the free plan works).",
+      "cnCfStep1": "1. Create a Cloudflare token",
+      "cnCfStep1Desc": "The link opens Cloudflare with the permissions already ticked. Check that Cloudflare Tunnel, DNS and Access: Apps and Policies show, all with Edit (add what is missing). Click Continue to summary, then Create Token, and copy the value.",
+      "cnCfTokenLink": "Open Cloudflare with the permissions ticked ↗",
+      "cnCfStep2": "2. Paste the token here",
+      "cnCfToken": "Cloudflare token",
+      "cnBtnCheck": "Check",
+      "cnCfStep3": "3. Check what the dashboard found",
+      "cnCfAccount": "Account",
+      "cnCfDomain": "Domain",
+      "cnCfTunnel": "Tunnel",
+      "cnCfRunHere": "Run this tunnel on this server",
+      "cnCfEmails": "Who may open protected apps (optional)",
+      "cnCfEmailsHint": "Only for apps published as “Allowed emails only”: the person gets a code by email to get in. Separate with commas.",
+      "cnBtnCfSave": "Save and connect",
+      "cnChecking": "Checking...",
+      "cnSaving": "Saving... creating a tunnel takes up to a minute.",
+      "cnFound": "Found {a} account(s) and {z} domain(s).",
+      "cnMiss_account": "The token sees no account: add the account under Account Resources.",
+      "cnMiss_zone": "The token sees no domain: add yours under Zone Resources (and check the domain is already on Cloudflare).",
+      "cnMiss_tunnel": "The Cloudflare Tunnel: Edit permission is missing.",
+      "cnMiss_access": "Without Access: Apps and Policies, “Allowed emails only” will not work (everything else does).",
+      "cnNoZoneHere": "No domain in this account",
+      "cnNewTunnel": "Create a new tunnel (recommended)",
+      "cnNewTunnelNote": "The dashboard creates the tunnel in your account and runs it here. It comes back by itself after a reboot.",
+      "cnTunLocal": "configured by a file",
+      "cnTunLocalNote": "This tunnel is configured by a file on the computer that runs it, so PaaSMCP cannot add addresses to it. Prefer creating a new tunnel.",
+      "cnTunIdleNote": "This tunnel runs nowhere. Leave it ticked so the dashboard runs it here.",
+      "cnTunLiveNote": "This tunnel already runs on some computer. If it is this server, or you are not sure, leave it unticked.",
+      "cnTun_healthy": "running",
+      "cnTun_degraded": "running with errors",
+      "cnTun_down": "stopped",
+      "cnTun_inactive": "never ran",
+      "cnSaved": "Done. Now publish an address under Apps → Make reachable.",
+      "cnSavedNew": "Done: tunnel created and running on this server. Now publish an address under Apps → Make reachable.",
+      "cnCfReady": "Connected",
+      "cnCfReadyDesc": "Apps can get addresses on {domain}.",
+      "cnCfEmailsNow": "May open protected apps:",
+      "cnConnRunning": "The tunnel runs on this server.",
+      "cnConnStopped": "This server's tunnel is stopped: click Change and save again to restart it.",
+      "cnCfNone": "Without it, apps open only over Tailscale or on the home network.",
+      "cnCfHalf": "The token is saved, but the domain and tunnel are not chosen yet.",
+      "cnGoExpose": "Publish an address",
+      "cnChange": "Change",
+      "cnGhTitle": "Code on GitHub",
+      "cnGhDesc": "A public repository needs nothing. For a private one, use one of the two options below.",
+      "cnGhKeyTitle": "Option 1: read-only key (safest)",
+      "cnGhKeyDesc": "On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste the key below and leave “Allow write access” unticked. Repeat for each private repository.",
+      "cnBtnCopyKey": "Copy key",
+      "cnGhTokenTitle": "Option 2: token (the dashboard adds the key by itself)",
+      "cnGhTokenDesc": "Create a fine-grained token, pick only the repositories you will publish and give it Administration: Read and write. The dashboard only uses it to add the read-only key to the repositories you name below.",
+      "cnGhTokenLink": "Create a token on GitHub ↗",
+      "cnGhToken": "GitHub token",
+      "cnBtnGhSave": "Test and save",
+      "cnGhOk": "Token saved. It belongs to @{login}.",
+      "cnGhSaved": "Token saved",
+      "cnGhSavedDesc": "Name each private repository below and the dashboard adds the read-only key to it.",
+      "cnGhRepo": "Private repository (owner/name)",
+      "cnBtnGhKey": "Add the key",
+      "cnGhKeyOk": "Read-only key added to {repo}. You can publish it now.",
+      "cnGhNoToken": "No token",
+      "cnGhNoTokenDesc": "Fine for public code or with the read-only key (option 1).",
+      "exposeNeedCf": "To publish on your domain, connect Cloudflare under Connections first. Tailscale mode works without it.",
+      "exposeOpenConnect": "Open Connections"
+    });
 
     function esc(str) {
       return String(str ?? '')
@@ -4570,6 +4822,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
       agents: ['connect', 'examples'],
+      connect: ['cloudflare', 'github'],
     };
     let activeSubs = {};
     try { activeSubs = JSON.parse(localStorage.getItem('paasmcp_active_subs') || '{}') || {}; } catch { activeSubs = {}; }
@@ -4802,6 +5055,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'doctor') runDoctor();
       if (tabName === 'email') loadEmail();
       if (tabName === 'agents') { renderAi(); loadAiTokens(); }
+      if (tabName === 'connect') loadConnections();
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') { loadStorage(); loadOffsite(); }
@@ -4856,6 +5110,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
       renderHome();
+      renderExposeHint();
       renderAi();
       renderArbiterInstall();
       for (const k of I18N_KEYS) {
@@ -5817,6 +6072,153 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!res.ok) { if (!data.confirmationRequired) ofsMsg(msgId, (currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status), 'err'); return null; }
       return data;
     }
+
+    // ---- Connections (Cloudflare and GitHub from the dashboard: no terminal, no ids to copy) ----
+    let cnData = null;
+    let cfFound = null;
+    const CF_TOKEN_TEMPLATE = 'https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=' +
+      encodeURIComponent(JSON.stringify([{ key: 'argotunnel', type: 'edit' }, { key: 'dns', type: 'edit' }, { key: 'access', type: 'edit' }])) +
+      '&accountId=*&zoneId=all&name=PaaSMCP';
+    function renderExposeHint() {
+      const el = document.getElementById('exposeCfHint');
+      if (!el) return;
+      const c = (lastStatus && lastStatus.cloudflare) || {};
+      const cfs = (lastStatus && lastStatus.systemSecretsConfigured) || {};
+      const ready = Boolean(c.accountId && c.tunnelId && c.baseDomain && c.baseDomain !== 'example.com' && cfs.CF_API_TOKEN);
+      el.innerHTML = ready ? '' : '<div class="preset-hint show" style="margin:0 0 12px;">' + esc(t('exposeNeedCf')) +
+        ' <a href="#connect/cloudflare">' + esc(t('exposeOpenConnect')) + '</a></div>';
+    }
+    async function loadConnections() {
+      const link = document.getElementById('cfTokenLink');
+      if (link) link.href = CF_TOKEN_TEMPLATE;
+      const res = await fetch('/api/connections');
+      if (!res.ok) return;
+      cnData = await res.json();
+      renderConnections();
+    }
+    function renderConnections() {
+      if (!cnData) return;
+      const c = cnData.cloudflare || {};
+      const st = document.getElementById('cfStatus');
+      if (st) {
+        const conn = c.connectorHere === 'running' ? t('cnConnRunning') : c.connectorHere === 'stopped' ? t('cnConnStopped') : '';
+        st.innerHTML = c.ready
+          ? card(badge('success', t('cnCfReady')) + ' <strong>' + esc(c.baseDomain) + '</strong>' +
+              '<div style="color:var(--muted);margin-top:4px;">' + esc(t('cnCfReadyDesc').split('{domain}').join(c.baseDomain)) + (conn ? ' ' + esc(conn) : '') + '</div>' +
+              ((c.zeroTrustEmails || []).length ? '<div style="color:var(--muted);margin-top:4px;">' + esc(t('cnCfEmailsNow')) + ' ' + esc(c.zeroTrustEmails.join(', ')) + '</div>' : '') +
+              '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;"><button class="secondary" onclick="goTo(&#39;overview&#39;, &#39;expose&#39;)">' + esc(t('cnGoExpose')) + '</button>' +
+              '<button class="secondary" onclick="cfShowForm()">' + esc(t('cnChange')) + '</button></div>')
+          : card(badge('warning', t('notConfigured')) + ' <span style="color:var(--muted);">' + esc(c.tokenSaved ? t('cnCfHalf') : t('cnCfNone')) + '</span>');
+      }
+      const form = document.getElementById('cfForm');
+      if (form && !form.dataset.forced) form.style.display = c.ready ? 'none' : '';
+      const tok = document.getElementById('cfToken');
+      if (tok) tok.placeholder = c.tokenSaved ? t('keepSaved') : '';
+      if (c.zeroTrustEmails && document.getElementById('cfEmails') && !document.getElementById('cfEmails').value) document.getElementById('cfEmails').value = c.zeroTrustEmails.join(', ');
+      const g = cnData.github || {};
+      const gs = document.getElementById('ghStatus');
+      if (gs) gs.innerHTML = card(g.tokenSaved ? badge('success', t('cnGhSaved')) + ' <span style="color:var(--muted);">' + esc(t('cnGhSavedDesc')) + '</span>'
+        : badge('', t('cnGhNoToken')) + ' <span style="color:var(--muted);">' + esc(t('cnGhNoTokenDesc')) + '</span>');
+      const kb = document.getElementById('ghKeyBox');
+      if (kb) kb.style.display = g.tokenSaved ? '' : 'none';
+      const key = document.getElementById('ghSshKey');
+      if (key && lastStatus) key.textContent = lastStatus.sshPublicKey || '';
+      setNavCounter('tabCountConnect', (c.ready ? 1 : 0) + (g.tokenSaved ? 1 : 0), 'cntConnect');
+    }
+    function cfShowForm() {
+      const form = document.getElementById('cfForm');
+      form.dataset.forced = '1';
+      form.style.display = '';
+      document.getElementById('cfToken').focus();
+    }
+    async function cfDiscover() {
+      ofsMsg('cfMsg', t('cnChecking'), '');
+      document.getElementById('cfChoose').style.display = 'none';
+      const r = await ofsPost('/api/connections/cloudflare/discover', { token: document.getElementById('cfToken').value.trim() }, 'cfMsg');
+      if (!r) return;
+      cfFound = r;
+      const miss = (r.missing || []).map(function (m) { return t('cnMiss_' + m); });
+      if (!r.accounts.length || !r.zones.length) { ofsMsg('cfMsg', miss.join(' '), 'err'); return; }
+      ofsMsg('cfMsg', t('cnFound').split('{a}').join(String(r.accounts.length)).split('{z}').join(String(r.zones.length)) + (miss.length ? ' ' + miss.join(' ') : ''), miss.length ? 'err' : 'ok');
+      const prev = (cnData && cnData.cloudflare) || {};
+      document.getElementById('cfAccount').innerHTML = r.accounts.map(function (a) {
+        return '<option value="' + esc(a.id) + '"' + (a.id === prev.accountId ? ' selected' : '') + '>' + esc(a.name) + '</option>';
+      }).join('');
+      cfFillChoices();
+      document.getElementById('cfChoose').style.display = '';
+    }
+    function cfFillChoices() {
+      if (!cfFound) return;
+      const accId = document.getElementById('cfAccount').value;
+      const acc = cfFound.accounts.find(function (a) { return a.id === accId; }) || { tunnels: [] };
+      const prev = (cnData && cnData.cloudflare) || {};
+      const zones = cfFound.zones.filter(function (z) { return !z.accountId || z.accountId === accId; });
+      document.getElementById('cfDomain').innerHTML = zones.length
+        ? zones.map(function (z) { return '<option value="' + esc(z.name) + '"' + (z.name === prev.baseDomain ? ' selected' : '') + '>' + esc(z.name) + '</option>'; }).join('')
+        : '<option value="">' + esc(t('cnNoZoneHere')) + '</option>';
+      const opts = ['<option value="new">' + esc(t('cnNewTunnel')) + '</option>'].concat(acc.tunnels.map(function (tu) {
+        return '<option value="' + esc(tu.id) + '"' + (tu.id === prev.tunnelId ? ' selected' : '') + '>' + esc(tu.name) + ' (' + esc(t('cnTun_' + tu.status) || tu.status) + (tu.remote ? '' : ', ' + t('cnTunLocal')) + ')</option>';
+      }));
+      document.getElementById('cfTunnel').innerHTML = opts.join('');
+      cfTunnelHint();
+    }
+    function cfTunnelHint() {
+      const accId = document.getElementById('cfAccount').value;
+      const acc = (cfFound && cfFound.accounts.find(function (a) { return a.id === accId; })) || { tunnels: [] };
+      const id = document.getElementById('cfTunnel').value;
+      const tu = acc.tunnels.find(function (x) { return x.id === id; });
+      const note = document.getElementById('cfTunnelNote');
+      const row = document.getElementById('cfRunHereRow');
+      if (!tu) { note.textContent = t('cnNewTunnelNote'); row.style.display = 'none'; return; }
+      if (!tu.remote) { note.textContent = t('cnTunLocalNote'); row.style.display = 'none'; return; }
+      const idle = tu.status === 'inactive' || tu.status === 'down';
+      note.textContent = idle ? t('cnTunIdleNote') : t('cnTunLiveNote');
+      row.style.display = 'flex';
+      document.getElementById('cfRunHere').checked = idle;
+    }
+    async function cfSave() {
+      ofsMsg('cfSaveMsg', t('cnSaving'), '');
+      const btn = document.getElementById('btnCfSave');
+      btn.disabled = true;
+      try {
+        const r = await ofsPost('/api/connections/cloudflare', {
+          token: document.getElementById('cfToken').value.trim(),
+          accountId: document.getElementById('cfAccount').value,
+          baseDomain: document.getElementById('cfDomain').value,
+          tunnelId: document.getElementById('cfTunnel').value,
+          runHere: document.getElementById('cfRunHereRow').style.display !== 'none' && document.getElementById('cfRunHere').checked,
+          zeroTrustEmails: document.getElementById('cfEmails').value,
+        }, 'cfSaveMsg');
+        if (!r) { if (document.getElementById('cfSaveMsg').textContent === t('cnSaving')) ofsMsg('cfSaveMsg', '', ''); return; }
+        ofsMsg('cfSaveMsg', r.created ? t('cnSavedNew') : t('cnSaved'), 'ok');
+        document.getElementById('cfToken').value = '';
+        document.getElementById('cfChoose').style.display = 'none';
+        delete document.getElementById('cfForm').dataset.forced;
+        cnData = r.summary;
+        loadAll();
+        renderConnections();
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    async function ghSave() {
+      ofsMsg('ghMsg', t('cnChecking'), '');
+      const r = await ofsPost('/api/connections/github', { token: document.getElementById('ghToken').value.trim() }, 'ghMsg');
+      if (!r) return;
+      document.getElementById('ghToken').value = '';
+      ofsMsg('ghMsg', t('cnGhOk').split('{login}').join(r.login), 'ok');
+      loadConnections();
+      loadAll();
+    }
+    async function ghKey() {
+      const repo = document.getElementById('ghRepo').value.trim();
+      if (!repo) return;
+      ofsMsg('ghKeyMsg', t('cnChecking'), '');
+      const r = await ofsPost('/api/connections/github/key', { repo: repo }, 'ghKeyMsg');
+      if (!r) return;
+      ofsMsg('ghKeyMsg', r.registered ? t('cnGhKeyOk').split('{repo}').join(repo) : r.message, r.registered ? 'ok' : 'err');
+    }
+
 
     async function loadOffsite() {
       const res = await fetch('/api/offsite');
