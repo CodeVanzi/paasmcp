@@ -4697,6 +4697,60 @@ volumes:
     }
   });
 
+  await t.test("57. PCs of the Tailscale: devices with and without PaaSMCP, phones and other people's devices never probed", async () => {
+    const pcs = await import("./pcinstall.js");
+    const judge = await import("./judge.js");
+    const net = await import("node:net");
+    const key = "ssh-ed25519 " + "A".repeat(68);
+    const fake = JSON.stringify({ Self: { TailscaleIPs: ["100.64.0.1"], UserID: 7 }, Peer: {
+      a: { HostName: "notebook", OS: "linux", Online: true, UserID: 7, TailscaleIPs: ["100.64.0.20"], sshHostKeys: [key + " root@notebook", "junk; rm -rf /"] },
+      b: { HostName: "cloud-graco-150", OS: "linux", Online: true, UserID: 7, TailscaleIPs: ["100.64.0.30"] },
+      c: { HostName: "phone", OS: "android", Online: true, UserID: 7, TailscaleIPs: ["100.64.0.40"] },
+      d: { HostName: "friend-pc", OS: "linux", Online: true, ShareeNode: true, UserID: 99, TailscaleIPs: ["100.64.0.50"] },
+      e: { HostName: "family-pc", OS: "linux", Online: true, UserID: 8, TailscaleIPs: ["100.64.0.60"] },
+      f: { HostName: "tagged-vm", OS: "linux", Online: false, UserID: 12345, Tags: ["tag:server", "bad tag"], TailscaleIPs: ["100.64.0.70"] },
+    } });
+    const peers = judge.listTailscalePeers(fake).peers;
+    assert.deepEqual(peers.find((p) => p.name === "notebook")?.sshHostKeys, [key], "only well-formed host keys are kept, without the comment");
+    assert.equal(peers.find((p) => p.name === "friend-pc")?.shared, true);
+    assert.equal(peers.find((p) => p.name === "family-pc")?.otherOwner, true);
+    assert.equal(peers.find((p) => p.name === "tagged-vm")?.otherOwner, undefined, "a tagged device has no owner to compare");
+    assert.deepEqual(peers.find((p) => p.name === "tagged-vm")?.tags, ["tag:server"]);
+
+    const st = config.loadState();
+    const savedPool = st.pool;
+    st.pool = { helpers: { nb: { name: "nb", ip: "100.64.0.30" } as never }, invites: {} } as never;
+    config.saveState(st);
+    try {
+      const r = await pcs.listTailnetPcs({ statusJson: fake, probe: false });
+      const by = Object.fromEntries(r.pcs.map((x) => [x.name, x]));
+      assert.equal(by.notebook.state, "installable");
+      assert.equal(by.notebook.hostKeysKnown, true);
+      assert.equal(by["cloud-graco-150"].state, "paasmcp");
+      assert.deepEqual(by["cloud-graco-150"].roles, ["helper"]);
+      assert.equal(by.phone.why, "notLinux");
+      assert.equal(by["friend-pc"].why, "shared");
+      assert.equal(by["family-pc"].why, "otherOwner");
+      assert.equal(by["tagged-vm"].state, "offline");
+      assert.equal(r.pcs[0].name, "notebook", "the ones PaaSMCP can go on come first");
+    } finally {
+      const s2 = config.loadState();
+      s2.pool = savedPool;
+      config.saveState(s2);
+    }
+
+    // SSH banner: which server answers on port 22.
+    assert.equal(pcs.sshKind("SSH-2.0-Tailscale"), "tailscale");
+    assert.equal(pcs.sshKind("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13"), "openssh");
+    assert.equal(pcs.sshKind(undefined), "closed");
+    const srv = net.createServer((c) => c.end("SSH-2.0-Tailscale\r\n"));
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const port = (srv.address() as { port: number }).port;
+    assert.equal(await pcs.sshBanner("127.0.0.1", port), "SSH-2.0-Tailscale");
+    srv.close();
+    assert.equal(await pcs.sshBanner("127.0.0.1", port, 300), undefined, "closed port: nothing answers");
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
