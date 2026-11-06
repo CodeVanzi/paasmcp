@@ -3473,6 +3473,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "tileMirrorOn": "Ligado",
           "tileMirrorOff": "Não usado",
           "tileMirrorNote": "Cópia ao vivo dos dados",
+          "tileMirrorWith": "Cópia ao vivo com {who}",
+          "tileMirrorStopped": "Parado",
+          "tileMirrorStoppedNote": "A cópia com {who} não está passando agora",
+          "tileMirrorPairedOnly": "Pareado com {who}, sem cópia dos dados",
+          "pairedWith": "Pareado com",
+          "pairedNobody": "Ninguém",
+          "footerPaired": "Pareado com: {who}",
+          "footerUnpaired": "Sem servidor pareado",
+          "peerViaCopy": "Pareado pela cópia ao vivo",
+          "peerSending": "este servidor manda a cópia",
+          "peerReceiving": "este servidor recebe a cópia",
           "tileEmail": "E-mail",
           "tileEmailNote": "Os apps ainda não enviam e-mail",
           "detailsTech": "Detalhes técnicos",
@@ -3792,6 +3803,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "tileMirrorOn": "On",
           "tileMirrorOff": "Not used",
           "tileMirrorNote": "Live copy of the data",
+          "tileMirrorWith": "Live copy with {who}",
+          "tileMirrorStopped": "Stopped",
+          "tileMirrorStoppedNote": "The copy with {who} is not flowing right now",
+          "tileMirrorPairedOnly": "Paired with {who}, no data copy",
+          "pairedWith": "Paired with",
+          "pairedNobody": "Nobody",
+          "footerPaired": "Paired with: {who}",
+          "footerUnpaired": "No paired server",
+          "peerViaCopy": "Paired through the live copy",
+          "peerSending": "this server sends the copy",
+          "peerReceiving": "this server receives the copy",
           "tileEmail": "Email",
           "tileEmailNote": "Apps cannot send email yet",
           "detailsTech": "Technical details",
@@ -6194,13 +6216,72 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (BTN_ICONS[name] || '') + '</svg>';
     }
 
+    // Who this server is paired with. The invite side of 'node invite/join' never hears back from the
+    // joiner, so its own pairing list stays empty: the live copy (offers sent, copies received) is what
+    // actually names the other server there. Both sources are merged, by name.
+    // The same server can carry two names (the pairing keeps the generic "primary-node", the copy its
+    // hostname): entries with the same node id are one server, shown by its more specific name.
+    function pairedServers(s) {
+      const byKey = {};
+      const add = function (key, name, how) {
+        if (!name) return;
+        const e = byKey[key] = byKey[key] || { name: name };
+        if (e.name === 'primary-node' && name !== 'primary-node') e.name = name;
+        e[how] = true;
+      };
+      Object.values(s.federation?.peers || {}).forEach(function (p) { add(p.nodeId ? 'id:' + p.nodeId : 'name:' + p.name, p.name, 'paired'); });
+      const m = s.mirror || {};
+      Object.values(m.replicas || {}).forEach(function (r) { add(r.peerNodeId ? 'id:' + r.peerNodeId : 'name:' + r.peerName, r.peerName, 'receiving'); });
+      Object.entries(m.offers || {}).forEach(function ([k, o]) {
+        const name = o.peer || k;
+        const same = Object.keys(byKey).find(function (key) { return byKey[key].name === name; });
+        add(same || 'name:' + name, name, 'sending');
+      });
+      const out = {};
+      Object.values(byKey).forEach(function (e) { out[e.name] = Object.assign(out[e.name] || {}, e); });
+      return out;
+    }
+    // Live state of the copy (GET /api/mirror asks Postgres), refreshed at most every 30 s.
+    let mirrorLive = null;
+    let mirrorLiveAt = 0;
+    let mirrorLiveBusy = false;
+    function refreshMirrorLive(s) {
+      const m = s.mirror || {};
+      if (!Object.keys(m.offers || {}).length && !Object.keys(m.replicas || {}).length) { mirrorLive = null; return; }
+      if (mirrorLiveBusy || Date.now() - mirrorLiveAt < 30000) return;
+      mirrorLiveBusy = true;
+      mirrorLiveAt = Date.now();
+      fetch('/api/mirror').then(function (r) { return r.ok ? r.json() : null; }).then(function (live) {
+        mirrorLiveBusy = false;
+        if (!live) return;
+        mirrorLive = live;
+        mirrorLiveAt = Date.now();
+        if (lastStatus) renderStatusData(lastStatus);
+        renderHome();
+      }).catch(function () { mirrorLiveBusy = false; });
+    }
+    // The second server in one line: 'none' | 'paired' (no copy) | 'on' | 'stopped' | 'fenced'.
+    function mirrorSummary(s) {
+      const m = s.mirror || {};
+      const peers = pairedServers(s);
+      const names = Object.keys(peers);
+      const copyNames = names.filter(function (n) { return peers[n].sending || peers[n].receiving; });
+      if (m.fenced) return { state: 'fenced', names: names, copyNames: copyNames, down: [] };
+      if (!copyNames.length) return { state: names.length ? 'paired' : 'none', names: names, copyNames: copyNames, down: [] };
+      const down = [];
+      if (mirrorLive) {
+        (mirrorLive.sending || []).forEach(function (o) { if (o.error || !o.connected) down.push(o.peer); });
+        (mirrorLive.receiving || []).forEach(function (r) { if (r.error || r.supersededBy || !(r.streaming || r.promotedAt)) down.push(r.peer); });
+      }
+      return { state: down.length ? 'stopped' : 'on', names: names, copyNames: copyNames, down: down.filter(function (n, i) { return down.indexOf(n) === i; }) };
+    }
+
     // "Quick health" box in the telemetry column: one line per thing that needs care, each opens its page.
     function healthCardHtml(s) {
       const backups = (s.backups || []).slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
       const last = backups[0];
       const offsiteOn = Boolean((s.systemSecretsConfigured || {}).BACKUP_S3_ENDPOINT);
-      const m = s.mirror || {};
-      const hasMirror = Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0;
+      const ms = mirrorSummary(s);
       const row = function (label, value, tone, tab, sub) {
         const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : 'var(--text)';
         return '<button class="telemetry-item health-row" data-go-tab="' + tab + '" data-go-sub="' + sub + '">' +
@@ -6211,7 +6292,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         '<div class="telemetry-title"><span>' + esc(t('healthTitle')) + '</span></div>' +
         row(t('healthBackup'), last ? (lastAge || new Date(last.createdAt).toLocaleString()) : t('never'), last ? 'ok' : 'warn', 'databases', 'backups') +
         row(t('healthOffsite'), offsiteOn ? t('healthOn') : t('notConfigured'), offsiteOn ? 'ok' : 'warn', 'databases', 'offsite') +
-        row(t('healthMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('healthOn') : t('healthOff'), m.fenced ? 'warn' : hasMirror ? 'ok' : '', 'mirror', hasMirror ? 'copy' : 'connect') +
+        row(t('healthMirror'),
+          ms.state === 'fenced' ? t('mirrorFenced') : ms.state === 'on' ? t('healthOn') : ms.state === 'stopped' ? t('tileMirrorStopped') : t('healthOff'),
+          ms.state === 'on' ? 'ok' : (ms.state === 'fenced' || ms.state === 'stopped') ? 'warn' : '', 'mirror', ms.copyNames.length ? 'copy' : 'connect') +
         row(t('healthEmail'), emailRelay ? t('healthOn') : t('notConfigured'), emailRelay ? 'ok' : '', 'email', '') +
         '</div>';
     }
@@ -6220,11 +6303,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const isPt = currentLang === 'pt';
       const domain = getBaseDomain();
       document.getElementById('topDomainBadge').innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> <span>\${isPt ? 'Domínio' : 'Domain'}: <strong>\${esc(domain)}</strong></span>\`;
-      const role = s.federation?.role || 'standalone';
-      const peersCount = Object.keys(s.federation?.peers || {}).length;
-      const roleLabel = role === 'standalone' ? (isPt ? 'autônomo' : 'standalone') : role;
-      const peersLabel = isPt ? (peersCount === 1 ? '1 par' : peersCount + ' pares') : (peersCount === 1 ? '1 peer' : peersCount + ' peers');
-      document.getElementById('nodeRoleFooter').textContent = (isPt ? 'Nó: ' : 'Node: ') + roleLabel + ' (' + peersLabel + ')';
+      const pairedNames = Object.keys(pairedServers(s));
+      refreshMirrorLive(s);
+      document.getElementById('nodeRoleFooter').textContent = pairedNames.length ? t('footerPaired').replace('{who}', pairedNames.join(', ')) : t('footerUnpaired');
 
       const elHostname = document.getElementById('topHostname');
       if (elHostname) elHostname.textContent = s.hostname || '-';
@@ -6256,12 +6337,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       setNavCounter('tabCountDbs', Object.keys(s.databases || {}).length, 'cntDbs');
       // systemSecretsConfigured is an object (key -> masked value), not a list.
       setNavCounter('tabCountVault', Object.keys(s.systemSecretsConfigured || {}).length, 'cntVault');
-      setNavCounter('tabCountMirror', peersCount, 'cntMirror');
+      setNavCounter('tabCountMirror', pairedNames.length, 'cntMirror');
       setNavCounter('tabCountPool', Object.keys(s.pool || {}).length, 'cntPool');
       setNavCounter('tabCountAgents', s.mcpToolCount || 0, 'cntAgents');
       renderSubNav();
 
-      const roleBadge = role === 'standalone' ? (isPt ? 'AUTÔNOMO' : 'STANDALONE') : role.toUpperCase();
       const tailscaleVal = s.tailscaleDomain || (s.federation?.peers ? (isPt ? 'Rede Ativa' : 'Tailnet Active') : '127.0.0.1');
       const dockerVal = isPt ? 'Ativo' : 'Running';
       const backupsCount = s.backupsCount || 0;
@@ -6294,8 +6374,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <span class="telemetry-val" style="font-size:11px;">\${esc((s.sshKeyFingerprint || '').slice(0, 16))}...</span>
           </div>
           <div class="telemetry-item">
-            <span>\${isPt ? 'Papel no Cluster' : 'Cluster Role'}</span>
-            <span class="badge" style="font-size:10px;padding:2px 7px;">\${esc(roleBadge)}</span>
+            <span>\${esc(t('pairedWith'))}</span>
+            <span class="telemetry-val">\${esc(pairedNames.length ? pairedNames.join(', ') : t('pairedNobody'))}</span>
           </div>
         </div>
 
@@ -6500,14 +6580,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyBackups')) + '</span>';
 
       const peers = Object.values(s.federation?.peers || {});
-      document.getElementById('fedPeersList').innerHTML = peers.length
+      const fedNames = peers.map(p => p.name);
+      const allPeers = pairedServers(s);
+      // Servers known only through the live copy (the invite side never hears back from 'node join').
+      const copyOnly = Object.keys(allPeers).filter(n => fedNames.indexOf(n) === -1);
+      const copyOnlyHtml = copyOnly.map(n => '<div style="padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">' +
+        '🤝 <strong>' + esc(n) + '</strong> — <span class="badge success">' + esc(t('peerViaCopy')) + '</span><br/>' +
+        '<span style="color:var(--muted);font-size:11.5px;">' + esc([allPeers[n].sending ? t('peerSending') : '', allPeers[n].receiving ? t('peerReceiving') : ''].filter(Boolean).join(' · ')) + '</span></div>').join('');
+      document.getElementById('fedPeersList').innerHTML = copyOnlyHtml + (peers.length
         ? peers.map(p => \`
           <div style="padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">
             🤝 <strong>\${esc(p.name)}</strong> (<code>\${esc(p.nodeId)}</code>) — <span class="badge success">\${esc(p.mode)}</span><br/>
             <span style="color:var(--muted);font-size:11.5px;">Endpoint: \${esc(p.endpointUrl)} · Key: <code>\${esc(p.publicKeyFingerprint)}</code></span>
           </div>
         \`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>';
+        : copyOnly.length ? '' : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>');
     }
 
     // Server answers 409 for risky actions: show its warning, ask the person, and resend with the confirmation.
@@ -6585,13 +6672,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const backups = (s.backups || []).slice().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
       const last = backups[0];
       const offsiteOn = Boolean((s.systemSecretsConfigured || {}).BACKUP_S3_ENDPOINT);
-      const m = s.mirror || {};
-      const hasMirror = Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0;
+      const ms = mirrorSummary(s);
+      const msWho = ms.copyNames.join(', ');
       const tile = (title, value, note) => '<div class="arch-box"><h3>' + esc(title) + '</h3><p style="font-size:18px;font-weight:700;color:var(--text);margin:4px 0;">' + esc(value) + '</p><p>' + esc(note) + '</p></div>';
       tiles.innerHTML =
         tile(t('tileApps'), String(apps.length), apps.length ? t('tileAppsNote') : t('tileAppsNone')) +
         tile(t('tileBackup'), last ? new Date(last.createdAt).toLocaleString() : t('never'), last ? (last.offsiteAt ? t('tileBackupOff') : t('tileBackupLocal')) : t('tileBackupNone')) +
-        tile(t('tileMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('tileMirrorOn') : t('tileMirrorOff'), t('tileMirrorNote')) +
+        tile(t('tileMirror'),
+          ms.state === 'fenced' ? t('mirrorFenced') : ms.state === 'on' ? t('tileMirrorOn') : ms.state === 'stopped' ? t('tileMirrorStopped') : t('tileMirrorOff'),
+          ms.state === 'on' ? t('tileMirrorWith').replace('{who}', msWho)
+            : ms.state === 'stopped' ? t('tileMirrorStoppedNote').replace('{who}', ms.down.join(', '))
+            : ms.state === 'paired' ? t('tileMirrorPairedOnly').replace('{who}', ms.names.join(', '))
+            : t('tileMirrorNote')) +
         tile(t('tileEmail'), emailRelay ? emailRelay.host : t('notConfigured'), emailRelay ? emailRelay.fromDomain : t('tileEmailNote'));
       renderNextStep();
       renderTutorial();
@@ -6736,6 +6828,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const res = await fetch('/api/mirror');
       if (!res.ok) return;
       const m = await res.json();
+      mirrorLive = m;
+      mirrorLiveAt = Date.now();
       let html = '';
       if (m.fenced) html += card(badge('danger', t('mirrorFenced')) + '<div style="margin-top:6px;">' + esc(t('mirrorFencedDesc')) + '</div>');
       html += card('<strong>' + esc(t('mirrorAuto')) + ':</strong> ' + ((m.auto || []).length ? badge('success', (m.auto || []).join(', ')) : badge('', t('off'))) +
