@@ -4758,6 +4758,73 @@ volumes:
     assert.equal(await pcs.sshBanner("127.0.0.1", port, 300), undefined, "closed port: nothing answers");
   });
 
+  await t.test("58. Installing on a PC: the check is parsed safely, the plan says what is missing, the root script quotes everything", async () => {
+    const r = await import("./pcremote.js");
+    const { spawnSync } = await import("node:child_process");
+    const out = [
+      "osId=ubuntu", "osLike=debian", "osVersion=24.04", "osName=Ubuntu 24.04.1 LTS", "arch=x86_64", "user=graco", "uid=1000",
+      "memMb=7800", "diskMb=90000", "systemd=1", "git=", "node=v18.19.1", "npm=", "docker=", "compose=", "tailscale=1.80.0",
+      "sshd=0", "paasmcp=", "sudo=password", "evil=$(rm -rf /)", "osName2=x",
+    ].join("\n");
+    const f = r.parseFacts(out);
+    assert.equal(f.osId, "ubuntu");
+    assert.equal(f.sudo, "password");
+    assert.equal(f.root, false);
+    assert.equal((f as unknown as Record<string, unknown>).evil, undefined, "unknown keys are dropped");
+    assert.equal(r.parseFacts("sudo=sure\nosName=\u0007bad\u001b[31m").sudo, "none", "an unknown sudo answer is no sudo");
+    const plan = r.planFor(f, { hasPair: false, localArch: "x64", havePassword: true });
+    assert.equal(plan.supported, true);
+    assert.deepEqual(plan.install, ["git", "docker", "compose", "node"]);
+    assert.deepEqual(plan.roles, ["server", "helper"], "arbiter only when this server has a pair");
+    assert.deepEqual(r.planFor({ ...f, arch: "aarch64" }, { hasPair: true, localArch: "x64", havePassword: true }).warnings, ["archDiffers"]);
+    assert.deepEqual(r.planFor(f, { hasPair: true, localArch: "x64", havePassword: false }).problems, ["sudoNeedsPassword"]);
+    assert.deepEqual(r.planFor({ ...f, osId: "fedora", osLike: "rhel", systemd: false, diskMb: 900 }, { hasPair: false, localArch: "x64", havePassword: true }).problems, ["notDebian", "systemd", "disk"]);
+    assert.equal(r.planFor({ ...f, osId: "linuxmint", osLike: "ubuntu debian" }, { hasPair: false, localArch: "x64", havePassword: true }).supported, true, "Debian family by ID_LIKE");
+
+    // Inputs: only what a login name / IP / PC name can be.
+    assert.throws(() => r.validateUser("-oProxyCommand=sh"));
+    assert.throws(() => r.validateUser("root;id"));
+    assert.equal(r.validateUser("graco"), "graco");
+    assert.throws(() => r.validateIp("100.64.0.300"));
+    assert.throws(() => r.validatePassword("a\nb"));
+    assert.equal(r.validatePcName("Notebook do Graco!"), "notebook-do-graco");
+
+    // The root script: valid bash, every value single-quoted, nothing from the PC in it.
+    const nasty = "https://github.com/a/b";
+    const script = r.installScript({ role: "helper", repoUrl: nasty, ref: "a".repeat(40), ip: "100.64.0.20", invite: "paasmcp-pool://AbC_d-e" + "x".repeat(40) });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pcs-"));
+    fs.writeFileSync(path.join(dir, "s.sh"), script);
+    assert.equal(spawnSync("bash", ["-n", path.join(dir, "s.sh")]).status, 0, "bash -n accepts the script");
+    assert.match(script, /REF='a{40}'/);
+    assert.match(script, new RegExp(r.NODE_SHA256.x64));
+    assert.match(script, /sha256sum -c/);
+    assert.throws(() => r.installScript({ role: "server", repoUrl: "https://x/y'; rm -rf /'", ref: "main", ip: "100.64.0.20" }));
+    assert.throws(() => r.installScript({ role: "server", repoUrl: nasty, ref: "main;id", ip: "100.64.0.20" }));
+    assert.throws(() => r.installScript({ role: "helper", repoUrl: nasty, ref: "main", ip: "100.64.0.20", invite: "x'$(id)'" }));
+    assert.throws(() => r.installScript({ role: "root" as never, repoUrl: nasty, ref: "main", ip: "100.64.0.20" }));
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // sudo: the password goes on stdin, never in the command.
+    const pw = "s3cr'et pass";
+    const a = r.asRoot({ sudo: "password" }, "bash '/tmp/x.sh'", pw);
+    assert.equal(a.command.includes(pw), false);
+    assert.equal(a.stdin, pw + "\n");
+    assert.equal(r.asRoot({ sudo: "root" }, "id").command, "id");
+    assert.equal(r.asRoot({ sudo: "nopass" }, "id").command, "sudo -n id");
+    assert.equal(r.redact(`x ${pw} y ${r.shq(pw)}`, pw), "x ••• y •••");
+    assert.equal(r.shq("it's"), `'it'\\''s'`);
+
+    // ssh's complaints become codes the screen explains.
+    assert.equal(r.sshError("Host key verification failed.").code, "hostKey");
+    assert.equal(r.sshError("graco@100.64.0.20: Permission denied (publickey,password).").code, "auth");
+    assert.equal(r.sshError("ssh: connect to host 100.64.0.20 port 22: Connection refused").code, "unreachable");
+
+    // Only a PC from the list, and nothing without a valid user.
+    await assert.rejects(r.startPcCheck({ ip: "100.64.0.20", user: "bad user", by: "test" }), /user name/);
+    await assert.rejects(r.startPcCheck({ ip: "100.64.0.99", user: "graco", by: "test" }), (e: Error & { code?: string }) => e.code === "notInList");
+    r.resetPcJobs();
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
