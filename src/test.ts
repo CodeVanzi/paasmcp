@@ -4376,6 +4376,93 @@ volumes:
     }
   });
 
+  await t.test("55. Push notices from the dashboard: the saved token creates or fixes the webhook, only for this address", async () => {
+    const conn = await import("./connections.js");
+    const http = await import("node:http");
+    const TOKEN = "github_pat_" + "w".repeat(30);
+    const before = vault.getSecrets("system").GITHUB_TOKEN;
+    vault.setSecretEntries("system", { GITHUB_TOKEN: TOKEN });
+    const URL_HERE = "https://painel.example.com/api/webhooks/github";
+    const hooks: Record<string, { id: number; active: boolean; events: string[]; config: Record<string, string>; last_response?: { code: number } }[]> = {
+      "octo/shop": [
+        { id: 7, active: true, events: ["push"], config: { url: "https://other.example.com/hook" } },
+        { id: 8, active: false, events: ["issues"], config: { url: URL_HERE } },
+      ],
+      "octo/site": [],
+    };
+    const calls: string[] = [];
+    const now = new Date().toISOString();
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end("{}");
+        const m = (req.url || "").match(/^\/gh\/repos\/([^/]+\/[^/]+)\/hooks(?:\/(\d+))?(\/pings|\/deliveries)?/);
+        calls.push(`${req.method} ${req.url}`);
+        if (!m || !(m[1] in hooks)) return res.writeHead(404).end("{}");
+        const list = hooks[m[1]];
+        if (req.method === "GET" && !m[2]) return res.writeHead(200).end(JSON.stringify(list));
+        if (req.method === "POST" && !m[2]) {
+          const body = JSON.parse(raw);
+          const h = { id: 100 + list.length, active: body.active, events: body.events, config: body.config };
+          list.push(h);
+          return res.writeHead(201).end(JSON.stringify(h));
+        }
+        const h = list.find((x) => x.id === Number(m[2]));
+        if (!h) return res.writeHead(404).end("{}");
+        if (req.method === "PATCH") { const b = JSON.parse(raw); Object.assign(h, { active: b.active, events: b.events, config: b.config }); return res.writeHead(200).end(JSON.stringify(h)); }
+        if (m[3] === "/pings") return res.writeHead(204).end();
+        if (m[3] === "/deliveries") return res.writeHead(200).end(JSON.stringify([{ event: "ping", status_code: m[1] === "octo/shop" ? 200 : 530, delivered_at: now }]));
+        res.writeHead(404).end("{}");
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GITHUB_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}/gh`;
+    try {
+      assert.equal(conn.githubRepoOf("https://github.com/octo/shop.git"), "octo/shop");
+      assert.equal(conn.githubRepoOf("git@github.com:octo/site.git"), "octo/site");
+      assert.equal(conn.githubRepoOf("https://gitlab.com/octo/shop"), "");
+      assert.equal(conn.githubRepoOf("octo/../etc"), "");
+      assert.equal(conn.webhookAddress("painel.example.com/qualquer"), URL_HERE, "always the dashboard's own path");
+      for (const bad of ["http://painel.example.com", "https://192.168.0.10:4099", "https://localhost", "https://srv.local", "https://u:p@painel.example.com"]) {
+        assert.throws(() => conn.webhookAddress(bad), conn.ConnectionError, bad);
+      }
+      const apps = [
+        { name: "shop", repoUrl: "https://github.com/octo/shop" },
+        { name: "shop-admin", repoUrl: "git@github.com:octo/shop.git" },
+        { name: "site", repoUrl: "octo/site" },
+        { name: "secret", repoUrl: "octo/nope" },
+        { name: "local" },
+      ];
+      const listed = await conn.listRepoHooks(apps, "https://painel.example.com");
+      assert.deepEqual(listed.map((r) => [r.repo, r.state, r.apps.join(",")]), [
+        ["octo/shop", "off", "shop,shop-admin"],
+        ["octo/site", "off", "site"],
+        ["octo/nope", "denied", "secret"],
+      ], "a disabled hook without push counts as off; a repo the token cannot see is denied");
+
+      const fixed = await conn.ensureRepoHook("octo/shop", "https://painel.example.com", "s3cret");
+      assert.deepEqual(fixed, { repo: "octo/shop", created: false, reach: "ok", code: 200 });
+      assert.equal(hooks["octo/shop"].length, 2, "the hook already pointing here is fixed, not duplicated");
+      assert.deepEqual(hooks["octo/shop"][1].config, { url: URL_HERE, content_type: "json", secret: "s3cret", insecure_ssl: "0" });
+      assert.deepEqual(hooks["octo/shop"][1].events, ["push"]);
+      assert.equal(hooks["octo/shop"][0].config.url, "https://other.example.com/hook", "someone else's hook is left alone");
+      assert.ok(calls.includes("POST /gh/repos/octo/shop/hooks/8/pings"), "a fixed hook gets a test call");
+
+      const made = await conn.ensureRepoHook("https://github.com/octo/site.git", "painel.example.com", "s3cret");
+      assert.deepEqual(made, { repo: "octo/site", created: true, reach: "unreachable", code: 530 });
+      assert.equal(hooks["octo/site"].length, 1);
+      await assert.rejects(conn.ensureRepoHook("octo/nope", "painel.example.com", "x"), (e: InstanceType<typeof conn.ConnectionError>) => /Webhooks: Read and write/.test(e.pt));
+      assert.deepEqual((await conn.listRepoHooks(apps.slice(0, 3), "painel.example.com")).map((r) => r.state), ["on", "on"]);
+      vault.deleteSecretKey("system", "GITHUB_TOKEN");
+      await assert.rejects(conn.listRepoHooks(apps, "painel.example.com"), /No GitHub token/);
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_GITHUB_API_URL;
+      if (before) vault.setSecretEntries("system", { GITHUB_TOKEN: before }); else vault.deleteSecretKey("system", "GITHUB_TOKEN");
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
