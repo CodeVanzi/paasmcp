@@ -16,7 +16,7 @@ import {
 } from "./config.js";
 import { ensureDockerNetwork, ensureSharedPostgresCluster, ensureSharedRedisCluster } from "./database.js";
 import { deployApp, manageAppLifecycle } from "./deployer.js";
-import { askArbiter } from "./arbiter.js";
+import { ArbiterAbout, askArbiter, pairWithArbiter } from "./arbiter.js";
 import { bucketTargets } from "./active.js";
 import { syncBucket } from "./filesync.js";
 import { audit } from "./guard.js";
@@ -563,6 +563,17 @@ export function setArbiterUrl(arbiterUrl: string): MirrorConfig {
   });
 }
 
+/**
+ * Pairs with a PC that shows a pairing code (`arbiter pair` / its dashboard), saves its address and
+ * checks it once. The other server learns the address through the control channel (active.ts).
+ */
+export async function pairArbiterAndSave(host: string, code: string, opts: { port?: number } = {}): Promise<{ url: string; cluster: string; host: string; check: ArbiterCheck }> {
+  const out = await pairWithArbiter(host, code, opts);
+  setArbiterUrl(out.url);
+  audit({ event: "mirror.arbiter-paired", url: out.url, cluster: out.cluster, arbiterHost: out.host });
+  return { ...out, check: await checkArbiter() };
+}
+
 export interface ArbiterCheck {
   configured: boolean;
   url?: string;
@@ -577,6 +588,42 @@ export interface ArbiterCheck {
   /** Whether `paasmcp mirror watch` (systemd) runs here; null when unknown. */
   watchActive?: boolean | null;
   auto?: string[];
+  /** The arbiter's own device (name, PaaSMCP version, running since); absent on older arbiters. */
+  about?: ArbiterAbout;
+  /** How long this check took, round trip. */
+  latencyMs?: number;
+  /** Whose data each server serves, as the arbiter records it (only after a takeover or handback). */
+  owners?: { dataOf: string; owner: string; epoch: number }[];
+  /** The watchdog's last talk with the arbiter (from `mirror watch` on this server). */
+  watch?: WatchContact;
+}
+
+/** Last time `mirror watch` reached the arbiter, and its last failure. */
+export interface WatchContact {
+  okAt?: string;
+  errorAt?: string;
+  error?: string;
+}
+const WATCH_FILE = () => path.join(PAAS_DATA_DIR, "mirror-watch.json");
+
+export function readWatchContact(): WatchContact {
+  try {
+    return JSON.parse(fs.readFileSync(WATCH_FILE(), "utf-8")) as WatchContact;
+  } catch {
+    return {};
+  }
+}
+
+function recordWatchContact(ok: boolean, error?: string): void {
+  const prev = readWatchContact();
+  const next: WatchContact = ok ? { ...prev, okAt: new Date().toISOString() } : { ...prev, errorAt: new Date().toISOString(), error: String(error || "").split("\n")[0].slice(0, 200) };
+  try {
+    fs.mkdirSync(path.dirname(WATCH_FILE()), { recursive: true });
+    fs.writeFileSync(`${WATCH_FILE()}.tmp`, JSON.stringify(next));
+    fs.renameSync(`${WATCH_FILE()}.tmp`, WATCH_FILE());
+  } catch {
+    // only for the dashboard: never stop the watchdog over it
+  }
 }
 
 /**
@@ -595,7 +642,7 @@ export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> 
           return false;
         }
       })();
-  const base = { watchActive, auto: m.auto || [] };
+  const base = { watchActive, auto: m.auto || [], watch: readWatchContact() };
   if (!url) return { configured: false, ...base };
   if (!ARBITER_URL_RE.test(url)) return { configured: true, url, ok: false, errorCode: "badUrl", error: "Invalid address. Use http://<Tailscale IP of the arbiter>:4097", ...base };
   const state = loadState();
@@ -604,11 +651,15 @@ export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> 
   for (const p of Object.values(state.federation?.peers || {})) names[p.nodeId] = p.name;
   for (const r of Object.values(m.replicas)) names[r.peerNodeId] = r.peerName;
   try {
+    const started = Date.now();
     const r = await askArbiter(url, { op: "heartbeat", node: me, epoch: m.epoch });
+    const latencyMs = Date.now() - started;
     const nodes = Object.entries(r.nodes || {})
       .map(([nodeId, n]) => ({ nodeId, name: names[nodeId] || nodeId, isMe: nodeId === me, secondsAgo: Math.max(0, Math.round((r.now - n.lastSeen) / 1000)) }))
       .sort((a, b) => Number(b.isMe) - Number(a.isMe) || a.secondsAgo - b.secondsAgo);
-    return { configured: true, url, ok: true, nodes, ...base };
+    const owners = Object.entries(r.owners || {}).map(([dataOf, o]) => ({ dataOf: names[dataOf] || dataOf, owner: names[o.owner] || o.owner, epoch: o.epoch }));
+    const about = r.about && typeof r.about === "object" ? r.about : undefined;
+    return { configured: true, url, ok: true, nodes, owners, latencyMs, ...(about ? { about } : {}), ...base };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const [errorCode, error]: [NonNullable<ArbiterCheck["errorCode"]>, string] = /HTTP 401/.test(msg)
@@ -683,7 +734,14 @@ export async function watchTick(opts: { streaming?: (rec: MirrorReplicaRecord) =
   const m = mirrorState();
   if (!m.arbiterUrl) return { skipped: "no arbiter configured" };
   const me = loadState().federation?.nodeId || "primary";
-  const beat = await askArbiter(m.arbiterUrl, { op: "heartbeat", node: me, epoch: m.epoch });
+  let beat: Awaited<ReturnType<typeof askArbiter>>;
+  try {
+    beat = await askArbiter(m.arbiterUrl, { op: "heartbeat", node: me, epoch: m.epoch });
+    recordWatchContact(true);
+  } catch (err) {
+    recordWatchContact(false, err instanceof Error ? err.message : String(err));
+    throw err;
+  }
   const out: Record<string, unknown> = { epoch: m.epoch };
 
   const myOwner = beat.owners[me];

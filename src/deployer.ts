@@ -370,6 +370,39 @@ export class HealthcheckFailedError extends Error {
   }
 }
 
+/** IP of a container on the PaaSMCP Docker network ('' when it has none). */
+function containerIp(name: string): string {
+  try {
+    return execFileSync(
+      "docker",
+      ["inspect", "-f", `{{with index .NetworkSettings.Networks "${DOCKER_NETWORK}"}}{{.IPAddress}}{{end}}`, name],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Where this process reaches a container's HTTP port for a health probe. Normally the host loopback
+ * port it publishes. Inside the dashboard container, 127.0.0.1 is the dashboard itself, so the probe
+ * goes to the container's own address on the Docker network instead (by IP: during the swap the
+ * candidate also answers for the production name).
+ */
+export function probeUrl(
+  container: string,
+  internalPort: number,
+  hostPort: number,
+  probePath: string,
+  ipOf: (name: string) => string = containerIp
+): string {
+  if (process.env.PAASMCP_IN_DASHBOARD === "1") {
+    const ip = ipOf(container);
+    if (/^[0-9a-f.:]+$/i.test(ip)) return `http://${ip.includes(":") ? `[${ip}]` : ip}:${internalPort}${probePath}`;
+  }
+  return `http://127.0.0.1:${hostPort}${probePath}`;
+}
+
 /** A free loopback port picked by the kernel (closed again right away; docker binds it next). */
 export function findFreeLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -621,7 +654,7 @@ networks:
         primaryService
       );
       const result = await waitForHealthy({
-        url: `http://127.0.0.1:${candidatePort}${probePath}`,
+        url: probeUrl(candidateName, internalPort, candidatePort, probePath),
         timeoutMs,
         isAlive: () => containerRunning(candidateName),
       });
@@ -653,7 +686,7 @@ networks:
     compose("up", "-d", "--no-build", "--remove-orphans");
     if (healthcheck) {
       const settled = await waitForHealthy({
-        url: `http://127.0.0.1:${localPort}${probePath}`,
+        url: probeUrl(containerName, internalPort, localPort, probePath),
         timeoutMs,
         isAlive: () => containerRunning(containerName),
       });
@@ -763,12 +796,15 @@ export type AppLifecycleAction =
   | "purge";
 
 /** Deletes apps that stayed in the trash longer than TRASH_RETENTION_DAYS (run daily from cron/timer). */
-export function purgeExpiredTrash(now = Date.now()): string[] {
+export function expiredTrashApps(now = Date.now()): string[] {
   const cutoff = now - TRASH_RETENTION_DAYS * 24 * 3600 * 1000;
-  const expired = Object.values(loadState().apps).filter(
-    (a) => a.trashedAt && Date.parse(a.trashedAt) < cutoff
-  );
-  return expired.map((a) => manageAppLifecycle(a.name, "purge"));
+  return Object.values(loadState().apps)
+    .filter((a) => a.trashedAt && Date.parse(a.trashedAt) < cutoff)
+    .map((a) => a.name);
+}
+
+export function purgeExpiredTrash(now = Date.now()): string[] {
+  return expiredTrashApps(now).map((name) => manageAppLifecycle(name, "purge"));
 }
 
 export function manageAppLifecycle(
@@ -792,6 +828,7 @@ export function manageAppLifecycle(
       fs.renameSync(app.trashDir, app.appDir);
       delete app.trashedAt;
       delete app.trashDir;
+      delete app.trashWarnedAt;
       app.status = "running";
       saveState(state);
       execFileSync("docker", ["compose", "-f", path.join(app.appDir, "compose.yaml"), "up", "-d"], {
@@ -903,6 +940,7 @@ export function manageAppLifecycle(
     else fs.mkdirSync(trashDir, { recursive: true, mode: 0o700 });
     app.trashedAt = now.toISOString();
     app.trashDir = trashDir;
+    delete app.trashWarnedAt;
     app.status = "trashed";
     saveState(state);
     syncHomepageDashboard();
@@ -912,43 +950,46 @@ export function manageAppLifecycle(
   throw new Error(`Unsupported action: ${action}`);
 }
 
-export function getContainerMetrics(): Record<string, AppMetrics> {
-  const metrics: Record<string, AppMetrics> = {};
-  if (process.env.PAASMCP_OFFLINE_TEST === "1") {
-    return metrics;
-  }
+/** Raw `docker stats --no-stream` output for every running container ("" when Docker can't answer). */
+export function readDockerStats(): string {
+  if (process.env.PAASMCP_OFFLINE_TEST === "1") return "";
   try {
-    const out = execFileSync(
-      "docker",
-      ["stats", "--no-stream", "--format", "{{json .}}"],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 4000 }
-    );
-    for (const line of out.trim().split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const row = JSON.parse(line) as {
-          Name?: string;
-          CPUPerc?: string;
-          MemUsage?: string;
-          MemPerc?: string;
-          NetIO?: string;
-          PIDs?: string;
-        };
-        if (row.Name && row.Name.startsWith("paasmcp-")) {
-          metrics[row.Name] = {
-            cpuPercent: row.CPUPerc || "0.00%",
-            memUsage: row.MemUsage || "0B / 0B",
-            memPercent: row.MemPerc || "0.00%",
-            netIO: row.NetIO || "0B / 0B",
-            pids: row.PIDs || "0",
-          };
-        }
-      } catch {
-        // ignore malformed row
-      }
-    }
+    return execFileSync("docker", ["stats", "--no-stream", "--format", "{{json .}}"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 4000,
+    });
   } catch {
     // Docker daemon unavailable or no running containers
+    return "";
+  }
+}
+
+export function getContainerMetrics(out: string = readDockerStats()): Record<string, AppMetrics> {
+  const metrics: Record<string, AppMetrics> = {};
+  for (const line of out.trim().split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line) as {
+        Name?: string;
+        CPUPerc?: string;
+        MemUsage?: string;
+        MemPerc?: string;
+        NetIO?: string;
+        PIDs?: string;
+      };
+      if (row.Name && row.Name.startsWith("paasmcp-")) {
+        metrics[row.Name] = {
+          cpuPercent: row.CPUPerc || "0.00%",
+          memUsage: row.MemUsage || "0B / 0B",
+          memPercent: row.MemPerc || "0.00%",
+          netIO: row.NetIO || "0B / 0B",
+          pids: row.PIDs || "0",
+        };
+      }
+    } catch {
+      // ignore malformed row
+    }
   }
   return metrics;
 }
@@ -959,6 +1000,9 @@ export interface DoctorDiagnosticItem {
   summary: string;
   recommendation?: string;
   details?: Record<string, unknown>;
+  /** Stable id of this finding plus its values, so the dashboard can say it in the screen's language. */
+  code?: string;
+  vars?: Record<string, string | number>;
 }
 
 export function runPaaSDoctor(appName?: string): {
@@ -981,6 +1025,8 @@ export function runPaaSDoctor(appName?: string): {
         target: app.name,
         severity: "healthy",
         summary: `Container ${app.containerName} registered on 127.0.0.1:${app.localPort}.`,
+        code: "app_registered",
+        vars: { port: app.localPort },
       });
       continue;
     }
@@ -1013,6 +1059,7 @@ export function runPaaSDoctor(appName?: string): {
           summary: `Container ${app.containerName} was terminated by Linux OOMKiller (Out of Memory).`,
           recommendation: `Increase memoryLimit in paas_app_deploy or optimize memory usage in ${app.name}.`,
           details: { status: cState.Status, exitCode: cState.ExitCode, restartCount },
+          code: "app_oom",
         });
       } else if (!cState.Running && app.status !== "stopped") {
         let lastLogs = "";
@@ -1037,6 +1084,8 @@ export function runPaaSDoctor(appName?: string): {
             restartCount,
             lastLogs: lastLogs.slice(-1500),
           },
+          code: "app_down",
+          vars: { status: String(cState.Status ?? "?"), exitCode: String(cState.ExitCode ?? "?") },
         });
       } else if (restartCount > 3) {
         diagnostics.push({
@@ -1045,6 +1094,8 @@ export function runPaaSDoctor(appName?: string): {
           summary: `Container ${app.containerName} is running but has restarted ${restartCount} times.`,
           recommendation: "Check paas_app_lifecycle(action='logs') for intermittent crashes.",
           details: { restartCount, metrics: containerMetric },
+          code: "app_restarts",
+          vars: { count: restartCount },
         });
       } else {
         diagnostics.push({
@@ -1052,6 +1103,8 @@ export function runPaaSDoctor(appName?: string): {
           severity: "healthy",
           summary: `Container ${app.containerName} is healthy and bound to 127.0.0.1:${app.localPort}.`,
           details: { restartCount, metrics: containerMetric },
+          code: "app_ok",
+          vars: { port: app.localPort },
         });
       }
     } catch {
@@ -1060,6 +1113,7 @@ export function runPaaSDoctor(appName?: string): {
         severity: app.status === "stopped" ? "healthy" : "warning",
         summary: `Container ${app.containerName} not found in Docker engine.`,
         recommendation: `Re-run paas_app_deploy for '${app.name}' to recreate the container stack.`,
+        code: app.status === "stopped" ? "app_missing_stopped" : "app_missing",
       });
     }
   }

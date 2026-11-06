@@ -12,8 +12,8 @@ import {
   withStateLock,
 } from "./config.js";
 import {
-  addArbiterKey, arbiterClusterId, deriveArbiterKey, installArbiterService, listArbiterClusters, parseArbiterKeys, removeArbiterKey,
-  resolveArbiterHost, startArbiterServer,
+  addArbiterKey, ARBITER_ENV_FILE, arbiterClusterId, deriveArbiterKey, installArbiterService, listArbiterClusters, openArbiterPairing, parseArbiterKeys, removeArbiterKey, serveArbiter,
+  resolveArbiterHost,
 } from "./arbiter.js";
 import { ensurePollSchedule, installPollTimer, pollRepos, remoteHead, setPolling } from "./poller.js";
 import {
@@ -39,6 +39,7 @@ import {
   promoteMirror,
   retireCopy,
   checkArbiter,
+  pairArbiterAndSave,
   setAutoFailover,
   watchTick,
 } from "./mirror.js";
@@ -77,10 +78,11 @@ import {
   AppLifecycleAction,
   deployApp,
   manageAppLifecycle,
+  expiredTrashApps,
   purgeExpiredTrash,
   runPaaSDoctor,
 } from "./deployer.js";
-import { exposeApplication } from "./exposure.js";
+import { exposeApplication, releaseAddresses } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -105,8 +107,10 @@ import {
   importDotEnvFile,
   listMaskedSecrets,
   setSecretEntries,
+  setSecretDescription,
   setSecretFromFile,
 } from "./vault.js";
+import { listSecretDetails } from "./vaultdocs.js";
 
 function getFlagValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -365,11 +369,16 @@ async function runCli() {
       const [sub, scope, ...kvArgs] = rest;
       if (!scope) {
         throw new Error(
-          "Usage: paasmcp secret <set|set-file|import-env|list|delete> <scope> ..."
+          "Usage: paasmcp secret <set|set-file|import-env|list|describe|delete> <scope> ..."
         );
       }
       if (sub === "list") {
-        console.log(JSON.stringify(listMaskedSecrets(scope), null, 2));
+        console.log(JSON.stringify(listSecretDetails(scope), null, 2));
+      } else if (sub === "describe") {
+        const [keyName, ...words] = kvArgs;
+        if (!keyName) throw new Error('Usage: paasmcp secret describe <scope> <KEY> "what it is for" (no text clears it)');
+        setSecretDescription(scope, keyName, words.join(" "));
+        console.log(JSON.stringify(listSecretDetails(scope), null, 2));
       } else if (sub === "set") {
         const entries: Record<string, string> = {};
         for (const item of kvArgs) {
@@ -584,14 +593,29 @@ async function runCli() {
         console.error(`This cluster's id on the arbiter: ${arbiterClusterId(key)}. An arbiter that already serves another cluster takes it with 'paasmcp arbiter add-key <key>'.`);
       } else if (sub === "serve") {
         const keys = parseArbiterKeys(getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY);
-        const hostFlag = getFlagValue(rest, "--host");
-        if (!keys.length || !hostFlag) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP|tailscale> [--port 4097] --key <key>[,<key of another cluster>...] (or PAASMCP_ARBITER_KEY)");
-        const host = resolveArbiterHost(hostFlag);
-        const port = Number(getFlagValue(rest, "--port") || 4097);
-        startArbiterServer({ port, host, keys });
-        console.error(`Arbiter listening on http://${host}:${port}/arbiter for ${keys.length} cluster(s): ${keys.map(arbiterClusterId).join(", ")}`);
-        console.error(`On the servers, use the arbiter address http://${host}:${port}`);
+        const hostFlag = getFlagValue(rest, "--host") || process.env.PAASMCP_ARBITER_HOST;
+        if (!hostFlag) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP|tailscale> [--port 4097] [--key <key>[,<key of another cluster>...]] (or PAASMCP_ARBITER_KEY; more keys arrive in the key file with 'arbiter pair')");
+        const port = Number(getFlagValue(rest, "--port") || process.env.PAASMCP_ARBITER_PORT || 4097);
+        const srv = serveArbiter({ host: hostFlag, port, keys });
+        await new Promise((r) => srv.once("listening", r));
+        const addr = srv.address() as { address: string; port: number };
+        console.error(`Arbiter listening on http://${addr.address}:${addr.port}/arbiter for ${keys.length || "the"} cluster(s) given, plus the ones in ${ARBITER_ENV_FILE()}`);
+        console.error(`On the servers, use the arbiter address http://${addr.address}:${addr.port}`);
         await new Promise(() => {});
+      } else if (sub === "pair") {
+        // On the arbiter device: open a 10-minute window and show the code to type on one of the servers.
+        const w = openArbiterPairing();
+        console.log(JSON.stringify({ code: w.code, expiresAt: new Date(w.expiresAt).toISOString() }, null, 2));
+        console.error(`Pairing code: ${w.code} (10 minutes). On one of the servers: Second server > Arbiter > “Easy way”, or 'paasmcp arbiter pair-with <this device's Tailscale IP> ${w.code}'.`);
+      } else if (sub === "be-judge") {
+        // On a PC with PaaSMCP: start the arbiter container here and open a pairing window (what the
+        // dashboard's "Be the arbiter of another pair" does; used when a server installs this PC).
+        const { beJudge } = await import("./judge.js");
+        const w = await beJudge();
+        console.log(JSON.stringify({ url: w.url, code: w.code, expiresAt: new Date(w.expiresAt).toISOString() }, null, 2));
+      } else if (sub === "pair-with" && rest[1] && rest[2]) {
+        // On a server: send the arbiter key to the device showing the code, then save its address.
+        console.log(JSON.stringify(await pairArbiterAndSave(rest[1], rest[2]), null, 2));
       } else if (sub === "install-service") {
         const key = getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY;
         if (!key) throw new Error("Usage: sudo paasmcp arbiter install-service --key <from 'paasmcp arbiter key'> [--host tailscale] [--port 4097]");
@@ -610,7 +634,7 @@ async function runCli() {
       } else if (sub === "check") {
         console.log(JSON.stringify(await checkArbiter(rest[1]), null, 2));
       } else {
-        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|add-key <key>|remove-key <cluster id>|clusters|check [url]>");
+        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|pair|be-judge|pair-with <ip> <code>|add-key <key>|remove-key <cluster id>|clusters|check [url]>");
       }
       break;
     }
@@ -727,6 +751,13 @@ async function runCli() {
           "Usage: paasmcp scale [status [app]]|auto on <app> [--min n] [--max n] [--yes]|auto off <app>|set <app> <copies> [--yes]|<app> <copies>|off <app>|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--target-rps n] [--up-rounds n] [--down-after s] [--cooldown s] [--yes]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
         );
       }
+      break;
+    }
+
+    case "pcs": {
+      // The devices of the Tailscale network, with and without PaaSMCP (installing is done from the dashboard).
+      const { listTailnetPcs } = await import("./pcinstall.js");
+      console.log(JSON.stringify(await listTailnetPcs({ probe: !rest.includes("--no-probe") }), null, 2));
       break;
     }
 
@@ -883,7 +914,7 @@ async function runCli() {
       } else if (sub === "prune") {
         console.log(JSON.stringify(pruneLocalBackups(days), null, 2));
       } else if (sub === "nightly") {
-        console.log(JSON.stringify(await runNightlyBackup(days), null, 2));
+        console.log(JSON.stringify(await runNightlyBackup(days, { ifDue: rest.includes("--if-due") }), null, 2));
       } else if (sub === "install-timer") {
         console.log(JSON.stringify(installBackupTimer(Number(getFlagValue(rest, "--hour") || 3)), null, 2));
       } else if (sub === "target") {
@@ -1031,7 +1062,9 @@ async function runCli() {
       const [appName] = rest;
       if (!appName) throw new Error(`Usage: paasmcp ${cmd} <appName>`);
       if (cmd === "destroy" || cmd === "purge") await confirmInCli(`app.${cmd}`, { appName }, rest);
+      const addressNote = cmd === "purge" && loadState().apps[sanitizeSlug(appName)]?.trashedAt ? await releaseAddresses(appName) : "";
       console.log(manageAppLifecycle(appName, cmd as AppLifecycleAction));
+      if (addressNote) console.log(addressNote);
       const poolNote = await poolAfterLifecycle(appName, cmd, (l) => console.error(l));
       if (poolNote) console.log(poolNote);
       break;
@@ -1073,7 +1106,9 @@ async function runCli() {
     case "trash": {
       // For a daily cron/systemd timer: deletes apps trashed more than 30 days ago.
       if (rest[0] !== "purge-expired") throw new Error("Usage: paasmcp trash purge-expired");
-      console.log(JSON.stringify({ purged: purgeExpiredTrash() }, null, 2));
+      const addressNotes: string[] = [];
+      for (const name of expiredTrashApps()) addressNotes.push(await releaseAddresses(name));
+      console.log(JSON.stringify({ purged: purgeExpiredTrash(), addresses: addressNotes.filter(Boolean) }, null, 2));
       break;
     }
 
@@ -1110,12 +1145,14 @@ Commands:
   paasmcp secret set <scope> KEY=VAL ...             Encrypt & store secrets in AES-256-GCM Vault
   paasmcp secret set-file <scope> <KEY> <path>       Store secret from file without printing it
   paasmcp secret import-env <scope> <.env>           Import .env file into encrypted Vault
-  paasmcp secret list <scope>                        List masked secrets in scope
+  paasmcp secret list <scope>                        List masked secrets in scope, with description and dates
+  paasmcp secret describe <scope> <KEY> "text"       Say what a key is for (empty text clears it)
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
-  paasmcp arbiter <key|serve|install-service|add-key|remove-key|clusters|check>
+  paasmcp pcs [--no-probe]                           Devices of your Tailscale, with and without PaaSMCP (install them in the dashboard: Connections > PCs)
+  paasmcp arbiter <key|serve|install-service|pair|be-judge|pair-with|add-key|remove-key|clusters|check>
                                                     Third vote for automatic failover (one device can serve several clusters)
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
   paasmcp active tunnel <status|on|off>             Cloudflare Tunnel just for those apps, on both servers

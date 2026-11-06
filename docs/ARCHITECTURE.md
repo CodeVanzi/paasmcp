@@ -18,7 +18,8 @@ By default, PaaSMCP stores all runtime state under `PAASMCP_ROOT` (`/opt/homelab
 │   │   └── paasmcp_deploy_ed25519.pub  # Public SSH deploy key (+ SHA256 fingerprint)
 │   ├── vault/
 │   │   ├── system.enc.json       # Encrypted platform tokens (CF_API_TOKEN, GITHUB_TOKEN, WEBHOOK_SECRET, FEDERATION_CLUSTER_KEY)
-│   │   └── <app-slug>.enc.json   # Encrypted environment variables per application
+│   │   ├── <app-slug>.enc.json   # Encrypted environment variables per application
+│   │   └── <scope>.meta.enc.json # Encrypted per-key description, created and last-changed dates (never the values)
 │   ├── backups/
 │   │   └── <id>.enc.bak          # Binary AES-256-GCM encrypted pg_dump / Redis / volume snapshots (mode 0600)
 │   ├── mirror/<peer>/            # Streaming copy of a peer's Postgres (its own compose.yaml + data/)
@@ -175,6 +176,35 @@ Automatic failover with only two servers would split the brain when the link bet
   normal heartbeat and explains the result: reachable, key accepted, clock in sync, which servers the
   arbiter hears and how long ago, and whether `mirror watch` runs here. `POST /api/mirror/arbiter` saves
   the address alone (the server that only sends a copy still needs it to heartbeat and be fenced).
+- Signed arbiter replies also carry `about` (`os.hostname()`, PaaSMCP version, start time, number of
+  clusters); `/health` stays anonymous. `checkArbiter` adds the round-trip time, the `owners` table with
+  names, and `watch`: `mirror watch` writes its last successful heartbeat and last failure to
+  `<data>/mirror-watch.json` every round. The dashboard's **Arbiter** tab shows all of it.
+- `POST /api/mirror/arbiter/install` (dashboard, authenticated, `Cache-Control: no-store`, audited as
+  `mirror.arbiter-key-shown`) returns `arbiterInstallCommand()`: clone/pull + build +
+  `arbiter install-service --key <k>`. The repository URL comes from the dashboard's followed repo or the
+  clone's `origin`, through `publicRepoUrl()` (https only, user/token stripped, SSH github.com turned into
+  https, anything odd falls back to the public repo), so no credential reaches the command. Since
+  `install-service` merges keys, the same command adds a cluster to an arbiter that already serves another.
+- **Pairing by code** (`src/arbiter.ts`, `src/judge.ts`). On the arbiter device, `openArbiterPairing()`
+  (`paasmcp arbiter pair`, or the dashboard's “Be the arbiter of another pair”) writes
+  `<data>/arbiter/pairing.json` (0600): a 6-digit code, 10 minutes, 5 tries. While it is open, `/health`
+  adds `pairing: true` and `POST /pair` answers. The server (`pairWithArbiter`, `arbiter pair-with`,
+  dashboard `POST /api/mirror/arbiter/pair`) sends a nonce; the arbiter answers with its own nonce and
+  `HMAC(scrypt(code), nonces)` (each hello costs a try), so a device that does not show the code never gets
+  anything. Then the key goes sealed with AES-256-GCM under `scrypt(code)` (nonces as AAD); the arbiter
+  stores it in its key file, closes the window and serves the cluster at once (`startArbiterServer`
+  re-reads `keyFile` when it changes, and can start with no key). Tailscale authenticates and encrypts
+  the link; the code is the person confirming both ends.
+- **A PC with PaaSMCP as arbiter** (`src/judge.ts`): `ensureLocalJudge` starts container
+  `paasmcp-arbiter` (`node:22` alpine, host network, `--restart unless-stopped`, 128 MB) unless an
+  arbiter already answers on this PC's Tailscale IP. Its code is a copy of `JUDGE_FILES` (arbiter.js and
+  the built-in-only modules it imports; a test runs the copy) in `<data>/arbiter/code`, so a dashboard
+  update never removes it; keys and state live next to it. `findJudgeCandidates` lists the online devices
+  of `tailscale status --json` (`listTailscalePeers`, which keeps every device) and probes `:4097/health`.
+- The control-channel manifest (`active.ts`) carries `arbiterUrl`; the other server adopts it in
+  `syncActivePeers` only when it has none (audited `mirror.arbiter-from-peer`). Saving or pairing an
+  arbiter in the dashboard republishes the manifest.
 
 ### Active-active: an app on both servers (`src/active.ts`, `src/edge.ts`)
 
@@ -583,6 +613,48 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   suspend is shorter than the load sleeps with copies on it (the balancer stops sending it visits within
   about 6 s, and it is woken again while its copy is still wanted).
 
+## 10e-1. PCs of your Tailscale (`src/pcinstall.ts`)
+
+**Connections → PCs** lists every device of `tailscale status --json` (`listTailscalePeers`, which now
+also keeps `ShareeNode`, the owner compared with `Self.UserID`, valid tags and valid `sshHostKeys`) and
+marks each one: *runs PaaSMCP* (an IP this server already knows as the other server of a pair, a helper, a
+federation peer or a PC installed from this dashboard, or an arbiter answering on `:4097`), *no PaaSMCP*
+(online Linux device of the owner), *off*, or *not possible here* (not Linux, shared from another
+account, another user's device, no IPv4). Only online Linux devices of the owner are probed, with two
+read-only probes: the arbiter's `/health` and the first line of port 22 (`SSH-2.0-Tailscale` vs OpenSSH),
+which says how the dashboard could log in there. The list itself logs in nowhere.
+
+**Installing from there** (`src/pcremote.ts`, one job at a time, `/api/pcs/check|install|job|cancel`):
+
+1. *Log in.* Only to an IP the list shows as the owner's online Linux PC without PaaSMCP (or one this
+   dashboard installed). One OpenSSH connection to the Tailscale IP, kept open as a ControlMaster in a
+   private folder under `/dev/shm`: by Tailscale SSH (no password; a `check` rule's login link, sent as
+   the SSH banner, is shown on the screen) or by the PC's password, passed once through a one-shot askpass
+   file that is deleted right after the login. No public-key login is offered, so no key of this server
+   is used or left there. Host key: pinned to the `sshHostKeys` Tailscale reports when it has them
+   (Tailscale SSH on), otherwise accepted on first use (the Tailscale IP already identifies the device)
+   and its fingerprint shown. Three wrong logins on one PC block it for 10 minutes.
+2. *Check (read-only, as the login user).* `CHECK_SCRIPT` prints `key=value` lines (OS, CPU type, memory,
+   free disk, systemd, git/node/docker/compose/tailscale versions, sshd, PaaSMCP already in
+   `/opt/paasmcp`, how root is reached); `parseFacts` keeps known keys only, printable and capped;
+   `planFor` says what is missing and what blocks (not Debian/Ubuntu, CPU type, no systemd, under 1.5 GB
+   free, no sudo, no Tailscale). When sudo wants the password, `sudo -S -v` checks it before anything is
+   offered. The job waits 15 minutes for the person's choice.
+3. *Install (root, after guard `pc.install`, confirm).* The script (`installScript`, every value validated
+   and single-quoted) is written to `/tmp/paasmcp-install-<id>.sh` (0600) and run with `bash`, `sudo -n`
+   or `sudo -S` (the password on stdin, never in argv), then deleted. Steps, marked `@@step`: apt packages
+   (git, ca-certificates, curl, xz-utils, `docker.io` when Docker is missing, a compose package until
+   `docker compose` works, `openssh-server` for a helper); Node.js 20+ (kept when there; else apt when it
+   has 20+; else the official v22 tarball checked against `NODE_SHA256`); the code (`git clone` of this
+   server's repository at this server's exact commit into `/opt/paasmcp`, `npm ci`, build, links in
+   `/usr/local/bin`); the role. Server: `init` + `dashboard`. Helper: invite made here, `pool join --yes`
+   there, Tailscale SSH switched off (its own SSH server would bypass the forced command the helper key
+   relies on), then `pool add` here. Arbiter (only when this server has a pair): `arbiter be-judge` there
+   and `pairArbiterAndSave` here with the code it prints. Optionally (always for a helper) Tailscale SSH
+   is switched off at the end, detached so it outlives the session it closes.
+4. *Records.* `audit.log` (`pc.install.connect|start|done|failed|cancelled`, no password),
+   `<data>/pcinstall/installs.json` (name, IP, role, commit, who), so the list knows the PC.
+
 ## 10f. Dashboard layout (`src/dashboard.ts`)
 
 One page, three columns: a side menu, the page, and telemetry (host, resources, and a "quick health" box whose lines
@@ -597,6 +669,30 @@ what is counted (the AI count comes from `mcpToolCount` in `paas_status`). Each 
 with the menu counter and a one-line lead (`lead_<tab>`); anything with `data-tip` gets the same small tooltip.
 Opening and closing the menu, its sections and the phone drawer are animated (off with reduced motion). The light theme uses blue-grey tones, not
 white.
+
+The **Resource usage** card (`src/resources.ts`) shows the whole server split in two: **PaaSMCP** (every `paasmcp-*`
+container: apps, copies, shared databases, the dashboard) and **Others** (the system, other programs and other
+containers), plus what is free. CPU is the share of all cores, read from `os.cpus()` around the same `docker stats`
+call that feeds the per-app numbers (`resourceSnapshot` in mcp-server.ts), so both describe the same second; memory
+uses `MemAvailable`; the disk is the one holding `PAASMCP_ROOT` (`statfs`, no `df` parsing). `/proc/stat`,
+`/proc/meminfo` and the bind-mounted data folder describe the host, so the numbers are the same inside the dashboard
+container. The card refreshes every 15 s from `GET /api/resources` while the page is visible. PaaSMCP's share is
+capped at the server's total, since the two readings come from different sources a moment apart.
+
+The disk line is split too: apps (code folders, app volumes, the part of each `paasmcp/<app>` image no other image
+shares), databases (Postgres and Redis folders), backups and trash, app files (Garage), others. Walking folders takes
+a while, so `src/usage.ts` measures it in the background every 10 minutes (`du -k -x -d 1`, `docker system df -v`),
+writes `usage/latest.json`, and the card reads that file (`diskSplit`). Folders sum to at most the disk's used space,
+in case Docker's data sits on another disk.
+
+The same round asks Postgres for each database's size (`pg_database_size`) and Redis for keys per logical database
+(password sent on stdin, never on a command line), and once an hour appends the sizes to `usage/db-history.ndjson`
+(90 days) for the growth charts on the Databases page (compact sparklines or full charts, `paasmcp_db_view`). The
+databases share one Postgres, so nothing is reserved per database: a database can get a **warning size**
+(`warnSizeMb` on its record, `POST /api/databases/limit`, 1 MB = 1,000,000 bytes); the page shows the share used and
+the round sends a notice (notify.ts) when it crosses 80% and 100% (`usage/db-warned.json`; dropping below 80% re-arms
+it). Nothing is blocked. `GET /api/usage?refresh=1` measures now (at most once every 30 s); `PAASMCP_USAGE=0`
+turns the loop off.
 
 ## 11. Environment variables
 
@@ -619,6 +715,7 @@ white.
 | `PAASMCP_WAKE_WAIT_SECONDS`, `PAASMCP_WAKE_RECHECK_SECONDS` | `180`, `60` | Labs only: how long a woken PC gets to answer before another magic packet, and how soon the decider retries a step it held for a PC waking up. |
 | `PAASMCP_WORKER_HOME`, `PAASMCP_WORKER_RUN_DIR` | `/var/lib/paasmcp-worker`, `/run/paasmcp-worker` | Tests only: where the helper's worker keeps its settings and the in-memory variables folder. |
 | `PAASMCP_WORKER_ALLOW_DISK` | — | Tests only: `1` lets the worker write variables outside tmpfs. |
+| `PAASMCP_PC_SSH_PORT` | `22` | Labs only: the SSH port used to install PaaSMCP on another PC. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
 
 ## 12. Test labs
@@ -636,6 +733,14 @@ white.
   the network: from 10 s after the cut every visit succeeds in under a second; pause and resume; a new
   deploy rolls every copy to v2; `scale off`, `pool remove` (the key stops working) and `pool leave`.
   Builds its helper image if missing (`POOL_LAB_BUILD_FLAGS` passes extra build flags).
+- `scripts/pcinstall-lab.sh`: installing PaaSMCP on other PCs from the dashboard, through its API. Two
+  plain Ubuntu containers (sshd, sudo, certificates; no git, Docker or Node) play the PCs; stand-ins for
+  `systemctl` and `tailscale`, and a fake `tailscale status` here. A wrong password ends in `auth`; pc-a
+  (sudo user + password) is checked (nothing changes there), asks for confirmation, and becomes a helper
+  that answers this server's key, with the same commit and Node 20+; pc-b (root + password) becomes a
+  server whose dashboard answers there. The passwords are in no answer, log, data file or PC disk; no key
+  is left in any `authorized_keys`; the script and the connection folders are gone. Needs the checkout's
+  commit on GitHub.
 - `scripts/autoscale-lab.sh`: scale phase 4 with real Docker, on the same kind of helper PCs. An app with
   Postgres gets automatic scaling (1 to 3 copies, 20 visits/s per copy) and rounds run by hand. The
   balancer must count exactly the visits sent through it; under 50 visits/s copies go 1 → 2 → 3 on the

@@ -29,8 +29,10 @@ export function getOrCreateMasterKey(): Buffer {
   return Buffer.from(hex, "hex");
 }
 
-// kind ".deleted" holds removed values; sanitizeSlug never produces a dot, so it cannot collide with a scope.
-function getVaultFilePath(scope: string, kind: "" | ".deleted" = ""): string {
+// kind ".deleted" holds removed values and ".meta" each key's description and dates; sanitizeSlug never
+// produces a dot, so neither can collide with a scope.
+type VaultKind = "" | ".deleted" | ".meta";
+function getVaultFilePath(scope: string, kind: VaultKind = ""): string {
   const safeScope = sanitizeSlug(scope);
   return path.join(PAAS_VAULT_DIR, `${safeScope}${kind}.enc.json`);
 }
@@ -73,11 +75,10 @@ export function decryptBinaryPayload(packedBuffer: Buffer, customKey?: Buffer): 
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-export function getSecrets(scope: string, kind: "" | ".deleted" = ""): Record<string, string> {
+function readEncryptedJson<T>(filePath: string, empty: T): T {
   ensureDirectories();
-  const filePath = getVaultFilePath(scope, kind);
   if (!fs.existsSync(filePath)) {
-    return {};
+    return empty;
   }
   const masterKey = getOrCreateMasterKey();
   const payload = JSON.parse(fs.readFileSync(filePath, "utf-8")) as EncryptedPayload;
@@ -91,19 +92,15 @@ export function getSecrets(scope: string, kind: "" | ".deleted" = ""): Record<st
     decipher.update(Buffer.from(payload.ciphertext, "hex")),
     decipher.final(),
   ]);
-  return JSON.parse(decrypted.toString("utf-8")) as Record<string, string>;
+  return JSON.parse(decrypted.toString("utf-8")) as T;
 }
 
-export function saveSecrets(
-  scope: string,
-  secrets: Record<string, string>,
-  kind: "" | ".deleted" = ""
-): void {
+function writeEncryptedJson(filePath: string, data: unknown): void {
   ensureDirectories();
   const masterKey = getOrCreateMasterKey();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", masterKey, iv);
-  const plaintext = Buffer.from(JSON.stringify(secrets), "utf-8");
+  const plaintext = Buffer.from(JSON.stringify(data), "utf-8");
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const authTag = cipher.getAuthTag();
 
@@ -115,7 +112,73 @@ export function saveSecrets(
     updatedAt: new Date().toISOString(),
   };
 
-  writeFileAtomic(getVaultFilePath(scope, kind), JSON.stringify(payload, null, 2));
+  writeFileAtomic(filePath, JSON.stringify(payload, null, 2));
+}
+
+export function getSecrets(scope: string, kind: "" | ".deleted" = ""): Record<string, string> {
+  return readEncryptedJson<Record<string, string>>(getVaultFilePath(scope, kind), {});
+}
+
+export function saveSecrets(
+  scope: string,
+  secrets: Record<string, string>,
+  kind: "" | ".deleted" = ""
+): void {
+  writeEncryptedJson(getVaultFilePath(scope, kind), secrets);
+}
+
+/**
+ * What a person wrote about a key, and when it was created and last changed. Kept in its own file
+ * (scope.meta.enc.json), encrypted with the same master key, so a description never sits in plain text
+ * and never shares a file with the value. Keys saved before this existed have no dates: they show as
+ * unknown instead of a guessed date.
+ */
+export interface SecretMeta {
+  description?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export const SECRET_DESCRIPTION_MAX = 300;
+
+export function getSecretMeta(scope: string): Record<string, SecretMeta> {
+  try {
+    return readEncryptedJson<Record<string, SecretMeta>>(getVaultFilePath(scope, ".meta"), {});
+  } catch {
+    // Metadata is a convenience: a damaged file must never stop the values themselves from loading.
+    return {};
+  }
+}
+
+function saveSecretMeta(scope: string, meta: Record<string, SecretMeta>): void {
+  writeEncryptedJson(getVaultFilePath(scope, ".meta"), meta);
+}
+
+/** Sets (or, with an empty text, clears) a key's description. The key must already exist. */
+export function setSecretDescription(scope: string, keyName: string, description: string): SecretMeta {
+  const validKey = validateEnvKey(keyName);
+  const current = getSecrets(scope);
+  if (!(validKey in current)) {
+    throw new Error(`No key '${validKey}' in this scope.`);
+  }
+  const text = String(description ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .trim();
+  if (text.length > SECRET_DESCRIPTION_MAX) {
+    throw new Error(`The description is too long (${SECRET_DESCRIPTION_MAX} characters at most).`);
+  }
+  // A description is shown in clear on the screen: refuse one that carries the value itself.
+  const value = current[validKey];
+  if (value && value.length >= 6 && text.includes(value)) {
+    throw new Error("The description contains the key's own value. Describe what it is for, without the value.");
+  }
+  const meta = getSecretMeta(scope);
+  const entry: SecretMeta = { ...(meta[validKey] || {}) };
+  if (text) entry.description = text;
+  else delete entry.description;
+  meta[validKey] = entry;
+  saveSecretMeta(scope, meta);
+  return entry;
 }
 
 export function setSecretEntries(
@@ -124,12 +187,30 @@ export function setSecretEntries(
 ): string[] {
   const current = getSecrets(scope);
   const savedKeys: string[] = [];
+  const now = new Date().toISOString();
+  const meta = getSecretMeta(scope);
+  let metaChanged = false;
   for (const [k, v] of Object.entries(entries)) {
     const validKey = validateEnvKey(k);
-    current[validKey] = String(v);
+    const value = String(v);
+    const isNew = !(validKey in current);
+    // Saving the same value again (a redeploy re-applying its variables) is not a change.
+    if (isNew || current[validKey] !== value) {
+      const entry: SecretMeta = { ...(meta[validKey] || {}) };
+      if (isNew) {
+        // A key removed and added again starts over; an old description would describe something else.
+        delete entry.description;
+        entry.createdAt = now;
+      }
+      entry.updatedAt = now;
+      meta[validKey] = entry;
+      metaChanged = true;
+    }
+    current[validKey] = value;
     savedKeys.push(validKey);
   }
   saveSecrets(scope, current);
+  if (metaChanged) saveSecretMeta(scope, meta);
   return savedKeys;
 }
 
@@ -182,6 +263,11 @@ export function deleteSecretKey(scope: string, keyName: string): boolean {
   saveSecrets(scope, archive, ".deleted");
   delete current[keyName];
   saveSecrets(scope, current);
+  const meta = getSecretMeta(scope);
+  if (keyName in meta) {
+    delete meta[keyName];
+    saveSecretMeta(scope, meta);
+  }
   return true;
 }
 
@@ -212,4 +298,36 @@ export function writeRuntimeEnvFile(
     return `${validKey}=${escaped}`;
   });
   fs.writeFileSync(targetPath, lines.join("\n") + "\n", { mode: 0o600 });
+}
+
+
+/**
+ * Reads a pasted `.env` file (the format Railway, Render, Vercel and docker compose use): `KEY=value`
+ * lines, `export KEY=value`, `#` comments, single or double quotes (double quotes understand \n).
+ * Lines that are not a variable come back in `skipped` (line numbers only, never their text, since
+ * they may hold a secret).
+ */
+export function parseDotenv(text: string): { entries: Record<string, string>; skipped: number[] } {
+  const entries: Record<string, string> = {};
+  const skipped: number[] = [];
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  lines.forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    const m = line.replace(/^export\s+/, "").match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m) {
+      skipped.push(i + 1);
+      return;
+    }
+    let value = m[2];
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1).replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1);
+    } else {
+      value = value.replace(/\s+#.*$/, "").trim();
+    }
+    entries[m[1]] = value;
+  });
+  return { entries, skipped };
 }

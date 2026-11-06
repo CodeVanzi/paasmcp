@@ -11,7 +11,12 @@ export const PAAS_GARAGE_DIR = path.join(HOMELAB_ROOT, "paasmcp-garage");
 export const GARAGE_INTERNAL_ENDPOINT = "http://paasmcp-garage:3900";
 export const GARAGE_REGION = "garage";
 const OFFLINE = () => process.env.PAASMCP_OFFLINE_TEST === "1";
-const adminUrl = () => process.env.PAASMCP_GARAGE_ADMIN_URL || "http://127.0.0.1:3903";
+// Inside the dashboard container, 127.0.0.1 is the dashboard itself: Garage is reached by its name on
+// the shared Docker network instead (the dashboard and Garage both join it).
+const inDashboard = () => process.env.PAASMCP_IN_DASHBOARD === "1";
+export const garageAdminUrl = () =>
+  process.env.PAASMCP_GARAGE_ADMIN_URL || (inDashboard() ? "http://paasmcp-garage:3903" : "http://127.0.0.1:3903");
+const adminUrl = garageAdminUrl;
 
 function garageSecrets(): { rpcSecret: string; adminToken: string } {
   const sys = getSecrets("system");
@@ -134,7 +139,7 @@ export async function createBucketWithKey(
 }
 
 /** This server's S3 API as seen from the host (labs run a second Garage on other ports). */
-export const localS3Url = () => process.env.PAASMCP_GARAGE_S3_URL || "http://127.0.0.1:3900";
+export const localS3Url = () => process.env.PAASMCP_GARAGE_S3_URL || (inDashboard() ? GARAGE_INTERNAL_ENDPOINT : "http://127.0.0.1:3900");
 
 /**
  * Active-active peer: the same bucket and the same access key as on the origin, so the app's

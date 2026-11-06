@@ -12,6 +12,8 @@ import {
   saveState,
 } from "./config.js";
 import { backupDatabase } from "./database.js";
+import { localDate, readNightlyMark, writeNightlyMark } from "./nightly.js";
+import { sendNotice } from "./notify.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets } from "./vault.js";
 
 export const VOLUME_HELPER_IMAGE = "alpine:3.20";
@@ -263,10 +265,13 @@ export function testRestore(backupId: string): {
   ok: boolean;
   plainBytes: number;
   detail: string;
+  /** For the dashboard's own words: what was checked, and how many tables/entries were found. */
+  code: "checked" | "pg_ok" | "volume_ok" | "redis_ok" | "redis_bad";
+  count?: number;
 } {
   const { backup, plain } = readVerifiedBackup(backupId);
   const base = { backupId: backup.id, engine: backup.engine, plainBytes: plain.length };
-  if (OFFLINE()) return { ...base, ok: true, detail: "Checksum and decryption OK (offline test mode)." };
+  if (OFFLINE()) return { ...base, ok: true, detail: "Checksum and decryption OK (offline test mode).", code: "checked" };
 
   if (backup.engine === "postgres") {
     const tempDb = `restoretest_${crypto.randomBytes(4).toString("hex")}`;
@@ -284,7 +289,7 @@ export function testRestore(backupId: string): {
         "psql", "-tA", "-U", "paasmcp_admin", "-d", tempDb, "-c",
         "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')",
       ]).trim();
-      return { ...base, ok: true, detail: `Loaded into a temporary database: ${tables} table(s).` };
+      return { ...base, ok: true, detail: `Loaded into a temporary database: ${tables} table(s).`, code: "pg_ok", count: Number(tables) || 0 };
     } finally {
       exec(["dropdb", "-U", "paasmcp_admin", "--if-exists", tempDb]);
     }
@@ -292,10 +297,10 @@ export function testRestore(backupId: string): {
   if (backup.engine === "volume") {
     const files = execFileSync("tar", ["tzf", "-"], { input: plain, encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 })
       .split("\n").filter(Boolean).length;
-    return { ...base, ok: true, detail: `Archive opens: ${files} entr${files === 1 ? "y" : "ies"}.` };
+    return { ...base, ok: true, detail: `Archive opens: ${files} entr${files === 1 ? "y" : "ies"}.`, code: "volume_ok", count: files };
   }
   const isRdb = plain.subarray(0, 5).toString("ascii") === "REDIS";
-  return { ...base, ok: isRdb, detail: isRdb ? "Redis RDB header OK." : "Not a Redis RDB file." };
+  return { ...base, ok: isRdb, detail: isRdb ? "Redis RDB header OK." : "Not a Redis RDB file.", code: isRdb ? "redis_ok" : "redis_bad" };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +379,12 @@ export function pruneLocalBackups(retentionDays = 7, now = Date.now()): { pruned
 // Nightly run and systemd timer
 // ---------------------------------------------------------------------------
 
-export async function runNightlyBackup(retentionDays = 7): Promise<Record<string, unknown>> {
+export async function runNightlyBackup(retentionDays = 7, opts: { ifDue?: boolean } = {}): Promise<Record<string, unknown>> {
+  // The mark is written first, so a systemd timer and the dashboard never both run on the same day.
+  const today = localDate(new Date());
+  if (opts.ifDue && readNightlyMark()?.date === today) return { skipped: `already ran today (${today})` };
+  const startedAt = new Date().toISOString();
+  writeNightlyMark({ date: today, startedAt });
   const state = loadState();
   const created: string[] = [];
   const errors: string[] = [];
@@ -394,7 +404,25 @@ export async function runNightlyBackup(retentionDays = 7): Promise<Record<string
   }
   const offsite = getOffsiteConfig() ? await syncOffsite() : "not configured: backups stay only on this server";
   const prune = getOffsiteConfig() ? pruneLocalBackups(retentionDays) : { pruned: [], keptNotOffsite: 0 };
-  return { created, errors, offsite, prune };
+  const offsiteState =
+    typeof offsite === "string" ? "not-configured" : offsite.failed.length ? "failed" : "ok";
+  const failures = [...errors, ...(typeof offsite === "string" ? [] : offsite.failed.map((f) => `${f.id}: ${f.error}`))];
+  // The trash empties itself after its 30 days, with a notice 3 days before (trashclean.ts).
+  const { runTrashCleanup } = await import("./trashclean.js");
+  const trash = await runTrashCleanup().catch((err: unknown) => ({ warned: [], purged: [], errors: [String(err instanceof Error ? err.message : err)] }));
+  failures.push(...trash.errors.map((e) => `trash ${e}`));
+  writeNightlyMark({ date: today, startedAt, finishedAt: new Date().toISOString(), created: created.length, errors: failures.slice(0, 20), offsite: offsiteState });
+  if (failures.length) {
+    await sendNotice(
+      (lang) =>
+        lang === "en"
+          ? { title: "Nightly backup had errors", text: `⚠️ The nightly backup had ${failures.length} error(s). First: ${failures[0].slice(0, 300)}\nSee Databases → Backups on the dashboard.` }
+          : { title: "Backup da noite com erros", text: `⚠️ O backup da noite teve ${failures.length} erro(s). Primeiro: ${failures[0].slice(0, 300)}\nVeja Bancos → Backups no painel.` },
+      "backup.nightly",
+      "backup"
+    );
+  }
+  return { created, errors, offsite, prune, trash };
 }
 
 export function installBackupTimer(hour = 3): { service: string; timer: string } {

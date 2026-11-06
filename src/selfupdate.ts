@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, ensureDataDir, HOMELAB_ROOT, PAAS_DATA_DIR, validateBranchName, writeFileAtomic } from "./config.js";
+import { DOCKER_NETWORK, ensureDataDir, HOMELAB_ROOT, PAAS_DATA_DIR, tailscaleSocketDir, validateBranchName, writeFileAtomic } from "./config.js";
 import { audit, DASHBOARD_APP_NAME } from "./guard.js";
 import { cleanText, continueDeployRun, DeployCommit, DeployTracker, DeployTrigger, shortCommit, startDeployRun } from "./deploys.js";
 
@@ -396,6 +396,8 @@ export function startSwapHelper(image: string, sha: string, runId: string): void
   validateCommit(sha);
   if (!/^[0-9]{8,20}-[0-9a-f]{6}$/.test(runId)) throw new Error("Invalid deploy run id.");
   const code = followedCode()?.dir || releaseDir(sha);
+  // The helper recreates the dashboard container: it needs the Tailscale socket to keep mounting it.
+  const tsDir = tailscaleSocketDir();
   try {
     execFileSync("docker", ["rm", "-f", SWAP_CONTAINER], { stdio: "ignore" });
   } catch {
@@ -411,6 +413,7 @@ export function startSwapHelper(image: string, sha: string, runId: string): void
       "-e", "PAASMCP_SWAP_HELPER=1",
       "-v", `${HOMELAB_ROOT}:${HOMELAB_ROOT}`,
       "-v", "/var/run/docker.sock:/var/run/docker.sock",
+      ...(tsDir ? ["-v", `${tsDir}:${tsDir}`] : []),
       "-v", `${code}:/app:ro`,
       "-w", "/app",
       image,

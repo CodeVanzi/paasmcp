@@ -66,8 +66,8 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         params);
     case "app.purge":
       return risk(action, subject, "strong",
-        `Permanently deletes app '${subject}': containers, volumes, images and files. This cannot be undone.`,
-        `Apaga de vez o app '${subject}': containers, volumes, imagens e arquivos. Não dá para desfazer.`,
+        `Permanently deletes app '${subject}': containers, volumes, images and files, and takes its addresses off the air. This cannot be undone.`,
+        `Apaga de vez o app '${subject}': containers, volumes, imagens e arquivos, e tira os endereços dele do ar. Não dá para desfazer.`,
         params);
     case "mirror.promote":
       return risk(action, subject, "strong",
@@ -88,6 +88,17 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       return risk(action, "rejoin", "confirm",
         "This server's database is stopped, moved aside (kept on disk, not deleted) and replaced by a read-only copy of the server that took over. Its apps stay stopped until you hand back.",
         "O banco deste servidor é parado, movido para o lado (fica guardado no disco, não é apagado) e trocado por uma cópia só de leitura do servidor que assumiu. Os apps daqui ficam parados até a devolução.",
+        params);
+    case "mirror.arbiter":
+      // Only the MCP asks this: on the dashboard and the CLI a person is already the one choosing the judge.
+      return risk(action, "arbiter", "confirm",
+        `This server will use ${String(params.url || params.host)} as its judge (arbiter): pairing hands it this pair's arbiter key, and its vote decides automatic takeovers and stops (fences) a server whose data moved.`,
+        `Este servidor vai usar ${String(params.url || params.host)} como juiz: o pareamento entrega a ele a chave deste par, e o voto dele decide as trocas automáticas e pode parar um servidor cujos dados mudaram de lugar.`,
+        params);
+    case "judge.stop":
+      return risk(action, "arbiter", "confirm",
+        "This PC stops being an arbiter. The pairs of servers it serves lose their arbiter: no automatic takeover until they get another one (their apps keep running).",
+        "Este PC deixa de ser juiz. Os pares de servidores que ele atende ficam sem juiz: sem troca automática até ganharem outro (os apps continuam rodando).",
         params);
     case "mirror.retire":
       return risk(action, subject, "confirm",
@@ -124,6 +135,32 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       return risk(action, helper, "confirm",
         `Creates a one-use invite for the PC '${helper}'. Whoever runs it on a PC within 15 minutes lets this server give that PC orders: run copies of the apps you choose there, with their variables (secrets included). The first time, this server's Postgres, Redis and S3 are also published on its Tailscale IP (a few seconds of restart), so those copies can reach them.`,
         `Cria um convite de uso único para o PC '${helper}'. Quem rodar o convite num PC nos próximos 15 minutos deixa este servidor dar ordens a ele: rodar lá cópias dos apps que você escolher, com as variáveis deles (inclusive senhas). Na primeira vez, o Postgres, o Redis e o S3 deste servidor também passam a ser publicados no IP Tailscale dele (alguns segundos de reinício), para essas cópias alcançarem.`,
+        params);
+    }
+    case "pc.install": {
+      const pc = String(params.pc);
+      const role = String(params.role);
+      const what =
+        role === "helper"
+          ? [
+              ` Then the PC becomes a helper: it gets a one-use invite from this server, which can then run copies of the apps you choose there, with their variables (secrets included). The first time, this server's Postgres, Redis and S3 are also published on its Tailscale IP (a few seconds of restart).`,
+              ` Depois o PC vira ajudante: recebe um convite de uso único deste servidor, que passa a poder rodar lá cópias dos apps que você escolher, com as variáveis deles (inclusive senhas). Na primeira vez, o Postgres, o Redis e o S3 deste servidor também passam a ser publicados no IP Tailscale dele (alguns segundos de reinício).`,
+            ]
+          : role === "arbiter"
+            ? [
+                " Then the PC becomes the arbiter of this pair of servers: it receives the pair's arbiter key and its vote decides automatic takeovers.",
+                " Depois o PC vira juiz deste par de servidores: recebe a chave de juiz do par, e o voto dele decide as trocas automáticas.",
+              ]
+            : [
+                " Then the PC becomes an independent PaaSMCP server with its own dashboard (on 127.0.0.1:4099 there).",
+                " Depois o PC vira um servidor PaaSMCP independente, com painel próprio (em 127.0.0.1:4099 lá).",
+              ];
+      const ts = params.turnOffTailscaleSsh
+        ? [" At the end, Tailscale SSH is switched off on that PC.", " No fim, o SSH da Tailscale é desligado nesse PC."]
+        : ["", ""];
+      return risk(action, pc, "confirm",
+        `As root on the PC '${pc}', this installs what is missing (git, Docker, Node.js) from the system's packages and the PaaSMCP code of this server's version in ${"/opt/paasmcp"}.${what[0]}${ts[0]} The password is not kept.`,
+        `Como root no PC '${pc}', isto instala o que falta (git, Docker, Node.js) pelos pacotes do sistema e o código do PaaSMCP na versão deste servidor em /opt/paasmcp.${what[1]}${ts[1]} A senha não fica guardada.`,
         params);
     }
     case "pool.remove": {
@@ -214,6 +251,12 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `https://${String(params.hostname)} stops answering.${params.users ? ` These keys stop working from outside Tailscale: ${String(params.users)}.` : ""} Nothing stored is deleted.`,
         `https://${String(params.hostname)} para de responder.${params.users ? ` Estas chaves param de funcionar fora da Tailscale: ${String(params.users)}.` : ""} Nada do que está guardado é apagado.`,
         params);
+    case "connect.cloudflare":
+      // Free the first time; replacing a working domain or tunnel is confirmed.
+      return risk(action, "cloudflare", "confirm",
+        `New public addresses will use ${String(params.target)} and the chosen tunnel instead of ${String(params.previous)}. Addresses already published keep working only while the old tunnel runs.`,
+        `Os endereços novos vão usar ${String(params.target)} e o túnel escolhido no lugar de ${String(params.previous)}. Os endereços já publicados só continuam funcionando enquanto o túnel antigo estiver ligado.`,
+        params);
     case "backup.target.clear":
       return risk(action, "backup-target", "confirm",
         "This server stops sending backups off the server. Copies already sent stay there, and local copies are no longer pruned (they only are after reaching the destination).",
@@ -273,6 +316,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       }
       return null;
     }
+    case "app.unexpose":
+      return risk(action, subject, "confirm",
+        `Address ${String(params.hostname)} of '${subject}' goes offline: whoever uses it can no longer open the app. You can publish an address again later.`,
+        `O endereço ${String(params.hostname)} do app '${subject}' sai do ar: quem usa esse endereço não consegue mais abrir o app. Dá para publicar um endereço de novo depois.`,
+        params);
     case "db.restore":
       return risk(action, subject, "confirm",
         `The current data (database or volume) will be replaced by backup '${subject}'. A backup of the current state is taken first.`,

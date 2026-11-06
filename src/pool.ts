@@ -1083,7 +1083,9 @@ export async function setCopies(appName: string, n: number, opts: { by?: string;
     if (!tailnetBindIp(state)) throw new Error("Prepare this server for helpers first: create an invite ('paasmcp pool invite <name>').");
     if (!OFFLINE()) {
       originImage(slug);
-      const local = await waitCopyHealthy(`http://127.0.0.1:${app.localPort}${app.healthcheckPath || "/"}`, 5000);
+      // From the dashboard container, 127.0.0.1 is the dashboard itself: probeUrl picks the app's own address.
+      const { probeUrl } = await import("./deployer.js");
+      const local = await waitCopyHealthy(probeUrl(app.containerName, app.internalPort, app.localPort, app.healthcheckPath || "/"), 5000);
       if (!local.healthy) {
         throw new Error(`This server's copy must answer GET ${app.healthcheckPath || "/"} with 2xx for the balancer to send it visits (now: ${local.reason}). Pick a health path that answers 200 ('paasmcp deploy ... --healthcheck-path /healthz').`);
       }

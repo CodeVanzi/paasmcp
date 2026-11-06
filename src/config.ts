@@ -45,6 +45,8 @@ export interface AppRecord {
   autoDeploy?: "poll";
   trashedAt?: string;
   trashDir?: string;
+  /** When the "will be deleted" notice went out (trashclean.ts); cleared on restore. */
+  trashWarnedAt?: string;
   /** Blue/green deploy: path probed on the candidate container (default "/"). */
   healthcheckPath?: string;
   /** Blue/green deploy: seconds to wait for a healthy answer (default 20). */
@@ -209,6 +211,8 @@ export interface DatabaseRecord {
   port: number;
   localPort: number;
   createdAt: string;
+  /** Warning size in MB of 1,000,000 bytes (Postgres): the dashboard shows the share used and sends a notice at 80% and 100%. */
+  warnSizeMb?: number;
 }
 
 export interface BackupRecord {
@@ -410,6 +414,15 @@ export const DEFAULT_CF_ACCOUNT_ID = process.env.PAASMCP_CF_ACCOUNT_ID || "";
 export const DEFAULT_CF_TUNNEL_ID = process.env.PAASMCP_CF_TUNNEL_ID || "";
 export const DEFAULT_BASE_DOMAIN = process.env.PAASMCP_BASE_DOMAIN || "example.com";
 export const DOCKER_NETWORK = process.env.PAASMCP_DOCKER_NETWORK || "homelab-network";
+
+/**
+ * The folder with tailscaled's socket, when this machine (or the container we run in) has it. The
+ * dashboard container gets it mounted, so "Tailscale Serve" works from the dashboard too.
+ */
+export const TAILSCALE_SOCKET_DIR = "/var/run/tailscale";
+export function tailscaleSocketDir(): string | undefined {
+  return fs.existsSync(path.join(TAILSCALE_SOCKET_DIR, "tailscaled.sock")) ? TAILSCALE_SOCKET_DIR : undefined;
+}
 
 /**
  * Every container PaaSMCP creates carries this label so Watchtower (common in homelabs) leaves it alone:

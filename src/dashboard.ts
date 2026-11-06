@@ -1,7 +1,11 @@
 import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { deploySummary } from "./deploys.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
-import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
+import { arbiterInstallCommand, PairError } from "./arbiter.js";
+import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { listTailnetPcs } from "./pcinstall.js";
+import { cancelPcJob, currentPcJob, PcInstallError, startPcCheck, startPcInstall, validatePcName } from "./pcremote.js";
+import { acceptMirror, checkArbiter, pairArbiterAndSave, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
@@ -11,8 +15,12 @@ import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
-import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
+import { createToken, listTokens, readMcpUse, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
+import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, ensureRepoHook, githubRepoOf, listGitHubRepos, listRepoHooks, saveCloudflare } from "./connections.js";
+import { explainDeployError } from "./deployhelp.js";
+import { prepareTemplate, TEMPLATES } from "./templates.js";
+import { clearNotify, NotifyError, notifySummary, saveNotify } from "./notify.js";
 import { clearOffsiteTarget, createBackupGrant, disablePublicStorage, listBackupGrants, OffsiteError, publicStorageUrl, useExternalStorage, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
@@ -20,7 +28,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
@@ -29,6 +37,7 @@ import {
   DASHBOARD_APP_NAME,
   ForbiddenActionError,
   listApprovals,
+  audit,
 } from "./guard.js";
 import {
   backupDatabase,
@@ -44,7 +53,8 @@ import {
   runPaaSDoctor,
   syncHomepageDashboard,
 } from "./deployer.js";
-import { exposeApplication } from "./exposure.js";
+import { exposeApplication, ExposeError, releaseAddresses, removeAppAddress } from "./exposure.js";
+import { trashDeleteDate } from "./trashclean.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -55,16 +65,22 @@ import {
   registerFederationPeer,
   verifyGitHubWebhookSignature,
 } from "./federation.js";
-import { getSystemStatusSummary } from "./mcp-server.js";
+import { getSystemStatusSummary, resourceSnapshot } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
 import { startPollLoop } from "./pollloop.js";
+import { startAppWatch } from "./appwatch.js";
+import { startNightlyLoop } from "./nightly.js";
+import { readDbHistory, readLatestUsage, setDatabaseLimit, startUsageLoop, usageRoundOnce } from "./usage.js";
 import {
   deleteSecretKey,
   getSecrets,
   listMaskedSecrets,
+  setSecretDescription,
   setSecretEntries,
   timingSafeCompare,
+  parseDotenv,
 } from "./vault.js";
+import { listSecretDetails } from "./vaultdocs.js";
 
 const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
 
@@ -363,8 +379,43 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         if (pathname === "/api/status" && req.method === "GET") {
           const status = { ...getSystemStatusSummary(true), controlPlane: followStatus() };
+          // Trashed apps: the day the trash deletes them for good (trashclean.ts).
+          const statusApps = (status as { apps?: Record<string, { trashedAt?: string }> }).apps;
+          if (statusApps && process.env.PAASMCP_TRASH_AUTO !== "0") {
+            for (const [k, a] of Object.entries(statusApps)) {
+              if (a?.trashedAt) statusApps[k] = { ...a, trashDeleteOn: trashDeleteDate(a as { name: string; trashedAt?: string }) } as typeof a;
+            }
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
+          return true;
+        }
+
+        // Live numbers for the Resource usage card (polled while the page is open), lighter than /api/status.
+        if (pathname === "/api/resources" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(resourceSnapshot(true)));
+          return true;
+        }
+
+        // Database sizes and their growth (Databases page), plus the disk split; refresh measures now.
+        // GET (outside the state lock): ?refresh=1 measures now instead of showing the last round.
+        if (pathname === "/api/usage" && req.method === "GET") {
+          // Measuring walks folders: at most once every 30 s, whoever asks.
+          const prev = readLatestUsage();
+          const age = prev ? Date.now() - Date.parse(prev.measuredAt) : Infinity;
+          if (url.searchParams.get("refresh") === "1" && !(age < 30_000)) await usageRoundOnce();
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ latest: readLatestUsage(), history: readDbHistory() }));
+          return true;
+        }
+        if (pathname === "/api/databases/limit" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const raw = body.sizeMb;
+          const sizeMb = raw === null || raw === "" || raw === undefined ? null : Number(raw);
+          const rec = setDatabaseLimit(String(body.name || ""), sizeMb);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ name: rec.name, warnSizeMb: rec.warnSizeMb ?? null }));
           return true;
         }
 
@@ -395,18 +446,48 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             JSON.stringify({
               scope,
               secrets: listMaskedSecrets(scope),
+              details: listSecretDetails(scope),
             })
           );
+          return true;
+        }
+
+        // A key's description (what it is and what it is for). Text only: the value never travels here.
+        if (pathname === "/api/secrets/description" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const scope = String(body.scope || "system");
+          const key = String(body.key || "").trim();
+          if (!key) throw new Error("Key is required");
+          setSecretDescription(scope, key, String(body.description ?? ""));
+          audit({ event: "secret.describe", scope: sanitizeSlug(scope), key, by: actor });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ scope, details: listSecretDetails(scope) }));
           return true;
         }
 
         if (pathname === "/api/secrets" && req.method === "POST") {
           const body = await readJsonBody(req);
           const scope = String(body.scope || "system");
+          // A pasted .env file: every variable at once (Railway, Render and Vercel take the same format).
+          if (typeof body.dotenv === "string") {
+            if (body.dotenv.length > 256 * 1024) throw new Error("The pasted text is too long (256 KB at most).");
+            const { entries, skipped } = parseDotenv(body.dotenv);
+            const keys = Object.keys(entries);
+            if (!keys.length) throw new Error("No KEY=value line found in the pasted text.");
+            if (keys.length > 300) throw new Error("Too many variables at once (300 at most).");
+            const saved = setSecretEntries(scope, entries);
+            audit({ event: "secret.import", scope: sanitizeSlug(scope), keys: saved.length, by: actor });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ scope, saved, skipped, secrets: listMaskedSecrets(scope) }));
+            return true;
+          }
           const key = String(body.key || "").trim();
           const value = String(body.value || "");
           if (!key) throw new Error("Key is required");
-          setSecretEntries(scope, { [key]: value });
+          const [savedKey] = setSecretEntries(scope, { [key]: value });
+          if (typeof body.description === "string" && body.description.trim()) {
+            setSecretDescription(scope, savedKey, body.description);
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
@@ -523,13 +604,21 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         }
 
+        // A failed deploy answers with the raw error plus what probably happened, for a plain-words card.
+        const deployFailed = (err: unknown) => {
+          res.writeHead(422, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err), failure: explainDeployError(err) }));
+          return true;
+        };
         if (pathname === "/api/deploy" && req.method === "POST") {
           const body = await readJsonBody(req);
           const trusted = typeof body.trusted === "boolean" ? body.trusted : undefined;
           if (trusted && !loadState().apps[sanitizeSlug(String(body.appName))]?.trusted) {
             confirmFromBody("app.trust", { appName: sanitizeSlug(String(body.appName)) }, body);
           }
-          const result = await deployApp({
+          let result;
+          try {
+            result = await deployApp({
             trigger: "dashboard",
             trusted,
             healthcheckPath: body.healthcheckPath ? String(body.healthcheckPath) : undefined,
@@ -543,7 +632,54 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             withRedis: Boolean(body.withRedis),
             memoryLimit: body.memoryLimit ? String(body.memoryLimit) : undefined,
             cpuLimit: body.cpuLimit ? String(body.cpuLimit) : undefined,
-          });
+            });
+          } catch (err) {
+            return deployFailed(err);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
+        // Ready-made apps: a pinned compose file written by PaaSMCP, published like a local folder.
+        if (pathname === "/api/templates" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ templates: TEMPLATES }));
+          return true;
+        }
+        if (pathname === "/api/templates/deploy" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const { dir, template } = prepareTemplate(String(body.id || ""));
+          const appName = sanitizeSlug(String(body.appName || template.id));
+          // Never replace an app that came from somewhere else (a repository, the dashboard itself).
+          const existing = loadState().apps[appName];
+          if (existing && existing.repoUrl !== dir) {
+            return deployFailed(new Error(`An app named '${appName}' already exists with other code. Pick another name.`));
+          }
+          let result;
+          try {
+            result = await deployApp({ appName, repoSource: dir, branch: "main", trigger: "dashboard" });
+          } catch (err) {
+            return deployFailed(err);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
+        // Publish again with what the app already has (same repository and branch): new passwords take effect.
+        if (pathname === "/api/apps/redeploy" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const slug = sanitizeSlug(String(body.appName || ""));
+          const app = loadState().apps[slug];
+          if (!app) throw new Error(`App '${slug}' not found.`);
+          if (!app.repoUrl || app.runtimeType === "paasmcp-control-plane") throw new Error(`App '${slug}' has no code source to publish again.`);
+          let result;
+          try {
+            result = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, trigger: "dashboard" });
+          } catch (err) {
+            return deployFailed(err);
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
           return true;
@@ -562,30 +698,45 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         }
 
+        if (pathname === "/api/unexpose" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const appName = sanitizeSlug(String(body.appName || ""));
+          const hostname = String(body.hostname || "");
+          confirmFromBody("app.unexpose", { appName, hostname }, body);
+          const result = await removeAppAddress(appName, hostname);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
         if (pathname === "/api/lifecycle" && req.method === "POST") {
           const body = await readJsonBody(req);
           const action = body.action as AppLifecycleAction;
           if (action === "destroy" || action === "purge") {
             confirmFromBody(`app.${action}`, { appName: String(body.appName) }, body);
           }
+          const addressNote = action === "purge" && loadState().apps[sanitizeSlug(String(body.appName))]?.trashedAt ? await releaseAddresses(String(body.appName)) : "";
           const output = manageAppLifecycle(
             String(body.appName),
             action,
             body.tailLines ? Number(body.tailLines) : 120
-          );
+          ) + (addressNote ? `\n${addressNote}` : "");
           // Copies on helper PCs follow this server's copy, in the background.
           let poolNote = "";
+          let pool: "updating" | "failed" | undefined;
           const lifeSlug = sanitizeSlug(String(body.appName));
           if (loadState().apps[lifeSlug]?.pool && ["restart", "stop", "start", "rollback", "destroy"].includes(action)) {
             try {
               startPoolJob(action, lifeSlug, (log) => poolAfterLifecycle(lifeSlug, action, log));
               poolNote = "\nCopies on helper PCs are being updated (Helpers screen).";
+              pool = "updating";
             } catch (err) {
               poolNote = `\nCopies on helper PCs were not updated: ${err instanceof Error ? err.message : String(err)}`;
+              pool = "failed";
             }
           }
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ output: output + poolNote }));
+          res.end(JSON.stringify({ output: output + poolNote, ...(pool ? { pool } : {}) }));
           return true;
         }
 
@@ -595,7 +746,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         };
 
-        if (pathname === "/api/tokens" && req.method === "GET") return reply({ tokens: listTokens() });
+        if (pathname === "/api/tokens" && req.method === "GET") return reply({ tokens: listTokens(), mcpUse: readMcpUse() });
         if (pathname === "/api/tokens" && req.method === "POST") {
           const body = await readJsonBody(req);
           const { token, record } = createToken(String(body.name || "ai"), String(body.level || "deploy") as TokenLevel);
@@ -775,6 +926,57 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return reply(await revokeBackupGrant(String(body.name || "")));
         }
 
+        // Connections (Cloudflare, GitHub): tokens come in to be tested or saved, never go back out.
+        if (pathname === "/api/connections" && req.method === "GET") return reply(connectionsSummary());
+        if (pathname === "/api/connections/cloudflare/discover" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await discoverCloudflare(body.token));
+        }
+        if (pathname === "/api/connections/cloudflare" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const r = await saveCloudflare(
+            {
+              token: typeof body.token === "string" ? body.token : undefined,
+              accountId: String(body.accountId || ""),
+              baseDomain: String(body.baseDomain || ""),
+              tunnelId: String(body.tunnelId || ""),
+              runHere: body.runHere === true,
+              zeroTrustEmails: typeof body.zeroTrustEmails === "string" || Array.isArray(body.zeroTrustEmails) ? (body.zeroTrustEmails as string | string[]) : undefined,
+            },
+            (params) => confirmFromBody("connect.cloudflare", params, body)
+          );
+          return reply({ ...r, summary: connectionsSummary() });
+        }
+        if (pathname === "/api/connections/github/repos" && req.method === "GET") return reply({ repos: await listGitHubRepos() });
+        // Push notices: the saved token creates or fixes the webhook on the apps' repositories.
+        if (pathname === "/api/connections/github/webhooks" && req.method === "GET") {
+          const apps = Object.values(loadState().apps).map((a) => ({ name: a.name, repoUrl: a.repoUrl }));
+          return reply({ repos: await listRepoHooks(apps, url.searchParams.get("address")) });
+        }
+        if (pathname === "/api/connections/github/webhooks" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          // Only repositories that an app here is published from: the token may reach many more.
+          const repo = githubRepoOf(body.repo).toLowerCase();
+          if (!repo || !Object.values(loadState().apps).some((a) => githubRepoOf(a.repoUrl).toLowerCase() === repo)) {
+            throw new ConnectionError("No app here is published from this repository.", "Nenhum app daqui é publicado deste repositório.");
+          }
+          return reply(await ensureRepoHook(body.repo, body.address, getOrCreateWebhookSecret()));
+        }
+        if (pathname === "/api/connections/github" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await checkGitHub(body.token));
+        }
+        // Notices (Discord, Slack, ntfy): a test notice must arrive before the address is saved.
+        if (pathname === "/api/connections/notify" && req.method === "GET") return reply(notifySummary());
+        if (pathname === "/api/connections/notify" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await saveNotify({ url: String(body.url || ""), onSuccess: Boolean(body.onSuccess), lang: String(body.lang || "pt") }));
+        }
+        if (pathname === "/api/connections/notify" && req.method === "DELETE") {
+          clearNotify();
+          return reply(notifySummary());
+        }
+
         if (pathname === "/api/storage" && req.method === "GET") return reply({ storage: listStorage() });
         if (pathname === "/api/storage" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -873,9 +1075,87 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
         // Test the arbiter (the saved one, or ?url= typed in the form before saving). A plain heartbeat.
         if (pathname === "/api/mirror/arbiter" && req.method === "GET") return reply(await checkArbiter(url.searchParams.get("url") || undefined));
+        // The arbiter's install command with this cluster's key already in it (same as `paasmcp arbiter key`).
+        // POST and no-store: the key only works on the arbiter, but it should not sit in caches or history.
+        if (pathname === "/api/mirror/arbiter/install" && req.method === "POST") {
+          const repo = followStatus().repoUrl || originOf(path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."));
+          const out = arbiterInstallCommand(repo);
+          audit({ event: "mirror.arbiter-key-shown", by: actor, cluster: out.cluster });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(out));
+          return true;
+        }
         if (pathname === "/api/mirror/arbiter" && req.method === "POST") {
           const body = await readJsonBody(req);
-          return reply(setArbiterUrl(String(body.url || "")));
+          const saved = setArbiterUrl(String(body.url || ""));
+          tellPeerAboutArbiter();
+          return reply(saved);
+        }
+        // Pair with a PC that shows a code (its dashboard's “Be the arbiter of another pair”).
+        if (pathname === "/api/mirror/arbiter/candidates" && req.method === "GET") return reply(await findJudgeCandidates());
+        if (pathname === "/api/pcs" && req.method === "GET") return reply(await listTailnetPcs());
+        if (pathname === "/api/pcs/job" && req.method === "GET") return reply({ job: currentPcJob() });
+        if (pathname === "/api/pcs/check" && req.method === "POST") {
+          // Logs in to the PC (Tailscale SSH or its password, kept in memory only) and runs the read-only check.
+          const body = await readJsonBody(req);
+          return reply({ job: await startPcCheck({ ip: body.ip, user: body.user, password: body.password, by: actor }) });
+        }
+        if (pathname === "/api/pcs/install" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const cur = currentPcJob();
+          if (!cur || cur.id !== String(body.jobId || "") || cur.phase !== "ready") throw new PcInstallError("expired", "This check is over. Log in to the PC again.", "Essa conferência acabou. Entre no PC de novo.");
+          const role = String(body.role || "");
+          const name = body.name ? validatePcName(body.name) : cur.name;
+          const turnOffTailscaleSsh = cur.via === "tailscale" && (role === "helper" || body.turnOffTailscaleSsh === true);
+          confirmFromBody("pc.install", { pc: name, ip: cur.ip, role, turnOffTailscaleSsh }, body);
+          return reply({
+            job: startPcInstall(
+              { jobId: body.jobId, role, name, turnOffTailscaleSsh: body.turnOffTailscaleSsh === true, by: actor },
+              {
+                createInvite: (n) => createInvite(n, { by: actor }),
+                addHelper: (n, ip) => addHelper(n, ip, { by: actor }),
+                pairArbiter: (ip, code) => pairArbiterAndSave(ip, code),
+              }
+            ),
+          });
+        }
+        if (pathname === "/api/pcs/cancel" && req.method === "POST") {
+          cancelPcJob();
+          return reply({ job: currentPcJob() });
+        }
+        if (pathname === "/api/mirror/arbiter/pair" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          try {
+            const out = await pairArbiterAndSave(String(body.host || ""), String(body.code || ""));
+            tellPeerAboutArbiter();
+            return reply(out);
+          } catch (err) {
+            if (!(err instanceof PairError)) throw err;
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message, errorCode: err.code }));
+            return true;
+          }
+        }
+        // This PC as the arbiter of another pair.
+        if (pathname === "/api/judge" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(await localJudgeStatus()));
+          return true;
+        }
+        if (pathname === "/api/judge/open" && req.method === "POST") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(await beJudge()));
+          return true;
+        }
+        if (pathname === "/api/judge/cancel" && req.method === "POST") {
+          cancelJudgePairing();
+          return reply({ ok: true });
+        }
+        if (pathname === "/api/judge/stop" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          confirmFromBody("judge.stop", {}, body);
+          stopLocalJudge();
+          return reply({ ok: true });
         }
         // App on both servers (active.ts) and the self-hosted entry (edge.ts).
         if (pathname === "/api/active" && req.method === "GET") {
@@ -939,12 +1219,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const status = err instanceof ForbiddenActionError ? 403 : err instanceof OffsiteError ? 400 : 500;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError || err instanceof PcInstallError;
+        const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(err instanceof OffsiteError ? { errorPt: err.pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError | PcInstallError).pt } : {}),
+            ...(err instanceof PcInstallError ? { errorCode: err.code } : {}),
           })
         );
         return;
@@ -959,6 +1241,15 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   // In the dashboard container the dashboard also does the auto-deploy checks, so no timer is needed.
   const stopPolling = startPollLoop();
   server.on("close", stopPolling);
+  // ...and it notices apps that stop on their own (a notice only when Connections → Notices is set up).
+  const stopWatch = startAppWatch();
+  server.on("close", stopWatch);
+  // ...and it makes the nightly backup, so no systemd timer has to be installed by hand.
+  const stopNightly = startNightlyLoop();
+  server.on("close", stopNightly);
+  // ...and it measures the disk split and the size of each database every 10 minutes (usage.ts).
+  const stopUsage = startUsageLoop();
+  server.on("close", stopUsage);
   return server;
 }
 
@@ -969,6 +1260,15 @@ function escapeHtmlServer(s?: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+/** The other server learns the arbiter address through the control channel (it adopts it if it has none). */
+function tellPeerAboutArbiter(): void {
+  import("./active.js")
+    .then(({ publishActiveState }) => publishActiveState())
+    .catch(() => {
+      // no copy goes to the other server yet: it is set there by hand
+    });
 }
 
 function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = false): string {
@@ -1132,6 +1432,57 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .ofs-kv { display: grid; grid-template-columns: max-content 1fr auto; gap: 4px 10px; align-items: center; font-size: 12.5px; }
     .ofs-kv code { word-break: break-all; }
     @media (max-width: 560px) { .ofs-kv { grid-template-columns: 1fr auto; } .ofs-kv .k { grid-column: 1 / -1; color: var(--muted); } }
+    .tut-row { display: flex; gap: 12px; align-items: center; padding: 11px 14px; margin-bottom: 8px; border-radius: 10px; background: var(--bg-subtle); border: 1px solid var(--border); font-size: 13px; }
+    .tut-check { flex: 0 0 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border); display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #fff; }
+    .tut-done .tut-check { background: var(--success, #22c55e); border-color: var(--success, #22c55e); }
+    .tut-done .tut-text strong { color: var(--muted); }
+    .tut-text { flex: 1; min-width: 0; }
+    .tut-desc { color: var(--muted); margin-top: 3px; line-height: 1.5; }
+    .tut-guide { margin-left: 4px; white-space: nowrap; }
+    .tut-act { flex: 0 0 auto; }
+    .tut-bar { height: 8px; border-radius: 99px; background: var(--bg-subtle); border: 1px solid var(--border); overflow: hidden; }
+    .tut-bar span { display: block; height: 100%; background: var(--success, #22c55e); transition: width .4s ease; }
+    .tut-count { font-size: 12.5px; color: var(--muted); margin: 6px 0 4px; }
+    .guide-steps { margin: 0; padding-left: 22px; display: grid; gap: 16px; }
+    .guide-step { font-size: 13.5px; line-height: 1.5; padding-left: 4px; }
+    .guide-step::marker { font-weight: 700; color: var(--accent, var(--text)); }
+    @media (max-width: 560px) { .tut-row { flex-wrap: wrap; } .tut-act { margin-left: 34px; } }
+    .sec-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 6px; border-radius: 8px; background: var(--bg-subtle); border: 1px solid var(--border); font-size: 12.5px; flex-wrap: wrap; }
+    .sec-k { min-width: 0; word-break: break-all; }
+    .sec-main { flex: 1 1 260px; min-width: 0; }
+    .sec-desc { margin-top: 4px; color: var(--text); line-height: 1.4; word-break: break-word; }
+    .sec-desc.sugg { color: var(--muted); }
+    .sec-desc.none { color: var(--muted); font-style: italic; }
+    .sec-tag { font-size: 10.5px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--border); margin-left: 4px; font-style: normal; }
+    .sec-dates { margin-top: 3px; color: var(--muted); font-size: 11.5px; }
+    .sec-edit { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+    .sec-edit input { flex: 1 1 220px; min-width: 0; font-size: 12.5px; padding: 5px 8px; }
+    .sec-edit button { padding: 3px 9px; font-size: 11px; }
+    .sec-act { display: flex; gap: 6px; }
+    .sec-act button { padding: 3px 9px; font-size: 11px; }
+    .sec-apply.changed { color: var(--text); border-left: 3px solid var(--warning, #d97706); padding-left: 8px; }
+    .sec-paste summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+    .sec-paste textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .dep-more { margin: 4px 0 14px; }
+    .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+    .dep-pick { margin: -4px 0 14px; max-width: 520px; }
+    .nt-list { margin: 0 0 12px; padding-left: 18px; }
+    .bak-nightly { font-size: 12.5px; margin: 0 0 14px; padding: 10px 12px; border-radius: 8px; background: var(--bg-subtle); border: 1px solid var(--border); line-height: 1.5; }
+    .bak-nightly.err { border-color: var(--danger); }
+    .tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+    .tpl-item { border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+    .tpl-item strong { font-size: 13.5px; }
+    .tpl-item p { margin: 0; color: var(--muted); flex: 1; }
+    .tpl-item .tpl-row { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+    .nt-list li { margin-bottom: 4px; }
+    .dep-result { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 720px; }
+    .dep-result.ok { background: var(--success-soft); }
+    .dep-result.err { background: var(--danger-soft); }
+    .dep-result p { margin: 4px 0 8px; }
+    .dep-result-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .dep-result details { margin-top: 8px; }
+    .dep-result summary { cursor: pointer; font-size: 12.5px; }
+    .dep-result pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; font-size: 11.5px; margin: 6px 0 0; }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -1668,6 +2019,17 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .progress-fill.danger {
       background: var(--danger);
     }
+    :root, [data-theme="dark"] { --seg-db: #a78bfa; --seg-bk: #f472b6; --seg-files: #a3e635; }
+    [data-theme="light"] { --seg-db: #7c3aed; --seg-bk: #db2777; --seg-files: #4d7c0f; }
+    .progress-track.stacked { display: flex; }
+    .progress-track .seg { height: 100%; transition: width 0.3s ease; }
+    .progress-track .seg.paas { background: var(--accent); }
+    .progress-track .seg.other { background: var(--muted); opacity: 0.55; }
+    .res-legend { font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; margin: -4px 0 10px; }
+    .res-legend .res-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -0.5px; }
+    .res-legend .res-dot.paas { background: var(--accent); }
+    .res-legend .res-dot.other { background: var(--muted); opacity: 0.55; }
+    .res-hint { font-size: 11px; color: var(--muted); line-height: 1.45; margin: 2px 0 8px; }
 
     .telemetry-card button.health-row {
       width: 100%; background: transparent; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; box-shadow: none;
@@ -2044,6 +2406,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       </div></div>
       <button class="nav-section" data-section="integrations" aria-expanded="true" aria-controls="navGroup-integrations" onclick="toggleNavSection('integrations')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecIntegrations"></span></button>
       <div class="nav-group" id="navGroup-integrations"><div class="nav-group-inner">
+        <button class="nav-item nav-btn" onclick="goTo('connect')" id="navConnect">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountConnect" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="connect"></div>
         <button class="nav-item nav-btn" onclick="goTo('agents')" id="navAgents">
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
           <span class="nav-label"></span>
@@ -2088,34 +2456,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
           <div id="homeSteps"></div>
         </div>
-        <div class="card" data-sub="setup">
+        <div class="card" data-sub="tutorial">
           <div class="card-header">
-            <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
-            <p class="card-desc" id="setupDesc">Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.</p>
+            <h2 data-i18n="tutTitle"></h2>
+            <p class="card-desc" data-i18n="tutDesc"></p>
           </div>
-          <div class="grid-2">
-            <div class="arch-box">
-              <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
-              <p id="setupGithubDesc">Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.</p>
-              <p><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" id="setupGithubLink">Criar fine-grained token ↗</a> · <a href="https://docs.github.com/en/rest/deploy-keys/deploy-keys#create-a-deploy-key" target="_blank" rel="noreferrer" id="setupGithubDocsLink">Permissões da API ↗</a></p>
-            </div>
-            <div class="arch-box">
-              <h3 id="setupCloudTitle">☁️ Cloudflare — opcional para publicar</h3>
-              <p id="setupCloudDesc">Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.</p>
-              <p><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" id="setupCloudLink">Criar API token ↗</a> · <a href="https://developers.cloudflare.com/fundamentals/api/get-started/create-token/" target="_blank" rel="noreferrer" id="setupCloudDocsLink">Guia de tokens ↗</a></p>
-            </div>
-            <div class="arch-box">
-              <h3 id="setupLocalTitle">🔐 Acesso e deploy local</h3>
-              <p id="setupLocalDesc">O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.</p>
-            </div>
-            <div class="arch-box">
-              <h3 id="setupAppTitle">🧩 Segredos e sugestões por aplicação</h3>
-              <p id="setupAppDesc">Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.</p>
-            </div>
-          </div>
-          <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
+          <div id="tutProgress"></div>
+          <div id="tutList"></div>
         </div>
       </div>
+      <div class="tab-pane" id="tab-guide"></div>
 
       <!-- TAB 2: OVERVIEW, APPS, DEPLOY & EXPOSE -->
       <div class="tab-pane active" id="tab-overview">
@@ -2129,7 +2479,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
           <div class="console-search-bar">
             <input class="console-search-input" id="appSearchInput" placeholder="Buscar aplicações por nome, stack ou porta..." oninput="filterApps(this.value)" />
-            <button class="secondary" onclick="fillDeployPreset('saas', document.getElementById('presetSaas')); const depEl = revealEl('depApp'); if (depEl) depEl.focus();" style="padding:6px 12px;font-size:12.5px;">+ Novo Deploy</button>
+            <button class="secondary" id="btnNewApp" onclick="goTo('overview', 'deploy'); const depEl = document.getElementById('depApp'); if (depEl) depEl.focus();" style="padding:6px 12px;font-size:12.5px;">+ Publicar um app</button>
           </div>
           <div class="apps-card-list" id="appsTable">
             <div style="padding: 24px; text-align: center; color: var(--muted);">...</div>
@@ -2157,40 +2507,27 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <p class="preset-hint" id="deployPresetHint"></p>
               <div class="form-grid">
                 <div>
-                  <label class="field-label" id="lblDepApp">Slug da Aplicação</label>
+                  <label class="field-label" id="lblDepApp">Nome do app</label>
                   <input id="depApp" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblDepRepo">Repositório GitHub ou Caminho</label>
+                  <label class="field-label" id="lblDepRepo">Repositório (dono/nome) ou pasta do servidor</label>
                   <input id="depRepo" placeholder="ex: seu-usuario/meu-repo" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblDepBranch">Branch Git</label>
+                  <label class="field-label" id="lblDepBranch">Branch</label>
                   <input id="depBranch" placeholder="main" value="main" />
                 </div>
               </div>
-              <div class="form-grid">
-                <div>
-                  <label class="field-label" id="lblDepMem">Limite de RAM (Opcional)</label>
-                  <input id="depMem" placeholder="ex: 512m ou 1g" />
-                </div>
-                <div>
-                  <label class="field-label" id="lblDepCpu">Limite de vCPUs (Opcional)</label>
-                  <input id="depCpu" placeholder="ex: 0.5 ou 1.0" />
-                </div>
-                <div>
-                  <label class="field-label" data-i18n="lblDepHealth"></label>
-                  <input id="depHealth" placeholder="/" />
-                </div>
-              </div>
+              <div id="depRepoPick" class="dep-pick"></div>
               <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; font-size:12.5px; flex-wrap:wrap;">
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depPg" style="width:auto;" />
-                  <span id="lblDepPg">Provisionar PostgreSQL 16 (injeta <code>DATABASE_URL</code>)</span>
+                  <span id="lblDepPg">Banco PostgreSQL (o app recebe <code>DATABASE_URL</code>)</span>
                 </label>
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depRedis" style="width:auto;" />
-                  <span id="lblDepRedis">Provisionar Redis 7 (injeta <code>REDIS_URL</code>)</span>
+                  <span id="lblDepRedis">Cache Redis (o app recebe <code>REDIS_URL</code>)</span>
                 </label>
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depPoll" style="width:auto;" />
@@ -2204,18 +2541,46 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input type="checkbox" id="depEmail" style="width:auto;" />
                   <span data-i18n="lblDepEmail"></span>
                 </label>
-                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              </div>
+              <details class="dep-more">
+                <summary data-i18n="depMore"></summary>
+                <p class="ofs-note" data-i18n="depMoreDesc" style="margin-top:8px;"></p>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" id="lblDepMem">Memória máxima</label>
+                  <input id="depMem" placeholder="ex: 512m ou 1g" />
+                </div>
+                <div>
+                  <label class="field-label" id="lblDepCpu">Processadores (CPUs) no máximo</label>
+                  <input id="depCpu" placeholder="ex: 0.5 ou 1.0" />
+                </div>
+                <div>
+                  <label class="field-label" data-i18n="lblDepHealth"></label>
+                  <input id="depHealth" placeholder="/" />
+                </div>
+              </div>
+                <label style="margin-bottom:12px;font-size:12.5px;display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depNoHealth" style="width:auto;" />
                   <span data-i18n="lblDepNoHealth"></span>
                 </label>
-              </div>
+              </details>
               <div id="depStoBox" style="display:none;margin:-4px 0 14px;padding:12px 14px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
                 <p class="ofs-note" data-i18n="stoWhere"></p>
                 <div id="depProviders" class="ofs-chips"></div>
                 <div id="depFields"></div>
                 <div class="ofs-msg" id="depStoMsg" role="status" aria-live="polite"></div>
               </div>
-              <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
+              <button onclick="deployNewApp()" id="btnDeploy">🚀 Publicar</button>
+              <div id="depResult"></div>
+            </div>
+
+            <div class="card" data-sub="deploy">
+              <div class="card-header">
+                <h2 data-i18n="tplTitle"></h2>
+                <p class="card-desc" data-i18n="tplDesc"></p>
+              </div>
+              <div id="tplList" class="tpl-grid"></div>
+              <div id="tplResult"></div>
             </div>
 
             <div class="card" data-sub="expose">
@@ -2223,32 +2588,30 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <h2 id="exposeTitle">🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)</h2>
                 <p class="card-desc" id="exposeDesc">Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.</p>
               </div>
-              <div class="examples-bar">
-                <span id="lblQuickFillExpose">⚡ Modos:</span>
-                <button class="chip" onclick="fillExposeMode('public')" id="chipModePublic">🌍 Público (HTTPS Aberto)</button>
-                <button class="chip" onclick="fillExposeMode('zero-trust')" id="chipModeZT">🛡️ Zero Trust (OTP por E-mail)</button>
-                <button class="chip" onclick="fillExposeMode('tailscale')" id="chipModeTS">🔒 Tailscale (VPN Privada)</button>
-              </div>
+              <div id="exposeCfHint"></div>
+              <p class="preset-hint show" id="expModeHint" style="margin:0 0 10px;"></p>
               <div class="form-grid">
                 <div>
                   <label class="field-label" id="lblExpApp">Aplicação</label>
-                  <input id="expApp" list="hostedAppsList" placeholder="ex: meu-saas" />
+                  <input id="expApp" list="hostedAppsList" placeholder="ex: meu-saas" oninput="expAppChanged()" />
                   <datalist id="hostedAppsList"></datalist>
                 </div>
                 <div>
-                  <label class="field-label" id="lblExpMode">Modo de Segurança</label>
-                  <select id="expMode">
+                  <label class="field-label" id="lblExpMode">Quem pode abrir</label>
+                  <select id="expMode" onchange="renderExposeHint()">
                     <option value="public" id="optPublic">Cloudflare Público (HTTPS aberto)</option>
                     <option value="zero-trust" id="optZT">Cloudflare Zero Trust (Login PIN por E-mail)</option>
                     <option value="tailscale" id="optTS">Tailscale Serve (Privado na Tailnet)</option>
                   </select>
                 </div>
-                <div>
+                <div id="expSubBox">
                   <label class="field-label" id="lblExpSub">Subdomínio</label>
-                  <input id="expSub" placeholder="ex: app" />
+                  <input id="expSub" placeholder="ex: loja" oninput="renderExposeHint()" />
                 </div>
               </div>
+              <p class="ofs-note" id="expPreviewLine" style="margin:-4px 0 10px;"></p>
               <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
+              <div id="expList" style="margin-top:18px;"></div>
             </div>
           
 
@@ -2318,22 +2681,35 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <h2 id="whTitle">⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
               <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
             </div>
-            <div style="margin-bottom:14px;">
-              <span class="field-label" id="lblWhUrl">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
-              <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
-            </div>
-            <div style="margin-bottom:16px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-                <span class="field-label" id="lblWhSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
-                <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
+            <div id="whAuto">
+              <h3 class="ofs-h" data-i18n="whAutoTitle"></h3>
+              <p class="ofs-note" id="whAutoNote"></p>
+              <div class="wh-form" style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;">
+                <div style="flex:1 1 240px;min-width:0;"><label class="field-label" for="whAddress" data-i18n="whLblAddress"></label><input id="whAddress" type="url" autocomplete="off" spellcheck="false" placeholder="https://painel.seudominio.com" /></div>
+                <div><button class="secondary" onclick="loadHooks()" data-i18n="whBtnCheck"></button></div>
               </div>
-              <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
+              <div class="ofs-msg" id="whMsg" role="status" aria-live="polite"></div>
+              <div id="whRepos" style="margin-top:8px;"></div>
             </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-              <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
-              <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
-            </div>
-            <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
+            <details id="whManual" style="margin-top:16px;">
+              <summary style="cursor:pointer;font-weight:600;font-size:14px;" data-i18n="whManualTitle"></summary>
+              <div style="margin:12px 0 14px;">
+                <span class="field-label" data-i18n="whLblUrl"></span>
+                <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
+              </div>
+              <div style="margin-bottom:16px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <span class="field-label" data-i18n="whLblSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
+                  <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
+                </div>
+                <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
+                <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
+              </div>
+              <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
+            </details>
           </div>
         </div>
 
@@ -2341,33 +2717,43 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         <div class="tab-pane" id="tab-vault">
           <div class="card">
             <div class="card-header">
-              <h2 id="vaultTitle">🔐 Cofre Criptografado de Variáveis (AES-256-GCM Vault)</h2>
-              <p class="card-desc" id="vaultDesc">Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.</p>
+              <h2 id="vaultTitle"></h2>
+              <p class="card-desc" id="vaultDesc"></p>
             </div>
-            <div class="examples-bar">
-              <span id="lblVaultScopes">⚡ Escopos:</span>
-              <button class="chip" id="chipSystemScope" onclick="setVaultScope('system')">⚙️ system (Global Tokens)</button>
-              <span id="dynamicScopeChips"></span>
+            <div class="form-grid" style="grid-template-columns:minmax(0,320px);">
+              <div>
+                <label class="field-label" for="secScope" id="lblSecScope"></label>
+                <select id="secScope" onchange="loadSecrets()"><option value="system"></option></select>
+              </div>
             </div>
+            <div id="secApply"></div>
+            <h3 class="ofs-h" data-i18n="secListTitle"></h3>
+            <div id="secretsList"></div>
+            <h3 class="ofs-h" style="margin-top:18px;" data-i18n="secAddTitle"></h3>
             <div class="form-grid">
               <div>
-                <label class="field-label" id="lblSecScope">Escopo (system ou slug do app)</label>
-                <input id="secScope" placeholder="system" value="system" onchange="loadSecrets()" />
+                <label class="field-label" for="secKey" id="lblSecKey"></label>
+                <input id="secKey" placeholder="STRIPE_SECRET_KEY" autocomplete="off" spellcheck="false" />
               </div>
               <div>
-                <label class="field-label" id="lblSecKey">Chave (A-Z, 0-9, _)</label>
-                <input id="secKey" placeholder="ex: STRIPE_SECRET_KEY" />
+                <label class="field-label" for="secVal" id="lblSecVal"></label>
+                <input id="secVal" type="password" autocomplete="new-password" />
               </div>
-              <div>
-                <label class="field-label" id="lblSecVal">Valor Secreto</label>
-                <input id="secVal" type="password" placeholder="••••••••••••" />
+              <div style="grid-column:1/-1;">
+                <label class="field-label" for="secDesc" data-i18n="secDescLabel"></label>
+                <input id="secDesc" maxlength="300" autocomplete="off" />
               </div>
             </div>
-            <div class="actions" style="margin-bottom:16px;">
-              <button onclick="saveSecret()" id="btnSaveSecret">💾 Criptografar & Salvar</button>
-              <button class="secondary" onclick="loadSecrets()" id="btnLoadSecrets">🔍 Recarregar Escopo</button>
+            <div class="actions" style="margin-bottom:6px;">
+              <button onclick="saveSecret()" id="btnSaveSecret"></button>
             </div>
-            <div id="secretsList"></div>
+            <details class="sec-paste" style="margin-top:14px;">
+              <summary data-i18n="secPasteTitle"></summary>
+              <p class="ofs-note" data-i18n="secPasteDesc" style="margin-top:8px;"></p>
+              <textarea id="secDotenv" rows="7" spellcheck="false" autocomplete="off" placeholder="DATABASE_URL=postgres://...&#10;STRIPE_SECRET_KEY=sk_live_...&#10;# comentários são ignorados"></textarea>
+              <div class="ofs-msg" id="secPasteMsg" role="status" aria-live="polite"></div>
+              <div style="margin-top:8px;"><button class="secondary" onclick="saveDotenv()" data-i18n="secPasteBtn"></button></div>
+            </details>
           </div>
         </div>
 
@@ -2439,7 +2825,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input id="dbApp" list="hostedAppsList" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblDbEngine">Engine</label>
+                  <label class="field-label" id="lblDbEngine">Tipo</label>
                   <select id="dbEngine">
                     <option value="postgres" id="optDbPg">PostgreSQL 16 (Isolado por DB + Role)</option>
                     <option value="redis" id="optDbRedis">Redis 7 (DB Lógico Isolado)</option>
@@ -2447,6 +2833,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 </div>
               </div>
               <button onclick="createDb()" id="btnCreateDb" style="margin-bottom:16px;">+ Provisionar Banco</button>
+              <div id="dbResult"></div>
               <div id="dbList"></div>
             </div>
 
@@ -2461,20 +2848,112 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input id="bakApp" list="hostedAppsList" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblBakEngine">Engine</label>
+                  <label class="field-label" id="lblBakEngine">O que copiar</label>
                   <select id="bakEngine">
                     <option value="postgres" id="optBakPg">PostgreSQL 16 (pg_dump)</option>
                     <option value="redis" id="optBakRedis">Redis 7 (RDB)</option>
-                    <option value="volume">Docker volumes</option>
+                    <option value="volume" id="optBakVol">Docker volumes</option>
                   </select>
                 </div>
               </div>
-              <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Criar Snapshot Criptografado</button>
+              <div id="bakNightly" class="bak-nightly"></div>
+              <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Fazer uma cópia agora</button>
               <div id="backupsList"></div>
             </div>
           
         </div>
 
+
+        <div class="tab-pane" id="tab-connect">
+          <div class="card" data-sub="cloudflare">
+            <div class="card-header">
+              <h2 data-i18n="cnCfTitle"></h2>
+              <p class="card-desc" data-i18n="cnCfDesc"></p>
+            </div>
+            <div id="cfStatus"></div>
+            <div id="cfForm">
+              <h3 class="ofs-h" data-i18n="cnCfStep1"></h3>
+              <p class="ofs-note" data-i18n="cnCfStep1Desc"></p>
+              <p style="margin:0 0 6px;"><a id="cfTokenLink" target="_blank" rel="noreferrer" data-i18n="cnCfTokenLink"></a></p>
+              <h3 class="ofs-h" data-i18n="cnCfStep2"></h3>
+              <div class="form-grid" style="grid-template-columns:minmax(0,1fr) auto;align-items:end;">
+                <div><label class="field-label" for="cfToken" data-i18n="cnCfToken"></label><input id="cfToken" type="password" autocomplete="off" spellcheck="false" /></div>
+                <div><button class="secondary" onclick="cfDiscover()" id="btnCfDiscover" data-i18n="cnBtnCheck"></button></div>
+              </div>
+              <div class="ofs-msg" id="cfMsg" role="status" aria-live="polite"></div>
+              <div id="cfChoose" style="display:none;">
+                <h3 class="ofs-h" data-i18n="cnCfStep3"></h3>
+                <div class="form-grid">
+                  <div><label class="field-label" for="cfAccount" data-i18n="cnCfAccount"></label><select id="cfAccount" onchange="cfFillChoices()"></select></div>
+                  <div><label class="field-label" for="cfDomain" data-i18n="cnCfDomain"></label><select id="cfDomain"></select></div>
+                  <div><label class="field-label" for="cfTunnel" data-i18n="cnCfTunnel"></label><select id="cfTunnel" onchange="cfTunnelHint()"></select></div>
+                </div>
+                <p class="ofs-note" id="cfTunnelNote"></p>
+                <label id="cfRunHereRow" style="display:none;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;margin-bottom:10px;">
+                  <input type="checkbox" id="cfRunHere" style="width:auto;" /> <span data-i18n="cnCfRunHere"></span>
+                </label>
+                <label class="field-label" for="cfEmails" data-i18n="cnCfEmails"></label>
+                <input id="cfEmails" placeholder="voce@exemplo.com, socio@exemplo.com" autocomplete="off" />
+                <p class="ofs-note" data-i18n="cnCfEmailsHint" style="margin-top:4px;"></p>
+                <div class="ofs-msg" id="cfSaveMsg" role="status" aria-live="polite"></div>
+                <div style="margin-top:10px;"><button onclick="cfSave()" id="btnCfSave" data-i18n="cnBtnCfSave"></button></div>
+              </div>
+            </div>
+          </div>
+          <div class="card" data-sub="github">
+            <div class="card-header">
+              <h2 data-i18n="cnGhTitle"></h2>
+              <p class="card-desc" data-i18n="cnGhDesc"></p>
+            </div>
+            <div id="ghStatus"></div>
+            <h3 class="ofs-h" data-i18n="cnGhKeyTitle"></h3>
+            <p class="ofs-note" data-i18n="cnGhKeyDesc"></p>
+            <div class="ofs-secret" id="ghSshKey">...</div>
+            <button class="secondary" onclick="copyText(document.getElementById('ghSshKey').textContent)" data-i18n="cnBtnCopyKey"></button>
+            <h3 class="ofs-h" style="margin-top:20px;" data-i18n="cnGhTokenTitle"></h3>
+            <p class="ofs-note" data-i18n="cnGhTokenDesc"></p>
+            <p style="margin:0 0 8px;"><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer" data-i18n="cnGhTokenLink"></a></p>
+            <div class="form-grid" style="grid-template-columns:minmax(0,1fr) auto;align-items:end;">
+              <div><label class="field-label" for="ghToken" data-i18n="cnGhToken"></label><input id="ghToken" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_..." /></div>
+              <div><button onclick="ghSave()" id="btnGhSave" data-i18n="cnBtnGhSave"></button></div>
+            </div>
+            <div class="ofs-msg" id="ghMsg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="card" data-sub="alerts">
+            <div class="card-header">
+              <h2 data-i18n="ntTitle"></h2>
+              <p class="card-desc" data-i18n="ntDesc"></p>
+            </div>
+            <div id="ntStatus"></div>
+            <div id="ntForm">
+              <p class="ofs-note" data-i18n="ntHow"></p>
+              <ul class="ofs-note nt-list">
+                <li data-i18n="ntHowNtfy"></li>
+                <li data-i18n="ntHowDiscord"></li>
+                <li data-i18n="ntHowSlack"></li>
+              </ul>
+              <label class="field-label" for="ntUrl" data-i18n="ntUrl"></label>
+              <input id="ntUrl" type="password" autocomplete="off" spellcheck="false" placeholder="https://ntfy.sh/..." />
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;margin:10px 0 12px;">
+                <input type="checkbox" id="ntSuccess" style="width:auto;" />
+                <span data-i18n="ntOnSuccess"></span>
+              </label>
+              <button onclick="ntSave()" id="btnNtSave" data-i18n="ntSave"></button>
+            </div>
+            <div class="ofs-msg" id="ntMsg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="card" data-sub="pcs">
+            <div class="card-header">
+              <h2 data-i18n="pcsTitle"></h2>
+              <p class="card-desc" data-i18n="pcsDesc"></p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+              <button class="secondary" onclick="loadPcs()" id="btnPcsLoad" data-i18n="pcsRefresh"></button>
+            </div>
+            <div id="pcsJobBox"></div>
+            <div id="pcsBox"></div>
+          </div>
+        </div>
 
         <div class="tab-pane" id="tab-email">
           <div class="card">
@@ -2573,36 +3052,85 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div style="margin-top:10px;"><button onclick="mirrorAccept()" data-i18n="btnMirrorAccept"></button></div>
             </div>
           </div>
+          <div class="card" data-sub="judge" id="judgeCard">
+            <div class="card-header"><h2 data-i18n="judgeTitle"></h2><p class="card-desc" data-i18n="judgeDesc"></p></div>
+            <div id="judgeInfoBox"></div>
+            <button class="secondary" onclick="loadArbiterStatus()" data-i18n="btnArbRefresh"></button>
+          </div>
+          <div class="card" data-sub="judge">
+            <div class="card-header"><h2 data-i18n="judgeHowTitle"></h2></div>
+            <ol style="margin:0 0 12px;padding-left:20px;font-size:13px;line-height:1.7;">
+              <li data-i18n="judgeHow1"></li>
+              <li data-i18n="judgeHow2"></li>
+              <li data-i18n="judgeHow3"></li>
+              <li data-i18n="judgeHow4"></li>
+            </ol>
+            <div id="judgeOwnersBox"></div>
+          </div>
+          <div class="card" data-sub="judge" id="judgeSetupCard">
+            <details id="judgeSetup" open>
+              <summary style="cursor:pointer;font-weight:600;font-size:15px;" id="judgeSetupTitle" data-i18n="judgeSetupTitle" onclick="this.parentNode.dataset.touched = '1'"></summary>
+              <p class="card-desc" data-i18n="judgeBefore" style="margin-top:10px;"></p>
+
+              <h3 data-i18n="pairEasyTitle" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="pairEasyDesc" style="margin-bottom:10px;"></p>
+              <button class="secondary" onclick="judgeFind()" id="btnJudgeFind" data-i18n="btnJudgeFind"></button>
+              <div id="judgeFindBox" style="margin-top:10px;"></div>
+              <div class="form-grid" style="margin-top:6px;">
+                <div>
+                  <label class="field-label" for="pairHost" data-i18n="lblPairHost"></label>
+                  <input id="pairHost" placeholder="100.64.0.9" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="pairCode" data-i18n="lblPairCode"></label>
+                  <input id="pairCode" inputmode="numeric" maxlength="7" placeholder="123456" autocomplete="off" />
+                </div>
+              </div>
+              <div style="margin-top:10px;"><button onclick="judgePair()" id="btnJudgePair" data-i18n="btnJudgePair"></button></div>
+              <div id="judgePairBox" style="margin-top:10px;"></div>
+
+              <h3 data-i18n="pairManualTitle" style="margin-top:22px;padding-top:14px;border-top:1px solid var(--border);"></h3>
+              <p class="card-desc" data-i18n="pairManualDesc"></p>
+
+              <h3 data-i18n="autoStep1" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="autoStep1Desc"></p>
+
+              <h3 data-i18n="autoStep2" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="autoStep2Desc" style="margin-bottom:10px;"></p>
+              <button onclick="arbiterInstallCmd()" id="btnArbCmd" data-i18n="btnArbCmd"></button>
+              <div id="arbInstallBox" style="display:none;margin-top:10px;">
+                <pre id="arbInstallCmd" style="user-select:all;white-space:pre-wrap;word-break:break-all;"></pre>
+                <button class="secondary" onclick="copyText(document.getElementById('arbInstallCmd').textContent)" data-i18n="aiCopy"></button>
+                <p class="card-desc" data-i18n="autoStep2After" style="margin-top:10px;"></p>
+              </div>
+              <details style="margin-top:12px;font-size:12.5px;">
+                <summary style="cursor:pointer;" data-i18n="autoPrereqTitle"></summary>
+                <p class="card-desc" data-i18n="autoPrereqDesc" style="margin-top:8px;"></p>
+                <pre style="user-select:all;white-space:pre-wrap;word-break:break-all;">curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs git</pre>
+                <p class="card-desc" data-i18n="autoStep3Check" style="margin-top:8px;"></p>
+                <pre style="user-select:all;">curl http://$(tailscale ip -4):4097/health</pre>
+              </details>
+
+              <h3 data-i18n="autoStep3" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="autoStep3Desc" style="margin-bottom:10px;"></p>
+              <label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label>
+              <input id="mArbiter" placeholder="http://100.64.0.9:4097" />
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+                <button class="secondary" onclick="arbiterTest()" id="btnArbTest" data-i18n="btnArbTest"></button>
+                <button onclick="arbiterSave()" data-i18n="btnArbSave"></button>
+              </div>
+              <div id="arbTestBox" style="margin-top:10px;"></div>
+            </details>
+          </div>
+          <div class="card" data-sub="judge" id="judgeLocalCard">
+            <div class="card-header"><h2 data-i18n="judgeLocalTitle"></h2><p class="card-desc" data-i18n="judgeLocalDesc"></p></div>
+            <div id="judgeLocalBox"></div>
+          </div>
           <div class="card" data-sub="auto">
             <div class="card-header"><h2 data-i18n="autoTitle"></h2><p class="card-desc" data-i18n="autoDesc"></p></div>
             <div id="arbStatusBox" style="margin-bottom:6px;"></div>
-            <p class="card-desc" data-i18n="autoBefore"></p>
-
-            <h3 data-i18n="autoStep1" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep1Desc"></p>
-
-            <h3 data-i18n="autoStep2" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep2Desc"></p>
-            <pre style="user-select:all;">sudo paasmcp arbiter key</pre>
-
-            <h3 data-i18n="autoStep3" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep3Desc"></p>
-            <pre id="arbInstallCmd" style="user-select:all;white-space:pre-wrap;word-break:break-all;"></pre>
-            <button class="secondary" onclick="copyText(document.getElementById('arbInstallCmd').textContent)" data-i18n="aiCopy"></button>
-            <p class="card-desc" data-i18n="autoStep3Check" style="margin-top:10px;"></p>
-            <pre style="user-select:all;">curl http://$(tailscale ip -4):4097/health</pre>
-            <p class="card-desc" data-i18n="autoStep3Shared" style="margin-top:10px;"></p>
-            <pre style="user-select:all;white-space:pre-wrap;word-break:break-all;" id="arbAddKeyCmd"></pre>
-
-            <h3 data-i18n="autoStep4" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep4Desc" style="margin-bottom:10px;"></p>
-            <label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label>
-            <input id="mArbiter" placeholder="http://100.64.0.9:4097" />
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
-              <button class="secondary" onclick="arbiterTest()" id="btnArbTest" data-i18n="btnArbTest"></button>
-              <button onclick="arbiterSave()" data-i18n="btnArbSave"></button>
-            </div>
-            <div id="arbTestBox" style="margin-top:10px;"></div>
+            <p class="card-desc"><span data-i18n="autoBefore"></span> <a href="javascript:void(0)" data-go-tab="mirror" data-go-sub="judge" data-i18n="autoGoJudge"></a></p>
 
             <h3 data-i18n="autoStep5" style="margin-top:16px;"></h3>
             <p class="card-desc" data-i18n="autoStep5Desc" style="margin-bottom:10px;"></p>
@@ -2828,10 +3356,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         <div class="card" id="logsCard" style="display:none;">
           <div class="card-header">
             <h2>
-              <span id="logsTitle">📜 Logs do Container</span>
-              <button class="secondary" id="btnCloseLogs" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
+              <span id="logsTitle">📜 O que o app escreveu (logs)</span>
+              <span style="display:flex;gap:6px;">
+                <button class="secondary" id="btnRefreshLogs" onclick="if (logsApp) appAction(logsApp, 'logs')" data-i18n="logsRefresh"></button>
+                <button class="secondary" id="btnCloseLogs" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
+              </span>
             </h2>
           </div>
+          <p class="ofs-note" id="logsHint" style="margin:0 0 8px;"></p>
           <pre id="logsBox"></pre>
         </div>
       </div>
@@ -2862,21 +3394,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     const I18N = {
       pt: {
-        setupTitle: "🧭 Primeira configuração: o que você precisa?",
-        setupDesc: "Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.",
-        setupGithubTitle: "🐙 GitHub — opcional",
-        setupGithubDesc: "Para repositório privado, use uma Deploy Key SSH somente leitura. Copie a chave pública no quadro do webhook, no fim da tela Apps, e adicione em Settings → Deploy keys. Para registrar automaticamente a chave ou clonar via HTTPS, salve <code>GITHUB_TOKEN</code> no escopo <code>system</code>. Um fine-grained token precisa de acesso apenas ao repositório e <em>Administration: read and write</em>; a chave criada continua somente leitura.",
-        setupGithubLink: "Criar fine-grained token ↗",
-        setupGithubDocsLink: "Permissões da API ↗",
-        setupCloudTitle: "☁️ Cloudflare — opcional para publicar",
-        setupCloudDesc: "Para Tunnel + DNS: token com Account → Cloudflare Tunnel: Edit e Zone → DNS: Edit, restrito à conta e zona necessárias. Para proteção Zero Trust, inclua também Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domínio e emails permitidos via <code>paasmcp config</code> ou <code>paas_configure</code>, e salve <code>CF_API_TOKEN</code> no escopo <code>system</code>.",
-        setupCloudLink: "Criar API token ↗",
-        setupCloudDocsLink: "Guia de tokens ↗",
-        setupLocalTitle: "🔐 Acesso e deploy local",
-        setupLocalDesc: "O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.",
-        setupAppTitle: "🧩 Segredos e sugestões por aplicação",
-        setupAppDesc: "Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.",
-        setupWebhookNote: "Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navHome: "Início",
         navOverview: "Aplicações",
@@ -2901,50 +3418,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         thActions: "Ações Rápidas",
         deployTitle: "➕ Novo Deploy (GitHub, Multi-Service Compose ou Local)",
         deployDesc: "Detecta automaticamente Node, Next.js, Python, Go, SPA, Dockerfile ou <code>docker-compose.yml</code> (injetando segredos do Vault com segurança).",
-        lblQuickFillDeploy: "⚡ Presets:",
-        lblDepApp: "Slug da Aplicação",
-        lblDepRepo: "Repositório GitHub ou Caminho",
-        lblDepBranch: "Branch Git",
-        lblDepMem: "Limite de RAM (Opcional)",
-        lblDepCpu: "Limite de vCPUs (Opcional)",
-        lblDepPg: "Provisionar PostgreSQL 16 (injeta <code>DATABASE_URL</code>)",
-        lblDepRedis: "Provisionar Redis 7 (injeta <code>REDIS_URL</code>)",
-        btnDeploy: "🚀 Fazer Build & Deploy",
         exposeTitle: "🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)",
         exposeDesc: "Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.",
-        lblQuickFillExpose: "⚡ Modos:",
-        chipModePublic: "🌍 Público (HTTPS Aberto)",
-        chipModeZT: "🛡️ Zero Trust (OTP por E-mail)",
-        chipModeTS: "🔒 Tailscale (VPN Privada)",
-        lblExpApp: "Aplicação",
-        lblExpMode: "Modo de Segurança",
-        optPublic: "Cloudflare Público (HTTPS aberto)",
-        optZT: "Cloudflare Zero Trust (Login PIN por E-mail)",
-        optTS: "Tailscale Serve (Privado na Tailnet)",
-        lblExpSub: "Subdomínio",
-        btnExpose: "🔗 Publicar Endereço",
-        vaultTitle: "🔐 Cofre Criptografado de Variáveis (AES-256-GCM Vault)",
-        vaultDesc: "Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.",
-        lblVaultScopes: "⚡ Escopos:",
-        lblSecScope: "Escopo (system ou slug do app)",
-        lblSecKey: "Chave (A-Z, 0-9, _)",
-        lblSecVal: "Valor Secreto",
-        btnSaveSecret: "💾 Criptografar & Salvar",
-        btnLoadSecrets: "🔍 Recarregar Escopo",
-        dbTitle: "🗄️ Provisionar Banco Multi-Tenant Isolado",
+        vaultTitle: "Variáveis de cada app",
+        vaultDesc: "O que o código do app lê como variável de ambiente: chaves de serviços (Stripe, OpenAI...), senhas e endereços. Fica cifrado no disco e não aparece inteiro de novo depois de salvo.",
+        lblSecScope: "De qual app?",
+        lblSecKey: "Nome (letras, números e _)",
+        lblSecVal: "Valor",
+        btnSaveSecret: "Salvar",
         dbDesc: "Cria banco, role exclusiva e injeta <code>DATABASE_URL</code> / <code>REDIS_URL</code> diretamente no Cofre do app.",
-        lblDbApp: "Aplicação",
-        lblDbEngine: "Engine",
-        optDbPg: "PostgreSQL 16 (Isolado por DB + Role)",
-        optDbRedis: "Redis 7 (DB Lógico Isolado)",
-        btnCreateDb: "+ Provisionar Banco",
-        backupsTitle: "🛡️ Snapshots & Restore Criptografados (AES-256-GCM)",
         backupsDesc: "Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.",
-        lblBakApp: "App para Backup",
-        lblBakEngine: "Engine",
-        optBakPg: "PostgreSQL 16 (pg_dump)",
-        optBakRedis: "Redis 7 (RDB)",
-        btnCreateBackup: "📸 Criar Snapshot Criptografado",
         fedTitle: "🌐 Handshake Multi-Servidor & Redundância (HA Federation)",
         fedDesc: "Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.",
         lblFedUrl: "URL deste Servidor (Primary)",
@@ -2957,17 +3440,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnJoinPeer: "🤝 Fazer Handshake",
         whTitle: "⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH",
         whDesc: "Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.",
-        lblWhUrl: "Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):",
-        lblWhSecret: "Webhook Secret (HMAC-SHA256):",
-        btnRevealWhSecret: "👁️ Revelar / Copiar Secret",
-        lblSshKey: "Chave SSH Pública de Deploy (Ed25519):",
-        btnCopySsh: "📋 Copiar Chave SSH",
         doctorTitle: "🩺 PaaSMCP Doctor — Diagnóstico Automático de Containers",
         doctorDesc: "Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.",
-        btnRunDoctor: "🔍 Executar Diagnóstico Agora",
         agentsTitle: "🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)",
         agentsDesc: "O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:",
-        logsTitle: "📜 Logs do Container",
+        logsTitle: "📜 O que o app escreveu (logs)",
         btnCloseLogs: "Fechar",
         statHost: "Servidor Host",
         statDisk: "Disco:",
@@ -2976,16 +3453,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         statAppsDbs: "Apps & Bancos Isolados",
         statSnapshots: "Snapshots Criptografados",
         statSecurityFed: "Segurança & Federação",
-        presetSaas: "SaaS Next.js + PG (512MB)",
-        presetCompose: "Multi-Service Compose + PG + Redis",
-        presetSpa: "SPA / Site Estático",
-        presetDjango: "Django + PG",
-        presetFastapi: "FastAPI + PG",
-        presetNode: "API Node / Express",
-        presetGo: "API Go",
-        presetDotnet: "C# / ASP.NET + PG",
         presetHint_dotnet: "C#: precisa de um <code>.csproj</code> na raiz (ou um projeto web em <code>src/&lt;nome&gt;</code>). O painel roda <code>dotnet publish</code> com a versão do <code>TargetFramework</code> e o app ouve a porta 8080. O banco chega em <code>DATABASE_URL</code>.",
-        presetDockerfile: "Dockerfile próprio (Rails, Laravel…)",
         presetHint_saas: "Next.js: precisa de <code>package.json</code> com os scripts <code>build</code> e <code>start</code>. Roda na porta 3000 e o banco chega em <code>DATABASE_URL</code>.",
         presetHint_django: "Django: precisa de <code>manage.py</code>, <code>requirements.txt</code> e da pasta do projeto com <code>wsgi.py</code>. Roda com gunicorn na porta 8000. Coloque o domínio em <code>ALLOWED_HOSTS</code> e leia o banco de <code>DATABASE_URL</code> (ex.: dj-database-url).",
         presetHint_fastapi: "FastAPI: precisa de <code>requirements.txt</code> com <code>fastapi</code> e <code>uvicorn</code>, e do objeto <code>app</code> em <code>main.py</code> (ou <code>app.py</code>). Roda na porta 8000.",
@@ -2994,7 +3462,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_compose: "Usa o <code>docker-compose.yml</code> do repositório. O serviço <code>web</code>, <code>app</code> ou <code>api</code> (ou o primeiro) recebe o tráfego. Opções inseguras como <code>privileged</code> são removidas.",
         presetHint_spa: "Vite, React ou Astro sem script <code>start</code>: o painel faz o build e serve os arquivos com nginx. Um <code>index.html</code> na raiz também funciona.",
         presetHint_dockerfile: "Para Rails, Laravel, Java ou qualquer outra stack: deixe um <code>Dockerfile</code> na raiz do repositório. A porta vem do <code>EXPOSE</code>.",
-        chipSystemScope: "⚙️ system (Tokens Globais)",
         followOn: "Atualiza sozinho",
         followOff: "Atualizar sozinho",
         followOnTitle: "Segue a branch {branch}: cada commit novo é compilado e testado antes de entrar. Clique para parar.",
@@ -3007,13 +3474,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         promptEx3Title: "💬 Diagnóstico & Multi-Node",
         promptEx3Desc: "'Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA'",
         emptyApps: "Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!",
-        emptyDbs: "Nenhum banco provisionado ainda.",
-        emptyBackups: "Nenhum snapshot criptografado criado ainda.",
         emptyPeers: "Nenhum servidor secundário pareado ainda.",
-        emptySecrets: "Nenhuma variável salva neste escopo.",
+        emptySecrets: "Nada salvo aqui ainda.",
         emptyDoctor: "Nenhum container registrado para diagnóstico.",
-        actionExpose: "Expor",
-        actionEnv: "Senhas",
+        actionEnv: "Variáveis",
         actionLogs: "Logs",
         actionRestart: "Reiniciar",
         actionRollback: "Versão anterior",
@@ -3032,8 +3496,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         actionRestore: "Restaurar",
         actionPurge: "Apagar de vez",
         trashedStatus: "Na lixeira desde ",
+        trashDeleteOn: " · apagado de vez em ",
         toastSecretSaved: "✅ Segredo criptografado no Vault!",
-        toastDbCreated: "✅ Banco isolado provisionado!",
+        toastDbCreated: "✅ Banco criado.",
         toastBackupSaved: "📸 Backup criptografado salvo: ",
         toastDbRestored: "✅ Banco restaurado com sucesso",
         toastExposed: "🌐 Publicado em: ",
@@ -3042,19 +3507,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         toastBundleGen: "📦 Bundle criptografado gerado",
         toastHandshakeDone: "🤝 Handshake concluído com o nó primário!",
         copiedToast: "✅ Copiado para a área de transferência!",
-        btnRestoreDump: "⏪ Restaurar Dump",
+        btnRestoreDump: "⏪ Restaurar",
         btnTestRestore: "🧪 Testar",
         offsiteLabel: "fora do servidor",
         btnRemoveSecret: "Remover",
         sizeLabel: "Tamanho:",
         stoppedStatus: "Parado",
-        onDemandStatus: "Sob demanda",
+        onDemandStatus: "Sem medição de uso agora",
         depPhase_detected: "🔔 Nova versão no repositório",
         depPhase_fetching: "⬇️ Baixando o código",
         depPhase_building: "🔨 Montando a imagem",
         depPhase_checking: "🩺 Testando a nova versão",
         depPhase_switching: "🔁 Trocando de versão",
-        depPhase_live: "🟢 No ar",
         depPhase_failed: "❌ Último deploy falhou",
         depOldStillLive: "a versão anterior segue no ar",
         depShowError: "Ver o erro",
@@ -3075,21 +3539,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         relDay: "há {n} dias",
       },
       en: {
-        setupTitle: "🧭 First-time setup: what do you need?",
-        setupDesc: "Configure only the integrations you plan to use. PaaSMCP works locally without third-party tokens; secret values are stored in the Vault.",
-        setupGithubTitle: "🐙 GitHub — optional",
-        setupGithubDesc: "For a private repository, use a read-only SSH Deploy Key. Copy the public key from the webhook box at the end of the Apps screen and add it under Settings → Deploy keys. To register it automatically or clone over HTTPS, save <code>GITHUB_TOKEN</code> in the <code>system</code> scope. A fine-grained token needs access only to the target repository and <em>Administration: read and write</em>; the created key remains read-only.",
-        setupGithubLink: "Create fine-grained token ↗",
-        setupGithubDocsLink: "API permissions ↗",
-        setupCloudTitle: "☁️ Cloudflare — optional for publishing",
-        setupCloudDesc: "For Tunnel + DNS: create a token with Account → Cloudflare Tunnel: Edit and Zone → DNS: Edit, scoped to the required account and zone. For Zero Trust protection, also add Account → Access: Apps and Policies: Edit. Configure Account ID, Tunnel ID, domain, and allowed emails with <code>paasmcp config</code> or <code>paas_configure</code>, and save <code>CF_API_TOKEN</code> in <code>system</code> scope.",
-        setupCloudLink: "Create API token ↗",
-        setupCloudDocsLink: "Token guide ↗",
-        setupLocalTitle: "🔐 Dashboard access and local deploy",
-        setupLocalDesc: "The dashboard token is generated automatically: retrieve it with <code>paasmcp dashboard token</code>. Public repositories, SSH access to private repositories, and local folders do not require a GitHub token if you add the public SSH key to the repository. Tailscale is a private alternative that does not require Cloudflare.",
-        setupAppTitle: "🧩 App secrets and recommendations",
-        setupAppDesc: "Save application keys in the scope named after its slug (for example <code>STRIPE_SECRET_KEY</code> or <code>API_KEY</code>), never in <code>system</code>. Select PostgreSQL/Redis during deployment if needed. Then check Logs and run Doctor; expose as Public only services with their own login. Use Zero Trust or Tailscale for admin tools.",
-        setupWebhookNote: "Webhook auto-deploy is optional: add the URL shown at the end of the Apps screen to GitHub, select Push events, and use the secret shown by the dashboard. Do not paste tokens into chat; enter them in the Vault.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navHome: "Home",
         navOverview: "Applications",
@@ -3114,50 +3563,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         thActions: "Quick Actions",
         deployTitle: "➕ New Deploy (GitHub, Multi-Service Compose, or Local)",
         deployDesc: "Auto-detects Node, Next.js, Python, Go, SPA, Dockerfile, or <code>docker-compose.yml</code> (safely injecting Vault secrets).",
-        lblQuickFillDeploy: "⚡ Presets:",
-        lblDepApp: "Application Slug",
-        lblDepRepo: "GitHub Repo or Path",
-        lblDepBranch: "Git Branch",
-        lblDepMem: "Memory Limit (Optional)",
-        lblDepCpu: "vCPU Limit (Optional)",
-        lblDepPg: "Provision PostgreSQL 16 (injects <code>DATABASE_URL</code>)",
-        lblDepRedis: "Provision Redis 7 (injects <code>REDIS_URL</code>)",
-        btnDeploy: "🚀 Build & Deploy",
         exposeTitle: "🌐 Expose Application (Cloudflare Tunnel / Zero Trust / Tailscale)",
         exposeDesc: "Configures Cloudflare Tunnel routing + proxied DNS CNAME + Zero Trust policy without opening router ports.",
-        lblQuickFillExpose: "⚡ Modes:",
-        chipModePublic: "🌍 Public (Open HTTPS)",
-        chipModeZT: "🛡️ Zero Trust (Email OTP)",
-        chipModeTS: "🔒 Tailscale (Private VPN)",
-        lblExpApp: "Application",
-        lblExpMode: "Security Mode",
-        optPublic: "Cloudflare Public (Open HTTPS)",
-        optZT: "Cloudflare Zero Trust (Email PIN Login)",
-        optTS: "Tailscale Serve (Private on Tailnet)",
-        lblExpSub: "Subdomain",
-        btnExpose: "🔗 Expose Address",
-        vaultTitle: "🔐 Encrypted Secret Vault (AES-256-GCM Vault)",
-        vaultDesc: "Each scope is encrypted on disk with random 96-bit IV and GCM auth tag. Values are never exposed in plaintext after save.",
-        lblVaultScopes: "⚡ Scopes:",
-        lblSecScope: "Scope (system or app slug)",
-        lblSecKey: "Key (A-Z, 0-9, _)",
-        lblSecVal: "Secret Value",
-        btnSaveSecret: "💾 Encrypt & Save",
-        btnLoadSecrets: "🔍 Reload Scope",
-        dbTitle: "🗄️ Provision Isolated Multi-Tenant Database",
+        vaultTitle: "Each app's variables",
+        vaultDesc: "What the app's code reads as environment variables: service keys (Stripe, OpenAI...), passwords and addresses. Encrypted on disk and never shown in full again after saving.",
+        lblSecScope: "Which app?",
+        lblSecKey: "Name (letters, digits and _)",
+        lblSecVal: "Value",
+        btnSaveSecret: "Save",
         dbDesc: "Creates database, exclusive role, and injects <code>DATABASE_URL</code> / <code>REDIS_URL</code> directly into app Vault.",
-        lblDbApp: "Application",
-        lblDbEngine: "Engine",
-        optDbPg: "PostgreSQL 16 (Isolated by DB + Role)",
-        optDbRedis: "Redis 7 (Isolated Logical DB)",
-        btnCreateDb: "+ Provision Database",
-        backupsTitle: "🛡️ Encrypted Snapshots & Restore (AES-256-GCM)",
         backupsDesc: "Generates <code>pg_dump</code> or Redis snapshot, encrypts with Vault master key, and verifies SHA-256 integrity prior to restore.",
-        lblBakApp: "App for Backup",
-        lblBakEngine: "Engine",
-        optBakPg: "PostgreSQL 16 (pg_dump)",
-        optBakRedis: "Redis 7 (RDB)",
-        btnCreateBackup: "📸 Create Encrypted Snapshot",
         fedTitle: "🌐 Multi-Server Handshake & Redundancy (HA Federation)",
         fedDesc: "Pair a secondary server (VPS or homelab) via <code>HMAC-SHA256</code> signed token to run identical services in <strong>High Availability via Cloudflare Tunnel</strong> or <strong>Warm Standby</strong>.",
         lblFedUrl: "This Server URL (Primary)",
@@ -3170,17 +3585,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnJoinPeer: "🤝 Perform Handshake",
         whTitle: "⚡ Auto-Deploy via GitHub Webhook & SSH Deploy Key",
         whDesc: "Receive GitHub <code>git push</code> with constant-time <code>X-Hub-Signature-256</code> signature validation to auto-rebuild apps.",
-        lblWhUrl: "Webhook Payload URL (add in GitHub → Settings → Webhooks):",
-        lblWhSecret: "Webhook Secret (HMAC-SHA256):",
-        btnRevealWhSecret: "👁️ Reveal / Copy Secret",
-        lblSshKey: "Public SSH Deploy Key (Ed25519):",
-        btnCopySsh: "📋 Copy SSH Key",
         doctorTitle: "🩺 PaaSMCP Doctor — Automated Container Diagnostics",
         doctorDesc: "Checks for <code>OOMKilled</code> (low RAM), restart loops, exit codes, and health of all services.",
-        btnRunDoctor: "🔍 Run Diagnostics Now",
         agentsTitle: "🤖 How to Connect your AI Agent (MCP Compatible Clients)",
         agentsDesc: "PaaSMCP exposes <strong>15 native MCP tools</strong> via stdio JSON-RPC. Copy the config below so your AI agent can manage the entire server for you:",
-        logsTitle: "📜 Container Logs",
+        logsTitle: "📜 What the app wrote (logs)",
         btnCloseLogs: "Close",
         statHost: "Host Server",
         statDisk: "Disk:",
@@ -3189,16 +3598,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         statAppsDbs: "Isolated Apps & DBs",
         statSnapshots: "Encrypted Snapshots",
         statSecurityFed: "Security & Federation",
-        presetSaas: "SaaS Next.js + PG (512MB)",
-        presetCompose: "Multi-Service Compose + PG + Redis",
-        presetSpa: "SPA / Static Site",
-        presetDjango: "Django + PG",
-        presetFastapi: "FastAPI + PG",
-        presetNode: "Node / Express API",
-        presetGo: "Go API",
-        presetDotnet: "C# / ASP.NET + PG",
         presetHint_dotnet: "C#: needs a <code>.csproj</code> at the root (or one web project in <code>src/&lt;name&gt;</code>). The dashboard runs <code>dotnet publish</code> with the <code>TargetFramework</code> version and the app listens on port 8080. The database arrives in <code>DATABASE_URL</code>.",
-        presetDockerfile: "Own Dockerfile (Rails, Laravel…)",
         presetHint_saas: "Next.js: needs a <code>package.json</code> with <code>build</code> and <code>start</code> scripts. Runs on port 3000 and the database arrives in <code>DATABASE_URL</code>.",
         presetHint_django: "Django: needs <code>manage.py</code>, <code>requirements.txt</code> and the project folder with <code>wsgi.py</code>. Runs with gunicorn on port 8000. Put the domain in <code>ALLOWED_HOSTS</code> and read the database from <code>DATABASE_URL</code> (e.g. dj-database-url).",
         presetHint_fastapi: "FastAPI: needs a <code>requirements.txt</code> with <code>fastapi</code> and <code>uvicorn</code>, and the <code>app</code> object in <code>main.py</code> (or <code>app.py</code>). Runs on port 8000.",
@@ -3207,7 +3607,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_compose: "Uses the repository's <code>docker-compose.yml</code>. The <code>web</code>, <code>app</code> or <code>api</code> service (or the first one) gets the traffic. Unsafe options such as <code>privileged</code> are stripped.",
         presetHint_spa: "Vite, React or Astro without a <code>start</code> script: the dashboard builds it and serves the files with nginx. A root <code>index.html</code> works too.",
         presetHint_dockerfile: "For Rails, Laravel, Java or any other stack: put a <code>Dockerfile</code> at the repository root. The port comes from <code>EXPOSE</code>.",
-        chipSystemScope: "⚙️ system (Global Tokens)",
         followOn: "Auto-updates",
         followOff: "Auto-update",
         followOnTitle: "Follows branch {branch}: each new commit is built and tested before it goes live. Click to stop.",
@@ -3220,13 +3619,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         promptEx3Title: "💬 Diagnostics & Multi-Node",
         promptEx3Desc: "'Run <code>paas_doctor</code> to check if any container suffered an OOMKill and generate an HA pairing token'",
         emptyApps: "No hosted applications yet. Use one of the presets below to get started!",
-        emptyDbs: "No databases provisioned yet.",
-        emptyBackups: "No encrypted snapshots created yet.",
         emptyPeers: "No secondary servers paired yet.",
-        emptySecrets: "No variables stored in this scope.",
+        emptySecrets: "Nothing saved here yet.",
         emptyDoctor: "No containers registered for diagnostics.",
-        actionExpose: "Expose",
-        actionEnv: "Secrets",
+        actionEnv: "Variables",
         actionLogs: "Logs",
         actionRestart: "Restart",
         actionRollback: "Previous version",
@@ -3245,8 +3641,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         actionRestore: "Restore",
         actionPurge: "Delete for good",
         trashedStatus: "In the trash since ",
+        trashDeleteOn: " · deleted for good on ",
         toastSecretSaved: "✅ Secret encrypted in Vault!",
-        toastDbCreated: "✅ Isolated database provisioned!",
+        toastDbCreated: "✅ Database created.",
         toastBackupSaved: "📸 Encrypted backup saved: ",
         toastDbRestored: "✅ Database restored successfully",
         toastExposed: "🌐 Published at: ",
@@ -3255,19 +3652,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         toastBundleGen: "📦 Encrypted bundle generated",
         toastHandshakeDone: "🤝 Handshake completed with primary node!",
         copiedToast: "✅ Copied to clipboard!",
-        btnRestoreDump: "⏪ Restore Dump",
+        btnRestoreDump: "⏪ Restore",
         btnTestRestore: "🧪 Test",
         offsiteLabel: "off-site",
         btnRemoveSecret: "Remove",
         sizeLabel: "Size:",
         stoppedStatus: "Stopped",
-        onDemandStatus: "On demand",
+        onDemandStatus: "No usage reading right now",
         depPhase_detected: "🔔 New version in the repository",
         depPhase_fetching: "⬇️ Fetching the code",
         depPhase_building: "🔨 Building the image",
         depPhase_checking: "🩺 Testing the new version",
         depPhase_switching: "🔁 Switching versions",
-        depPhase_live: "🟢 Live",
         depPhase_failed: "❌ Last deploy failed",
         depOldStillLive: "the previous version is still live",
         depShowError: "Show the error",
@@ -3303,18 +3699,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navAgents": "Conectar IA",
           "navPool": "Ajudantes",
           "homeTitle": "Resumo do servidor",
-          "setupTitle": "🧭 Integrações opcionais",
           "appsTitle": "📦 Seus apps",
           "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app. Quando chega um commit novo, a linha do app mostra a nova versão sendo montada e testada; a versão atual continua no ar até a nova passar no teste.",
           "deployTitle": "➕ Publicar um app",
           "deployDesc": "Informe o repositório do GitHub (ou uma pasta do servidor). O painel descobre a linguagem e monta tudo sozinho. As senhas do app ficam em Senhas e chaves.",
           "exposeTitle": "🌐 Deixar um app acessível",
           "exposeDesc": "Escolha quem pode abrir: qualquer pessoa na internet, só e-mails autorizados ou só a sua rede privada (Tailscale). Nenhuma porta do roteador é aberta.",
-          "vaultTitle": "🔐 Senhas e chaves dos apps",
-          "vaultDesc": "Guarde aqui as senhas e chaves que seus apps usam (ex.: chave do Stripe). Tudo fica cifrado no disco e não aparece de novo por inteiro depois de salvo. Use o nome do app como escopo; <code>system</code> é só para as chaves do próprio painel.",
-          "dbTitle": "🗄️ Criar um banco de dados",
           "dbDesc": "Cada app ganha o seu próprio banco, separado dos outros. O endereço de conexão (<code>DATABASE_URL</code> ou <code>REDIS_URL</code>) entra sozinho nas senhas do app.",
-          "backupsTitle": "🛡️ Cópias de segurança",
           "backupsDesc": "Cópias cifradas dos bancos e dos arquivos dos apps. Use “Testar” para conferir que a cópia abre antes de precisar dela.",
           "fedTitle": "🔗 Conectar outro servidor",
           "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use a aba “Cópia ao vivo” para copiar os dados.",
@@ -3332,18 +3723,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "agentsTitle": "🤖 Conectar sua IA",
           "agentsDesc": "Qualquer IA compatível com MCP (Claude Code, Codex, Gemini CLI, Cursor, VS Code, modelos locais) pode cuidar do servidor por você: publicar apps, fazer cópias, ver o que deu errado. Ações arriscadas sempre esperam a sua aprovação no Início.",
           "homeDesc": "Resumo do servidor, pedidos esperando você e os próximos passos.",
-          "stepsTitle": "🧭 Primeiros passos",
-          "stepsDesc": "Faça na ordem. Cada passo diz o que é e por que vale a pena.",
-          "step1Title": "Publicar o primeiro app",
-          "step1Desc": "Cole o endereço do código e o painel monta o resto.",
-          "step2Title": "Guardar cópias fora do servidor",
-          "step2Desc": "Se o servidor quebrar ou for roubado, seus dados continuam salvos em outro lugar.",
-          "step3Title": "Configurar o envio de e-mails",
-          "step3Desc": "Para os apps mandarem “esqueci a senha” e avisos. Leva 5 minutos com uma conta gratuita.",
-          "step4Title": "Ligar um segundo servidor",
-          "step4Desc": "Ele guarda uma cópia ao vivo de tudo e pode assumir se este cair.",
-          "step5Title": "Conectar sua IA",
-          "step5Desc": "Peça em português: “publica meu app”, “faz uma cópia agora”.",
           "optional": "opcional",
           "done": "Feito",
           "openStep": "Fazer agora",
@@ -3361,6 +3740,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "tileMirrorOn": "Ligado",
           "tileMirrorOff": "Não usado",
           "tileMirrorNote": "Cópia ao vivo dos dados",
+          "tileMirrorWith": "Cópia ao vivo com {who}",
+          "tileMirrorStopped": "Parado",
+          "tileMirrorStoppedNote": "A cópia com {who} não está passando agora",
+          "tileMirrorPairedOnly": "Pareado com {who}, sem cópia dos dados",
+          "pairedWith": "Pareado com",
+          "pairedNobody": "Ninguém",
+          "footerPaired": "Pareado com: {who}",
+          "footerUnpaired": "Sem servidor pareado",
+          "peerViaCopy": "Pareado pela cópia ao vivo",
+          "peerSending": "este servidor manda a cópia",
+          "peerReceiving": "este servidor recebe a cópia",
           "tileEmail": "E-mail",
           "tileEmailNote": "Os apps ainda não enviam e-mail",
           "detailsTech": "Detalhes técnicos",
@@ -3448,9 +3838,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepPoll": "Atualizar sozinho quando eu mudar o código (confere a cada 2 min)",
           "lblDepStorage": "Criar espaço para arquivos",
           "lblDepEmail": "Deixar o app enviar e-mails",
-          "lblDepHealth": "Endereço de teste antes de trocar (Opcional)",
-          "lblDepNoHealth": "Não é um site (pular o teste antes de trocar)",
-          "deployHealthFailed": "A nova versão não passou no teste e NÃO foi colocada no ar. A versão anterior continua funcionando. Veja o erro do app abaixo:",
           "emailTitle": "✉️ Envio de e-mails",
           "emailDesc": "E-mail enviado direto de casa cai no spam ou nem sai. Por isso o painel usa um serviço de envio, configurado uma vez para todos os apps.",
           "emailTip": "Sugestão: o Brevo tem plano gratuito de 300 e-mails por dia. Crie a conta, confirme seu domínio e copie os dados de SMTP. A senha fica cifrada e só é enviada por conexão segura.",
@@ -3571,52 +3958,118 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorAccepted": "Cópia iniciada.",
           "mirrorPromoted": "Apps assumidos.",
           "mirrorHandedBack": "Apps devolvidos. Agora assuma-os no outro servidor.",
+          "autoGoJudge": "Ver o juiz",
+          "pairEasyTitle": "Jeito fácil: um PC que já tem o PaaSMCP",
+          "pairEasyDesc": "No PC que vai ser o juiz, abra o painel dele, aba Juiz, e clique em “Ser juiz de outro par”. Ele mostra um código de 6 números. Aqui, escolha esse PC na lista (ou digite o IP do Tailscale dele) e digite o código. A chave vai cifrada e só depois que o PC prova que mostra o mesmo código. Se o outro servidor recebe cópia deste, ele passa a usar o mesmo juiz sozinho.",
+          "btnJudgeFind": "Procurar PCs na Tailscale",
+          "judgeFinding": "Procurando…",
+          "judgeFindNoTs": "Não deu para ler a lista da Tailscale aqui. Digite o IP do Tailscale do PC abaixo.",
+          "judgeFindNone": "Nenhum outro aparelho ligado na Tailscale.",
+          "judgeFindHint": "Aparecem todos os aparelhos ligados; os que mostram um código vêm primeiro.",
+          "judgeTagCode": "mostrando código",
+          "judgeTagArbiter": "já é juiz",
+          "judgeTagPair": "servidor deste par",
+          "btnJudgePick": "Usar este",
+          "lblPairHost": "IP do Tailscale do PC",
+          "lblPairCode": "Código que aparece nele",
+          "btnJudgePair": "Parear com o juiz",
+          "pairDone": "Pareado. {host} é o juiz deste par ({url}).",
+          "pairErr_badHost": "Endereço inválido: use o IP do Tailscale do PC (100.x.x.x) ou o nome dele.",
+          "pairErr_badCode": "O código tem 6 números.",
+          "pairErr_unreachable": "O PC não respondeu. Confira se ele está ligado, na Tailscale, e mostrando um código.",
+          "pairErr_notArbiter": "Algo respondeu nesse endereço, mas não é um juiz do PaaSMCP.",
+          "pairErr_notPairing": "Esse PC não está mostrando código (ou o código venceu). Clique de novo em “Ser juiz de outro par” lá.",
+          "pairErr_wrongCode": "O código não confere com o que aparece nesse PC. Depois de 5 erros ele precisa gerar outro.",
+          "pairManualTitle": "Ou instale num aparelho sem PaaSMCP",
+          "pairManualDesc": "Para uma VM ou um Raspberry que não roda o PaaSMCP. Dá para usar o comando abaixo e, no passo 3, o endereço; ou rodar “paasmcp arbiter pair” no aparelho e parear pelo código acima.",
+          "judgeLocalTitle": "Este PC como juiz de outro par",
+          "judgeLocalDesc": "Use num PC que fica ligado 24 horas e não é nenhum dos dois servidores do par. O juiz roda num contêiner pequeno, atende só na Tailscale e volta sozinho depois de reiniciar.",
+          "judgeLocalNoTs": "Este PC não tem endereço Tailscale. Instale o Tailscale e entre na mesma conta dos servidores.",
+          "judgeLocalOn": "Juiz ligado",
+          "judgeLocalOff": "Este PC não é juiz de nenhum par",
+          "judgeLocalPairs": "atende {n} pares",
+          "judgeLocalPairs1": "atende 1 par",
+          "judgeLocalCodeIntro": "No painel de um dos servidores do par, aba Juiz, escolha este PC e digite:",
+          "judgeLocalCodeMeta": "IP deste PC: {ip} · vale até {until} · some sozinho quando o servidor parear",
+          "btnBeJudge": "Ser juiz de outro par",
+          "judgeLocalStarting": "Ligando o juiz…",
+          "btnJudgeCancel": "Cancelar código",
+          "btnJudgeStop": "Parar de ser juiz",
+          "judgeTitle": "⚖️ Juiz",
+          "judgeDesc": "Um terceiro aparelho que dá o voto de desempate na troca automática. Ele não guarda apps nem dados: só ouve os servidores e anota quem cuida dos dados de quem.",
+          "judgeState_none": "Não configurado",
+          "judgeState_ok": "Respondendo",
+          "judgeState_err": "Sem resposta",
+          "judgeNoneDesc": "Sem juiz, a troca automática fica desligada: se um servidor cair, você assume os apps dele à mão (aba “Cópia ao vivo”). Para configurar, veja abaixo.",
+          "judgeAddress": "Endereço",
+          "judgeWhere": "Onde roda",
+          "judgeOldArbiter": "versão antiga do juiz: rode de novo o comando do passo 2 no aparelho dele para ver o nome",
+          "judgeSince": "Ligado desde",
+          "judgeLatency": "Tempo de resposta",
+          "judgeLastWatch": "Último contato do vigia daqui",
+          "judgeWatchNever": "nunca: ligue o vigia (aba “Troca automática”, passo 2)",
+          "judgeWatchErr": "última falha {when}: {err}",
+          "judgeHears": "Servidores que ele ouve",
+          "judgeHeardNone": "nenhum ainda",
+          "judgeHeardAgo": "{who} {when}",
+          "judgeClusters": "Pares de servidores que ele atende",
+          "judgeHowTitle": "Como o juiz decide",
+          "judgeHow1": "Cada servidor avisa o juiz que está vivo a cada 15 segundos. Quem faz isso é o vigia de cada servidor.",
+          "judgeHow2": "Se um servidor some por mais de 1 minuto, o outro só assume os apps dele se o juiz também parou de ouvi-lo e a cópia parou de chegar. Se só a conexão entre os dois caiu, o juiz ainda ouve os dois e a troca não acontece.",
+          "judgeHow3": "O juiz deixa um único servidor assumir. Cada troca recebe um número maior que a anterior, e um pedido com número velho é recusado.",
+          "judgeHow4": "Quando o servidor que caiu volta, ele pergunta ao juiz, vê que outro assumiu e para os próprios apps até a devolução. Assim os dois nunca gravam dados diferentes.",
+          "judgeOwnersTitle": "Quem cuida dos dados agora",
+          "judgeOwnersNone": "Nenhuma troca registrada: cada servidor cuida dos próprios dados.",
+          "judgeOwnerLine": "Dados de {data}: com {owner} (troca nº {epoch})",
+          "judgeOwnerHome": "Dados de {data}: de volta com {owner} (troca nº {epoch})",
+          "judgeSetupTitle": "Configurar o juiz",
+          "judgeSetupRedo": "Trocar ou reinstalar o juiz",
+          "judgeBefore": "Antes de começar: os dois servidores precisam estar conectados (aba “Conectar”) e os três aparelhos na mesma rede Tailscale. Faça os passos uma vez, nesta ordem.",
+          "btnArbCmd": "Gerar comando de instalação",
+          "autoStep2After": "No fim, o comando mostra o endereço do juiz. Use-o no passo 3. A chave dentro do comando só serve para o juiz (não abre senhas, apps nem dados), mas não a passe para outras pessoas: quem tem a chave pode confundir o juiz.",
+          "autoPrereqTitle": "O aparelho ainda não tem Node.js ou Tailscale?",
+          "autoPrereqDesc": "O juiz precisa de Node.js 20 ou mais novo, git e o Tailscale na mesma conta dos servidores. Em Ubuntu ou Debian, estes comandos instalam o que falta:",
           "autoTitle": "Troca automática",
           "autoDesc": "Se o outro servidor sumir por mais de 1 minuto, este assume os apps dele sozinho. Para isso precisa de um juiz: um terceiro aparelho que dá o voto de desempate. Sem juiz, se só a conexão entre os dois cair, cada um acharia que o outro morreu e os dois gravariam dados diferentes.",
-          "autoBefore": "Antes de começar: a cópia já precisa estar funcionando (aparece “Cópia de …” na aba “Cópia ao vivo”) e os três aparelhos precisam estar na mesma rede Tailscale. Faça os passos abaixo uma vez, nesta ordem.",
+          "autoBefore": "Antes: a cópia precisa estar funcionando (aba “Cópia ao vivo”) e o juiz configurado e respondendo.",
           "autoStep1": "1. Escolha o aparelho do juiz",
-          "autoStep1Desc": "Qualquer aparelho ligado 24 horas que não seja nenhum dos dois servidores: um Raspberry Pi, uma VPS barata ou um PC velho. De preferência em outro lugar ou outra internet. Ele precisa de Node.js 20 ou mais novo e do Tailscale ligado na mesma conta. Não precisa de Docker e quase não usa memória.",
-          "autoStep2": "2. Pegue a chave do juiz (neste servidor)",
-          "autoStep2Desc": "No terminal deste servidor, rode o comando abaixo e copie a linha que aparecer (64 letras e números). Os dois servidores dão a mesma chave, porque ela vem do pareamento. Ela só serve para o juiz: não abre senhas, apps nem dados.",
-          "autoStep3": "3. Instale e ligue o juiz (no terceiro aparelho)",
-          "autoStep3Desc": "No terminal do aparelho do juiz, rode os comandos abaixo, trocando os dois trechos entre < >. O juiz passa a rodar sozinho, volta depois de reiniciar e atende só no endereço Tailscale do aparelho, porta 4097. No fim ele mostra o endereço para usar no passo 4.",
+          "autoStep1Desc": "Qualquer aparelho ligado 24 horas que não seja nenhum dos dois servidores: uma VM pequena na nuvem (como as gratuitas da Oracle), um Raspberry Pi ou um PC velho. De preferência em outro lugar ou outra internet. Não precisa de Docker e quase não usa memória.",
+          "autoStep2": "2. Instale o juiz no terceiro aparelho",
+          "autoStep2Desc": "Gere o comando abaixo, já com a chave deste par de servidores, e cole-o no terminal do aparelho do juiz. Ele baixa o PaaSMCP e deixa o juiz rodando como serviço: volta sozinho depois de reiniciar e atende só no endereço Tailscale do aparelho, porta 4097. Se o aparelho já é juiz de outro par de servidores, use o mesmo comando: o outro par continua.",
+          "autoStep3": "3. Informe o endereço do juiz (neste servidor e no outro)",
+          "autoStep3Desc": "É o endereço que o comando do passo 2 mostrou no fim, por exemplo http://100.64.0.9:4097. Clique em Testar: tem que aparecer “O juiz respondeu”. Depois Salvar. Faça o mesmo no painel do outro servidor, com o mesmo endereço.",
           "autoStep3Check": "Para conferir no próprio aparelho do juiz, rode o comando abaixo. Se responder {&quot;ok&quot;:true}, o juiz está no ar.",
-          "autoStep3Shared": "Se esse aparelho já é juiz de outro par de servidores, não instale de novo: rode só o comando abaixo. Cada par fica separado, com a própria chave.",
-          "autoRepoPlaceholder": "<mesmo repositório que você usou nos servidores>",
-          "autoKeyPlaceholder": "<chave do passo 2>",
-          "autoStep4": "4. Informe o endereço do juiz (neste servidor e no outro)",
-          "autoStep4Desc": "É http:// + o IP do Tailscale do aparelho do juiz + :4097, por exemplo http://100.64.0.9:4097. O IP aparece no app do Tailscale ou com “tailscale ip -4” no aparelho do juiz. Clique em Testar: tem que aparecer “O juiz respondeu”. Depois Salvar. Repita este passo no painel do outro servidor, com o mesmo endereço.",
           "btnArbTest": "Testar",
           "btnArbSave": "Salvar",
-          "autoStep5": "5. Escolha qual servidor este pode substituir",
+          "autoStep5": "1. Escolha qual servidor este pode substituir",
           "autoStep5Desc": "É o servidor cujos apps este vai assumir se ele cair. A lista mostra só os servidores dos quais este já guarda uma cópia. Ao ligar, o painel pede para digitar o nome para confirmar. Se a cópia é nos dois sentidos e você quer que qualquer um assuma o outro, faça este passo também no outro servidor.",
           "lblAutoPeer": "Servidor que este pode substituir",
           "autoNoCopy": "Nenhuma cópia recebida ainda (use “Receber cópia”, na aba “Cópia ao vivo”)",
           "autoNoPeer": "Escolha o servidor na lista. Se ela estiver vazia, este servidor ainda não guarda cópia de nenhum outro.",
-          "autoStep6": "6. Ligue o vigia (nos dois servidores)",
+          "autoStep6": "2. Ligue o vigia (nos dois servidores)",
           "autoStep6Desc": "O vigia conversa com o juiz a cada 15 segundos. É ele que avisa o juiz que o servidor está vivo, troca sozinho quando precisa e bloqueia o servidor que volta depois de ter sido substituído. Rode o comando abaixo no terminal de cada um dos dois servidores.",
-          "autoStep7": "7. Confira se está funcionando",
-          "autoStep7Desc": "O quadro no topo deste cartão mostra o que o juiz está ouvindo. Está pronto quando tudo fica verde: o juiz respondeu, ouviu este servidor e o outro há menos de 1 minuto, o vigia está rodando aqui e a troca está ligada. Se o outro servidor não aparece ou aparece com tempo alto, falta o passo 4 ou 6 nele.",
+          "autoStep7": "3. Confira se está funcionando",
+          "autoStep7Desc": "O quadro no topo deste cartão mostra o que o juiz está ouvindo. Está pronto quando tudo fica verde: o juiz respondeu, ouviu este servidor e o outro há menos de 1 minuto, o vigia está rodando aqui e a troca está ligada. Se o outro servidor não aparece ou aparece com tempo alto, falta informar o juiz (aba “Juiz”) ou ligar o vigia nele.",
           "btnArbRefresh": "Verificar de novo",
-          "arbNotSet": "Juiz ainda não informado (passo 4).",
+          "arbNotSet": "Juiz ainda não configurado (aba “Juiz”).",
           "arbOk": "O juiz respondeu e aceitou a chave",
           "arbThisServer": "este servidor",
           "arbHeard": "O juiz ouviu {who} há {s} s",
           "arbHeardOld": "mais de 1 minuto: o vigia está ligado nele?",
-          "arbPeerUnknown": "O juiz nunca ouviu {who}. Faça os passos 4 e 6 no painel e no terminal de {who}. Enquanto isso, se a cópia parar, este servidor assume.",
+          "arbPeerUnknown": "O juiz nunca ouviu {who}. Em {who}, informe o endereço do juiz (aba “Juiz”) e ligue o vigia (passo 2 daqui). Enquanto isso, se a cópia parar, este servidor assume.",
           "arbWatchOn": "Vigia rodando neste servidor",
-          "arbWatchOff": "Vigia desligado neste servidor (passo 6)",
+          "arbWatchOff": "Vigia desligado neste servidor (passo 2 da troca automática)",
           "arbAutoOn": "Troca automática ligada para: {who}",
-          "arbAutoOff": "Troca automática desligada neste servidor (passo 5)",
+          "arbAutoOff": "Troca automática desligada neste servidor (passo 1 da troca automática)",
           "arbAutoTag": "troca ligada",
           "arbReady": "✅ Troca automática pronta",
           "arbNotReady": "Ainda falta algo:",
           "arbErr_badUrl": "Endereço inválido. Use http://<IP do Tailscale do juiz>:4097",
-          "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Reinstale o juiz com a chave do passo 2.",
+          "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Rode de novo, no aparelho do juiz, o comando do passo 2 (aba “Juiz”).",
           "arbErr_clock": "O juiz respondeu, mas o relógio dele está mais de 1 minuto diferente. Ligue o horário automático nos aparelhos.",
           "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso em Segundo servidor, aba “Conectar”.",
           "arbErr_notArbiter": "Algo respondeu nesse endereço, mas não é o juiz. Confira a porta (padrão 4097).",
-          "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 3), se o IP é o do Tailscale dele e se a porta é 4097.",
+          "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 2 da aba “Juiz”), se o IP é o do Tailscale dele e se a porta é 4097.",
           "lblArbiter": "Endereço do juiz",
           "btnAutoOn": "Ligar",
           "btnAutoOff": "Desligar",
@@ -3653,18 +4106,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navAgents": "Connect AI",
           "navPool": "Helpers",
           "homeTitle": "Server summary",
-          "setupTitle": "🧭 Optional integrations",
           "appsTitle": "📦 Your apps",
           "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app. When a new commit arrives, the app's row shows the new version being built and tested; the current version stays live until the new one passes the test.",
           "deployTitle": "➕ Publish an app",
           "deployDesc": "Enter the GitHub repository (or a folder on the server). The dashboard detects the language and builds everything. App passwords live in Passwords & keys.",
           "exposeTitle": "🌐 Make an app reachable",
           "exposeDesc": "Choose who can open it: anyone on the internet, only allowed emails, or only your private network (Tailscale). No router port is opened.",
-          "vaultTitle": "🔐 App passwords & keys",
-          "vaultDesc": "Store the passwords and keys your apps use (e.g. a Stripe key). Everything is encrypted on disk and never shown in full again after saving. Use the app name as scope; <code>system</code> is only for the dashboard's own keys.",
-          "dbTitle": "🗄️ Create a database",
           "dbDesc": "Each app gets its own database, separate from the others. The connection address (<code>DATABASE_URL</code> or <code>REDIS_URL</code>) goes into the app's passwords automatically.",
-          "backupsTitle": "🛡️ Backups",
           "backupsDesc": "Encrypted copies of app databases and files. Use “Test” to check a backup opens before you need it.",
           "fedTitle": "🔗 Connect another server",
           "fedDesc": "First step to a second server: both exchange a trust key. Then use the “Live copy” tab to copy the data.",
@@ -3682,18 +4130,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "agentsTitle": "🤖 Connect your AI",
           "agentsDesc": "Any MCP-compatible AI (Claude Code, Codex, Gemini CLI, Cursor, VS Code, local models) can run the server for you: publish apps, make backups, find what went wrong. Risky actions always wait for your approval on Home.",
           "homeDesc": "Server summary, requests waiting for you and next steps.",
-          "stepsTitle": "🧭 First steps",
-          "stepsDesc": "Do them in order. Each step says what it is and why it is worth it.",
-          "step1Title": "Publish your first app",
-          "step1Desc": "Paste the code address and the dashboard does the rest.",
-          "step2Title": "Keep backups off the server",
-          "step2Desc": "If the server breaks or is stolen, your data is still safe elsewhere.",
-          "step3Title": "Set up email sending",
-          "step3Desc": "So apps can send “forgot password” and notices. Takes 5 minutes with a free account.",
-          "step4Title": "Add a second server",
-          "step4Desc": "It keeps a live copy of everything and can take over if this one goes down.",
-          "step5Title": "Connect your AI",
-          "step5Desc": "Ask in plain words: “publish my app”, “back up now”.",
           "optional": "optional",
           "done": "Done",
           "openStep": "Do it now",
@@ -3711,6 +4147,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "tileMirrorOn": "On",
           "tileMirrorOff": "Not used",
           "tileMirrorNote": "Live copy of the data",
+          "tileMirrorWith": "Live copy with {who}",
+          "tileMirrorStopped": "Stopped",
+          "tileMirrorStoppedNote": "The copy with {who} is not flowing right now",
+          "tileMirrorPairedOnly": "Paired with {who}, no data copy",
+          "pairedWith": "Paired with",
+          "pairedNobody": "Nobody",
+          "footerPaired": "Paired with: {who}",
+          "footerUnpaired": "No paired server",
+          "peerViaCopy": "Paired through the live copy",
+          "peerSending": "this server sends the copy",
+          "peerReceiving": "this server receives the copy",
           "tileEmail": "Email",
           "tileEmailNote": "Apps cannot send email yet",
           "detailsTech": "Technical details",
@@ -3798,9 +4245,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepPoll": "Update by itself when I change the code (checks every 2 min)",
           "lblDepStorage": "Create file space",
           "lblDepEmail": "Let the app send email",
-          "lblDepHealth": "Test address before switching (Optional)",
-          "lblDepNoHealth": "Not a website (skip the test before switching)",
-          "deployHealthFailed": "The new version failed its test and was NOT put live. The previous version is still running. The app's error is below:",
           "emailTitle": "✉️ Email sending",
           "emailDesc": "Email sent straight from home lands in spam or never leaves. So the dashboard uses a sending service, set up once for all apps.",
           "emailTip": "Tip: Brevo has a free plan with 300 emails a day. Create the account, verify your domain and copy the SMTP details. The password is encrypted and only sent over a secure connection.",
@@ -3910,52 +4354,118 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorAccepted": "Copy started.",
           "mirrorPromoted": "Apps taken over.",
           "mirrorHandedBack": "Apps handed back. Now take them over on the other server.",
+          "autoGoJudge": "See the arbiter",
+          "pairEasyTitle": "Easy way: a PC that already runs PaaSMCP",
+          "pairEasyDesc": "On the PC that will be the arbiter, open its dashboard, Arbiter tab, and click “Be the arbiter of another pair”. It shows a 6-digit code. Here, pick that PC in the list (or type its Tailscale IP) and type the code. The key travels encrypted, and only after the PC proves it shows the same code. If the other server receives a copy of this one, it starts using the same arbiter by itself.",
+          "btnJudgeFind": "Look for PCs on Tailscale",
+          "judgeFinding": "Looking…",
+          "judgeFindNoTs": "Could not read the Tailscale list here. Type the PC's Tailscale IP below.",
+          "judgeFindNone": "No other device is online on Tailscale.",
+          "judgeFindHint": "Every online device shows up; those showing a code come first.",
+          "judgeTagCode": "showing a code",
+          "judgeTagArbiter": "already an arbiter",
+          "judgeTagPair": "server of this pair",
+          "btnJudgePick": "Use this one",
+          "lblPairHost": "PC's Tailscale IP",
+          "lblPairCode": "Code shown on it",
+          "btnJudgePair": "Pair with the arbiter",
+          "pairDone": "Paired. {host} is this pair's arbiter ({url}).",
+          "pairErr_badHost": "Invalid address: use the PC's Tailscale IP (100.x.x.x) or its name.",
+          "pairErr_badCode": "The code has 6 digits.",
+          "pairErr_unreachable": "The PC did not answer. Check that it is on, on Tailscale, and showing a code.",
+          "pairErr_notArbiter": "Something answered at that address, but it is not a PaaSMCP arbiter.",
+          "pairErr_notPairing": "That PC is not showing a code (or it expired). Click “Be the arbiter of another pair” there again.",
+          "pairErr_wrongCode": "The code does not match the one on that PC. After 5 misses it needs a new one.",
+          "pairManualTitle": "Or install it on a device without PaaSMCP",
+          "pairManualDesc": "For a VM or a Raspberry that does not run PaaSMCP. Use the command below and the address in step 3; or run “paasmcp arbiter pair” on the device and pair with the code above.",
+          "judgeLocalTitle": "This PC as the arbiter of another pair",
+          "judgeLocalDesc": "Use it on a PC that stays on 24/7 and is neither of the pair's two servers. The arbiter runs in a small container, answers only on Tailscale and comes back after a reboot.",
+          "judgeLocalNoTs": "This PC has no Tailscale address. Install Tailscale and sign in with the servers' account.",
+          "judgeLocalOn": "Arbiter on",
+          "judgeLocalOff": "This PC is not the arbiter of any pair",
+          "judgeLocalPairs": "serves {n} pairs",
+          "judgeLocalPairs1": "serves 1 pair",
+          "judgeLocalCodeIntro": "On the dashboard of one of the pair's servers, Arbiter tab, pick this PC and type:",
+          "judgeLocalCodeMeta": "This PC's IP: {ip} · valid until {until} · goes away by itself once the server pairs",
+          "btnBeJudge": "Be the arbiter of another pair",
+          "judgeLocalStarting": "Starting the arbiter…",
+          "btnJudgeCancel": "Cancel code",
+          "btnJudgeStop": "Stop being an arbiter",
+          "judgeTitle": "⚖️ Arbiter",
+          "judgeDesc": "A third device that casts the deciding vote for automatic takeover. It holds no apps or data: it only listens to the servers and records who looks after whose data.",
+          "judgeState_none": "Not set up",
+          "judgeState_ok": "Answering",
+          "judgeState_err": "Not answering",
+          "judgeNoneDesc": "Without an arbiter, automatic takeover stays off: if a server goes down, you take over its apps by hand (“Live copy” tab). To set it up, see below.",
+          "judgeAddress": "Address",
+          "judgeWhere": "Runs on",
+          "judgeOldArbiter": "older arbiter: run the step 2 command again on its device to see its name",
+          "judgeSince": "Running since",
+          "judgeLatency": "Response time",
+          "judgeLastWatch": "Last contact from this server's watchdog",
+          "judgeWatchNever": "never: turn on the watchdog (“Automatic takeover” tab, step 2)",
+          "judgeWatchErr": "last failure {when}: {err}",
+          "judgeHears": "Servers it hears",
+          "judgeHeardNone": "none yet",
+          "judgeHeardAgo": "{who} {when}",
+          "judgeClusters": "Pairs of servers it serves",
+          "judgeHowTitle": "How the arbiter decides",
+          "judgeHow1": "Each server tells the arbiter it is alive every 15 seconds. Each server's watchdog does that.",
+          "judgeHow2": "If a server disappears for more than 1 minute, the other one only takes over its apps if the arbiter stopped hearing it too and the copy stopped arriving. If only the link between the two broke, the arbiter still hears both and no takeover happens.",
+          "judgeHow3": "The arbiter lets a single server take over. Each takeover gets a higher number than the last, and a request with an old number is refused.",
+          "judgeHow4": "When the server that went down comes back, it asks the arbiter, sees another one took over and stops its own apps until the handback. So the two never write different data.",
+          "judgeOwnersTitle": "Who looks after the data now",
+          "judgeOwnersNone": "No takeover recorded: each server looks after its own data.",
+          "judgeOwnerLine": "Data of {data}: with {owner} (takeover no. {epoch})",
+          "judgeOwnerHome": "Data of {data}: back with {owner} (takeover no. {epoch})",
+          "judgeSetupTitle": "Set up the arbiter",
+          "judgeSetupRedo": "Change or reinstall the arbiter",
+          "judgeBefore": "Before you start: both servers must be connected (“Connect” tab) and all three devices on the same Tailscale network. Do the steps once, in this order.",
+          "btnArbCmd": "Generate install command",
+          "autoStep2After": "At the end, the command prints the arbiter address. Use it in step 3. The key in the command only works for the arbiter (it opens no passwords, apps or data), but don't hand it to other people: whoever has it can confuse the arbiter.",
+          "autoPrereqTitle": "The device has no Node.js or Tailscale yet?",
+          "autoPrereqDesc": "The arbiter needs Node.js 20 or newer, git and Tailscale on the same account as the servers. On Ubuntu or Debian, these commands install what is missing:",
           "autoTitle": "Automatic takeover",
           "autoDesc": "If the other server disappears for more than 1 minute, this one takes over its apps. That needs an arbiter: a third device that casts the deciding vote. Without it, if only the link between the two breaks, each would think the other died and both would write different data.",
-          "autoBefore": "Before you start: the copy must already work (“Copy of …” shows in the “Live copy” tab) and all three devices must be on the same Tailscale network. Do the steps below once, in this order.",
+          "autoBefore": "Before: the copy must already work (“Live copy” tab) and the arbiter must be set up and answering.",
           "autoStep1": "1. Pick the arbiter device",
-          "autoStep1Desc": "Any device that stays on 24/7 and is neither of the two servers: a Raspberry Pi, a cheap VPS or an old PC. Ideally somewhere else or on another internet link. It needs Node.js 20 or newer and Tailscale on the same account. No Docker, and it barely uses memory.",
-          "autoStep2": "2. Get the arbiter key (on this server)",
-          "autoStep2Desc": "In this server's terminal, run the command below and copy the line it prints (64 letters and digits). Both servers print the same key, because it comes from the pairing. It only works for the arbiter: it opens no passwords, apps or data.",
-          "autoStep3": "3. Install and start the arbiter (on the third device)",
-          "autoStep3Desc": "In the arbiter device's terminal, run the commands below, replacing both parts between < >. The arbiter then runs on its own, comes back after a reboot and only answers on the device's Tailscale address, port 4097. At the end it prints the address to use in step 4.",
+          "autoStep1Desc": "Any device that stays on 24/7 and is neither of the two servers: a small cloud VM (like Oracle's free ones), a Raspberry Pi or an old PC. Ideally somewhere else or on another internet link. No Docker, and it barely uses memory.",
+          "autoStep2": "2. Install the arbiter on the third device",
+          "autoStep2Desc": "Generate the command below, with this pair's key already in it, and paste it in the arbiter device's terminal. It downloads PaaSMCP and keeps the arbiter running as a service: it comes back after a reboot and only answers on the device's Tailscale address, port 4097. If the device is already the arbiter for another pair of servers, use the same command: that pair keeps working.",
+          "autoStep3": "3. Enter the arbiter address (on this server and the other)",
+          "autoStep3Desc": "It is the address the step 2 command printed at the end, for example http://100.64.0.9:4097. Click Test: it must say “The arbiter answered”. Then Save. Do the same on the other server's dashboard, with the same address.",
           "autoStep3Check": "To check on the arbiter device itself, run the command below. If it answers {&quot;ok&quot;:true}, the arbiter is up.",
-          "autoStep3Shared": "If this device is already the arbiter for another pair of servers, don't install it again: just run the command below. Each pair stays separate, with its own key.",
-          "autoRepoPlaceholder": "<same repository you used on the servers>",
-          "autoKeyPlaceholder": "<key from step 2>",
-          "autoStep4": "4. Enter the arbiter address (on this server and the other)",
-          "autoStep4Desc": "It is http:// + the arbiter device's Tailscale IP + :4097, for example http://100.64.0.9:4097. The IP shows in the Tailscale app or with “tailscale ip -4” on the arbiter. Click Test: it must say “The arbiter answered”. Then Save. Repeat this step on the other server's dashboard, with the same address.",
           "btnArbTest": "Test",
           "btnArbSave": "Save",
-          "autoStep5": "5. Choose which server this one may replace",
+          "autoStep5": "1. Choose which server this one may replace",
           "autoStep5Desc": "The server whose apps this one takes over if it goes down. The list only shows servers this one already holds a copy of. Turning it on asks you to type the name to confirm. If the copy goes both ways and either should replace the other, do this step on the other server too.",
           "lblAutoPeer": "Server this one may replace",
           "autoNoCopy": "No copy received yet (use “Receive a copy”, in the “Live copy” tab)",
           "autoNoPeer": "Pick the server in the list. If it is empty, this server holds no copy of another one yet.",
-          "autoStep6": "6. Turn on the watchdog (on both servers)",
+          "autoStep6": "2. Turn on the watchdog (on both servers)",
           "autoStep6Desc": "The watchdog talks to the arbiter every 15 seconds. It tells the arbiter the server is alive, takes over when needed and blocks a server that comes back after being replaced. Run the command below in the terminal of each of the two servers.",
-          "autoStep7": "7. Check that it works",
-          "autoStep7Desc": "The box at the top of this card shows what the arbiter hears. It is ready when everything is green: the arbiter answered, heard this server and the other one less than 1 minute ago, the watchdog runs here and the takeover is on. If the other server is missing or shows a long time, step 4 or 6 is missing there.",
+          "autoStep7": "3. Check that it works",
+          "autoStep7Desc": "The box at the top of this card shows what the arbiter hears. It is ready when everything is green: the arbiter answered, heard this server and the other one less than 1 minute ago, the watchdog runs here and the takeover is on. If the other server is missing or shows a long time, it still needs the arbiter address (“Arbiter” tab) or its watchdog.",
           "btnArbRefresh": "Check again",
-          "arbNotSet": "No arbiter entered yet (step 4).",
+          "arbNotSet": "No arbiter set up yet (“Arbiter” tab).",
           "arbOk": "The arbiter answered and accepted the key",
           "arbThisServer": "this server",
           "arbHeard": "The arbiter heard {who} {s} s ago",
           "arbHeardOld": "over 1 minute: is the watchdog on there?",
-          "arbPeerUnknown": "The arbiter never heard {who}. Do steps 4 and 6 on {who}'s dashboard and terminal. Meanwhile, if the copy stops, this server takes over.",
+          "arbPeerUnknown": "The arbiter never heard {who}. On {who}, enter the arbiter address (“Arbiter” tab) and turn on the watchdog (step 2 here). Meanwhile, if the copy stops, this server takes over.",
           "arbWatchOn": "Watchdog running on this server",
-          "arbWatchOff": "Watchdog off on this server (step 6)",
+          "arbWatchOff": "Watchdog off on this server (automatic takeover, step 2)",
           "arbAutoOn": "Automatic takeover on for: {who}",
-          "arbAutoOff": "Automatic takeover off on this server (step 5)",
+          "arbAutoOff": "Automatic takeover off on this server (automatic takeover, step 1)",
           "arbAutoTag": "takeover on",
           "arbReady": "✅ Automatic takeover ready",
           "arbNotReady": "Something is still missing:",
           "arbErr_badUrl": "Invalid address. Use http://<arbiter Tailscale IP>:4097",
-          "arbErr_badKey": "The arbiter answered but refused the key. Reinstall it with the key from step 2.",
+          "arbErr_badKey": "The arbiter answered but refused the key. Run the step 2 command (“Arbiter” tab) again on the arbiter device.",
           "arbErr_clock": "The arbiter answered but its clock is more than 1 minute off. Turn on automatic time on the devices.",
           "arbErr_notPaired": "This server is not paired with the other one yet: do it under Second server, in the “Connect” tab.",
           "arbErr_notArbiter": "Something answered at that address, but it is not the arbiter. Check the port (default 4097).",
-          "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 3), that the IP is its Tailscale IP and that the port is 4097.",
+          "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 2 of the “Arbiter” tab), that the IP is its Tailscale IP and that the port is 4097.",
           "lblArbiter": "Arbiter address",
           "btnAutoOn": "Turn on",
           "btnAutoOff": "Turn off",
@@ -3999,6 +4509,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aiTokenOnce": "Copie agora: este token aparece só uma vez (já foi copiado).",
           "aiTokensTitle": "Acessos criados",
           "aiLastUsed": "Último uso:",
+          "aiUsedStdio": "✅ Sua IA já usa o PaaSMCP neste servidor. Último uso:",
+          "aiUsedHttp": "✅ Sua IA já usa o PaaSMCP pela rede. Último uso:",
           "aiRevoke": "Revogar",
           "aiRevokeConfirm": "Revogar este acesso? A IA que o usa deixa de conectar.",
           "aiStep2": "2. Ligar o acesso pela rede (uma vez)",
@@ -4044,6 +4556,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "aiTokenOnce": "Copy it now: this token is shown only once (already copied).",
           "aiTokensTitle": "Accesses",
           "aiLastUsed": "Last used:",
+          "aiUsedStdio": "✅ Your AI already uses PaaSMCP on this server. Last used:",
+          "aiUsedHttp": "✅ Your AI already uses PaaSMCP over the network. Last used:",
           "aiRevoke": "Revoke",
           "aiRevokeConfirm": "Revoke this access? The AI using it can no longer connect.",
           "aiStep2": "2. Turn on network access (once)",
@@ -4446,8 +4960,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navSecSystem": "Sistema",
           "navCollapse": "Recolher menu",
           "navExpand": "Expandir menu",
-          "sub_home_start": "Primeiros passos",
-          "sub_home_setup": "Primeira configuração",
           "sub_overview_list": "Seus apps",
           "sub_overview_deploy": "Publicar um app",
           "sub_overview_expose": "Deixar acessível",
@@ -4460,6 +4972,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sub_databases_files": "Arquivos dos apps",
           "sub_mirror_connect": "Conectar",
           "sub_mirror_copy": "Cópia ao vivo",
+          "sub_mirror_judge": "Juiz",
           "sub_mirror_auto": "Troca automática",
           "sub_mirror_aa": "App nos dois",
           "sub_mirror_back": "Devolver apps",
@@ -4482,6 +4995,49 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "cntPoolOne": "1 PC ajudante",
           "cntAgents": "{n} ferramentas MCP disponíveis",
           "cntAgentsOne": "1 ferramenta MCP disponível",
+          "resTitle": "Uso de Recursos",
+          "resCpu": "Processador agora",
+          "resMem": "Memória",
+          "resDisk": "Disco",
+          "resPaas": "PaaSMCP",
+          "resOthers": "Outros",
+          "resFree": "{v} livres",
+          "resCores": "{n} núcleos",
+          "resCoreOne": "1 núcleo",
+          "resHint": "PaaSMCP soma seus apps, os bancos e o próprio painel. Outros é o resto do servidor: o sistema e programas fora do PaaSMCP.",
+          "resTopTip": "Quem mais usa memória:",
+          "resMeasuring": "Medindo o servidor...",
+          "resMeasuringShort": "medindo...",
+          "resSnapshots": "Instantâneos",
+          "resSnapshotsOne": "1 cópia",
+          "resSnapshotsN": "{n} cópias",
+          "resDiskApps": "Apps",
+          "resDiskDbs": "Bancos",
+          "resDiskBackups": "Cópias e lixeira",
+          "resDiskFiles": "Arquivos",
+          "resDiskMeasuring": "divisão sendo medida...",
+          "resTopDiskTip": "Quem mais ocupa disco (código, volumes, imagem e banco):",
+          "dbMeasuring": "Medindo os bancos...",
+          "dbMeasuredAt": "Medido {when}",
+          "dbNotMeasured": "Ainda não medido",
+          "dbMeasureNow": "Medir agora",
+          "dbViewFull": "Ver gráficos",
+          "dbViewCompact": "Modo compacto",
+          "dbShareTitle": "Divisão entre os bancos",
+          "dbShareOf": "{p} dos bancos",
+          "dbSizeUnknown": "tamanho ainda não medido",
+          "dbRedisKeys": "{n} chaves",
+          "dbRedisNote": "O Redis guarda tudo na memória e não separa o tamanho por banco: {v} no total.",
+          "dbChartAgo": "{n} dias atrás",
+          "dbChartLimit": "--- tamanho de aviso",
+          "dbLimitLabel": "Tamanho de aviso",
+          "dbLimitNone": "sem limite",
+          "dbLimitSave": "Salvar",
+          "dbLimitClear": "Tirar",
+          "dbLimitSaved": "Tamanho de aviso salvo.",
+          "dbLimitCleared": "Tamanho de aviso removido.",
+          "dbLimitBad": "Use um número inteiro de MB, a partir de 1.",
+          "dbLimitHint": "Os bancos dividem um Postgres só, então nenhum tem espaço reservado. O tamanho de aviso é o seu limite: o painel mostra quanto dele já foi usado e manda um aviso (Conexões → Avisos) em 80% e 100%, sem travar o app.",
           "healthTitle": "Saúde rápida",
           "healthBackup": "Última cópia",
           "healthOffsite": "Cópia fora do servidor",
@@ -4507,8 +5063,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navSecSystem": "System",
           "navCollapse": "Collapse menu",
           "navExpand": "Expand menu",
-          "sub_home_start": "First steps",
-          "sub_home_setup": "First setup",
           "sub_overview_list": "Your apps",
           "sub_overview_deploy": "Publish an app",
           "sub_overview_expose": "Make reachable",
@@ -4521,6 +5075,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sub_databases_files": "App files",
           "sub_mirror_connect": "Connect",
           "sub_mirror_copy": "Live copy",
+          "sub_mirror_judge": "Arbiter",
           "sub_mirror_auto": "Automatic takeover",
           "sub_mirror_aa": "App on both",
           "sub_mirror_back": "Give apps back",
@@ -4543,6 +5098,49 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "cntPoolOne": "1 helper PC",
           "cntAgents": "{n} MCP tools available",
           "cntAgentsOne": "1 MCP tool available",
+          "resTitle": "Resource Usage",
+          "resCpu": "Processor now",
+          "resMem": "Memory",
+          "resDisk": "Disk",
+          "resPaas": "PaaSMCP",
+          "resOthers": "Others",
+          "resFree": "{v} free",
+          "resCores": "{n} cores",
+          "resCoreOne": "1 core",
+          "resHint": "PaaSMCP adds up your apps, the databases and the dashboard itself. Others is the rest of the server: the system and programs outside PaaSMCP.",
+          "resTopTip": "Using the most memory:",
+          "resMeasuring": "Measuring the server...",
+          "resMeasuringShort": "measuring...",
+          "resSnapshots": "Snapshots",
+          "resSnapshotsOne": "1 backup",
+          "resSnapshotsN": "{n} backups",
+          "resDiskApps": "Apps",
+          "resDiskDbs": "Databases",
+          "resDiskBackups": "Backups and trash",
+          "resDiskFiles": "Files",
+          "resDiskMeasuring": "split being measured...",
+          "resTopDiskTip": "Using the most disk (code, volumes, image and database):",
+          "dbMeasuring": "Measuring the databases...",
+          "dbMeasuredAt": "Measured {when}",
+          "dbNotMeasured": "Not measured yet",
+          "dbMeasureNow": "Measure now",
+          "dbViewFull": "Show charts",
+          "dbViewCompact": "Compact view",
+          "dbShareTitle": "Split between databases",
+          "dbShareOf": "{p} of the databases",
+          "dbSizeUnknown": "size not measured yet",
+          "dbRedisKeys": "{n} keys",
+          "dbRedisNote": "Redis keeps everything in memory and has no size per database: {v} in total.",
+          "dbChartAgo": "{n} days ago",
+          "dbChartLimit": "--- warning size",
+          "dbLimitLabel": "Warning size",
+          "dbLimitNone": "no limit",
+          "dbLimitSave": "Save",
+          "dbLimitClear": "Remove",
+          "dbLimitSaved": "Warning size saved.",
+          "dbLimitCleared": "Warning size removed.",
+          "dbLimitBad": "Use a whole number of MB, 1 or more.",
+          "dbLimitHint": "The databases share one Postgres, so none has space set aside. The warning size is your limit: the dashboard shows how much of it is used and sends a notice (Connections → Notices) at 80% and 100%, without stopping the app.",
           "healthTitle": "Quick health",
           "healthBackup": "Last backup",
           "healthOffsite": "Off-server backup",
@@ -4568,24 +5166,1229 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     const I18N_KEYS = [
-      'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
-      'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
-      'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents',
+      'btnNewApp', 'dbTitle', 'optDbPg', 'optDbRedis', 'backupsTitle', 'lblBakApp', 'lblBakEngine', 'optBakPg', 'optBakRedis', 'optBakVol', 'btnCreateBackup', 'lblDbApp', 'lblDbEngine', 'btnCreateDb',
+      'setupGithubDocsLink',
+      'setupLocalDesc',
+      'setupWebhookNote',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect',
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
-      'exposeTitle', 'exposeDesc', 'lblQuickFillExpose', 'chipModePublic', 'chipModeZT', 'chipModeTS', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
-      'vaultTitle', 'vaultDesc', 'lblVaultScopes', 'lblSecScope', 'lblSecKey', 'lblSecVal', 'btnSaveSecret', 'btnLoadSecrets',
+      'exposeTitle', 'exposeDesc', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
+      'vaultTitle', 'vaultDesc', 'lblSecScope', 'lblSecKey', 'lblSecVal', 'btnSaveSecret',
       'dbTitle', 'dbDesc', 'lblDbApp', 'lblDbEngine', 'optDbPg', 'optDbRedis', 'btnCreateDb',
       'backupsTitle', 'backupsDesc', 'lblBakApp', 'lblBakEngine', 'optBakPg', 'optBakRedis', 'btnCreateBackup',
       'fedTitle', 'fedDesc', 'lblFedUrl', 'lblFedMode', 'optFedActive', 'optFedWarm', 'btnGenInvite', 'btnExportSync', 'lblJoinPeer', 'btnJoinPeer',
-      'whTitle', 'whDesc', 'lblWhUrl', 'lblWhSecret', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
+      'whTitle', 'whDesc', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
       'doctorTitle', 'doctorDesc', 'btnRunDoctor',
-      'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetDotnet', 'presetCompose', 'presetSpa', 'presetDockerfile', 'chipSystemScope',
+      'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetDotnet', 'presetCompose', 'presetSpa', 'presetDockerfile',
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
       'agentsTitle', 'agentsDesc', 'logsTitle', 'btnCloseLogs',
     ];
+
+    Object.assign(I18N.pt, {
+      "navConnect": "Conexões",
+      "lead_connect": "Ligue a Cloudflare e o GitHub uma vez, aqui mesmo, e veja os PCs da sua Tailscale. Nada de terminal nem de IDs para copiar.",
+      "sub_connect_cloudflare": "Domínio (Cloudflare)",
+      "sub_connect_github": "GitHub",
+      "cntConnect": "{n} conexões ligadas",
+      "cntConnectOne": "1 conexão ligada",
+      "cnCfTitle": "Seu domínio pela Cloudflare",
+      "cnCfDesc": "Para abrir os apps num endereço como app.seudominio.com, com HTTPS e sem abrir portas no roteador. O domínio precisa estar na Cloudflare (o plano grátis serve).",
+      "cnCfStep1": "1. Crie um token na Cloudflare",
+      "cnCfStep1Desc": "O link abre a Cloudflare com as permissões já marcadas. Confira se aparecem Cloudflare Tunnel, DNS e Access: Apps and Policies, todos com Edit (inclua o que faltar). Clique em Continue to summary, depois em Create Token, e copie o valor.",
+      "cnCfTokenLink": "Abrir a Cloudflare com as permissões marcadas ↗",
+      "cnCfStep2": "2. Cole o token aqui",
+      "cnCfToken": "Token da Cloudflare",
+      "cnBtnCheck": "Verificar",
+      "cnCfStep3": "3. Confira o que o painel encontrou",
+      "cnCfAccount": "Conta",
+      "cnCfDomain": "Domínio",
+      "cnCfTunnel": "Túnel",
+      "cnCfRunHere": "Rodar este túnel neste servidor",
+      "cnCfEmails": "Quem pode abrir os apps protegidos (opcional)",
+      "cnCfEmailsHint": "Só vale para apps publicados no modo “Só e-mails autorizados”: a pessoa recebe um código no e-mail para entrar. Separe com vírgula.",
+      "cnBtnCfSave": "Salvar e conectar",
+      "cnChecking": "Verificando...",
+      "cnSaving": "Salvando... criar um túnel leva até um minuto.",
+      "cnFound": "Encontrei {a} conta(s) e {z} domínio(s).",
+      "cnMiss_account": "O token não enxerga nenhuma conta: inclua a conta em Account Resources.",
+      "cnMiss_zone": "O token não enxerga nenhum domínio: inclua o seu em Zone Resources (e confira se o domínio já está na Cloudflare).",
+      "cnMiss_tunnel": "Falta a permissão Cloudflare Tunnel: Edit.",
+      "cnMiss_access": "Sem a permissão Access: Apps and Policies, o modo “Só e-mails autorizados” não vai funcionar (o resto funciona).",
+      "cnNoZoneHere": "Nenhum domínio nesta conta",
+      "cnNewTunnel": "Criar um túnel novo (recomendado)",
+      "cnNewTunnelNote": "O painel cria o túnel na sua conta e o liga aqui. Ele volta sozinho depois de reiniciar o servidor.",
+      "cnTunLocal": "configurado por arquivo",
+      "cnTunLocalNote": "Este túnel é configurado por um arquivo no computador onde roda, então o PaaSMCP não consegue colocar endereços nele. Prefira criar um túnel novo.",
+      "cnTunIdleNote": "Este túnel não está ligado em lugar nenhum. Deixe marcado para o painel ligá-lo aqui.",
+      "cnTunLiveNote": "Este túnel já está ligado em algum computador. Se for este servidor, ou se você não sabe, deixe desmarcado.",
+      "cnTun_healthy": "ligado",
+      "cnTun_degraded": "ligado com falhas",
+      "cnTun_down": "desligado",
+      "cnTun_inactive": "nunca ligado",
+      "cnSaved": "Pronto. Agora publique um endereço em Apps → Deixar acessível.",
+      "cnSavedNew": "Pronto: túnel criado e ligado neste servidor. Agora publique um endereço em Apps → Deixar acessível.",
+      "cnCfReady": "Conectado",
+      "cnCfReadyDesc": "Os apps podem ganhar endereços em {domain}.",
+      "cnCfEmailsNow": "Podem entrar nos apps protegidos:",
+      "cnConnRunning": "O túnel roda neste servidor.",
+      "cnConnStopped": "O túnel deste servidor está parado: clique em Trocar e salve de novo para religar.",
+      "cnCfNone": "Sem isso, os apps abrem só pela Tailscale ou na rede de casa.",
+      "cnCfHalf": "O token está guardado, mas falta escolher domínio e túnel.",
+      "cnGoExpose": "Publicar um endereço",
+      "cnChange": "Trocar",
+      "cnGhTitle": "Código no GitHub",
+      "cnGhDesc": "Repositório público não precisa de nada. Para um privado, use uma das duas opções abaixo.",
+      "cnGhKeyTitle": "Opção 1: chave de leitura (mais segura)",
+      "cnGhKeyDesc": "No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole a chave abaixo e deixe “Allow write access” desmarcado. Repita em cada repositório privado.",
+      "cnBtnCopyKey": "Copiar chave",
+      "cnGhTokenTitle": "Opção 2: token (mais prático)",
+      "cnGhTokenDesc": "Crie um token “fine-grained”, escolha só os repositórios que vai publicar e dê a permissão Contents: Read-only. Com ele, Publicar um app mostra a lista dos seus repositórios e o painel baixa o código privado sozinho, sem colar chave em cada repositório. Quer publicar a cada push sem copiar nada? Dê também Webhooks: Read and write.",
+      "cnGhTokenLink": "Criar token no GitHub ↗",
+      "cnGhToken": "Token do GitHub",
+      "cnBtnGhSave": "Testar e salvar",
+      "cnGhOk": "Token salvo. Ele é da conta @{login}.",
+      "cnGhSaved": "Token salvo",
+      "cnGhSavedDesc": "Publicar um app já mostra a lista dos seus repositórios.",
+      "cnGhNoToken": "Sem token",
+      "cnGhNoTokenDesc": "Tudo bem para código público ou com a chave de leitura (opção 1).",
+      "exposeNeedCf": "Para publicar com o seu domínio, ligue a Cloudflare em Conexões primeiro. O modo Tailscale funciona sem ela.",
+      "exposeOpenConnect": "Abrir Conexões"
+    });
+    Object.assign(I18N.en, {
+      "navConnect": "Connections",
+      "lead_connect": "Connect Cloudflare and GitHub once, right here, and see the PCs of your Tailscale. No terminal, no ids to copy.",
+      "sub_connect_cloudflare": "Domain (Cloudflare)",
+      "sub_connect_github": "GitHub",
+      "cntConnect": "{n} connections on",
+      "cntConnectOne": "1 connection on",
+      "cnCfTitle": "Your domain through Cloudflare",
+      "cnCfDesc": "To open apps at an address like app.yourdomain.com, with HTTPS and no router port opened. The domain must be on Cloudflare (the free plan works).",
+      "cnCfStep1": "1. Create a Cloudflare token",
+      "cnCfStep1Desc": "The link opens Cloudflare with the permissions already ticked. Check that Cloudflare Tunnel, DNS and Access: Apps and Policies show, all with Edit (add what is missing). Click Continue to summary, then Create Token, and copy the value.",
+      "cnCfTokenLink": "Open Cloudflare with the permissions ticked ↗",
+      "cnCfStep2": "2. Paste the token here",
+      "cnCfToken": "Cloudflare token",
+      "cnBtnCheck": "Check",
+      "cnCfStep3": "3. Check what the dashboard found",
+      "cnCfAccount": "Account",
+      "cnCfDomain": "Domain",
+      "cnCfTunnel": "Tunnel",
+      "cnCfRunHere": "Run this tunnel on this server",
+      "cnCfEmails": "Who may open protected apps (optional)",
+      "cnCfEmailsHint": "Only for apps published as “Allowed emails only”: the person gets a code by email to get in. Separate with commas.",
+      "cnBtnCfSave": "Save and connect",
+      "cnChecking": "Checking...",
+      "cnSaving": "Saving... creating a tunnel takes up to a minute.",
+      "cnFound": "Found {a} account(s) and {z} domain(s).",
+      "cnMiss_account": "The token sees no account: add the account under Account Resources.",
+      "cnMiss_zone": "The token sees no domain: add yours under Zone Resources (and check the domain is already on Cloudflare).",
+      "cnMiss_tunnel": "The Cloudflare Tunnel: Edit permission is missing.",
+      "cnMiss_access": "Without Access: Apps and Policies, “Allowed emails only” will not work (everything else does).",
+      "cnNoZoneHere": "No domain in this account",
+      "cnNewTunnel": "Create a new tunnel (recommended)",
+      "cnNewTunnelNote": "The dashboard creates the tunnel in your account and runs it here. It comes back by itself after a reboot.",
+      "cnTunLocal": "configured by a file",
+      "cnTunLocalNote": "This tunnel is configured by a file on the computer that runs it, so PaaSMCP cannot add addresses to it. Prefer creating a new tunnel.",
+      "cnTunIdleNote": "This tunnel runs nowhere. Leave it ticked so the dashboard runs it here.",
+      "cnTunLiveNote": "This tunnel already runs on some computer. If it is this server, or you are not sure, leave it unticked.",
+      "cnTun_healthy": "running",
+      "cnTun_degraded": "running with errors",
+      "cnTun_down": "stopped",
+      "cnTun_inactive": "never ran",
+      "cnSaved": "Done. Now publish an address under Apps → Make reachable.",
+      "cnSavedNew": "Done: tunnel created and running on this server. Now publish an address under Apps → Make reachable.",
+      "cnCfReady": "Connected",
+      "cnCfReadyDesc": "Apps can get addresses on {domain}.",
+      "cnCfEmailsNow": "May open protected apps:",
+      "cnConnRunning": "The tunnel runs on this server.",
+      "cnConnStopped": "This server's tunnel is stopped: click Change and save again to restart it.",
+      "cnCfNone": "Without it, apps open only over Tailscale or on the home network.",
+      "cnCfHalf": "The token is saved, but the domain and tunnel are not chosen yet.",
+      "cnGoExpose": "Publish an address",
+      "cnChange": "Change",
+      "cnGhTitle": "Code on GitHub",
+      "cnGhDesc": "A public repository needs nothing. For a private one, use one of the two options below.",
+      "cnGhKeyTitle": "Option 1: read-only key (safest)",
+      "cnGhKeyDesc": "On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste the key below and leave “Allow write access” unticked. Repeat for each private repository.",
+      "cnBtnCopyKey": "Copy key",
+      "cnGhTokenTitle": "Option 2: token (easiest)",
+      "cnGhTokenDesc": "Create a fine-grained token, pick only the repositories you will publish and give it Contents: Read-only. With it, Publish an app lists your repositories and the dashboard fetches private code by itself, with no key to paste in each repository. Want to publish on every push with nothing to copy? Also give Webhooks: Read and write.",
+      "cnGhTokenLink": "Create a token on GitHub ↗",
+      "cnGhToken": "GitHub token",
+      "cnBtnGhSave": "Test and save",
+      "cnGhOk": "Token saved. It belongs to @{login}.",
+      "cnGhSaved": "Token saved",
+      "cnGhSavedDesc": "Publish an app now lists your repositories.",
+      "cnGhNoToken": "No token",
+      "cnGhNoTokenDesc": "Fine for public code or with the read-only key (option 1).",
+      "exposeNeedCf": "To publish on your domain, connect Cloudflare under Connections first. Tailscale mode works without it.",
+      "exposeOpenConnect": "Open Connections"
+    });
+
+    Object.assign(I18N.pt, {
+      "sub_home_start": "Resumo",
+      "sub_home_tutorial": "Tutorial",
+      "stepsTitle": "Próximo passo",
+      "stepsDesc": "O que mais vale a pena fazer agora.",
+      "tutTitle": "O que você já fez e o que ainda pode fazer",
+      "tutDesc": "Os itens se marcam sozinhos quando o painel vê que estão prontos. Os guias explicam passo a passo, numa página própria.",
+      "tutCount": "{n} de {t} feitos",
+      "tutGuide": "Ver o guia",
+      "tutOpen": "Abrir",
+      "tutSeeAll": "Ver o tutorial completo",
+      "tutAllEssential": "O essencial está pronto. Veja no tutorial o que mais dá para fazer.",
+      "tutGroup_essential": "Essencial",
+      "tutGroup_essentialDesc": "Para ter um app no ar, com endereço e com os dados guardados fora do servidor.",
+      "tutGroup_recommended": "Recomendado",
+      "tutGroup_recommendedDesc": "Deixa o dia a dia mais fácil e evita sustos.",
+      "tutGroup_grow": "Quando precisar de mais",
+      "tutGroup_growDesc": "Mais segurança contra queda, mais força ou ajuda de uma IA.",
+      "tut_app": "Publicar o primeiro app",
+      "tut_appDesc": "Informe o repositório do GitHub, ou instale um app pronto sem código, e o painel monta e liga o app.",
+      "tut_address": "Dar um endereço ao app",
+      "tut_addressDesc": "Pelo seu domínio (Cloudflare) ou só para você e sua família (Tailscale).",
+      "tut_offsite": "Guardar cópias fora do servidor",
+      "tut_offsiteDesc": "Se o servidor quebrar ou for roubado, os dados continuam salvos em outro lugar.",
+      "tut_autoupdate": "Atualizar o app sozinho quando o código muda",
+      "tut_autoupdateDesc": "Você manda o código para o GitHub e o app se atualiza, sem abrir o painel.",
+      "tut_email": "Configurar o envio de e-mails",
+      "tut_emailDesc": "Para os apps mandarem “esqueci a senha” e avisos. Leva 5 minutos com uma conta grátis.",
+      "tut_backup": "Fazer uma cópia e testar",
+      "tut_backupDesc": "O painel já faz uma cópia toda noite. Use “Testar” numa delas para ver se ela abre antes de precisar.",
+      "tut_doctor": "Rodar o diagnóstico",
+      "tut_doctorDesc": "Procura problemas no servidor e nos apps e diz o que fazer. Vale rodar de vez em quando.",
+      "tut_github": "Ligar o GitHub para código privado",
+      "tut_githubDesc": "Só se o seu repositório for privado.",
+      "tut_mirror": "Ligar um segundo servidor",
+      "tut_mirrorDesc": "Guarda uma cópia ao vivo de tudo e pode assumir se este cair.",
+      "tut_pool": "Emprestar força de outros PCs",
+      "tut_poolDesc": "PCs da casa rodam cópias extras dos apps quando o servidor aperta.",
+      "tut_ai": "Conectar sua IA",
+      "tut_aiDesc": "Peça em português: “publica meu app”, “faz uma cópia agora”.",
+      "guideCrumb": "Guia",
+      "guideOpenScreen": "Abrir esta tela",
+      "guideOthers": "Outros guias:",
+      "guideBack": "← Voltar ao tutorial",
+      "guide_firstapp": "Publicar o primeiro app",
+      "guide_firstapp_lead": "Uns 5 minutos. Você precisa só do endereço do repositório no GitHub.",
+      "guide_firstapp_s1": "Abra “Publicar um app”",
+      "guide_firstapp_s1Desc": "Se o seu projeto parece com um dos modelos (Next.js, Django, Node...), clique nele para preencher os campos. Senão, deixe sem modelo: o painel descobre a linguagem sozinho.",
+      "guide_firstapp_s2": "Código privado? Ligue o GitHub antes",
+      "guide_firstapp_s2Desc": "Repositório público não precisa de nada. Se for privado, siga a tela Conexões → GitHub (leva 2 minutos).",
+      "guide_firstapp_s3": "Preencha nome e repositório",
+      "guide_firstapp_s3Desc": "O nome vira o endereço do app (use letras minúsculas e hífen, por exemplo <code>minha-loja</code>). O repositório é <code>dono/nome</code>, como aparece no GitHub. Marque PostgreSQL ou Redis se o app usa banco: o endereço do banco entra no app sozinho.",
+      "guide_firstapp_s4": "Clique em Publicar e acompanhe",
+      "guide_firstapp_s4Desc": "A linha do app mostra cada fase: baixando, montando, testando, no ar. Se algo falhar, o painel mostra o motivo, e uma versão que já estava no ar continua funcionando.",
+      "guide_firstapp_s5": "Senhas do app ficam em Senhas e chaves",
+      "guide_firstapp_s5Desc": "Chaves como a da Stripe vão em Senhas e chaves, com o nome do app. Depois publique de novo para o app usar.",
+      "guide_address": "Dar um endereço ao app",
+      "guide_address_lead": "Escolha quem pode abrir o app. Não precisa abrir porta no roteador.",
+      "guide_address_s1": "Decida quem vai usar",
+      "guide_address_s1Desc": "Qualquer pessoa na internet: modo Público, com o seu domínio. Só pessoas convidadas: “Só e-mails autorizados”, que pede um código enviado por e-mail. Só você e sua família: Tailscale, que funciona sem domínio.",
+      "guide_address_s2": "Com domínio: ligue a Cloudflare",
+      "guide_address_s2Desc": "Em Conexões → Domínio, cole um token e escolha o domínio. O painel cria o túnel sozinho. (Com Tailscale, pule este passo: instale o app Tailscale no servidor e no seu celular ou computador, com a mesma conta, e no site do Tailscale, em DNS, ligue “HTTPS Certificates”.)",
+      "guide_address_s3": "Publique o endereço",
+      "guide_address_s3Desc": "Em “Deixar acessível”, escolha o app, o modo e o começo do endereço (por exemplo <code>loja</code> vira <code>loja.seudominio.com</code>).",
+      "guide_address_s4": "Teste no celular",
+      "guide_address_s4Desc": "Abra o endereço fora do Wi-Fi de casa. O endereço aparece também na linha do app. O HTTPS já vem pronto.",
+      "guide_offsite": "Guardar cópias fora do servidor",
+      "guide_offsite_lead": "Uns 10 minutos. Depois disso o servidor manda as cópias toda noite, sozinho.",
+      "guide_offsite_s1": "Escolha onde guardar",
+      "guide_offsite_s1Desc": "Cloudflare R2 e Backblaze B2 têm 10 GB grátis e servem para a maioria. Se você já usa Amazon, Google ou Wasabi, use o que já tem. Outro PaaSMCP (de um amigo, ou seu em outra casa) também serve.",
+      "guide_offsite_s2": "Crie o lugar e a chave no serviço",
+      "guide_offsite_s2Desc": "No serviço escolhido, crie um “bucket” (uma pasta para as cópias) e uma chave de acesso só para ele. A tela de cópias mostra onde fica cada coisa no serviço que você escolher.",
+      "guide_offsite_s3": "Cole os campos e clique em Testar e salvar",
+      "guide_offsite_s3Desc": "O painel grava, lê e apaga um arquivo de teste antes de salvar. Se der errado, ele diz qual campo conferir.",
+      "guide_offsite_s4": "Confira a primeira cópia",
+      "guide_offsite_s4Desc": "No dia seguinte, o quadro “Última cópia” no Início diz “Guardada também fora do servidor”. Para não esperar, faça uma cópia agora na aba Cópias de segurança e clique em “Enviar agora”.",
+      "guide_autoupdate": "Atualizar o app sozinho",
+      "guide_autoupdate_lead": "Você manda o código para o GitHub e o app se atualiza. Duas formas: escolha uma.",
+      "guide_autoupdate_s1": "Mais simples: marque “Atualizar sozinho”",
+      "guide_autoupdate_s1Desc": "Ao publicar o app, marque “Atualizar sozinho quando eu mudar o código”. O servidor olha o GitHub a cada 2 minutos. Funciona em qualquer rede, sem configurar mais nada.",
+      "guide_autoupdate_s2": "Mais rápido: aviso do GitHub (webhook)",
+      "guide_autoupdate_s2Desc": "O GitHub avisa o servidor na hora. Só funciona se o painel tiver um endereço na internet. Com o GitHub ligado em Conexões, a tela “Publicar a cada push” cria o aviso com um clique; sem isso, ela mostra o endereço e o segredo para colar no GitHub.",
+      "guide_autoupdate_s3": "Nada quebra no meio",
+      "guide_autoupdate_s3Desc": "A versão nova só entra depois de responder ao teste. Se falhar, a atual continua no ar e a linha do app mostra o motivo.",
+      "guide_email": "Configurar o envio de e-mails",
+      "guide_email_lead": "Uns 5 minutos com uma conta grátis. Vale para todos os apps.",
+      "guide_email_s1": "Crie uma conta num serviço de envio",
+      "guide_email_s1Desc": "O Brevo tem plano grátis com 300 e-mails por dia. Outros (Resend, Mailgun, Amazon SES) também servem. E-mail mandado direto de casa cai no spam, por isso o serviço.",
+      "guide_email_s2": "Confirme o seu domínio no serviço",
+      "guide_email_s2Desc": "O serviço pede para criar alguns registros no DNS do domínio. Se o domínio está na Cloudflare, cole os registros lá, em DNS → Records.",
+      "guide_email_s3": "Copie os dados SMTP para o painel",
+      "guide_email_s3Desc": "Servidor, porta, usuário e senha (ou chave SMTP) ficam na área SMTP do serviço. Cole na tela E-mail e salve. Mande um e-mail de teste para você.",
+      "guide_email_s4": "Libere o envio para cada app",
+      "guide_email_s4Desc": "Na mesma tela, em “Permitir que um app envie e-mail”, escreva o nome do app. Depois publique o app de novo.",
+      "guide_github": "Ligar o GitHub para código privado",
+      "guide_github_lead": "Só para repositórios privados. Uns 2 minutos.",
+      "guide_github_s1": "Escolha entre chave e token",
+      "guide_github_s1Desc": "A chave de leitura é a mais segura: o servidor só consegue ler aquele repositório. O token poupa o trabalho de colar a chave em cada repositório e mostra a lista dos seus repositórios ao publicar.",
+      "guide_github_s2": "Com chave: cole no repositório",
+      "guide_github_s2Desc": "Copie a chave em Conexões → GitHub. No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole e deixe “Allow write access” desmarcado.",
+      "guide_github_s3": "Com token: crie e teste",
+      "guide_github_s3Desc": "Crie um token fine-grained só com os repositórios que vai publicar e a permissão Contents: Read-only. Cole em Conexões → GitHub e clique em Testar e salvar. Pronto: Publicar um app passa a mostrar a lista dos seus repositórios.",
+      "lead_guide": ""
+    });
+    Object.assign(I18N.en, {
+      "sub_home_start": "Summary",
+      "sub_home_tutorial": "Tutorial",
+      "stepsTitle": "Next step",
+      "stepsDesc": "What is most worth doing now.",
+      "tutTitle": "What you have done and what you can still do",
+      "tutDesc": "Items tick themselves when the dashboard sees they are ready. The guides explain step by step, on a page of their own.",
+      "tutCount": "{n} of {t} done",
+      "tutGuide": "See the guide",
+      "tutOpen": "Open",
+      "tutSeeAll": "See the full tutorial",
+      "tutAllEssential": "The essentials are ready. See the tutorial for what else you can do.",
+      "tutGroup_essential": "Essential",
+      "tutGroup_essentialDesc": "To have an app online, with an address and its data kept off the server.",
+      "tutGroup_recommended": "Recommended",
+      "tutGroup_recommendedDesc": "Makes day to day easier and avoids scares.",
+      "tutGroup_grow": "When you need more",
+      "tutGroup_growDesc": "More safety against outages, more power, or help from an AI.",
+      "tut_app": "Publish your first app",
+      "tut_appDesc": "Enter the GitHub repository, or install a ready-made app with no code, and the dashboard builds and starts it.",
+      "tut_address": "Give the app an address",
+      "tut_addressDesc": "On your domain (Cloudflare) or only for you and your family (Tailscale).",
+      "tut_offsite": "Keep backups off the server",
+      "tut_offsiteDesc": "If the server breaks or is stolen, the data is still safe elsewhere.",
+      "tut_autoupdate": "Update the app by itself when the code changes",
+      "tut_autoupdateDesc": "You push code to GitHub and the app updates, without opening the dashboard.",
+      "tut_email": "Set up email sending",
+      "tut_emailDesc": "So apps can send “forgot password” and notices. Takes 5 minutes with a free account.",
+      "tut_backup": "Make a backup and test it",
+      "tut_backupDesc": "The dashboard already makes a copy every night. Use “Test” on one to check it opens before you need it.",
+      "tut_doctor": "Run diagnostics",
+      "tut_doctorDesc": "Looks for problems in the server and apps and says what to do. Worth running now and then.",
+      "tut_github": "Connect GitHub for private code",
+      "tut_githubDesc": "Only if your repository is private.",
+      "tut_mirror": "Add a second server",
+      "tut_mirrorDesc": "Keeps a live copy of everything and can take over if this one goes down.",
+      "tut_pool": "Borrow power from other PCs",
+      "tut_poolDesc": "Home PCs run extra copies of the apps when the server is busy.",
+      "tut_ai": "Connect your AI",
+      "tut_aiDesc": "Ask in plain words: “publish my app”, “back up now”.",
+      "guideCrumb": "Guide",
+      "guideOpenScreen": "Open this screen",
+      "guideOthers": "Other guides:",
+      "guideBack": "← Back to the tutorial",
+      "guide_firstapp": "Publish your first app",
+      "guide_firstapp_lead": "About 5 minutes. You only need the repository's address on GitHub.",
+      "guide_firstapp_s1": "Open “Publish an app”",
+      "guide_firstapp_s1Desc": "If your project looks like one of the presets (Next.js, Django, Node...), click it to fill in the fields. Otherwise leave it: the dashboard detects the language by itself.",
+      "guide_firstapp_s2": "Private code? Connect GitHub first",
+      "guide_firstapp_s2Desc": "A public repository needs nothing. If it is private, follow Connections → GitHub (takes 2 minutes).",
+      "guide_firstapp_s3": "Fill in the name and repository",
+      "guide_firstapp_s3Desc": "The name becomes the app's address (use lowercase letters and hyphens, e.g. <code>my-shop</code>). The repository is <code>owner/name</code>, as shown on GitHub. Tick PostgreSQL or Redis if the app uses a database: its address goes into the app by itself.",
+      "guide_firstapp_s4": "Click Publish and follow along",
+      "guide_firstapp_s4Desc": "The app's row shows each phase: fetching, building, testing, live. If something fails, the dashboard shows why, and a version already live keeps working.",
+      "guide_firstapp_s5": "App passwords live in Secrets & keys",
+      "guide_firstapp_s5Desc": "Keys such as Stripe's go in Secrets & keys, under the app's name. Then publish again so the app uses them.",
+      "guide_address": "Give the app an address",
+      "guide_address_lead": "Choose who can open the app. No router port needs opening.",
+      "guide_address_s1": "Decide who will use it",
+      "guide_address_s1Desc": "Anyone on the internet: Public mode, on your domain. Only invited people: “Allowed emails only”, which asks for a code sent by email. Only you and your family: Tailscale, which needs no domain.",
+      "guide_address_s2": "With a domain: connect Cloudflare",
+      "guide_address_s2Desc": "Under Connections → Domain, paste a token and pick the domain. The dashboard creates the tunnel by itself. (With Tailscale, skip this: install the Tailscale app on the server and on your phone or computer, same account, and on the Tailscale website, under DNS, turn on “HTTPS Certificates”.)",
+      "guide_address_s3": "Publish the address",
+      "guide_address_s3Desc": "Under “Make reachable”, pick the app, the mode and the start of the address (e.g. <code>shop</code> becomes <code>shop.yourdomain.com</code>).",
+      "guide_address_s4": "Test it on your phone",
+      "guide_address_s4Desc": "Open the address off your home Wi-Fi. The address also shows on the app's row. HTTPS comes ready.",
+      "guide_offsite": "Keep backups off the server",
+      "guide_offsite_lead": "About 10 minutes. After that the server sends backups every night by itself.",
+      "guide_offsite_s1": "Pick where to keep them",
+      "guide_offsite_s1Desc": "Cloudflare R2 and Backblaze B2 have 10 GB free and suit most people. If you already use Amazon, Google or Wasabi, use what you have. Another PaaSMCP (a friend's, or yours in another house) works too.",
+      "guide_offsite_s2": "Create the bucket and key on the service",
+      "guide_offsite_s2Desc": "On the chosen service, create a “bucket” (a folder for the backups) and an access key just for it. The backups screen shows where each thing is on the service you pick.",
+      "guide_offsite_s3": "Paste the fields and click Test and save",
+      "guide_offsite_s3Desc": "The dashboard writes, reads and deletes a test file before saving. If it fails, it says which field to check.",
+      "guide_offsite_s4": "Check the first backup",
+      "guide_offsite_s4Desc": "The next day, the “Last backup” tile on Home says “Also stored off the server”. To skip the wait, make a backup now on the Backups tab and click “Send now”.",
+      "guide_autoupdate": "Update the app by itself",
+      "guide_autoupdate_lead": "You push code to GitHub and the app updates. Two ways: pick one.",
+      "guide_autoupdate_s1": "Simplest: tick “Update by itself”",
+      "guide_autoupdate_s1Desc": "When publishing, tick “Update by itself when I change the code”. The server checks GitHub every 2 minutes. Works on any network, nothing else to set up.",
+      "guide_autoupdate_s2": "Faster: GitHub notice (webhook)",
+      "guide_autoupdate_s2Desc": "GitHub tells the server right away. Only works if the dashboard has an internet address. With GitHub connected under Connections, the “Publish on every push” screen creates the notice in one click; without it, it shows the address and the secret to paste into GitHub.",
+      "guide_autoupdate_s3": "Nothing breaks halfway",
+      "guide_autoupdate_s3Desc": "The new version only goes live after it answers the test. If it fails, the current one stays live and the app's row shows why.",
+      "guide_email": "Set up email sending",
+      "guide_email_lead": "About 5 minutes with a free account. Works for every app.",
+      "guide_email_s1": "Create an account on a sending service",
+      "guide_email_s1Desc": "Brevo has a free plan with 300 emails a day. Others (Resend, Mailgun, Amazon SES) work too. Email sent straight from home lands in spam, hence the service.",
+      "guide_email_s2": "Verify your domain on the service",
+      "guide_email_s2Desc": "The service asks you to create a few DNS records. If the domain is on Cloudflare, paste them there under DNS → Records.",
+      "guide_email_s3": "Copy the SMTP details into the dashboard",
+      "guide_email_s3Desc": "Server, port, user and password (or SMTP key) are in the service's SMTP area. Paste them on the Email screen and save. Send yourself a test email.",
+      "guide_email_s4": "Allow each app to send",
+      "guide_email_s4Desc": "On the same screen, under “Allow an app to send email”, type the app's name. Then publish the app again.",
+      "guide_github": "Connect GitHub for private code",
+      "guide_github_lead": "Only for private repositories. About 2 minutes.",
+      "guide_github_s1": "Choose between key and token",
+      "guide_github_s1Desc": "The read-only key is safest: the server can only read that repository. The token saves pasting the key into each repository and lists your repositories when publishing.",
+      "guide_github_s2": "With a key: paste it into the repository",
+      "guide_github_s2Desc": "Copy the key under Connections → GitHub. On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste it and leave “Allow write access” unticked.",
+      "guide_github_s3": "With a token: create and test",
+      "guide_github_s3Desc": "Create a fine-grained token with only the repositories you will publish and Contents: Read-only. Paste it under Connections → GitHub and click Test and save. Done: Publish an app now lists your repositories.",
+      "lead_guide": ""
+    });
+
+    Object.assign(I18N.pt, {
+      "secSystemScope": "Painel e integrações (system)",
+      "secSystemNote": "Chaves do próprio painel (Cloudflare, GitHub, cópias fora do servidor). Os apps não enxergam estas. Para mudar uma conexão, prefira a tela Conexões.",
+      "secApplyNote": "O app lê estas variáveis quando é publicado. Depois de mudar algo, publique de novo.",
+      "secApplyChanged": "Você mudou variáveis deste app. Elas valem depois de publicar de novo.",
+      "secListTitle": "Salvas",
+      "secAddTitle": "Adicionar ou trocar uma",
+      "secChange": "Trocar",
+      "secDescLabel": "Para que serve (opcional)",
+      "secDescPh": "ex: chave da Stripe da loja, conta de produção",
+      "secDescBtn": "Descrever",
+      "secDescEditBtn": "Editar descrição",
+      "secDescSave": "Salvar",
+      "secDescCancel": "Cancelar",
+      "secDescNone": "Sem descrição.",
+      "secDescDefault": "padrão",
+      "secDescDefaultTitle": "Explicação que vem com o PaaSMCP. Clique em Editar descrição para trocar pela sua.",
+      "secCreated": "Criada em {d}",
+      "secCreatedUnknown": "Criada antes de o painel registrar datas",
+      "secUpdated": "última alteração em {d}",
+      "secNeverChanged": "sem alterações",
+      "secUpdatedUnknown": "última alteração desconhecida",
+      "toastSecDescSaved": "Descrição salva.",
+      "secPasteTitle": "Colar um arquivo .env inteiro",
+      "secPasteDesc": "Cole o conteúdo do seu .env (uma linha NOME=valor por variável). Comentários com # e aspas funcionam. Variáveis com o mesmo nome são trocadas; as outras ficam como estão.",
+      "secPasteBtn": "Salvar todas",
+      "secPasteOk": "{n} variáveis salvas.",
+      "secPasteSkipped": "Ficaram de fora (não pareciam NOME=valor): linha {lines}.",
+      "actionRedeploy": "Publicar de novo",
+      "redeployTitle": "Monta e publica de novo o mesmo repositório e branch, com as variáveis atuais. A versão no ar continua até a nova passar no teste.",
+      "redeployConfirm": "Publicar {app} de novo com as variáveis atuais? A versão no ar continua funcionando até a nova passar no teste."
+    });
+    Object.assign(I18N.en, {
+      "secSystemScope": "Dashboard and integrations (system)",
+      "secSystemNote": "The dashboard's own keys (Cloudflare, GitHub, off-server backups). Apps do not see these. To change a connection, prefer the Connections screen.",
+      "secApplyNote": "The app reads these variables when it is published. After changing something, publish again.",
+      "secApplyChanged": "You changed this app's variables. They take effect after publishing again.",
+      "secListTitle": "Saved",
+      "secAddTitle": "Add or change one",
+      "secChange": "Change",
+      "secDescLabel": "What it is for (optional)",
+      "secDescPh": "e.g.: the shop's Stripe key, live account",
+      "secDescBtn": "Describe",
+      "secDescEditBtn": "Edit description",
+      "secDescSave": "Save",
+      "secDescCancel": "Cancel",
+      "secDescNone": "No description.",
+      "secDescDefault": "default",
+      "secDescDefaultTitle": "Explanation that ships with PaaSMCP. Click Edit description to replace it with yours.",
+      "secCreated": "Created {d}",
+      "secCreatedUnknown": "Created before the dashboard recorded dates",
+      "secUpdated": "last changed {d}",
+      "secNeverChanged": "never changed",
+      "secUpdatedUnknown": "last change unknown",
+      "toastSecDescSaved": "Description saved.",
+      "secPasteTitle": "Paste a whole .env file",
+      "secPasteDesc": "Paste your .env content (one NAME=value line per variable). # comments and quotes work. Variables with the same name are replaced; the others stay as they are.",
+      "secPasteBtn": "Save all",
+      "secPasteOk": "{n} variables saved.",
+      "secPasteSkipped": "Left out (not NAME=value): line {lines}.",
+      "actionRedeploy": "Publish again",
+      "redeployTitle": "Builds and publishes the same repository and branch again, with the current variables. The live version stays until the new one passes the test.",
+      "redeployConfirm": "Publish {app} again with the current variables? The live version keeps working until the new one passes the test."
+    });
+
+    Object.assign(I18N.pt, {
+      "lblQuickFillDeploy": "Parecido com:",
+      "lblDepApp": "Nome do app",
+      "lblDepRepo": "Repositório (dono/nome) ou pasta do servidor",
+      "lblDepBranch": "Branch",
+      "lblDepMem": "Memória máxima",
+      "lblDepCpu": "Processadores (CPUs) no máximo",
+      "lblDepPg": "Banco PostgreSQL (o app recebe <code>DATABASE_URL</code>)",
+      "lblDepRedis": "Cache Redis (o app recebe <code>REDIS_URL</code>)",
+      "btnDeploy": "🚀 Publicar",
+      "lblDepHealth": "Página que o teste abre",
+      "lblDepNoHealth": "Não é um site (pular o teste antes de trocar)",
+      "depMore": "Mais opções",
+      "depMoreDesc": "Pode deixar em branco. Antes de trocar a versão no ar, o painel abre uma página do app para ver se ele responde (por padrão, a página inicial).",
+      "presetSaas": "Next.js + banco",
+      "presetCompose": "Vários serviços (docker-compose)",
+      "presetSpa": "Site estático (React, Vue...)",
+      "presetDjango": "Django + banco",
+      "presetFastapi": "FastAPI + banco",
+      "presetNode": "Node / Express",
+      "presetGo": "Go",
+      "presetDotnet": "C# / ASP.NET + banco",
+      "presetDockerfile": "Dockerfile próprio (Rails, Laravel…)",
+      "btnNewApp": "+ Publicar um app",
+      "appSearch": "Buscar por nome, linguagem ou porta...",
+      "appsCount": "{n} apps",
+      "appsCountOne": "1 app",
+      "lblPort": "Porta",
+      "depPhase_live": "No ar",
+      "actionExpose": "Endereço",
+      "lblExpApp": "App",
+      "lblExpMode": "Quem pode abrir",
+      "optPublic": "Qualquer pessoa (público)",
+      "optZT": "Só e-mails autorizados",
+      "optTS": "Só a minha rede (Tailscale)",
+      "lblExpSub": "Começo do endereço",
+      "btnExpose": "🔗 Publicar endereço",
+      "expHint_public": "Bom para sites e apps com login próprio. Qualquer pessoa com o endereço abre.",
+      "expHint_zero-trust": "A pessoa digita o e-mail e recebe um código. Só entra quem está na lista de Conexões → Domínio. Bom para painéis e ferramentas internas.",
+      "expHint_tailscale": "Só abre em aparelhos com o Tailscale ligado na sua conta. Não precisa de domínio.",
+      "expPreview": "Vai ficar:",
+      "whLblUrl": "Endereço para colar no GitHub (Settings → Webhooks → Add webhook, campo Payload URL; Content type: application/json; evento: Just the push event)",
+      "whLblSecret": "Segredo (campo Secret do mesmo formulário)",
+      "btnRevealWhSecret": "👁️ Mostrar e copiar",
+      "lblSshKey": "Chave de leitura para repositório privado (só se não usar o token do GitHub)",
+      "whAutoTitle": "Ligar pelo painel",
+      "whAutoNoteOn": "O painel cria o aviso no GitHub de cada repositório que tem app publicado aqui, sem copiar nada. O token precisa da permissão Webhooks: Read and write, além de Contents: Read-only. Dá para acrescentar editando o token no GitHub, sem criar outro.",
+      "whAutoNoteOff": "Ligue o GitHub em Conexões → GitHub e o painel faz isto sozinho. Sem isso, use o passo a passo abaixo.",
+      "whLblAddress": "Endereço do painel na internet",
+      "whBtnCheck": "Conferir repositórios",
+      "whChecking": "Conferindo no GitHub...",
+      "whNoRepos": "Nenhum app daqui vem de um repositório do GitHub ainda.",
+      "whStOn": "Ligado",
+      "whStOff": "Desligado",
+      "whStDenied": "Sem acesso",
+      "whStError": "Não deu para conferir",
+      "whDeniedHint": "O token não alcança este repositório ou não tem a permissão Webhooks: Read and write.",
+      "whLastFail": "A última chamada do GitHub não chegou ao painel (código {code}).",
+      "whBtnOn": "Ligar",
+      "whBtnRedo": "Ligar de novo",
+      "whBtnAll": "Ligar em todos",
+      "whWorking": "Ligando em {repo} e testando...",
+      "whOk": "Pronto: o GitHub avisou o painel e ele respondeu. Cada push em {repo} publica sozinho.",
+      "whUnreachable": "O aviso foi criado em {repo}, mas o teste do GitHub não chegou ao painel (código {code}). Confira se o endereço abre de fora de casa. Se o painel está publicado como “Só e-mails autorizados”, o GitHub fica barrado no login: use “Atualizar sozinho” ao publicar o app.",
+      "whUnknown": "O aviso foi criado em {repo}. O GitHub ainda não mostrou o resultado do teste: confira de novo em alguns segundos.",
+      "whManualTitle": "Fazer à mão no GitHub",
+      "btnCopySsh": "📋 Copiar chave",
+      "dbTitle": "🗄️ Criar um banco de dados",
+      "lblDbApp": "App",
+      "lblDbEngine": "Tipo",
+      "optDbPg": "PostgreSQL (banco de dados)",
+      "optDbRedis": "Redis (cache e filas)",
+      "btnCreateDb": "+ Criar banco",
+      "emptyDbs": "Nenhum banco ainda.",
+      "backupsTitle": "🛡️ Cópias de segurança",
+      "lblBakApp": "App",
+      "lblBakEngine": "O que copiar",
+      "optBakPg": "Banco PostgreSQL",
+      "optBakRedis": "Cache Redis",
+      "optBakVol": "Arquivos do app (volumes do Docker)",
+      "btnCreateBackup": "📸 Fazer uma cópia agora",
+      "emptyBackups": "Nenhuma cópia ainda.",
+      "btnRunDoctor": "🔍 Rodar diagnóstico",
+      "sev_healthy": "Tudo certo",
+      "sev_warning": "Atenção",
+      "sev_critical": "Problema"
+    });
+    Object.assign(I18N.en, {
+      "lblQuickFillDeploy": "Looks like:",
+      "lblDepApp": "App name",
+      "lblDepRepo": "Repository (owner/name) or server folder",
+      "lblDepBranch": "Branch",
+      "lblDepMem": "Maximum memory",
+      "lblDepCpu": "Maximum processors (CPUs)",
+      "lblDepPg": "PostgreSQL database (the app gets <code>DATABASE_URL</code>)",
+      "lblDepRedis": "Redis cache (the app gets <code>REDIS_URL</code>)",
+      "btnDeploy": "🚀 Publish",
+      "lblDepHealth": "Page the test opens",
+      "lblDepNoHealth": "Not a website (skip the test before switching)",
+      "depMore": "More options",
+      "depMoreDesc": "You can leave these empty. Before replacing the live version, the dashboard opens a page of the app to see that it answers (the home page by default).",
+      "presetSaas": "Next.js + database",
+      "presetCompose": "Several services (docker-compose)",
+      "presetSpa": "Static site (React, Vue...)",
+      "presetDjango": "Django + database",
+      "presetFastapi": "FastAPI + database",
+      "presetNode": "Node / Express",
+      "presetGo": "Go",
+      "presetDotnet": "C# / ASP.NET + database",
+      "presetDockerfile": "Own Dockerfile (Rails, Laravel…)",
+      "btnNewApp": "+ Publish an app",
+      "appSearch": "Search by name, language or port...",
+      "appsCount": "{n} apps",
+      "appsCountOne": "1 app",
+      "lblPort": "Port",
+      "depPhase_live": "Live",
+      "actionExpose": "Address",
+      "lblExpApp": "App",
+      "lblExpMode": "Who can open it",
+      "optPublic": "Anyone (public)",
+      "optZT": "Allowed emails only",
+      "optTS": "Only my network (Tailscale)",
+      "lblExpSub": "Start of the address",
+      "btnExpose": "🔗 Publish address",
+      "expHint_public": "Good for sites and apps with their own login. Anyone with the address can open it.",
+      "expHint_zero-trust": "The person types their email and gets a code. Only people on the list in Connections → Domain get in. Good for admin panels and internal tools.",
+      "expHint_tailscale": "Only opens on devices with Tailscale on, in your account. No domain needed.",
+      "expPreview": "It will be:",
+      "whLblUrl": "Address to paste on GitHub (Settings → Webhooks → Add webhook, Payload URL field; Content type: application/json; event: Just the push event)",
+      "whLblSecret": "Secret (the Secret field on the same form)",
+      "btnRevealWhSecret": "👁️ Show and copy",
+      "lblSshKey": "Read-only key for a private repository (only if you do not use the GitHub token)",
+      "whAutoTitle": "Turn on from the dashboard",
+      "whAutoNoteOn": "The dashboard creates the notice on GitHub for each repository with an app published here, with nothing to copy. The token needs the Webhooks: Read and write permission, besides Contents: Read-only. You can add it by editing the token on GitHub, no new token needed.",
+      "whAutoNoteOff": "Connect GitHub under Connections → GitHub and the dashboard does this by itself. Without it, use the steps below.",
+      "whLblAddress": "Dashboard's internet address",
+      "whBtnCheck": "Check repositories",
+      "whChecking": "Checking on GitHub...",
+      "whNoRepos": "No app here comes from a GitHub repository yet.",
+      "whStOn": "On",
+      "whStOff": "Off",
+      "whStDenied": "No access",
+      "whStError": "Could not check",
+      "whDeniedHint": "The token does not reach this repository or lacks the Webhooks: Read and write permission.",
+      "whLastFail": "GitHub's last call did not reach the dashboard (code {code}).",
+      "whBtnOn": "Turn on",
+      "whBtnRedo": "Turn on again",
+      "whBtnAll": "Turn on for all",
+      "whWorking": "Turning on for {repo} and testing...",
+      "whOk": "Done: GitHub called the dashboard and it answered. Every push to {repo} publishes by itself.",
+      "whUnreachable": "The notice was created on {repo}, but GitHub's test did not reach the dashboard (code {code}). Check that the address opens from outside your home network. If the dashboard is published as “Only allowed emails”, GitHub is stopped at the login: use “Update by itself” when publishing the app.",
+      "whUnknown": "The notice was created on {repo}. GitHub has not shown the test result yet: check again in a few seconds.",
+      "whManualTitle": "Do it by hand on GitHub",
+      "btnCopySsh": "📋 Copy key",
+      "dbTitle": "🗄️ Create a database",
+      "lblDbApp": "App",
+      "lblDbEngine": "Type",
+      "optDbPg": "PostgreSQL (database)",
+      "optDbRedis": "Redis (cache and queues)",
+      "btnCreateDb": "+ Create database",
+      "emptyDbs": "No databases yet.",
+      "backupsTitle": "🛡️ Backups",
+      "lblBakApp": "App",
+      "lblBakEngine": "What to back up",
+      "optBakPg": "PostgreSQL database",
+      "optBakRedis": "Redis cache",
+      "optBakVol": "App files (Docker volumes)",
+      "btnCreateBackup": "📸 Back up now",
+      "emptyBackups": "No backups yet.",
+      "btnRunDoctor": "🔍 Run diagnostics",
+      "sev_healthy": "All good",
+      "sev_warning": "Warning",
+      "sev_critical": "Problem"
+    });
+
+    Object.assign(I18N.pt, {
+      "pickLabel": "Ou escolha da sua lista do GitHub",
+      "pickChoose": "Escolha um repositório...",
+      "pickPrivate": "privado",
+      "pickPrivateNote": "Repositório privado: o painel baixa o código com o token salvo em Conexões.",
+      "pickLoading": "Buscando seus repositórios no GitHub...",
+      "pickEmpty": "O token do GitHub não enxerga nenhum repositório. Em Conexões → GitHub, crie um token com acesso aos repositórios que vai publicar.",
+      "pickNoToken": "Quer escolher da lista ou publicar código privado?",
+      "pickConnect": "Ligue o GitHub em Conexões"
+    });
+    Object.assign(I18N.en, {
+      "pickLabel": "Or pick from your GitHub list",
+      "pickChoose": "Pick a repository...",
+      "pickPrivate": "private",
+      "pickPrivateNote": "Private repository: the dashboard fetches the code with the token saved under Connections.",
+      "pickLoading": "Fetching your GitHub repositories...",
+      "pickEmpty": "The GitHub token sees no repository. Under Connections → GitHub, create a token with access to the repositories you will publish.",
+      "pickNoToken": "Want to pick from a list, or publish private code?",
+      "pickConnect": "Connect GitHub under Connections"
+    });
+
+    Object.assign(I18N.pt, {
+      "df_healthcheck": "A nova versão não respondeu e não foi para o ar.",
+      "dfh_healthcheck": "A versão anterior continua funcionando. O erro do app está nos detalhes. Se ele não é um site (um robô ou uma tarefa de fundo), marque “Não é um site” em Mais opções.",
+      "df_access": "Não consegui baixar o código.",
+      "dfh_access": "Confira o nome do repositório (dono/nome). Se ele é privado, conecte o GitHub.",
+      "df_branch": "Esse branch não existe no repositório.",
+      "dfh_branch": "Confira o nome do branch. Normalmente é main ou master.",
+      "df_stack": "Não reconheci o tipo do projeto.",
+      "dfh_stack": "O painel monta sozinho projetos Node, Python, Go, .NET e sites estáticos. Para outros, coloque um Dockerfile no repositório.",
+      "df_memory": "Faltou memória para montar ou rodar o app.",
+      "dfh_memory": "Aumente a memória máxima em Mais opções (por exemplo 1g) e publique de novo.",
+      "df_build": "A montagem do app falhou.",
+      "dfh_build": "Costuma ser um erro no código ou numa dependência. As últimas linhas dos detalhes mostram onde. Corrija no repositório e publique de novo.",
+      "df_network": "O servidor não conseguiu acessar a internet.",
+      "dfh_network": "Confira a conexão do servidor e tente de novo em alguns minutos.",
+      "df_trash": "Esse app está na lixeira.",
+      "dfh_trash": "Restaure ou apague de vez na lista Seus apps antes de publicar com esse nome.",
+      "df_name": "Já existe um app com esse nome.",
+      "dfh_name": "Escolha outro nome. O app que já existe continua como está.",
+      "df_other": "Não deu para publicar.",
+      "dfh_other": "O erro está nos detalhes. Se não ficar claro, o Diagnóstico confere o servidor.",
+      "dfDetails": "Detalhes técnicos",
+      "dfAct_github": "Conectar o GitHub",
+      "dfAct_options": "Abrir Mais opções",
+      "dfAct_guide": "Ver o guia",
+      "dfAct_trash": "Ver Seus apps",
+      "dfAct_doctor": "Abrir o Diagnóstico",
+      "dfOkTitle": "Publicado: {app}",
+      "dfOkNext": "Próximo passo: dar um endereço para abrir o app de qualquer lugar.",
+      "dfOkLive": "O app está no ar em:",
+      "dfOkExpose": "Dar um endereço",
+      "dfOkList": "Ver Seus apps"
+    });
+    Object.assign(I18N.en, {
+      "df_healthcheck": "The new version did not answer and was not put live.",
+      "dfh_healthcheck": "The previous version is still running. The app's error is in the details. If it is not a website (a bot or a background task), tick “Not a website” under More options.",
+      "df_access": "Could not download the code.",
+      "dfh_access": "Check the repository name (owner/name). If it is private, connect GitHub.",
+      "df_branch": "That branch does not exist in the repository.",
+      "dfh_branch": "Check the branch name. It is usually main or master.",
+      "df_stack": "Could not tell what kind of project this is.",
+      "dfh_stack": "The dashboard builds Node, Python, Go, .NET and static sites by itself. For anything else, add a Dockerfile to the repository.",
+      "df_memory": "Ran out of memory while building or running the app.",
+      "dfh_memory": "Raise the maximum memory under More options (for example 1g) and publish again.",
+      "df_build": "Building the app failed.",
+      "dfh_build": "This is usually an error in the code or in a dependency. The last lines of the details show where. Fix it in the repository and publish again.",
+      "df_network": "The server could not reach the internet.",
+      "dfh_network": "Check the server's connection and try again in a few minutes.",
+      "df_trash": "This app is in the trash.",
+      "dfh_trash": "Restore it or delete it for good in Your apps before publishing with this name.",
+      "df_name": "An app with this name already exists.",
+      "dfh_name": "Pick another name. The existing app stays as it is.",
+      "df_other": "Could not publish.",
+      "dfh_other": "The error is in the details. If it is not clear, Diagnostics checks the server.",
+      "dfDetails": "Technical details",
+      "dfAct_github": "Connect GitHub",
+      "dfAct_options": "Open More options",
+      "dfAct_guide": "See the guide",
+      "dfAct_trash": "See Your apps",
+      "dfAct_doctor": "Open Diagnostics",
+      "dfOkTitle": "Published: {app}",
+      "dfOkNext": "Next step: give it an address so you can open it from anywhere.",
+      "dfOkLive": "The app is live at:",
+      "dfOkExpose": "Give it an address",
+      "dfOkList": "See Your apps"
+    });
+
+    Object.assign(I18N.pt, {
+      "life_restart": "{app} foi reiniciado.",
+      "life_stop": "{app} foi parado.",
+      "life_start": "{app} foi ligado.",
+      "life_rollback": "{app} voltou para a versão anterior.",
+      "life_destroy": "{app} foi para a lixeira. Dá para restaurar na lista Seus apps.",
+      "life_restore": "{app} saiu da lixeira e está ligado.",
+      "life_purge": "{app} foi apagado de vez.",
+      "lifePoolUpdating": "As cópias nos PCs ajudantes estão sendo atualizadas.",
+      "lifePoolFailed": "As cópias nos PCs ajudantes não foram atualizadas (veja a tela Ajudantes).",
+      "lifeErrNoPrevious": "Ainda não existe uma versão anterior guardada desse app. Ela aparece depois da próxima publicação.",
+      "lifeErr": "Não deu para fazer isso agora.",
+      "logsEmpty": "O app ainda não escreveu nada.",
+      "logsHint": "As linhas mais recentes ficam no fim. Erros costumam aparecer com Error, Exception ou Traceback.",
+      "actionRollbackTip": "Volta para a versão publicada antes desta, em segundos"
+    });
+    Object.assign(I18N.en, {
+      "life_restart": "{app} was restarted.",
+      "life_stop": "{app} was stopped.",
+      "life_start": "{app} was started.",
+      "life_rollback": "{app} is back on the previous version.",
+      "life_destroy": "{app} went to the trash. You can restore it in Your apps.",
+      "life_restore": "{app} left the trash and is running.",
+      "life_purge": "{app} was deleted for good.",
+      "lifePoolUpdating": "Copies on helper PCs are being updated.",
+      "lifePoolFailed": "Copies on helper PCs were not updated (see the Helpers screen).",
+      "lifeErrNoPrevious": "There is no earlier version of this app saved yet. One appears after the next publish.",
+      "lifeErr": "Could not do that right now.",
+      "logsEmpty": "The app has not written anything yet.",
+      "logsHint": "The newest lines are at the end. Errors usually show up with Error, Exception or Traceback.",
+      "actionRollbackTip": "Goes back to the version published before this one, in seconds"
+    });
+
+    Object.assign(I18N.pt, {
+      "appNoAddressTip": "Este app ainda não tem endereço. Clique para dar um.",
+      "pillLocalOnly": "Só neste servidor",
+      "mode_public": "público",
+      "mode_zero-trust": "só e-mails autorizados",
+      "mode_tailscale": "só a minha rede",
+      "mode_local": "rede de casa",
+      "limitsLabel": "Limite: {mem} de memória, {cpu} CPU",
+      "expListTitle": "Endereços publicados",
+      "btnUnexpose": "Tirar do ar",
+      "toastUnexposed": "Endereço tirado do ar: "
+    });
+    Object.assign(I18N.en, {
+      "appNoAddressTip": "This app has no address yet. Click to give it one.",
+      "pillLocalOnly": "Only on this server",
+      "mode_public": "public",
+      "mode_zero-trust": "authorized emails only",
+      "mode_tailscale": "my network only",
+      "mode_local": "home network",
+      "limitsLabel": "Limit: {mem} memory, {cpu} CPU",
+      "expListTitle": "Published addresses",
+      "btnUnexpose": "Take offline",
+      "toastUnexposed": "Address taken offline: "
+    });
+
+    Object.assign(I18N.pt, {
+      "doc_app_registered": "Registrado, respondendo só neste servidor (porta {port}).",
+      "doc_app_ok": "Ligado e saudável (porta {port} neste servidor).",
+      "doc_app_oom": "O app foi derrubado por falta de memória.",
+      "docr_app_oom": "Aumente a memória máxima em Publicar um app → Mais opções e publique de novo, ou reduza o uso de memória do app.",
+      "doc_app_down": "O app não está rodando (estado {status}, código de saída {exitCode}).",
+      "docr_app_down": "Abra os Logs do app para ver o erro. Confira as Variáveis (falta alguma senha?) ou use Voltar versão.",
+      "doc_app_restarts": "O app está ligado, mas já reiniciou sozinho {count} vezes.",
+      "docr_app_restarts": "Abra os Logs para ver por que ele cai de vez em quando.",
+      "doc_app_missing": "O app não foi encontrado no Docker.",
+      "docr_app_missing": "Use Publicar de novo na lista Seus apps para recriá-lo.",
+      "doc_app_missing_stopped": "O app está parado e não existe no Docker agora.",
+      "doc_dns_ok": "O servidor resolve nomes da internet (DNS funcionando).",
+      "doc_dns_fail": "O servidor não consegue resolver nomes da internet (DNS). Sem isso, endereço público, publicação e PCs ajudantes param.",
+      "docr_dns_fail": "Se o DNS roda nesta mesma máquina (AdGuard Home, Pi-hole), confira se ele está ligado e dê ao servidor um DNS reserva: em /etc/systemd/resolved.conf coloque FallbackDNS=1.1.1.1 9.9.9.9 e faça o /etc/resolv.conf apontar para o systemd-resolved.",
+      "doc_wt_label_mode": "O Watchtower roda aqui, mas só atualiza o que foi marcado para ele, então não mexe no PaaSMCP.",
+      "doc_wt_all_labeled": "O Watchtower roda aqui e todos os contêineres do PaaSMCP estão marcados para ele pular.",
+      "doc_wt_unlabeled": "O Watchtower roda aqui e pode reiniciar sozinho {count} contêiner(es) do PaaSMCP: {names}. Um reinício surpresa do banco ou de um app parece uma queda.",
+      "docr_wt_unlabeled": "Os contêineres novos já saem marcados; esses antigos ganham a marca na próxima publicação. Até lá, o mais simples: rode o Watchtower com WATCHTOWER_LABEL_ENABLE=true e marque só o que você quer que ele atualize.",
+      "doc_net_clash": "Uma rede do Docker cobre uma rede deste servidor ({clash}). O tráfego para esses endereços vai para o Docker em vez da rede de casa ou do Tailscale.",
+      "docr_net_clash": "Dê ao Docker uma faixa própria: em /etc/docker/daemon.json adicione \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}], reinicie o Docker num momento calmo e recrie a rede que conflita.",
+      "doc_net_pool": "O Docker já usou {used} das suas {total} redes padrão. As próximas vêm de 192.168.x.0/20, que pode cobrir a rede de casa.",
+      "docr_net_pool": "Antes disso, dê ao Docker uma faixa própria: em /etc/docker/daemon.json adicione \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}] e reinicie o Docker num momento calmo. Só vale para redes criadas depois.",
+      "doc_tunnel_net": "O contêiner do Cloudflare Tunnel ({names}) não está na rede {network}, então os endereços públicos responderiam com erro 502.",
+      "docr_tunnel_net": "Ligue-o à rede: docker network connect {network} {first} (e adicione a rede no compose dele para continuar depois de reiniciar)."
+    });
+    Object.assign(I18N.en, {
+      "doc_app_registered": "Registered, answering only on this server (port {port}).",
+      "doc_app_ok": "Running and healthy (port {port} on this server).",
+      "doc_app_oom": "The app was stopped for running out of memory.",
+      "docr_app_oom": "Raise the maximum memory under Publish an app → More options and publish again, or make the app use less memory.",
+      "doc_app_down": "The app is not running (state {status}, exit code {exitCode}).",
+      "docr_app_down": "Open the app's Logs to see the error. Check its Variables (a missing password?) or use Roll back.",
+      "doc_app_restarts": "The app is running, but has restarted on its own {count} times.",
+      "docr_app_restarts": "Open the Logs to see why it falls over now and then.",
+      "doc_app_missing": "The app was not found in Docker.",
+      "docr_app_missing": "Use Publish again in Your apps to recreate it.",
+      "doc_app_missing_stopped": "The app is stopped and does not exist in Docker right now.",
+      "doc_dns_ok": "This server resolves internet names (DNS works).",
+      "doc_dns_fail": "This server cannot resolve internet names (DNS). Without it, public addresses, publishing and helper PCs stop working.",
+      "docr_dns_fail": "If the DNS server runs on this same machine (AdGuard Home, Pi-hole), check that it is up and give the server a fallback: in /etc/systemd/resolved.conf set FallbackDNS=1.1.1.1 9.9.9.9 and make /etc/resolv.conf point to systemd-resolved.",
+      "doc_wt_label_mode": "Watchtower runs here, but only updates what is marked for it, so it leaves PaaSMCP alone.",
+      "doc_wt_all_labeled": "Watchtower runs here and every PaaSMCP container is marked for it to skip.",
+      "doc_wt_unlabeled": "Watchtower runs here and may restart {count} PaaSMCP container(s) on its own: {names}. A surprise restart of the database or an app looks like an outage.",
+      "docr_wt_unlabeled": "New containers are already marked; these older ones get the mark on their next publish. Until then, the simplest fix: run Watchtower with WATCHTOWER_LABEL_ENABLE=true and mark only what you want it to update.",
+      "doc_net_clash": "A Docker network covers one of this server's networks ({clash}). Traffic to those addresses goes into Docker instead of the home network or Tailscale.",
+      "docr_net_clash": "Give Docker a range of its own: in /etc/docker/daemon.json add \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}], restart Docker in a quiet moment, then recreate the clashing network.",
+      "doc_net_pool": "Docker has used {used} of its {total} default networks. The next ones come from 192.168.x.0/20, which can cover a home network.",
+      "docr_net_pool": "Before that happens, give Docker a range of its own: in /etc/docker/daemon.json add \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}] and restart Docker in a quiet moment. It only affects networks created afterwards.",
+      "doc_tunnel_net": "The Cloudflare Tunnel container ({names}) is not on the {network} network, so public addresses would answer with error 502.",
+      "docr_tunnel_net": "Connect it: docker network connect {network} {first} (and add the network to its compose file so it stays after a restart)."
+    });
+
+    // A doctor finding in the screen's language when it carries a known code; the server's English text otherwise.
+    function docText(d, field) {
+      const key = (field === 'summary' ? 'doc_' : 'docr_') + (d.code || '');
+      if (!d.code || !I18N.en['doc_' + d.code]) return field === 'summary' ? d.summary : d.recommendation;
+      if (!I18N.en[key]) return field === 'summary' ? d.summary : '';
+      let txt = t(key);
+      for (const [k, v] of Object.entries(d.vars || {})) txt = txt.split('{' + k + '}').join(String(v));
+      return txt;
+    }
+
+    Object.assign(I18N.pt, {
+      "sub_connect_pcs": "PCs",
+      "pcsDesc": "Todos os aparelhos da sua rede Tailscale, e quais já têm o PaaSMCP. Num PC Linux sem PaaSMCP, o botão Instalar entra nele uma vez, confere o que ele tem e só instala depois da sua confirmação.",
+      "pcsBtnInstall": "Instalar o PaaSMCP",
+      "pcsFormTitle": "Instalar o PaaSMCP em {name}",
+      "pcsFormDesc": "O painel entra no PC pela Tailscale, confere o sistema e o que falta, e só instala depois que você escolher o papel e confirmar. A senha fica só na memória durante a instalação: não é salva em lugar nenhum.",
+      "pcsUser": "Usuário no PC",
+      "pcsPass": "Senha",
+      "pcsPassHint": "O usuário e a senha com que você entra nesse PC. O usuário precisa poder usar o sudo, e a mesma senha serve para ele.",
+      "pcsPassHintTs": "O SSH da Tailscale entra sem senha. Deixe a senha vazia se entrar como root; com outro usuário, digite a senha dele para o sudo.",
+      "pcsBtnCheck": "Entrar e conferir",
+      "pcsCancelBtn": "Cancelar",
+      "pcsCloseBtn": "Fechar",
+      "pcsAuthUrl": "A regra do SSH da sua Tailscale pede que você confirme a entrada:",
+      "pcsAuthOpen": "abrir a confirmação da Tailscale",
+      "pcsStep_connect": "Entrar no PC",
+      "pcsStep_check": "Conferir o PC (só leitura)",
+      "pcsStep_packages": "Instalar git e Docker que faltarem",
+      "pcsStep_node": "Node.js",
+      "pcsStep_code": "Baixar e montar o PaaSMCP desta versão",
+      "pcsStep_role": "Preparar o papel do PC",
+      "pcsStep_finish": "Terminar e sair do PC",
+      "pcsFactSystem": "Sistema",
+      "pcsFactSize": "Tamanho",
+      "pcsFactFree": "livres",
+      "pcsFactUser": "Usuário",
+      "pcsSudo_root": "é o root",
+      "pcsSudo_nopass": "sudo sem senha",
+      "pcsSudo_password": "sudo com a senha",
+      "pcsSudo_none": "sem sudo",
+      "pcsWillInstall": "Vai instalar o que falta: {list}, e o PaaSMCP em /opt/paasmcp.",
+      "pcsNothingMissing": "Nada falta além do PaaSMCP, que vai para /opt/paasmcp.",
+      "pcsPkg_git": "git",
+      "pcsPkg_docker": "Docker",
+      "pcsPkg_compose": "Docker Compose",
+      "pcsPkg_node": "Node.js 20 ou mais novo",
+      "pcsPkg_sshd": "servidor SSH",
+      "pcsWarn_diskLow": "Pouco espaço livre (menos de 4 GB): cabe o PaaSMCP, mas sobra pouco para apps.",
+      "pcsWarn_memLow": "Menos de 1 GB de memória: serve como juiz, mas não para rodar apps.",
+      "pcsWarn_archDiffers": "Esse PC tem outro tipo de processador (ARM ou x86) que este servidor: como ajudante, ele só recebe cópias de apps com imagem para ele.",
+      "pcsWarn_hasPaasmcp": "Já existe PaaSMCP em /opt/paasmcp nesse PC: ele vai para a versão deste servidor.",
+      "pcsKeyPinned": "Identidade do PC conferida com a chave que a Tailscale conhece dele:",
+      "pcsKeyFirst": "Chave do PC aceita nesta primeira entrada (a Tailscale já garante que esse IP é desse aparelho):",
+      "pcsRoleTitle": "O que esse PC vai ser",
+      "pcsRole_serverTitle": "Servidor independente",
+      "pcsRole_serverDesc": "Um PaaSMCP com painel próprio nesse PC, para publicar apps nele.",
+      "pcsRole_helperTitle": "Ajudante deste servidor",
+      "pcsRole_helperDesc": "Este servidor roda nele cópias dos apps que você escolher, quando precisar de mais força. Aparece em Ajudantes.",
+      "pcsRole_arbiterTitle": "Juiz deste par de servidores",
+      "pcsRole_arbiterDesc": "O voto de desempate da troca automática. Precisa ficar ligado 24 h e não pode ser um dos dois servidores.",
+      "pcsName": "Nome do PC no PaaSMCP",
+      "pcsTsOff": "Desligar o SSH da Tailscale nesse PC no fim (recomendado: ninguém entra mais sem senha)",
+      "pcsTsOffHelper": "O SSH da Tailscale vai ser desligado no fim: as ordens deste servidor para o ajudante passam pelo SSH comum, com a chave restrita que o ajudante aceita",
+      "pcsBtnGo": "Instalar",
+      "pcsReadyUntil": "Nada foi mudado no PC ainda. Esta conferência vale por 15 minutos.",
+      "pcsInstalling": "Isso leva de 3 a 15 minutos, conforme o que falta e a internet do PC. Pode sair desta tela: a instalação continua.",
+      "pcsLog": "Ver o registro",
+      "pcsDoneServer": "Pronto: {name} tem o PaaSMCP com painel próprio em {url} (no próprio PC). Para entrar nele, rode lá: sudo paasmcp dashboard token.",
+      "pcsDoneHelper": "Pronto: {name} já é ajudante e aparece em Ajudantes.",
+      "pcsDoneArbiter": "Pronto: {name} é o juiz deste par ({url}).",
+      "pcsDoneTsOff": "O SSH da Tailscale foi desligado nele.",
+      "pcsGoHelpers": "Abrir Ajudantes",
+      "pcsCancelled": "Cancelado. Nada foi instalado.",
+      "pcsHint_auth": "Confira o usuário e a senha. Pelo SSH da Tailscale, a regra de acesso (ACL) da sua Tailscale precisa deixar este servidor entrar como esse usuário. Depois de 3 erros, espere 10 minutos.",
+      "pcsHint_hostKey": "Pode ser que o PC tenha sido reinstalado. Se não foi, alguém pode estar se passando por ele: confira antes de tentar de novo.",
+      "pcsHint_unreachable": "Ligue o SSH no PC: sudo tailscale set --ssh (sem senha) ou sudo apt install openssh-server.",
+      "pcsHint_sudoPassword": "Esse usuário precisa poder usar o sudo, com a mesma senha que você digitou.",
+      "pcsHint_remote": "Veja no registro a última coisa que o PC respondeu. Dá para tentar de novo: os passos que já deram certo são pulados ou refeitos sem estragar nada.",
+      "pcsProblem_notDebian": "Por enquanto, a instalação pelo painel é só para Debian e Ubuntu.",
+      "pcsProblem_arch": "Tipo de processador sem suporte (precisa ser x86-64 ou ARM64).",
+      "pcsProblem_systemd": "O PC não usa systemd, que o Docker precisa para voltar sozinho depois de reiniciar.",
+      "pcsProblem_disk": "Menos de 1,5 GB livres no disco.",
+      "pcsProblem_noSudo": "Esse usuário não tem sudo. Entre como root ou com um usuário que tenha.",
+      "pcsProblem_sudoNeedsPassword": "O sudo desse usuário pede senha: digite a senha e confira de novo.",
+      "pcsProblem_tailscale": "A Tailscale não aparece nesse PC para esse usuário.",
+      "pcsTitle": "🖥️ PCs da sua Tailscale",
+      "pcsRefresh": "Procurar de novo",
+      "pcsLooking": "Procurando os aparelhos da Tailscale...",
+      "pcsNoTs": "O painel não achou a Tailscale neste servidor. Confira se ela está instalada e conectada (tailscale status).",
+      "pcsNone": "A Tailscale não mostra nenhum outro aparelho. Instale a Tailscale no outro PC e entre com a mesma conta.",
+      "pcsHas": "Tem PaaSMCP",
+      "pcsRole_pair": "o outro servidor do par",
+      "pcsRole_helper": "ajudante",
+      "pcsRole_federation": "servidor ligado",
+      "pcsRole_arbiter": "juiz",
+      "pcsRole_installed": "instalado por este painel",
+      "pcsCan": "Sem PaaSMCP",
+      "pcsOffline": "Desligado",
+      "pcsWhy_notLinux": "Não é Linux",
+      "pcsWhy_shared": "Compartilhado de outra conta",
+      "pcsWhy_otherOwner": "De outra pessoa da rede",
+      "pcsWhy_noIp": "Sem endereço Tailscale",
+      "pcsSsh_tailscale": "Entrada sem senha: o SSH da Tailscale está ligado nele.",
+      "pcsSsh_openssh": "Entrada com a senha do PC (SSH ligado).",
+      "pcsSsh_other": "Algo responde na porta do SSH, mas não parece um SSH conhecido.",
+      "pcsSsh_closed": "Nenhum SSH responde nele. Para instalar daqui, ligue o SSH da Tailscale (sudo tailscale set --ssh) ou o SSH comum (sudo apt install openssh-server)."
+    });
+    Object.assign(I18N.en, {
+      "sub_connect_pcs": "PCs",
+      "pcsDesc": "Every device of your Tailscale network, and which ones already run PaaSMCP. On a Linux PC without PaaSMCP, the Install button logs in once, checks what it has, and only installs after you confirm.",
+      "pcsBtnInstall": "Install PaaSMCP",
+      "pcsFormTitle": "Install PaaSMCP on {name}",
+      "pcsFormDesc": "The dashboard logs in to the PC through Tailscale, checks the system and what is missing, and only installs after you pick the role and confirm. The password stays in memory during the install only: it is saved nowhere.",
+      "pcsUser": "User on the PC",
+      "pcsPass": "Password",
+      "pcsPassHint": "The user and password you log in with on that PC. The user must be allowed to use sudo, with the same password.",
+      "pcsPassHintTs": "Tailscale SSH needs no password. Leave it empty to log in as root; with another user, type its password for sudo.",
+      "pcsBtnCheck": "Log in and check",
+      "pcsCancelBtn": "Cancel",
+      "pcsCloseBtn": "Close",
+      "pcsAuthUrl": "Your Tailscale SSH rule asks you to confirm the login:",
+      "pcsAuthOpen": "open Tailscale's confirmation",
+      "pcsStep_connect": "Log in to the PC",
+      "pcsStep_check": "Check the PC (read-only)",
+      "pcsStep_packages": "Install the git and Docker it lacks",
+      "pcsStep_node": "Node.js",
+      "pcsStep_code": "Get and build PaaSMCP at this version",
+      "pcsStep_role": "Set up the PC's role",
+      "pcsStep_finish": "Finish and log out",
+      "pcsFactSystem": "System",
+      "pcsFactSize": "Size",
+      "pcsFactFree": "free",
+      "pcsFactUser": "User",
+      "pcsSudo_root": "is root",
+      "pcsSudo_nopass": "sudo without a password",
+      "pcsSudo_password": "sudo with the password",
+      "pcsSudo_none": "no sudo",
+      "pcsWillInstall": "It will install what is missing: {list}, and PaaSMCP in /opt/paasmcp.",
+      "pcsNothingMissing": "Nothing is missing but PaaSMCP, which goes to /opt/paasmcp.",
+      "pcsPkg_git": "git",
+      "pcsPkg_docker": "Docker",
+      "pcsPkg_compose": "Docker Compose",
+      "pcsPkg_node": "Node.js 20 or newer",
+      "pcsPkg_sshd": "SSH server",
+      "pcsWarn_diskLow": "Little free space (under 4 GB): PaaSMCP fits, but little is left for apps.",
+      "pcsWarn_memLow": "Under 1 GB of memory: fine as an arbiter, not for running apps.",
+      "pcsWarn_archDiffers": "This PC has another kind of processor (ARM or x86) than this server: as a helper it only gets copies of apps with an image for it.",
+      "pcsWarn_hasPaasmcp": "There is already PaaSMCP in /opt/paasmcp on this PC: it moves to this server's version.",
+      "pcsKeyPinned": "PC identity checked against the key Tailscale knows for it:",
+      "pcsKeyFirst": "PC key accepted on this first login (Tailscale already ensures this IP is that device):",
+      "pcsRoleTitle": "What this PC will be",
+      "pcsRole_serverTitle": "Independent server",
+      "pcsRole_serverDesc": "A PaaSMCP with its own dashboard on that PC, to publish apps on it.",
+      "pcsRole_helperTitle": "Helper of this server",
+      "pcsRole_helperDesc": "This server runs copies of the apps you choose on it when it needs more power. It shows up in Helpers.",
+      "pcsRole_arbiterTitle": "Arbiter of this pair of servers",
+      "pcsRole_arbiterDesc": "The tie-breaking vote for automatic takeover. It must stay on 24 h and cannot be one of the two servers.",
+      "pcsName": "PC name in PaaSMCP",
+      "pcsTsOff": "Turn off Tailscale SSH on that PC at the end (recommended: nobody logs in without a password any more)",
+      "pcsTsOffHelper": "Tailscale SSH will be turned off at the end: this server's orders to the helper go through regular SSH, with the restricted key the helper accepts",
+      "pcsBtnGo": "Install",
+      "pcsReadyUntil": "Nothing was changed on the PC yet. This check is valid for 15 minutes.",
+      "pcsInstalling": "This takes 3 to 15 minutes, depending on what is missing and the PC's internet. You can leave this screen: the install goes on.",
+      "pcsLog": "See the log",
+      "pcsDoneServer": "Done: {name} runs PaaSMCP with its own dashboard at {url} (on that PC). To sign in there, run on it: sudo paasmcp dashboard token.",
+      "pcsDoneHelper": "Done: {name} is a helper now and shows up in Helpers.",
+      "pcsDoneArbiter": "Done: {name} is the arbiter of this pair ({url}).",
+      "pcsDoneTsOff": "Tailscale SSH was turned off on it.",
+      "pcsGoHelpers": "Open Helpers",
+      "pcsCancelled": "Cancelled. Nothing was installed.",
+      "pcsHint_auth": "Check the user and password. With Tailscale SSH, your Tailscale access rules (ACL) must let this server in as that user. After 3 failures, wait 10 minutes.",
+      "pcsHint_hostKey": "The PC may have been reinstalled. If not, someone may be posing as it: check before trying again.",
+      "pcsHint_unreachable": "Turn SSH on there: sudo tailscale set --ssh (no password) or sudo apt install openssh-server.",
+      "pcsHint_sudoPassword": "That user must be allowed to use sudo, with the password you typed.",
+      "pcsHint_remote": "The log shows the last thing the PC answered. You can try again: steps that already worked are skipped or redone without harm.",
+      "pcsProblem_notDebian": "For now, installing from the dashboard is for Debian and Ubuntu only.",
+      "pcsProblem_arch": "Unsupported processor (it must be x86-64 or ARM64).",
+      "pcsProblem_systemd": "The PC does not use systemd, which Docker needs to come back after a reboot.",
+      "pcsProblem_disk": "Under 1.5 GB free on the disk.",
+      "pcsProblem_noSudo": "That user has no sudo. Log in as root or with a user that has it.",
+      "pcsProblem_sudoNeedsPassword": "That user's sudo asks for a password: type it and check again.",
+      "pcsProblem_tailscale": "Tailscale does not show up on that PC for that user.",
+      "pcsTitle": "🖥️ PCs of your Tailscale",
+      "pcsRefresh": "Look again",
+      "pcsLooking": "Looking for the Tailscale devices...",
+      "pcsNoTs": "The dashboard did not find Tailscale on this server. Check that it is installed and connected (tailscale status).",
+      "pcsNone": "Tailscale shows no other device. Install Tailscale on the other PC and sign in with the same account.",
+      "pcsHas": "Runs PaaSMCP",
+      "pcsRole_pair": "the other server of the pair",
+      "pcsRole_helper": "helper",
+      "pcsRole_federation": "linked server",
+      "pcsRole_arbiter": "arbiter",
+      "pcsRole_installed": "installed from this dashboard",
+      "pcsCan": "No PaaSMCP",
+      "pcsOffline": "Off",
+      "pcsWhy_notLinux": "Not Linux",
+      "pcsWhy_shared": "Shared from another account",
+      "pcsWhy_otherOwner": "Someone else's in the network",
+      "pcsWhy_noIp": "No Tailscale address",
+      "pcsSsh_tailscale": "Login without a password: Tailscale SSH is on there.",
+      "pcsSsh_openssh": "Login with the PC's password (SSH is on).",
+      "pcsSsh_other": "Something answers on the SSH port, but it does not look like a known SSH.",
+      "pcsSsh_closed": "No SSH answers there. To install from here, turn on Tailscale SSH (sudo tailscale set --ssh) or regular SSH (sudo apt install openssh-server)."
+    });
+    Object.assign(I18N.pt, {
+      "sub_connect_alerts": "Avisos",
+      "ntTitle": "🔔 Avisos no celular ou no chat",
+      "ntDesc": "O painel avisa quando uma publicação automática (git push ou atualização sozinha) falha e quando um app para sozinho, e de novo quando ele volta. Assim você fica sabendo sem abrir o painel.",
+      "ntHow": "Cole um destes endereços:",
+      "ntHowNtfy": "Celular: instale o app ntfy (grátis), assine um tópico com um nome difícil de adivinhar e cole https://ntfy.sh/seu-topico.",
+      "ntHowDiscord": "Discord: no canal, Editar canal → Integrações → Webhooks → Novo webhook → Copiar URL.",
+      "ntHowSlack": "Slack: crie um app com Incoming Webhooks e copie a Webhook URL.",
+      "ntUrl": "Endereço dos avisos",
+      "ntOnSuccess": "Avisar também quando a publicação automática der certo",
+      "ntSave": "Mandar teste e salvar",
+      "ntSending": "Mandando um aviso de teste...",
+      "ntSaved": "Aviso de teste enviado e endereço salvo.",
+      "ntOn": "Avisos ligados",
+      "ntOnDesc": "Para {host}. Publicações que falharem e apps que pararem vão gerar um aviso{success}.",
+      "ntOnSuccessShort": ", e as automáticas que derem certo também",
+      "ntChange": "Trocar endereço",
+      "ntOff": "Desligar avisos",
+      "ntOffConfirm": "Desligar os avisos?",
+      "tut_alerts": "Receber avisos quando algo falhar",
+      "tut_alertsDesc": "No celular (ntfy), no Discord ou no Slack."
+    });
+    Object.assign(I18N.en, {
+      "sub_connect_alerts": "Notices",
+      "ntTitle": "🔔 Notices on your phone or chat",
+      "ntDesc": "The dashboard tells you when an automatic publish (git push or self-update) fails and when an app stops on its own, and again when it is back, so you know without opening the dashboard.",
+      "ntHow": "Paste one of these addresses:",
+      "ntHowNtfy": "Phone: install the ntfy app (free), subscribe to a topic with a hard-to-guess name and paste https://ntfy.sh/your-topic.",
+      "ntHowDiscord": "Discord: in the channel, Edit channel → Integrations → Webhooks → New webhook → Copy URL.",
+      "ntHowSlack": "Slack: create an app with Incoming Webhooks and copy the Webhook URL.",
+      "ntUrl": "Notice address",
+      "ntOnSuccess": "Also tell me when an automatic publish works",
+      "ntSave": "Send a test and save",
+      "ntSending": "Sending a test notice...",
+      "ntSaved": "Test notice sent and address saved.",
+      "ntOn": "Notices on",
+      "ntOnDesc": "To {host}. Failed publishes and apps that stop send a notice{success}.",
+      "ntOnSuccessShort": ", and so do automatic ones that work",
+      "ntChange": "Change address",
+      "ntOff": "Turn notices off",
+      "ntOffConfirm": "Turn notices off?",
+      "tut_alerts": "Get a notice when something fails",
+      "tut_alertsDesc": "On your phone (ntfy), Discord or Slack."
+    });
+
+    Object.assign(I18N.pt, {
+      "tplTitle": "📦 Apps prontos",
+      "tplDesc": "Sem repositório: escolha um app conhecido e o painel instala a versão testada, com os dados guardados entre atualizações.",
+      "tpl_uptime-kuma": "Uptime Kuma",
+      "tpl_uptime-kumaDesc": "Vigia seus sites e serviços e avisa quando algum cai.",
+      "tpl_memos": "Memos",
+      "tpl_memosDesc": "Anotações rápidas e privadas, como um Twitter só seu.",
+      "tpl_it-tools": "IT Tools",
+      "tpl_it-toolsDesc": "Dezenas de ferramentas úteis no navegador: gerar senhas, converter formatos, QR code.",
+      "tplInstall": "Instalar",
+      "tplInstalling": "Instalando...",
+      "tplSite": "Site do projeto",
+      "tplNamePrompt": "Nome do app (letras minúsculas, números e hífen):",
+      "tplFirstAdmin": "Atenção: na primeira visita, quem abrir cria a conta de administrador. Crie a sua logo, ou dê o endereço “Só e-mails autorizados”."
+    });
+    Object.assign(I18N.en, {
+      "tplTitle": "📦 Ready-made apps",
+      "tplDesc": "No repository needed: pick a well-known app and the dashboard installs the tested version, with its data kept across updates.",
+      "tpl_uptime-kuma": "Uptime Kuma",
+      "tpl_uptime-kumaDesc": "Watches your sites and services and tells you when one goes down.",
+      "tpl_memos": "Memos",
+      "tpl_memosDesc": "Quick private notes, like a Twitter of your own.",
+      "tpl_it-tools": "IT Tools",
+      "tpl_it-toolsDesc": "Dozens of handy browser tools: password generator, format converters, QR codes.",
+      "tplInstall": "Install",
+      "tplInstalling": "Installing...",
+      "tplSite": "Project site",
+      "tplNamePrompt": "App name (lowercase letters, numbers and hyphens):",
+      "tplFirstAdmin": "Heads up: on the first visit, whoever opens it creates the admin account. Create yours right away, or give it the “Authorized emails only” address."
+    });
+
+    let tplData = null;
+    async function renderTemplates() {
+      const box = document.getElementById('tplList');
+      if (!box) return;
+      if (!tplData) {
+        const res = await fetch('/api/templates');
+        if (!res.ok) return;
+        tplData = (await res.json()).templates || [];
+      }
+      box.innerHTML = tplData.map(function (tp) {
+        return '<div class="tpl-item"><strong>' + esc(t('tpl_' + tp.id) || tp.id) + '</strong><p>' + esc(t('tpl_' + tp.id + 'Desc')) + '</p>' +
+          '<div class="tpl-row"><a href="' + esc(tp.homepage) + '" target="_blank" rel="noopener noreferrer">' + esc(t('tplSite')) + ' ↗</a>' +
+          '<button class="secondary" data-tpl="' + esc(tp.id) + '" onclick="installTemplate(this.dataset.tpl, this)">' + esc(t('tplInstall')) + '</button></div></div>';
+      }).join('');
+    }
+    async function installTemplate(id, btn) {
+      const tp = (tplData || []).find(function (x) { return x.id === id; });
+      if (!tp) return;
+      const name = (prompt(t('tplNamePrompt'), id) || '').trim().toLowerCase();
+      if (!name) return;
+      const box = document.getElementById('tplResult');
+      box.innerHTML = '';
+      const label = btn.textContent;
+      btn.textContent = t('tplInstalling');
+      btn.disabled = true;
+      try {
+        setTimeout(pollDeploys, 800);
+        const res = await fetch('/api/templates/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, appName: name }) });
+        const data = await res.json().catch(function () { return {}; });
+        if (!res.ok && !data.failure && !data.error) data.error = 'HTTP ' + res.status;
+        box.innerHTML = deployResultHtml(res.ok, name, data) + (res.ok && tp.firstVisitAdmin ? '<p class="ofs-note" style="margin-top:8px;">⚠️ ' + esc(t('tplFirstAdmin')) + '</p>' : '');
+        if (res.ok) { showToast(t('toastDeployDone') + name); loadAll(); }
+        box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } finally {
+        btn.textContent = label;
+        btn.disabled = false;
+      }
+    }
+
+    Object.assign(I18N.pt, {
+      "nbNone": "🌙 Cópia automática: uma por noite, a partir das 3h30 (horário do servidor), de todos os bancos e dados dos apps. Ainda não houve nenhuma.",
+      "nbRunning": "🌙 Cópia automática em andamento desde {when}.",
+      "nbOk": "🌙 Última cópia automática: {when}, {n} arquivo(s).",
+      "nbErr": "🌙 Última cópia automática: {when}, com {n} erro(s). Primeiro: {first}",
+      "nbOffsiteOk": "Enviada para fora do servidor.",
+      "nbOffsiteFailed": "O envio para fora do servidor falhou.",
+      "nbOffsiteNone": "Ficou só neste servidor: configure “Cópias fora do servidor” para não perder tudo se ele quebrar.",
+      "nbNext": "Próxima: toda noite, a partir das 3h30."
+    });
+    Object.assign(I18N.en, {
+      "nbNone": "🌙 Automatic copy: one per night, from 3:30 (server time), of every database and app data. None yet.",
+      "nbRunning": "🌙 Automatic copy running since {when}.",
+      "nbOk": "🌙 Last automatic copy: {when}, {n} file(s).",
+      "nbErr": "🌙 Last automatic copy: {when}, with {n} error(s). First: {first}",
+      "nbOffsiteOk": "Sent off the server.",
+      "nbOffsiteFailed": "Sending it off the server failed.",
+      "nbOffsiteNone": "It stayed only on this server: set up “Off-server backups” so a broken server does not take everything.",
+      "nbNext": "Next: every night, from 3:30."
+    });
+
+    function renderNightly(nb) {
+      const box = document.getElementById('bakNightly');
+      if (!box) return;
+      const when = function (iso) { try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return iso; } };
+      let html;
+      let err = false;
+      if (!nb) html = esc(t('nbNone'));
+      else if (!nb.finishedAt) html = esc(t('nbRunning').split('{when}').join(when(nb.startedAt)));
+      else {
+        const errs = nb.errors || [];
+        err = errs.length > 0 || nb.offsite === 'failed';
+        html = esc(errs.length
+          ? t('nbErr').split('{when}').join(when(nb.finishedAt)).split('{n}').join(String(errs.length)).split('{first}').join(String(errs[0]).slice(0, 200))
+          : t('nbOk').split('{when}').join(when(nb.finishedAt)).split('{n}').join(String(nb.created || 0)));
+        const off = nb.offsite === 'ok' ? t('nbOffsiteOk') : nb.offsite === 'failed' ? t('nbOffsiteFailed') : t('nbOffsiteNone');
+        html += ' ' + esc(off) + (nb.offsite === 'not-configured' ? ' <a href="#databases/offsite">→</a>' : '') + '<br><span style="color:var(--muted);">' + esc(t('nbNext')) + '</span>';
+      }
+      box.className = 'bak-nightly' + (err ? ' err' : '');
+      box.innerHTML = html;
+    }
+
+    Object.assign(I18N.pt, { "logsRefresh": "↻ Atualizar" });
+    Object.assign(I18N.en, { "logsRefresh": "↻ Refresh" });
+
+    Object.assign(I18N.pt, {
+      "bkKind_postgres": "banco PostgreSQL",
+      "bkKind_redis": "cache Redis",
+      "bkKind_volume": "arquivos do app",
+      "bkTest_checked": "A cópia abre: conferida e decifrada.",
+      "bkTest_pg_ok": "A cópia abre: carregada num banco temporário, {n} tabela(s).",
+      "bkTest_volume_ok": "A cópia abre: {n} arquivo(s) e pasta(s).",
+      "bkTest_redis_ok": "A cópia do Redis abre.",
+      "bkTest_redis_bad": "Essa cópia não parece um arquivo do Redis.",
+      "bkRestoredDb": "Banco restaurado.",
+      "bkRestoredVolume": "Arquivos do app restaurados.",
+      "bkSafety": "Antes, o painel guardou uma cópia de como estava, para desfazer se preciso.",
+      "bkErr": "Não deu para fazer isso agora."
+    });
+    Object.assign(I18N.en, {
+      "bkKind_postgres": "PostgreSQL database",
+      "bkKind_redis": "Redis cache",
+      "bkKind_volume": "app files",
+      "bkTest_checked": "The copy opens: checked and decrypted.",
+      "bkTest_pg_ok": "The copy opens: loaded into a temporary database, {n} table(s).",
+      "bkTest_volume_ok": "The copy opens: {n} file(s) and folder(s).",
+      "bkTest_redis_ok": "The Redis copy opens.",
+      "bkTest_redis_bad": "This copy does not look like a Redis file.",
+      "bkRestoredDb": "Database restored.",
+      "bkRestoredVolume": "App files restored.",
+      "bkSafety": "First, the dashboard kept a copy of how it was, to undo if needed.",
+      "bkErr": "Could not do that right now."
+    });
+
+    Object.assign(I18N.pt, {
+      "dbGetsPg": "O app já recebe o endereço do banco em DATABASE_URL (em Variáveis). A senha fica guardada e cifrada.",
+      "dbGetsRedis": "O app já recebe o endereço do cache em REDIS_URL (em Variáveis).",
+      "dbRedeployNote": "Banco criado. Para {app} passar a usá-lo, publique de novo (leva o mesmo tempo de uma atualização)."
+    });
+    Object.assign(I18N.en, {
+      "dbGetsPg": "The app already gets the database address in DATABASE_URL (under Variables). The password is kept encrypted.",
+      "dbGetsRedis": "The app already gets the cache address in REDIS_URL (under Variables).",
+      "dbRedeployNote": "Database created. For {app} to use it, publish it again (takes as long as an update)."
+    });
+
+    function fmtWhen(iso) {
+      try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return String(iso || ''); }
+    }
+    function fmtSize(bytes) {
+      const n = Number(bytes) || 0;
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+      return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    }
 
     function esc(str) {
       return String(str ?? '')
@@ -4626,12 +6429,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     // Pages with more than one part get folder tabs on top and nested items in the side menu.
     const PAGE_SUBS = {
-      home: ['start', 'setup'],
+      home: ['start', 'tutorial'],
       overview: ['list', 'deploy', 'expose', 'scale', 'diary', 'webhook'],
       databases: ['dbs', 'backups', 'offsite', 'files'],
-      mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
+      mirror: ['connect', 'copy', 'judge', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
       agents: ['connect', 'examples'],
+      connect: ['cloudflare', 'github', 'alerts', 'pcs'],
     };
     let activeSubs = {};
     try { activeSubs = JSON.parse(localStorage.getItem('paasmcp_active_subs') || '{}') || {}; } catch { activeSubs = {}; }
@@ -4742,12 +6546,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         activeSubs[tab] = sub;
         try { localStorage.setItem('paasmcp_active_subs', JSON.stringify(activeSubs)); } catch {}
       }
-      const moved = tab !== currentTab || currentSub(tab) !== prevSub;
+      const moved = tab !== currentTab || currentSub(tab) !== prevSub || (tab === 'guide' && sub !== currentGuide);
       if (tab !== currentTab) switchTab(tab, navBtnFor(tab));
       if (mode !== 'init') openSectionOf(tab);
       currentTab = tab;
       renderSubNav();
-      const hash = '#' + tab + (subs ? '/' + currentSub(tab) : '');
+      if (tab === 'guide') { if (sub) currentGuide = sub; renderGuide(); }
+      if (tab === 'overview' && currentSub('overview') === 'webhook' && (moved || mode === 'init')) loadHooks();
+      if (tab === 'connect' && currentSub('connect') === 'pcs' && (moved || mode === 'init')) loadPcs();
+      const hash = '#' + tab + (subs ? '/' + currentSub(tab) : tab === 'guide' && currentGuide ? '/' + currentGuide : '');
       if (mode !== 'hash' && location.hash !== hash) {
         try {
           if (mode === 'init') history.replaceState(null, '', hash);
@@ -4864,6 +6671,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'doctor') runDoctor();
       if (tabName === 'email') loadEmail();
       if (tabName === 'agents') { renderAi(); loadAiTokens(); }
+      if (tabName === 'connect') loadConnections();
+      if (tabName === 'home') loadTutorialExtra();
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') { loadStorage(); loadOffsite(); }
@@ -4918,8 +6727,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
       renderHome();
+      renderExposeHint();
+      renderRepoPick();
+      renderTemplates();
+      const search = document.getElementById('appSearchInput');
+      if (search) search.placeholder = t('appSearch');
       renderAi();
-      renderArbiterInstall();
       for (const k of I18N_KEYS) {
         const el = document.getElementById(k);
         if (el) {
@@ -4964,6 +6777,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           expApp: "ex: meu-saas",
           expSub: "ex: app",
           secKey: "ex: STRIPE_SECRET_KEY",
+          secDesc: "ex: chave da Stripe da loja, conta de produção",
           dbApp: "ex: meu-saas",
           bakApp: "ex: meu-saas",
           fedUrl: "https://paas.seudominio.com"
@@ -4976,6 +6790,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           expApp: "e.g.: my-saas",
           expSub: "e.g.: app",
           secKey: "e.g.: STRIPE_SECRET_KEY",
+          secDesc: "e.g.: the shop's Stripe key, live account",
           dbApp: "e.g.: my-saas",
           bakApp: "e.g.: my-saas",
           fedUrl: "https://paas.yourdomain.com"
@@ -5034,9 +6849,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     function fillExposeMode(mode) {
       document.getElementById('expMode').value = mode;
+      renderExposeHint();
     }
 
     function setVaultScope(scope) {
+      fillScopeSelect(Object.values((lastStatus && lastStatus.apps) || {}));
       document.getElementById('secScope').value = scope;
       loadSecrets();
       goTo('vault');
@@ -5045,6 +6862,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function selectAppForExpose(appName) {
       document.getElementById('expApp').value = appName;
       document.getElementById('expSub').value = appName.replace(/^paasmcp-/, '');
+      renderExposeHint();
       revealEl('expApp');
     }
 
@@ -5137,13 +6955,300 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (BTN_ICONS[name] || '') + '</svg>';
     }
 
+    // Who this server is paired with. The invite side of 'node invite/join' never hears back from the
+    // joiner, so its own pairing list stays empty: the live copy (offers sent, copies received) is what
+    // actually names the other server there. Both sources are merged, by name.
+    // The same server can carry two names (the pairing keeps the generic "primary-node", the copy its
+    // hostname): entries with the same node id are one server, shown by its more specific name.
+    function pairedServers(s) {
+      const byKey = {};
+      const add = function (key, name, how) {
+        if (!name) return;
+        const e = byKey[key] = byKey[key] || { name: name };
+        if (e.name === 'primary-node' && name !== 'primary-node') e.name = name;
+        e[how] = true;
+      };
+      Object.values(s.federation?.peers || {}).forEach(function (p) { add(p.nodeId ? 'id:' + p.nodeId : 'name:' + p.name, p.name, 'paired'); });
+      const m = s.mirror || {};
+      Object.values(m.replicas || {}).forEach(function (r) { add(r.peerNodeId ? 'id:' + r.peerNodeId : 'name:' + r.peerName, r.peerName, 'receiving'); });
+      Object.entries(m.offers || {}).forEach(function ([k, o]) {
+        const name = o.peer || k;
+        const same = Object.keys(byKey).find(function (key) { return byKey[key].name === name; });
+        add(same || 'name:' + name, name, 'sending');
+      });
+      const out = {};
+      Object.values(byKey).forEach(function (e) { out[e.name] = Object.assign(out[e.name] || {}, e); });
+      return out;
+    }
+    // Live state of the copy (GET /api/mirror asks Postgres), refreshed at most every 30 s.
+    let mirrorLive = null;
+    let mirrorLiveAt = 0;
+    let mirrorLiveBusy = false;
+    function refreshMirrorLive(s) {
+      const m = s.mirror || {};
+      if (!Object.keys(m.offers || {}).length && !Object.keys(m.replicas || {}).length) { mirrorLive = null; return; }
+      if (mirrorLiveBusy || Date.now() - mirrorLiveAt < 30000) return;
+      mirrorLiveBusy = true;
+      mirrorLiveAt = Date.now();
+      fetch('/api/mirror').then(function (r) { return r.ok ? r.json() : null; }).then(function (live) {
+        mirrorLiveBusy = false;
+        if (!live) return;
+        mirrorLive = live;
+        mirrorLiveAt = Date.now();
+        if (lastStatus) renderStatusData(lastStatus);
+        renderHome();
+      }).catch(function () { mirrorLiveBusy = false; });
+    }
+    // The second server in one line: 'none' | 'paired' (no copy) | 'on' | 'stopped' | 'fenced'.
+    function mirrorSummary(s) {
+      const m = s.mirror || {};
+      const peers = pairedServers(s);
+      const names = Object.keys(peers);
+      const copyNames = names.filter(function (n) { return peers[n].sending || peers[n].receiving; });
+      if (m.fenced) return { state: 'fenced', names: names, copyNames: copyNames, down: [] };
+      if (!copyNames.length) return { state: names.length ? 'paired' : 'none', names: names, copyNames: copyNames, down: [] };
+      const down = [];
+      if (mirrorLive) {
+        (mirrorLive.sending || []).forEach(function (o) { if (o.error || !o.connected) down.push(o.peer); });
+        (mirrorLive.receiving || []).forEach(function (r) { if (r.error || r.supersededBy || !(r.streaming || r.promotedAt)) down.push(r.peer); });
+      }
+      return { state: down.length ? 'stopped' : 'on', names: names, copyNames: copyNames, down: down.filter(function (n, i) { return down.indexOf(n) === i; }) };
+    }
+
+    // Resource usage card: whole server, split into PaaSMCP's containers and everything else.
+    // Live numbers come from /api/resources every 15 s while the page is visible.
+    let liveResources = null;
+    function fmtResBytes(b) {
+      if (b === null || b === undefined) return '-';
+      if (b >= 1e12) return fmtNum(b / 1e12, 1) + ' TB';
+      if (b >= 1e9) return fmtNum(b / 1e9, 1) + ' GB';
+      return fmtNum(b / 1e6, 0) + ' MB';
+    }
+    function pctNum(n) { return fmtNum(n, n < 10 ? 1 : 0) + '%'; }
+    function toneOf(pct) { return pct > 85 ? 'var(--danger)' : pct > 70 ? 'var(--warning)' : 'var(--text)'; }
+    function stackedBar(paasPct, otherPct) {
+      const p = Math.max(0, Math.min(100, paasPct));
+      const o = Math.max(0, Math.min(100 - p, otherPct));
+      return '<div class="progress-track stacked"><div class="seg paas" style="width:' + p.toFixed(1) + '%;"></div>' +
+        '<div class="seg other" style="width:' + o.toFixed(1) + '%;"></div></div>';
+    }
+    function resourcesCardHtml(s) {
+      const r = (liveResources && liveResources.resources) || s.resources;
+      const backupsCount = s.backupsCount || 0;
+      const head = '<div class="telemetry-card" id="resourcesCard"><div class="telemetry-title"><span>' + esc(t('resTitle')) + '</span>' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg></div>';
+      const snapshots = '<div class="telemetry-item"><span>' + esc(t('resSnapshots')) + '</span><span class="telemetry-val">' +
+        esc(t(backupsCount === 1 ? 'resSnapshotsOne' : 'resSnapshotsN').replace('{n}', String(backupsCount))) + '</span></div>';
+      if (!r) return head + '<div class="res-hint">' + esc(t('resMeasuring')) + '</div>' + snapshots + '</div>';
+      const top = (r.top || []).filter(function (c) { return c.memBytes; })
+        .map(function (c) { return c.name.replace(/^paasmcp-/, '') + ': ' + fmtResBytes(c.memBytes); }).join(' · ');
+      const legend = function (paas, other, extra) {
+        return '<div class="res-legend">' +
+          '<span' + (top ? ' title="' + esc(t('resTopTip') + ' ' + top) + '"' : '') + '><span class="res-dot paas"></span>' + esc(t('resPaas')) + ' ' + esc(paas) + '</span>' +
+          '<span><span class="res-dot other"></span>' + esc(t('resOthers')) + ' ' + esc(other) + '</span>' +
+          (extra ? '<span>' + esc(extra) + '</span>' : '') + '</div>';
+      };
+      let html = head;
+
+      // Processor
+      const cpu = r.cpu || {};
+      const cpuPct = cpu.usedPercent;
+      html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resCpu')) + '</span>' +
+        '<span class="telemetry-val" style="color:' + (cpuPct === null || cpuPct === undefined ? 'var(--muted)' : toneOf(cpuPct)) + ';">' +
+        esc(cpuPct === null || cpuPct === undefined ? t('resMeasuringShort') : pctNum(cpuPct)) + '</span></div>';
+      const coresTxt = t(cpu.cores === 1 ? 'resCoreOne' : 'resCores').replace('{n}', String(cpu.cores || '-'));
+      if (cpu.split) {
+        html += stackedBar(cpu.split.paasmcp, cpu.split.others) + legend(pctNum(cpu.split.paasmcp), pctNum(cpu.split.others), coresTxt);
+      } else {
+        html += stackedBar(0, cpuPct || 0) + '<div class="res-legend"><span>' + esc(coresTxt) + '</span></div>';
+      }
+
+      // Memory
+      const mem = r.memory || {};
+      const memPct = mem.totalBytes ? (mem.usedBytes / mem.totalBytes) * 100 : 0;
+      html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resMem')) + ' (' + esc(fmtResBytes(mem.usedBytes)) + ' / ' + esc(fmtResBytes(mem.totalBytes)) + ')</span>' +
+        '<span class="telemetry-val" style="color:' + toneOf(memPct) + ';">' + esc(pctNum(memPct)) + '</span></div>';
+      const freeTxt = t('resFree').replace('{v}', fmtResBytes(mem.availableBytes));
+      if (mem.split && mem.totalBytes) {
+        html += stackedBar((mem.split.paasmcp / mem.totalBytes) * 100, (mem.split.others / mem.totalBytes) * 100) +
+          legend(fmtResBytes(mem.split.paasmcp), fmtResBytes(mem.split.others), freeTxt);
+      } else {
+        html += stackedBar(0, memPct) + '<div class="res-legend"><span>' + esc(freeTxt) + '</span></div>';
+      }
+
+      // Disk (the one holding the apps' data), split by what PaaSMCP keeps there when measured.
+      const d = r.disk;
+      const split = (liveResources && liveResources.diskSplit) || s.diskSplit;
+      if (d) {
+        html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resDisk')) + ' (' + esc(fmtResBytes(d.usedBytes)) + ' / ' + esc(fmtResBytes(d.totalBytes)) + ')</span>' +
+          '<span class="telemetry-val" style="color:' + toneOf(d.usedPercent) + ';">' + esc(d.usedPercent + '%') + '</span></div>';
+        const freeDisk = t('resFree').replace('{v}', fmtResBytes(d.freeBytes));
+        if (split && split.parts && d.totalBytes) {
+          const kinds = [['apps', 'resDiskApps', 'var(--accent)'], ['databases', 'resDiskDbs', 'var(--seg-db)'], ['backups', 'resDiskBackups', 'var(--seg-bk)'], ['files', 'resDiskFiles', 'var(--seg-files)']];
+          const sum = kinds.reduce(function (n, k) { return n + (split.parts[k[0]] || 0); }, 0);
+          // Folders measured with du can sit on another disk than Docker's: never show more than is used.
+          const scale = sum > d.usedBytes && sum > 0 ? d.usedBytes / sum : 1;
+          const others = Math.max(0, d.usedBytes - sum * scale);
+          const topApps = Object.entries(split.perApp || {}).filter(function (e) { return e[1] > 0; })
+            .sort(function (a, b) { return b[1] - a[1]; }).slice(0, 5)
+            .map(function (e) { return e[0] + ': ' + fmtResBytes(e[1]); }).join(' · ');
+          html += '<div class="progress-track stacked">' + kinds.map(function (k) {
+              return '<div class="seg" style="width:' + ((split.parts[k[0]] || 0) * scale / d.totalBytes * 100).toFixed(2) + '%;background:' + k[2] + ';"></div>';
+            }).join('') + '<div class="seg other" style="width:' + (others / d.totalBytes * 100).toFixed(2) + '%;"></div></div>' +
+            '<div class="res-legend">' + kinds.filter(function (k) { return split.parts[k[0]] * scale >= 1e6; }).map(function (k) {
+              return '<span' + (k[0] === 'apps' && topApps ? ' title="' + esc(t('resTopDiskTip') + ' ' + topApps) + '"' : '') + '><span class="res-dot" style="background:' + k[2] + ';"></span>' + esc(t(k[1])) + ' ' + esc(fmtResBytes(split.parts[k[0]] * scale)) + '</span>';
+            }).join('') + '<span><span class="res-dot other"></span>' + esc(t('resOthers')) + ' ' + esc(fmtResBytes(others)) + '</span><span>' + esc(freeDisk) + '</span></div>';
+        } else {
+          html += '<div class="progress-track"><div class="progress-fill ' + (d.usedPercent > 85 ? 'danger' : d.usedPercent > 70 ? 'warning' : '') + '" style="width:' + d.usedPercent + '%;"></div></div>' +
+            '<div class="res-legend"><span>' + esc(freeDisk) + '</span>' + (split ? '' : '<span>' + esc(t('resDiskMeasuring')) + '</span>') + '</div>';
+        }
+      }
+      if (cpu.split || mem.split || split) html += '<div class="res-hint">' + esc(t('resHint')) + '</div>';
+      return html + snapshots + '</div>';
+    }
+    let resourcesTimer = null;
+    async function pollResources() {
+      clearTimeout(resourcesTimer);
+      try {
+        if (document.visibilityState === 'visible' && lastStatus) {
+          const res = await rawFetch('/api/resources');
+          if (res.ok) {
+            liveResources = await res.json();
+            const card = document.getElementById('resourcesCard');
+            if (card) card.outerHTML = resourcesCardHtml(lastStatus);
+          }
+        }
+      } catch {
+        // offline for a moment: try again later
+      }
+      resourcesTimer = setTimeout(pollResources, 15000);
+    }
+
+    // Databases page: size of each database, its share, a warning size and growth charts (usage.ts).
+    let usageData = null;
+    let usageLoading = false;
+    function dbViewMode() { try { return localStorage.getItem('paasmcp_db_view') === 'full' ? 'full' : 'compact'; } catch { return 'compact'; } }
+    function setDbView(mode) { try { localStorage.setItem('paasmcp_db_view', mode); } catch {} renderDbUsage(); }
+    async function loadUsage(refresh) {
+      if (usageLoading) return;
+      usageLoading = true;
+      if (refresh) renderDbUsage();
+      try {
+        const res = await rawFetch('/api/usage' + (refresh ? '?refresh=1' : ''));
+        if (res.ok) usageData = await res.json();
+      } catch {}
+      usageLoading = false;
+      renderDbUsage();
+      if (refresh && lastStatus) pollResources();
+    }
+    // Growth line for one database over the kept history (up to 90 days); limitBytes draws the warning size.
+    function dbChart(points, limitBytes, compact, label) {
+      const W = compact ? 120 : 300, H = compact ? 28 : 90;
+      const now = Date.now();
+      const from = points.length ? Math.min(points[0].t, now - 24 * 3600 * 1000) : now - 24 * 3600 * 1000;
+      const top = Math.max(1, limitBytes || 0, ...points.map(function (p) { return p.v; })) * 1.08;
+      const x = function (tt) { return ((tt - from) / Math.max(1, now - from)) * W; };
+      const y = function (v) { return H - (v / top) * (H - 3); };
+      const pts = points.map(function (p) { return x(p.t).toFixed(1) + ',' + y(p.v).toFixed(1); });
+      const line = pts.length > 1
+        ? '<polyline points="' + pts.join(' ') + '" style="fill:none;stroke:var(--accent);stroke-width:' + (compact ? 1.4 : 1.6) + '"/>'
+        : pts.length ? '<circle cx="' + pts[0].split(',')[0] + '" cy="' + pts[0].split(',')[1] + '" r="2" style="fill:var(--accent)"/>' : '';
+      const lim = limitBytes ? '<line x1="0" x2="' + W + '" y1="' + y(limitBytes).toFixed(1) + '" y2="' + y(limitBytes).toFixed(1) + '" style="stroke:var(--warning);stroke-width:1;stroke-dasharray:4 3"/>' : '';
+      const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:' + (compact ? '120px' : '100%') + ';height:' + H + 'px;display:block;' + (compact ? '' : 'border-bottom:1px solid var(--border);') + '" role="img" aria-label="' + esc(label) + '">' + lim + line + '</svg>';
+      if (compact) return svg;
+      const days = Math.max(1, Math.round((now - from) / 86400000));
+      return svg + '<div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted);margin-top:3px;"><span>' +
+        esc(t('dbChartAgo').replace('{n}', String(days))) + '</span>' + (limitBytes ? '<span>' + esc(t('dbChartLimit')) + '</span>' : '') + '<span>' + esc(t('scaleNowLbl')) + '</span></div>';
+    }
+    function renderDbUsage() {
+      const box = document.getElementById('dbList');
+      if (!box || !lastStatus) return;
+      const dbs = Object.values(lastStatus.databases || {});
+      if (!dbs.length) { box.innerHTML = '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>'; return; }
+      if (!usageData && !usageLoading) { loadUsage(false); }
+      const latest = (usageData && usageData.latest) || null;
+      const sizes = {};
+      ((latest && latest.databases) || []).forEach(function (d) { sizes[d.name] = d; });
+      const hist = (usageData && usageData.history) || [];
+      const compact = dbViewMode() === 'compact';
+      const pgTotal = dbs.reduce(function (n, d) { const z = sizes[d.name]; return n + (d.engine === 'postgres' && z && z.bytes ? z.bytes : 0); }, 0);
+
+      let head = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 8px;">' +
+        '<span style="font-size:11.5px;color:var(--muted);">' + esc(usageLoading ? t('dbMeasuring') : latest ? t('dbMeasuredAt').replace('{when}', relTime(latest.measuredAt) || fmtWhen(latest.measuredAt)) : t('dbNotMeasured')) + '</span>' +
+        '<span style="display:flex;gap:6px;">' +
+        '<button class="secondary" style="padding:4px 9px;font-size:11px;" data-mode="' + (compact ? 'full' : 'compact') + '" onclick="setDbView(this.dataset.mode)">' + esc(t(compact ? 'dbViewFull' : 'dbViewCompact')) + '</button>' +
+        '<button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="loadUsage(true)"' + (usageLoading ? ' disabled' : '') + '>' + esc(t('dbMeasureNow')) + '</button>' +
+        '</span></div>';
+      // Share of each Postgres database in the whole, one bar.
+      const pgDbs = dbs.filter(function (d) { const z = sizes[d.name]; return d.engine === 'postgres' && z && z.bytes; });
+      if (pgDbs.length > 1 && pgTotal > 0) {
+        const palette = ['var(--accent)', '#8b5cf6', '#db2777', '#65a30d', '#0d9488', '#ea580c'];
+        head += '<div style="font-size:11.5px;color:var(--muted);margin-bottom:2px;">' + esc(t('dbShareTitle')) + ' · ' + esc(fmtResBytes(pgTotal)) + '</div>' +
+          '<div class="progress-track stacked">' + pgDbs.map(function (d, i) {
+            return '<div class="seg" title="' + esc(d.appName + ': ' + fmtResBytes(sizes[d.name].bytes)) + '" style="width:' + (sizes[d.name].bytes / pgTotal * 100).toFixed(1) + '%;background:' + palette[i % palette.length] + ';"></div>';
+          }).join('') + '</div>' +
+          '<div class="res-legend">' + pgDbs.map(function (d, i) {
+            return '<span><span class="res-dot" style="background:' + palette[i % palette.length] + ';"></span>' + esc(d.appName) + ' ' + esc(pctNum(sizes[d.name].bytes / pgTotal * 100)) + '</span>';
+          }).join('') + '</div>';
+      }
+
+      const rows = dbs.map(function (d) {
+        const z = sizes[d.name];
+        const isPg = d.engine === 'postgres';
+        const bytes = z && typeof z.bytes === 'number' ? z.bytes : null;
+        const limit = d.warnSizeMb ? d.warnSizeMb * 1e6 : 0;
+        const pct = limit && bytes !== null ? bytes / limit * 100 : null;
+        const points = isPg ? hist.filter(function (p) { return p.s && typeof p.s[d.name] === 'number'; }).map(function (p) { return { t: p.t, v: p.s[d.name] }; }) : [];
+        if (isPg && bytes !== null && latest) points.push({ t: Date.parse(latest.measuredAt), v: bytes });
+        const sizeTxt = isPg
+          ? (bytes === null ? t('dbSizeUnknown') : fmtResBytes(bytes) + (limit ? ' / ' + fmtResBytes(limit) : '') + (pgTotal > 0 && !limit && pgDbs.length > 1 ? ' · ' + t('dbShareOf').replace('{p}', pctNum(bytes / pgTotal * 100)) : ''))
+          : t('dbRedisKeys').replace('{n}', String((z && z.keys) || 0));
+        const top = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+          '<div><strong>' + esc(d.appName) + '</strong> · ' + esc(t('bkKind_' + d.engine) || d.engine) + '<br/><span style="color:var(--muted);">' + esc(t(isPg ? 'dbGetsPg' : 'dbGetsRedis')) + '</span></div>' +
+          '<div style="display:flex;align-items:center;gap:10px;">' + (compact && points.length ? dbChart(points, limit, true, d.appName) : '') +
+          '<span class="telemetry-val" style="color:' + (pct === null ? 'var(--text)' : toneOf(pct)) + ';">' + esc(sizeTxt) + (pct !== null ? ' (' + esc(pctNum(pct)) + ')' : '') + '</span></div></div>';
+        const bar = pct !== null
+          ? '<div class="progress-track" style="margin:8px 0 4px;"><div class="progress-fill ' + (pct >= 100 ? 'danger' : pct >= 80 ? 'warning' : '') + '" style="width:' + Math.min(100, pct).toFixed(1) + '%;"></div></div>'
+          : '';
+        const chart = !compact && points.length ? '<div style="margin-top:8px;">' + dbChart(points, limit, false, d.appName) + '</div>' : '';
+        const limitForm = isPg
+          ? '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:11.5px;color:var(--muted);">' +
+            '<label for="dbLim_' + esc(d.name) + '">' + esc(t('dbLimitLabel')) + '</label>' +
+            '<input id="dbLim_' + esc(d.name) + '" type="number" min="1" step="1" inputmode="numeric" value="' + esc(d.warnSizeMb || '') + '" placeholder="' + esc(t('dbLimitNone')) + '" style="width:110px;padding:4px 8px;font-size:12px;" />' +
+            '<span>MB</span>' +
+            '<button class="secondary" style="padding:4px 9px;font-size:11px;" data-db="' + esc(d.name) + '" onclick="saveDbLimit(this.dataset.db, false)">' + esc(t('dbLimitSave')) + '</button>' +
+            (d.warnSizeMb ? '<button class="secondary" style="padding:4px 9px;font-size:11px;" data-db="' + esc(d.name) + '" onclick="saveDbLimit(this.dataset.db, true)">' + esc(t('dbLimitClear')) + '</button>' : '') +
+            '</div>'
+          : '';
+        return '<div style="margin-bottom:8px;padding:10px 12px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;" title="' + esc(d.dbName + ' / ' + d.dbUser) + '">' +
+          top + bar + chart + limitForm + '</div>';
+      }).join('');
+      const redisNote = latest && latest.redis && dbs.some(function (d) { return d.engine === 'redis'; })
+        ? '<p class="res-hint">' + esc(t('dbRedisNote').replace('{v}', fmtResBytes(latest.redis.usedMemoryBytes))) + '</p>' : '';
+      const hint = dbs.some(function (d) { return d.engine === 'postgres'; }) ? '<p class="res-hint">' + esc(t('dbLimitHint')) + '</p>' : '';
+      box.innerHTML = head + rows + redisNote + hint;
+    }
+    async function saveDbLimit(name, clear) {
+      const input = document.getElementById('dbLim_' + name);
+      const raw = clear ? '' : String((input && input.value) || '').trim();
+      if (raw !== '' && !(Number.isInteger(Number(raw)) && Number(raw) >= 1)) { showToast(t('dbLimitBad')); return; }
+      const res = await rawFetch('/api/databases/limit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, sizeMb: raw === '' ? null : Number(raw) }) });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { showToast(data.error || t('dbLimitBad')); return; }
+      if (lastStatus && lastStatus.databases && lastStatus.databases[name]) {
+        if (data.warnSizeMb) lastStatus.databases[name].warnSizeMb = data.warnSizeMb;
+        else delete lastStatus.databases[name].warnSizeMb;
+      }
+      showToast(t(data.warnSizeMb ? 'dbLimitSaved' : 'dbLimitCleared'));
+      renderDbUsage();
+    }
+
     // "Quick health" box in the telemetry column: one line per thing that needs care, each opens its page.
     function healthCardHtml(s) {
       const backups = (s.backups || []).slice().sort(function (a, b) { return String(b.createdAt).localeCompare(String(a.createdAt)); });
       const last = backups[0];
       const offsiteOn = Boolean((s.systemSecretsConfigured || {}).BACKUP_S3_ENDPOINT);
-      const m = s.mirror || {};
-      const hasMirror = Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0;
+      const ms = mirrorSummary(s);
       const row = function (label, value, tone, tab, sub) {
         const color = tone === 'ok' ? 'var(--success)' : tone === 'warn' ? 'var(--warning)' : 'var(--text)';
         return '<button class="telemetry-item health-row" data-go-tab="' + tab + '" data-go-sub="' + sub + '">' +
@@ -5154,7 +7259,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         '<div class="telemetry-title"><span>' + esc(t('healthTitle')) + '</span></div>' +
         row(t('healthBackup'), last ? (lastAge || new Date(last.createdAt).toLocaleString()) : t('never'), last ? 'ok' : 'warn', 'databases', 'backups') +
         row(t('healthOffsite'), offsiteOn ? t('healthOn') : t('notConfigured'), offsiteOn ? 'ok' : 'warn', 'databases', 'offsite') +
-        row(t('healthMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('healthOn') : t('healthOff'), m.fenced ? 'warn' : hasMirror ? 'ok' : '', 'mirror', hasMirror ? 'copy' : 'connect') +
+        row(t('healthMirror'),
+          ms.state === 'fenced' ? t('mirrorFenced') : ms.state === 'on' ? t('healthOn') : ms.state === 'stopped' ? t('tileMirrorStopped') : t('healthOff'),
+          ms.state === 'on' ? 'ok' : (ms.state === 'fenced' || ms.state === 'stopped') ? 'warn' : '', 'mirror', ms.copyNames.length ? 'copy' : 'connect') +
         row(t('healthEmail'), emailRelay ? t('healthOn') : t('notConfigured'), emailRelay ? 'ok' : '', 'email', '') +
         '</div>';
     }
@@ -5163,11 +7270,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const isPt = currentLang === 'pt';
       const domain = getBaseDomain();
       document.getElementById('topDomainBadge').innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg> <span>\${isPt ? 'Domínio' : 'Domain'}: <strong>\${esc(domain)}</strong></span>\`;
-      const role = s.federation?.role || 'standalone';
-      const peersCount = Object.keys(s.federation?.peers || {}).length;
-      const roleLabel = role === 'standalone' ? (isPt ? 'autônomo' : 'standalone') : role;
-      const peersLabel = isPt ? (peersCount === 1 ? '1 par' : peersCount + ' pares') : (peersCount === 1 ? '1 peer' : peersCount + ' peers');
-      document.getElementById('nodeRoleFooter').textContent = (isPt ? 'Nó: ' : 'Node: ') + roleLabel + ' (' + peersLabel + ')';
+      const pairedNames = Object.keys(pairedServers(s));
+      refreshMirrorLive(s);
+      document.getElementById('nodeRoleFooter').textContent = pairedNames.length ? t('footerPaired').replace('{who}', pairedNames.join(', ')) : t('footerUnpaired');
 
       const elHostname = document.getElementById('topHostname');
       if (elHostname) elHostname.textContent = s.hostname || '-';
@@ -5175,40 +7280,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const elHealth = document.getElementById('topHealthBadge');
       if (elHealth) elHealth.textContent = isPt ? 'Sistema Online' : 'System Online';
 
-      // Parse disk info
-      let diskTotal = '-';
-      let diskUsed = '-';
-      let diskPercent = 0;
-      if (s.rootDisk && typeof s.rootDisk === 'string') {
-        const parts = s.rootDisk.trim().split(/\s+/);
-        if (parts.length >= 5) {
-          diskTotal = parts[1] || '-';
-          diskUsed = parts[2] || '-';
-          diskPercent = parseInt((parts[4] || '0').replace('%', ''), 10) || 0;
-        }
-      }
-
-      // Memory calculations
-      const totalMem = s.totalMemGb || 1;
-      const freeMem = s.freeMemGb || 0;
-      const usedMem = Math.max(0, +(totalMem - freeMem).toFixed(1));
-      const ramPercent = Math.min(100, Math.max(0, Math.round((usedMem / totalMem) * 100)));
-
       // Counters in the side menu
       setNavCounter('tabCountApps', Object.keys(s.apps || {}).length, 'cntApps');
       setNavCounter('tabCountDbs', Object.keys(s.databases || {}).length, 'cntDbs');
       // systemSecretsConfigured is an object (key -> masked value), not a list.
       setNavCounter('tabCountVault', Object.keys(s.systemSecretsConfigured || {}).length, 'cntVault');
-      setNavCounter('tabCountMirror', peersCount, 'cntMirror');
+      setNavCounter('tabCountMirror', pairedNames.length, 'cntMirror');
       setNavCounter('tabCountPool', Object.keys(s.pool || {}).length, 'cntPool');
       setNavCounter('tabCountAgents', s.mcpToolCount || 0, 'cntAgents');
       renderSubNav();
 
-      const roleBadge = role === 'standalone' ? (isPt ? 'AUTÔNOMO' : 'STANDALONE') : role.toUpperCase();
       const tailscaleVal = s.tailscaleDomain || (s.federation?.peers ? (isPt ? 'Rede Ativa' : 'Tailnet Active') : '127.0.0.1');
       const dockerVal = isPt ? 'Ativo' : 'Running';
-      const backupsCount = s.backupsCount || 0;
-      const backupsUnit = isPt ? (backupsCount === 1 ? 'cópia' : 'cópias') : (backupsCount === 1 ? 'backup' : 'backups');
 
       document.getElementById('statsGrid').innerHTML = \`
         <div class="telemetry-card">
@@ -5237,41 +7320,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <span class="telemetry-val" style="font-size:11px;">\${esc((s.sshKeyFingerprint || '').slice(0, 16))}...</span>
           </div>
           <div class="telemetry-item">
-            <span>\${isPt ? 'Papel no Cluster' : 'Cluster Role'}</span>
-            <span class="badge" style="font-size:10px;padding:2px 7px;">\${esc(roleBadge)}</span>
+            <span>\${esc(t('pairedWith'))}</span>
+            <span class="telemetry-val">\${esc(pairedNames.length ? pairedNames.join(', ') : t('pairedNobody'))}</span>
           </div>
         </div>
 
-        <div class="telemetry-card">
-          <div class="telemetry-title">
-            <span>\${isPt ? 'Uso de Recursos' : 'Resource Usage'}</span>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-          </div>
-          <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
-            <span>RAM (\${usedMem} / \${s.totalMemGb} GB)</span>
-            <span class="telemetry-val">\${ramPercent}%</span>
-          </div>
-          <div class="progress-track">
-            <div class="progress-fill \${ramPercent > 85 ? 'danger' : ramPercent > 70 ? 'warning' : ''}" style="width: \${ramPercent}%;"></div>
-          </div>
-
-          <div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;">
-            <span>\${isPt ? 'Disco' : 'Disk'} (\${diskTotal === '-' ? '-' : diskUsed + ' / ' + diskTotal})</span>
-            <span class="telemetry-val">\${diskPercent}%</span>
-          </div>
-          <div class="progress-track">
-            <div class="progress-fill \${diskPercent > 85 ? 'danger' : diskPercent > 70 ? 'warning' : ''}" style="width: \${diskPercent}%;"></div>
-          </div>
-
-          <div class="telemetry-item" style="margin-top:6px;">
-            <span>CPUs</span>
-            <span class="telemetry-val">\${esc(s.cpus)} vCPUs</span>
-          </div>
-          <div class="telemetry-item">
-            <span>\${isPt ? 'Instantâneos' : 'Snapshots'}</span>
-            <span class="telemetry-val">\${esc(backupsCount)} \${backupsUnit}</span>
-          </div>
-        </div>
+        \${resourcesCardHtml(s)}
         \${healthCardHtml(s)}
       \`;
 
@@ -5280,10 +7334,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       const apps = Object.values(s.apps || {});
       const metricsMap = s.containerMetrics || {};
-      document.getElementById('appsBadgeCount').textContent = apps.length + ' apps';
+      document.getElementById('appsBadgeCount').textContent = t(apps.length === 1 ? 'appsCountOne' : 'appsCount').split('{n}').join(String(apps.length));
 
       document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
-      document.getElementById('dynamicScopeChips').innerHTML = apps.map(a => \`<button class="chip" onclick="setVaultScope('\${esc(a.name)}')">📦 \${esc(a.name)}</button>\`).join(' ');
+      fillScopeSelect(apps);
+      renderAddresses();
 
       const deploys = deployState || s.deploys || {};
       const tbody = document.getElementById('appsTable');
@@ -5314,7 +7369,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
           // Main domain / access link
           const mainDomain = (a.domains || [])[0];
-          const appLink = mainDomain ? mainDomain.url : \`http://127.0.0.1:\${a.localPort}\`;
+          // Without an address, 127.0.0.1 only opens on the server itself: elsewhere the name leads to "Endereço".
+          const onServer = /^(127\\.|localhost$|\\[::1\\]$)/.test(location.hostname);
+          const appLink = mainDomain ? mainDomain.url : (onServer ? \`http://127.0.0.1:\${a.localPort}\` : '');
 
           // Language dot color
           let langColor = '#8b949e';
@@ -5340,7 +7397,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             ? \`<span><strong>CPU:</strong> \${esc(m.cpuPercent)}</span> · <span><strong>RAM:</strong> \${esc(m.memUsage)}</span>\`
             : \`<span style="color:var(--muted);">\${esc(a.status === 'stopped' ? t('stoppedStatus') : t('onDemandStatus'))}</span>\`;
           const limitsHtml = (a.memoryLimit || a.cpuLimit)
-            ? \`<span>(Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU)</span>\`
+            ? \`<span>\${esc(t('limitsLabel').split('{mem}').join(a.memoryLimit || '-').split('{cpu}').join(a.cpuLimit || '-'))}</span>\`
             : '';
           const cp = s.controlPlane || {};
           const followBtn = a.runtimeType === 'paasmcp-control-plane'
@@ -5350,15 +7407,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:2px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
             : '';
           const rollbackBtn = a.previousImageTag
-            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${btnIcon('back')}\${esc(t('actionRollback'))}</button>\`
+            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="\${esc(t('actionRollbackTip'))}">\${btnIcon('back')}\${esc(t('actionRollback'))}</button>\`
             : '';
 
           const domainPills = (a.domains || []).map(dom => \`
             <span class="app-badge-pill">
               <a href="\${esc(dom.url)}" target="_blank" rel="noopener noreferrer">\${btnIcon('globe')} \${esc(dom.url)}</a>
-              <span class="badge" style="padding:1px 5px;font-size:9.5px;">\${esc(dom.mode)}</span>
+              <span class="badge" style="padding:1px 5px;font-size:9.5px;">\${esc(I18N.en['mode_' + dom.mode] ? t('mode_' + dom.mode) : dom.mode)}</span>
             </span>
-          \`).join('') || \`<span class="app-badge-pill">🔒 127.0.0.1:\${esc(a.localPort)}</span>\`;
+          \`).join('') || \`<span class="app-badge-pill" title="127.0.0.1:\${esc(a.localPort)}">🔒 \${esc(t('pillLocalOnly'))}</span>\`;
 
           const dbPills = (a.databases || []).map(db => \`
             <span class="app-badge-pill" style="font-size:11px;">🗄️ \${esc(db)}</span>
@@ -5368,7 +7425,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <div class="app-entry-row">
               <div class="app-row-top">
                 <div class="app-row-main-identity">
-                  <a href="\${esc(appLink)}" target="_blank" rel="noopener noreferrer" class="app-row-name-link">
+                  <a \${appLink ? \`href="\${esc(appLink)}" target="_blank" rel="noopener noreferrer"\` : \`href="#" onclick="selectAppForExpose('\${esc(a.name)}'); return false;" title="\${esc(t('appNoAddressTip'))}"\`} class="app-row-name-link">
                     <span class="status-dot \${dotClass}"></span>
                     <span>\${esc(a.name)}</span>
                   </a>
@@ -5381,10 +7438,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   <button class="secondary" onclick="setVaultScope('\${esc(a.name)}')">\${btnIcon('lock')}\${esc(t('actionEnv'))}</button>
                   <button class="secondary" onclick="appAction('\${esc(a.name)}','logs')">\${btnIcon('logs')}\${esc(t('actionLogs'))}</button>
                   <button class="secondary" onclick="appAction('\${esc(a.name)}','restart')">\${btnIcon('restart')}\${esc(t('actionRestart'))}</button>
+                  \${a.repoUrl && a.runtimeType !== 'paasmcp-control-plane' ? \`<button class="secondary" onclick="redeployApp('\${esc(a.name)}')" title="\${esc(t('redeployTitle'))}">\${btnIcon('sync')}\${esc(t('actionRedeploy'))}</button>\` : ''}
                   \${rollbackBtn}
                   \${followBtn}
                   \${a.trashedAt
-                    ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10))}</span>
+                    ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10) + (a.trashDeleteOn ? t('trashDeleteOn') + new Date(a.trashDeleteOn).toLocaleDateString() : ''))}</span>
                        <button class="secondary" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
                        <button class="danger" onclick="appAction('\${esc(a.name)}','purge')">\${esc(t('actionPurge'))}</button>\`
                     : \`<button class="danger" onclick="appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>\`}
@@ -5403,7 +7461,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   <span class="lang-dot" style="background:\${langColor};"></span>
                   <code>\${esc(a.runtimeType)}</code>
                 </span>
-                <span>Porta: <code>\${esc(a.localPort)}</code></span>
+                <span>\${esc(t('lblPort'))}: <code>\${esc(a.localPort)}</code></span>
                 <span>\${metricHtml} \${limitsHtml}</span>
                 \${deployStatusHtml(d, true)}
                 \${a.lastWebhookAt ? \`<span style="color:var(--muted)">⚡ Webhook: \${esc(a.lastWebhookAt.slice(0,19))}</span>\` : ''}
@@ -5416,18 +7474,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const searchVal = document.getElementById('appSearchInput')?.value;
       if (searchVal) filterApps(searchVal);
 
-      const dbs = Object.values(s.databases || {});
-      document.getElementById('dbList').innerHTML = dbs.length
-        ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">🗄️ <strong>\${esc(d.name)}</strong> (\${esc(d.engine)}) → DB: <code>\${esc(d.dbName)}</code> | User: <code>\${esc(d.dbUser)}</code></div>\`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>';
+      renderDbUsage();
 
+      renderNightly(s.nightlyBackup);
       const backups = s.backups || [];
       document.getElementById('backupsList').innerHTML = backups.length
         ? backups.map(b => \`
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12px;gap:8px;flex-wrap:wrap;">
             <div>
-              🔒 <strong>\${esc(b.id)}</strong> (\${esc(b.engine)})<br/>
-              <span style="color:var(--muted);">\${esc(t('sizeLabel'))} \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code>\${b.offsiteKey ? ' · ☁️ ' + esc(t('offsiteLabel')) : ''}</span>
+              🔒 <strong>\${esc(b.appName)}</strong> · \${esc(t('bkKind_' + b.engine) || b.engine)}\${b.engine === 'volume' ? ' (' + esc(b.databaseName) + ')' : ''} · \${esc(fmtWhen(b.createdAt))}<br/>
+              <span style="color:var(--muted);" title="\${esc(b.id)} · SHA256 \${esc(b.sha256 || '')}">\${esc(fmtSize(b.sizeBytes))}\${b.offsiteKey ? ' · ☁️ ' + esc(t('offsiteLabel')) : ''}</span>
             </div>
             <span>
               <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="testBackup('\${esc(b.id)}')">\${esc(t('btnTestRestore'))}</button>
@@ -5438,14 +7494,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyBackups')) + '</span>';
 
       const peers = Object.values(s.federation?.peers || {});
-      document.getElementById('fedPeersList').innerHTML = peers.length
+      const fedNames = peers.map(p => p.name);
+      const allPeers = pairedServers(s);
+      // Servers known only through the live copy (the invite side never hears back from 'node join').
+      const copyOnly = Object.keys(allPeers).filter(n => fedNames.indexOf(n) === -1);
+      const copyOnlyHtml = copyOnly.map(n => '<div style="padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">' +
+        '🤝 <strong>' + esc(n) + '</strong> — <span class="badge success">' + esc(t('peerViaCopy')) + '</span><br/>' +
+        '<span style="color:var(--muted);font-size:11.5px;">' + esc([allPeers[n].sending ? t('peerSending') : '', allPeers[n].receiving ? t('peerReceiving') : ''].filter(Boolean).join(' · ')) + '</span></div>').join('');
+      document.getElementById('fedPeersList').innerHTML = copyOnlyHtml + (peers.length
         ? peers.map(p => \`
           <div style="padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">
             🤝 <strong>\${esc(p.name)}</strong> (<code>\${esc(p.nodeId)}</code>) — <span class="badge success">\${esc(p.mode)}</span><br/>
             <span style="color:var(--muted);font-size:11.5px;">Endpoint: \${esc(p.endpointUrl)} · Key: <code>\${esc(p.publicKeyFingerprint)}</code></span>
           </div>
         \`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>';
+        : copyOnly.length ? '' : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>');
     }
 
     // Server answers 409 for risky actions: show its warning, ask the person, and resend with the confirmation.
@@ -5523,27 +7586,121 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const backups = (s.backups || []).slice().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
       const last = backups[0];
       const offsiteOn = Boolean((s.systemSecretsConfigured || {}).BACKUP_S3_ENDPOINT);
-      const m = s.mirror || {};
-      const hasMirror = Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0;
+      const ms = mirrorSummary(s);
+      const msWho = ms.copyNames.join(', ');
       const tile = (title, value, note) => '<div class="arch-box"><h3>' + esc(title) + '</h3><p style="font-size:18px;font-weight:700;color:var(--text);margin:4px 0;">' + esc(value) + '</p><p>' + esc(note) + '</p></div>';
       tiles.innerHTML =
         tile(t('tileApps'), String(apps.length), apps.length ? t('tileAppsNote') : t('tileAppsNone')) +
         tile(t('tileBackup'), last ? new Date(last.createdAt).toLocaleString() : t('never'), last ? (last.offsiteAt ? t('tileBackupOff') : t('tileBackupLocal')) : t('tileBackupNone')) +
-        tile(t('tileMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('tileMirrorOn') : t('tileMirrorOff'), t('tileMirrorNote')) +
+        tile(t('tileMirror'),
+          ms.state === 'fenced' ? t('mirrorFenced') : ms.state === 'on' ? t('tileMirrorOn') : ms.state === 'stopped' ? t('tileMirrorStopped') : t('tileMirrorOff'),
+          ms.state === 'on' ? t('tileMirrorWith').replace('{who}', msWho)
+            : ms.state === 'stopped' ? t('tileMirrorStoppedNote').replace('{who}', ms.down.join(', '))
+            : ms.state === 'paired' ? t('tileMirrorPairedOnly').replace('{who}', ms.names.join(', '))
+            : t('tileMirrorNote')) +
         tile(t('tileEmail'), emailRelay ? emailRelay.host : t('notConfigured'), emailRelay ? emailRelay.fromDomain : t('tileEmailNote'));
-      const steps = [
-        ['step1', apps.length > 0, 'overview', false, 'deploy'],
-        ['step2', offsiteOn, 'databases', false, 'offsite'],
-        ['step3', Boolean(emailRelay), 'email', false],
-        ['step4', hasMirror, 'mirror', true, 'connect'],
-        ['step5', false, 'agents', true, 'connect'],
+      renderNextStep();
+      renderTutorial();
+      if (!tutExtra.loaded && (currentTab === 'home')) loadTutorialExtra();
+    }
+
+    // ---- Tutorial: what is done and what can still be done, with step-by-step guides on their own pages ----
+    let tutExtra = { pool: 0, ai: 0, loaded: false };
+    let currentGuide = '';
+    async function loadTutorialExtra() {
+      try {
+        const [p, k] = await Promise.all([fetch('/api/pool'), fetch('/api/tokens')]);
+        const pool = p.ok ? await p.json() : {};
+        const tok = k.ok ? await k.json() : {};
+        // Done when an access exists or an AI already called a tool (stdio on the server needs no access).
+        tutExtra = { pool: (pool.helpers || []).length, ai: (tok.tokens || []).length + (tok.mcpUse ? 1 : 0), loaded: true };
+      } catch { tutExtra.loaded = true; }
+      renderHome();
+    }
+    function tutorialItems() {
+      const s = lastStatus || {};
+      const apps = Object.values(s.apps || {});
+      const sys = s.systemSecretsConfigured || {};
+      const m = s.mirror || {};
+      return [
+        { id: 'app', group: 'essential', done: apps.length > 0, go: ['overview', 'deploy'], guide: 'firstapp' },
+        { id: 'address', group: 'essential', done: apps.some(function (a) { return (a.domains || []).length > 0; }), go: ['overview', 'expose'], guide: 'address' },
+        { id: 'offsite', group: 'essential', done: Boolean(sys.BACKUP_S3_ENDPOINT), go: ['databases', 'offsite'], guide: 'offsite' },
+        { id: 'autoupdate', group: 'recommended', done: apps.some(function (a) { return Boolean(a.autoDeploy); }), go: ['overview', 'deploy'], guide: 'autoupdate' },
+        { id: 'email', group: 'recommended', done: Boolean(emailRelay), go: ['email', ''], guide: 'email' },
+        { id: 'backup', group: 'recommended', done: (s.backups || []).length > 0, go: ['databases', 'backups'] },
+        { id: 'doctor', group: 'recommended', done: false, go: ['doctor', ''], always: true },
+        { id: 'github', group: 'recommended', done: Boolean(sys.GITHUB_TOKEN), go: ['connect', 'github'], guide: 'github', optional: true },
+        { id: 'alerts', group: 'recommended', done: Boolean(sys.NOTIFY_URL), go: ['connect', 'alerts'] },
+        { id: 'mirror', group: 'grow', done: Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0, go: ['mirror', 'connect'] },
+        { id: 'pool', group: 'grow', done: tutExtra.pool > 0, go: ['pool', 'add'] },
+        { id: 'ai', group: 'grow', done: tutExtra.ai > 0, go: ['agents', 'connect'] },
       ];
-      document.getElementById('homeSteps').innerHTML = steps.map((st, i) => card(
-        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
-        '<div><strong>' + (i + 1) + '. ' + esc(t(st[0] + 'Title')) + '</strong>' + (st[3] ? ' <span style="color:var(--muted)">(' + esc(t('optional')) + ')</span>' : '') +
-        '<div style="color:var(--muted);margin-top:4px;">' + esc(t(st[0] + 'Desc')) + '</div></div>' +
-        (st[1] ? badge('success', t('done')) : '<button class="secondary" onclick="goTab(&#39;' + st[2] + '&#39;, &#39;' + (st[4] || '') + '&#39;)">' + esc(t('openStep')) + '</button>') +
-        '</div>')).join('');
+    }
+    function tutRow(it) {
+      const guide = it.guide ? ' <a href="#guide/' + it.guide + '" class="tut-guide">' + esc(t('tutGuide')) + '</a>' : '';
+      const action = it.done
+        ? badge('success', t('done'))
+        : '<button class="secondary" data-go-tab="' + it.go[0] + '" data-go-sub="' + it.go[1] + '">' + esc(t(it.always ? 'tutOpen' : 'openStep')) + '</button>';
+      return '<div class="tut-row' + (it.done ? ' tut-done' : '') + '">' +
+        '<span class="tut-check" aria-hidden="true">' + (it.done ? '✓' : '') + '</span>' +
+        '<div class="tut-text"><strong>' + esc(t('tut_' + it.id)) + '</strong>' + (it.optional ? ' <span style="color:var(--muted)">(' + esc(t('optional')) + ')</span>' : '') +
+        '<div class="tut-desc">' + esc(t('tut_' + it.id + 'Desc')) + guide + '</div></div>' +
+        '<div class="tut-act">' + action + '</div></div>';
+    }
+    function tutCountText() {
+      const items = tutorialItems().filter(function (it) { return !it.always; });
+      return t('tutCount').split('{n}').join(String(items.filter(function (it) { return it.done; }).length)).split('{t}').join(String(items.length));
+    }
+    function renderTutorial() {
+      const box = document.getElementById('tutList');
+      if (!box) return;
+      const items = tutorialItems().filter(function (it) { return !it.always; });
+      const done = items.filter(function (it) { return it.done; }).length;
+      const bar = document.getElementById('tutProgress');
+      if (bar) bar.innerHTML = '<div class="tut-bar" role="progressbar" aria-valuemin="0" aria-valuemax="' + items.length + '" aria-valuenow="' + done + '"><span style="width:' + Math.round(done * 100 / items.length) + '%"></span></div>' +
+        '<div class="tut-count">' + esc(tutCountText()) + '</div>';
+      box.innerHTML = ['essential', 'recommended', 'grow'].map(function (g) {
+        return '<h3 class="ofs-h">' + esc(t('tutGroup_' + g)) + '</h3><p class="ofs-note">' + esc(t('tutGroup_' + g + 'Desc')) + '</p>' +
+          tutorialItems().filter(function (it) { return it.group === g; }).map(tutRow).join('');
+      }).join('');
+    }
+    function renderNextStep() {
+      const box = document.getElementById('homeSteps');
+      if (!box) return;
+      const next = tutorialItems().filter(function (it) { return !it.done && !it.always && !it.optional; }).slice(0, 2);
+      box.innerHTML = (next.length ? next.map(tutRow).join('') : card(badge('success', t('done')) + ' ' + esc(t('tutAllEssential')))) +
+        '<div style="margin-top:8px;"><a href="#home/tutorial">' + esc(t('tutSeeAll')) + '</a> <span style="color:var(--muted);font-size:12.5px;">· ' + esc(tutCountText()) + '</span></div>';
+    }
+
+    const GUIDES = {
+      firstapp: { steps: 5, go: [['overview', 'deploy'], ['connect', 'github'], ['overview', 'deploy'], ['overview', 'list'], ['vault', '']] },
+      address: { steps: 4, go: [null, ['connect', 'cloudflare'], ['overview', 'expose'], ['overview', 'expose']] },
+      offsite: { steps: 4, go: [null, null, ['databases', 'offsite'], ['databases', 'backups']] },
+      autoupdate: { steps: 3, go: [['overview', 'deploy'], ['overview', 'webhook'], null] },
+      email: { steps: 4, go: [null, null, ['email', ''], ['email', '']] },
+      github: { steps: 3, go: [null, ['connect', 'github'], ['connect', 'github']] },
+    };
+    function renderGuide() {
+      const pane = document.getElementById('tab-guide');
+      if (!pane) return;
+      const id = GUIDES[currentGuide] ? currentGuide : 'firstapp';
+      const g = GUIDES[id];
+      const k = 'guide_' + id;
+      let steps = '';
+      for (let i = 1; i <= g.steps; i++) {
+        const go = g.go[i - 1];
+        steps += '<li class="guide-step"><strong>' + esc(t(k + '_s' + i)) + '</strong><div class="tut-desc">' + t(k + '_s' + i + 'Desc') + '</div>' +
+          (go ? '<button class="secondary" style="margin-top:6px;" data-go-tab="' + go[0] + '" data-go-sub="' + go[1] + '">' + esc(t('guideOpenScreen')) + '</button>' : '') + '</li>';
+      }
+      const others = Object.keys(GUIDES).filter(function (x) { return x !== id; })
+        .map(function (x) { return '<a href="#guide/' + x + '">' + esc(t('guide_' + x)) + '</a>'; }).join(' · ');
+      pane.innerHTML =
+        '<div class="page-head"><div class="page-crumb"><a href="#home/tutorial">' + esc(t('sub_home_tutorial')) + '</a> <span aria-hidden="true">/</span> ' + esc(t('guideCrumb')) + '</div>' +
+        '<h1><span>' + esc(t(k)) + '</span></h1><p class="page-lead">' + esc(t(k + '_lead')) + '</p></div>' +
+        '<div class="card"><ol class="guide-steps">' + steps + '</ol>' +
+        '<p class="ofs-note" style="margin-top:14px;">' + esc(t('guideOthers')) + ' ' + others + '</p>' +
+        '<a href="#home/tutorial">' + esc(t('guideBack')) + '</a></div>';
     }
 
     async function loadEmail() {
@@ -5584,12 +7741,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     async function loadMirror() {
       const res = await fetch('/api/mirror');
-      if (!res.ok) return;
+      if (!res.ok) { loadArbiterStatus(); loadJudgeLocal(); return; }
       const m = await res.json();
+      mirrorLive = m;
+      mirrorLiveAt = Date.now();
       let html = '';
       if (m.fenced) html += card(badge('danger', t('mirrorFenced')) + '<div style="margin-top:6px;">' + esc(t('mirrorFencedDesc')) + '</div>');
       html += card('<strong>' + esc(t('mirrorAuto')) + ':</strong> ' + ((m.auto || []).length ? badge('success', (m.auto || []).join(', ')) : badge('', t('off'))) +
-        ' · <strong>' + esc(t('mirrorArbiter')) + ':</strong> ' + (m.arbiterUrl ? esc(m.arbiterUrl) : esc(t('notConfigured'))));
+        ' · <strong>' + esc(t('mirrorArbiter')) + ':</strong> ' + (m.arbiterUrl ? esc(m.arbiterUrl) : esc(t('notConfigured'))) +
+        ' · <a href="javascript:void(0)" data-go-tab="mirror" data-go-sub="judge">' + esc(t(m.arbiterUrl ? 'autoGoJudge' : 'judgeSetupTitle')) + '</a>');
       (m.sending || []).forEach(o => {
         html += card('<strong>' + esc(t('mirrorSendingTo')) + ' ' + esc(o.peer) + '</strong> ' +
           (o.error ? badge('danger', o.error) : o.connected ? badge('success', t('connected')) : badge('warning', t('waitingPeer'))) +
@@ -5631,8 +7791,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         : '<option value="">' + esc(t('autoNoCopy')) + '</option>';
       if (keep && peers.includes(keep)) sel.value = keep;
       if (m.arbiterUrl && !document.getElementById('mArbiter').value) document.getElementById('mArbiter').value = m.arbiterUrl;
-      renderArbiterInstall();
       loadArbiterStatus();
+      loadJudgeLocal();
       loadActive();
     }
     async function mirrorOffer() {
@@ -5661,13 +7821,139 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const r = await postJson('/api/mirror/auto', { peer, on, arbiterUrl: document.getElementById('mArbiter').value.trim() || undefined });
       if (r) { showToast(t('saved')); loadMirror(); }
     }
-    function renderArbiterInstall() {
-      document.getElementById('arbInstallCmd').textContent =
-        'git clone ' + t('autoRepoPlaceholder') + ' paasmcp\\n' +
-        'cd paasmcp && npm install && npm run build\\n' +
-        'sudo node dist/cli.js arbiter install-service --key ' + t('autoKeyPlaceholder');
-      document.getElementById('arbAddKeyCmd').textContent =
-        'cd paasmcp && sudo node dist/cli.js arbiter add-key ' + t('autoKeyPlaceholder');
+    // Arbiter tab, easy way: list the PCs of the Tailscale network and pair with the one showing a code.
+    async function judgeFind() {
+      const btn = document.getElementById('btnJudgeFind');
+      const box = document.getElementById('judgeFindBox');
+      btn.disabled = true;
+      box.innerHTML = card(esc(t('judgeFinding')));
+      try {
+        const res = await fetch('/api/mirror/arbiter/candidates');
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { box.innerHTML = card(badge('danger', d.error || 'error')); return; }
+        if (d.error) { box.innerHTML = card(esc(t('judgeFindNoTs'))); return; }
+        const list = d.devices || [];
+        if (!list.length) { box.innerHTML = card(esc(t('judgeFindNone'))); return; }
+        box.innerHTML = card(list.map(x => {
+          const tag = x.inPair ? badge('', t('judgeTagPair')) : x.pairing ? badge('success', t('judgeTagCode')) : x.arbiter ? badge('', t('judgeTagArbiter')) : '';
+          const pick = x.inPair ? '' : '<button class="secondary" style="padding:3px 10px;font-size:12px;" data-ip="' + esc(x.ip) + '" onclick="judgePick(this.dataset.ip)">' + esc(t('btnJudgePick')) + '</button>';
+          return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:5px 0;border-bottom:1px solid var(--border);">' +
+            '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip) + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + '</div>' + pick + '</div>';
+        }).join('') + '<div style="color:var(--muted);font-size:12px;margin-top:6px;">' + esc(t('judgeFindHint')) + '</div>');
+      } finally { btn.disabled = false; }
+    }
+    function judgePick(ip) {
+      document.getElementById('pairHost').value = ip;
+      document.getElementById('pairCode').focus();
+    }
+    async function judgePair() {
+      const host = document.getElementById('pairHost').value.trim();
+      const code = document.getElementById('pairCode').value.trim();
+      const box = document.getElementById('judgePairBox');
+      const btn = document.getElementById('btnJudgePair');
+      btn.disabled = true;
+      box.innerHTML = card(esc(t('checking')));
+      try {
+        const res = await fetch('/api/mirror/arbiter/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ host, code }) });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { box.innerHTML = card(badge('danger', '✗') + ' ' + esc(d.errorCode ? t('pairErr_' + d.errorCode) : (d.error || 'error'))); return; }
+        document.getElementById('pairCode').value = '';
+        document.getElementById('mArbiter').value = d.url;
+        box.innerHTML = card(badge('success', '✓') + ' ' + esc(t('pairDone').replace('{host}', d.host).replace('{url}', d.url)));
+        showToast(t('saved'));
+        loadMirror();
+      } finally { btn.disabled = false; }
+    }
+    // This PC as the arbiter of another pair: state, the code to type on the server, stop.
+    let judgeLocalTimer = null;
+    async function loadJudgeLocal() {
+      const box = document.getElementById('judgeLocalBox');
+      if (!box) return;
+      const res = await fetch('/api/judge');
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { box.innerHTML = card(badge('danger', j.error || 'error')); return; }
+      renderJudgeLocal(j);
+    }
+    function renderJudgeLocal(j) {
+      const box = document.getElementById('judgeLocalBox');
+      clearTimeout(judgeLocalTimer);
+      if (j.problem === 'noTailscale') { box.innerHTML = card(badge('warning', '!') + ' ' + esc(t('judgeLocalNoTs'))); return; }
+      const n = (j.clusters || []).length;
+      let html = '<div>' + (j.running
+        ? badge('success', t('judgeLocalOn')) + ' ' + esc(t(n === 1 ? 'judgeLocalPairs1' : 'judgeLocalPairs').replace('{n}', String(n))) + ' · ' + esc(j.url || '')
+        : badge('', t('judgeLocalOff'))) + '</div>';
+      const p = j.pairing || {};
+      if (p.open) {
+        const until = new Date(p.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        html += '<div style="margin-top:12px;">' + esc(t('judgeLocalCodeIntro')) + '</div>' +
+          '<div style="font-size:34px;font-weight:700;letter-spacing:6px;font-family:var(--mono, monospace);margin:6px 0;user-select:all;">' + esc(p.code) + '</div>' +
+          '<div style="color:var(--muted);font-size:12.5px;">' + esc(t('judgeLocalCodeMeta').replace('{ip}', j.ip || '').replace('{until}', until)) + '</div>' +
+          '<div style="margin-top:10px;"><button class="secondary" onclick="judgeLocalCancel()">' + esc(t('btnJudgeCancel')) + '</button></div>';
+        judgeLocalTimer = setTimeout(loadJudgeLocal, 5000); // closes by itself once the server paired
+      } else {
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button onclick="judgeLocalOpen()" id="btnBeJudge">' + esc(t('btnBeJudge')) + '</button>' +
+          (j.container ? '<button class="secondary" onclick="judgeLocalStop()">' + esc(t('btnJudgeStop')) + '</button>' : '') + '</div>';
+      }
+      box.innerHTML = card(html);
+    }
+    async function judgeLocalOpen() {
+      const btn = document.getElementById('btnBeJudge');
+      if (btn) { btn.disabled = true; btn.textContent = t('judgeLocalStarting'); }
+      const r = await postJson('/api/judge/open', {});
+      if (!r && btn) { btn.disabled = false; btn.textContent = t('btnBeJudge'); }
+      loadJudgeLocal();
+    }
+    async function judgeLocalCancel() { await postJson('/api/judge/cancel', {}); loadJudgeLocal(); }
+    async function judgeLocalStop() { if (await postJson('/api/judge/stop', {})) { showToast(t('saved')); loadJudgeLocal(); } }
+
+    // Step 2 of the Arbiter tab: the install command with this pair's key already in it.
+    async function arbiterInstallCmd() {
+      const btn = document.getElementById('btnArbCmd');
+      btn.disabled = true;
+      try {
+        const r = await postJson('/api/mirror/arbiter/install', {});
+        if (!r) return;
+        document.getElementById('arbInstallCmd').textContent = r.command;
+        document.getElementById('arbInstallBox').style.display = 'block';
+      } finally { btn.disabled = false; }
+    }
+    // Arbiter tab: state, where it runs, last contact, what it hears and who looks after whose data.
+    function renderJudge(c) {
+      const info = document.getElementById('judgeInfoBox');
+      const owners = document.getElementById('judgeOwnersBox');
+      if (!info) return;
+      const row = (k, v) => '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:4px 0;"><span style="color:var(--muted);min-width:180px;">' + esc(k) + '</span><span>' + v + '</span></div>';
+      const ago = (sec) => relTime(new Date(Date.now() - sec * 1000).toISOString());
+      const setup = document.getElementById('judgeSetup');
+      const ready = c.configured && c.ok;
+      if (setup && !setup.dataset.touched) setup.open = !ready;
+      document.getElementById('judgeSetupTitle').textContent = t(c.configured ? 'judgeSetupRedo' : 'judgeSetupTitle');
+      if (!c.configured) {
+        info.innerHTML = card(badge('', t('judgeState_none')) + '<div style="margin-top:6px;">' + esc(t('judgeNoneDesc')) + '</div>');
+        owners.innerHTML = '';
+        return;
+      }
+      let html = badge(c.ok ? 'success' : 'danger', t(c.ok ? 'judgeState_ok' : 'judgeState_err'));
+      if (!c.ok) html += '<div style="margin-top:6px;">' + esc(t('arbErr_' + (c.errorCode || 'unreachable'))) + '</div>';
+      html += '<div style="margin-top:8px;">' + row(t('judgeAddress'), esc(c.url || ''));
+      if (c.ok) {
+        const a = c.about;
+        html += row(t('judgeWhere'), a ? '<strong>' + esc(a.host) + '</strong>' + (a.version ? ' · PaaSMCP ' + esc(a.version) : '') : esc(t('judgeOldArbiter')));
+        if (a && a.startedAt) html += row(t('judgeSince'), esc(new Date(a.startedAt).toLocaleString()));
+        if (c.latencyMs != null) html += row(t('judgeLatency'), esc(c.latencyMs + ' ms'));
+        const heard = (c.nodes || []).map(n => esc(t('judgeHeardAgo').replace('{who}', n.isMe ? t('arbThisServer') + ' (' + n.name + ')' : n.name).replace('{when}', n.isMe ? t('relNow') : ago(n.secondsAgo))));
+        html += row(t('judgeHears'), heard.length ? heard.join('<br>') : esc(t('judgeHeardNone')));
+        if (a && a.clusters > 1) html += row(t('judgeClusters'), esc(String(a.clusters)));
+      }
+      const w = c.watch || {};
+      let watch = w.okAt ? relSpan(w.okAt) : esc(t('judgeWatchNever'));
+      if (w.errorAt && (!w.okAt || w.errorAt > w.okAt)) watch += '<br>' + badge('warning', '!') + ' ' + esc(t('judgeWatchErr').replace('{when}', relTime(w.errorAt)).replace('{err}', w.error || ''));
+      html += row(t('judgeLastWatch'), watch) + '</div>';
+      info.innerHTML = card(html);
+      if (!c.ok) { owners.innerHTML = ''; return; }
+      const list = c.owners || [];
+      owners.innerHTML = card('<strong>' + esc(t('judgeOwnersTitle')) + '</strong><div style="margin-top:4px;">' +
+        (list.length ? list.map(o => esc(t(o.owner === o.dataOf ? 'judgeOwnerHome' : 'judgeOwnerLine').replace('{data}', o.dataOf).replace('{owner}', o.owner).replace('{epoch}', String(o.epoch)))).join('<br>') : esc(t('judgeOwnersNone'))) + '</div>');
     }
     // Explains one arbiter check (GET /api/mirror/arbiter) in plain words: one line per thing to verify.
     function renderArbiterCheck(c, opts) {
@@ -5703,10 +7989,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function loadArbiterStatus() {
       const box = document.getElementById('arbStatusBox');
       box.innerHTML = card(esc(t('checking')));
+      const jb = document.getElementById('judgeInfoBox');
+      if (jb && !jb.innerHTML) jb.innerHTML = card(esc(t('checking')));
       const res = await fetch('/api/mirror/arbiter');
       const c = await res.json().catch(() => ({}));
-      if (!res.ok) { box.innerHTML = card(badge('danger', c.error || 'error')); return; }
+      if (!res.ok) {
+        box.innerHTML = card(badge('danger', c.error || 'error'));
+        if (jb) jb.innerHTML = box.innerHTML;
+        return;
+      }
       box.innerHTML = renderArbiterCheck(c);
+      renderJudge(c);
       const input = document.getElementById('mArbiter');
       if (c.url && !input.value) input.value = c.url;
     }
@@ -5883,6 +8176,478 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { if (!data.confirmationRequired) ofsMsg(msgId, (currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status), 'err'); return null; }
       return data;
+    }
+
+    // ---- Connections (Cloudflare and GitHub from the dashboard: no terminal, no ids to copy) ----
+    let cnData = null;
+    let cfFound = null;
+    const CF_TOKEN_TEMPLATE = 'https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=' +
+      encodeURIComponent(JSON.stringify([{ key: 'argotunnel', type: 'edit' }, { key: 'dns', type: 'edit' }, { key: 'access', type: 'edit' }])) +
+      '&accountId=*&zoneId=all&name=PaaSMCP';
+    function renderExposeHint() {
+      const el = document.getElementById('exposeCfHint');
+      if (!el) return;
+      const c = (lastStatus && lastStatus.cloudflare) || {};
+      const cfs = (lastStatus && lastStatus.systemSecretsConfigured) || {};
+      const ready = Boolean(c.accountId && c.tunnelId && c.baseDomain && c.baseDomain !== 'example.com' && cfs.CF_API_TOKEN);
+      const mode = (document.getElementById('expMode') || {}).value || 'public';
+      el.innerHTML = ready || mode === 'tailscale' ? '' : '<div class="preset-hint show" style="margin:0 0 12px;">' + esc(t('exposeNeedCf')) +
+        ' <a href="#connect/cloudflare">' + esc(t('exposeOpenConnect')) + '</a></div>';
+      const hint = document.getElementById('expModeHint');
+      if (hint) hint.textContent = t('expHint_' + mode);
+      const line = document.getElementById('expPreviewLine');
+      const sub = ((document.getElementById('expSub') || {}).value || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+      if (line) line.textContent = sub && mode !== 'tailscale' && c.baseDomain && c.baseDomain !== 'example.com' ? t('expPreview') + ' https://' + sub + '.' + c.baseDomain : '';
+      const subBox = document.getElementById('expSubBox');
+      if (subBox) subBox.style.display = mode === 'tailscale' ? 'none' : '';
+      renderAddresses();
+    }
+    // Choosing an app suggests the start of the address from its name (until the person types their own).
+    let expAutoSub = '';
+    function expAppChanged() {
+      const app = document.getElementById('expApp').value.trim();
+      const subEl = document.getElementById('expSub');
+      if (!subEl.value || subEl.value === expAutoSub) {
+        expAutoSub = app.toLowerCase().replace(/^paasmcp-/, '').replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+        subEl.value = expAutoSub;
+      }
+      renderExposeHint();
+    }
+    function renderAddresses() {
+      const box = document.getElementById('expList');
+      if (!box) return;
+      const rows = [];
+      Object.values((lastStatus && lastStatus.apps) || {}).forEach(function (a) {
+        (a.domains || []).forEach(function (d) {
+          if (d && d.url && ['public', 'zero-trust', 'tailscale'].indexOf(d.mode) !== -1) rows.push({ app: a.name, d: d });
+        });
+      });
+      box.innerHTML = rows.length
+        ? '<h3 style="font-size:14px;margin:0 0 8px;">' + esc(t('expListTitle')) + '</h3>' + rows.map(function (r) {
+            return '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;">'
+              + '<a href="' + esc(r.d.url) + '" target="_blank" rel="noopener" style="font-weight:600;word-break:break-all;">' + esc(r.d.url.replace(/^https?:[/][/]/, '')) + '</a>'
+              + '<span style="color:var(--muted);">' + esc(r.app) + ' · ' + esc(t('mode_' + r.d.mode)) + '</span>'
+              + '<button class="secondary" style="margin-left:auto;padding:4px 10px;font-size:12px;" data-app="' + esc(r.app) + '" data-host="' + esc(r.d.hostname) + '" onclick="removeAddress(this)">' + esc(t('btnUnexpose')) + '</button>'
+              + '</div>';
+          }).join('')
+        : '';
+    }
+    async function removeAddress(btn) {
+      btn.disabled = true;
+      const res = await fetch('/api/unexpose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appName: btn.getAttribute('data-app'), hostname: btn.getAttribute('data-host') })
+      });
+      const data = await res.json().catch(function () { return {}; });
+      btn.disabled = false;
+      if (!res.ok) { if (!data.confirmationRequired) alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
+      showToast(t('toastUnexposed') + data.removed);
+      loadAll();
+    }
+    // Connections > PCs: the devices of the Tailscale network, with and without PaaSMCP.
+    async function loadPcs() {
+      const box = document.getElementById('pcsBox');
+      const btn = document.getElementById('btnPcsLoad');
+      if (!box) return;
+      btn.disabled = true;
+      box.innerHTML = '<p class="card-desc">' + esc(t('pcsLooking')) + '</p>';
+      try {
+        const res = await fetch('/api/pcs');
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { box.innerHTML = badge('danger', d.error || 'error'); return; }
+        if (d.error) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNoTs')) + '</p>'; return; }
+        const list = d.pcs || [];
+        if (!list.length) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNone')) + '</p>'; return; }
+        if (!document.getElementById('pcsJobBox').innerHTML) await pcResume();
+        box.innerHTML = list.map(pcRow).join('');
+      } finally { btn.disabled = false; }
+    }
+    function pcRow(x) {
+      const busy = lastPcJob && lastPcJob.ip === x.ip && ['connecting', 'ready', 'installing'].indexOf(lastPcJob.phase) !== -1;
+      const canInstall = !busy && x.ssh !== 'closed' && (x.state === 'installable' || (x.state === 'paasmcp' && (x.roles || []).join() === 'installed'));
+      let tag;
+      if (x.state === 'paasmcp') tag = badge('success', t('pcsHas')) + (x.roles || []).map(r => ' ' + badge('', t('pcsRole_' + r))).join('');
+      else if (x.state === 'installable') tag = badge('warning', t('pcsCan'));
+      else if (x.state === 'offline') tag = badge('', t('pcsOffline'));
+      else tag = badge('', t('pcsWhy_' + (x.why || 'notLinux')));
+      const ssh = x.state === 'installable' && x.ssh && !busy ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('pcsSsh_' + x.ssh)) + '</div>' : '';
+      return '<div class="pc-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border);">' +
+        '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip || '') + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + ssh + '</div>' +
+        '<div class="pc-actions">' + (canInstall ? '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" data-ip="' + esc(x.ip) + '" data-name="' + esc(x.name) + '" data-ssh="' + esc(x.ssh || '') + '" onclick="pcOpenForm(this.dataset)">' + esc(t('pcsBtnInstall')) + '</button>' : '') + '</div></div>';
+    }
+    // Installing PaaSMCP on one of those PCs: log in, check, pick the role, confirm, watch the steps.
+    let pcJobTimer = null;
+    let pcFormFor = null;
+    function pcOpenForm(d) {
+      pcFormFor = { ip: d.ip, name: d.name, ssh: d.ssh };
+      const viaTs = d.ssh === 'tailscale';
+      document.getElementById('pcsJobBox').innerHTML = card(
+        '<h3 class="ofs-h" style="margin-top:0;">' + esc(t('pcsFormTitle').replace('{name}', d.name)) + '</h3>' +
+        '<p class="ofs-note">' + esc(t('pcsFormDesc')) + '</p>' +
+        '<div class="form-grid">' +
+          '<div><label class="field-label" for="pcUser">' + esc(t('pcsUser')) + '</label><input id="pcUser" autocomplete="off" spellcheck="false" value="' + (viaTs ? 'root' : '') + '" /></div>' +
+          '<div><label class="field-label" for="pcPass">' + esc(t('pcsPass')) + '</label><input id="pcPass" type="password" autocomplete="new-password" /></div>' +
+        '</div>' +
+        '<p class="ofs-note" style="margin-top:6px;">' + esc(t(viaTs ? 'pcsPassHintTs' : 'pcsPassHint')) + '</p>' +
+        '<div class="ofs-msg" id="pcFormMsg" role="status" aria-live="polite"></div>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;"><button onclick="pcCheck()" id="btnPcCheck">' + esc(t('pcsBtnCheck')) + '</button>' +
+        '<button class="secondary" onclick="pcCloseForm()">' + esc(t('pcsCancelBtn')) + '</button></div>');
+      document.getElementById(viaTs ? 'pcPass' : 'pcUser').focus();
+    }
+    function pcCloseForm() { pcFormFor = null; document.getElementById('pcsJobBox').innerHTML = ''; }
+    async function pcCheck() {
+      const btn = document.getElementById('btnPcCheck');
+      const pass = document.getElementById('pcPass');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/pcs/check', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip: pcFormFor.ip, user: document.getElementById('pcUser').value.trim(), password: pass.value }) });
+        const d = await res.json().catch(() => ({}));
+        pass.value = '';
+        if (!res.ok) { ofsMsg('pcFormMsg', (currentLang === 'pt' && d.errorPt) || d.error || ('HTTP ' + res.status), 'err'); return; }
+        renderPcJob(d.job);
+        pcPoll();
+        loadPcs();
+      } finally { if (document.getElementById('btnPcCheck')) btn.disabled = false; }
+    }
+    function pcPoll() {
+      clearTimeout(pcJobTimer);
+      pcJobTimer = setTimeout(async () => {
+        const res = await fetch('/api/pcs/job').catch(() => null);
+        const d = res && res.ok ? await res.json().catch(() => ({})) : {};
+        if (!d.job) return;
+        renderPcJob(d.job);
+        if (d.job.phase === 'connecting' || d.job.phase === 'installing') pcPoll();
+        else if (d.job.phase === 'done') loadPcs();
+      }, 2000);
+    }
+    const PC_STEP_ICON = { todo: '○', run: '⏳', ok: '✓', fail: '✗', skip: '–' };
+    function pcSteps(j, from) {
+      return '<ol class="ofs-note" style="list-style:none;padding:0;margin:8px 0;">' + j.steps.filter(s => from.indexOf(s.id) !== -1).map(s =>
+        '<li style="padding:2px 0;' + (s.state === 'fail' ? 'color:var(--danger);' : s.state === 'ok' ? 'color:var(--text);' : '') + '">' + PC_STEP_ICON[s.state] + ' ' + esc(t('pcsStep_' + s.id)) + '</li>').join('') + '</ol>';
+    }
+    function pcLog(j, open) {
+      if (!j.log || !j.log.length) return '';
+      return '<details' + (open ? ' open' : '') + ' style="margin-top:6px;"><summary class="ofs-note" style="cursor:pointer;">' + esc(t('pcsLog')) + '</summary><pre id="pcLogPre" style="max-height:260px;overflow:auto;font-size:11px;white-space:pre-wrap;word-break:break-all;">' + esc(j.log.join('\\n')) + '</pre></details>';
+    }
+    function pcFacts(f) {
+      const rows = [
+        [t('pcsFactSystem'), f.osName + ' · ' + f.arch],
+        [t('pcsFactSize'), (f.memMb / 1024).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en', { maximumFractionDigits: 1 }) + ' GB RAM · ' + Math.round(f.diskMb / 1024) + ' GB ' + t('pcsFactFree')],
+        [t('pcsFactUser'), f.user + ' · ' + t('pcsSudo_' + f.sudo)],
+      ];
+      return '<table style="font-size:12.5px;margin:6px 0;">' + rows.map(r => '<tr><td style="color:var(--muted);padding:2px 12px 2px 0;">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>').join('') + '</table>';
+    }
+    let lastPcJob = null;
+    function renderPcJob(j) {
+      const box = document.getElementById('pcsJobBox');
+      if (!box || !j) return;
+      lastPcJob = j;
+      const keep = box.querySelector('details[open]');
+      let html = '<h3 class="ofs-h" style="margin-top:0;">' + esc(t('pcsFormTitle').replace('{name}', j.name)) + ' <span style="color:var(--muted);font-weight:400;">' + esc(j.ip) + '</span></h3>';
+      if (j.phase === 'connecting') {
+        html += pcSteps(j, ['connect', 'check']);
+        if (j.authUrl) html += '<p class="ofs-note">' + esc(t('pcsAuthUrl')) + ' <a href="' + esc(j.authUrl) + '" target="_blank" rel="noreferrer">' + esc(t('pcsAuthOpen')) + '</a></p>';
+      } else if (j.phase === 'ready') {
+        const p = j.plan, f = j.facts;
+        html += pcFacts(f);
+        html += '<p class="ofs-note" style="margin:6px 0;">' + esc(p.install.length ? t('pcsWillInstall').replace('{list}', p.install.map(x => t('pcsPkg_' + x)).join(', ')) : t('pcsNothingMissing')) + '</p>';
+        html += (p.warnings || []).map(w => '<p class="ofs-note" style="margin:4px 0;">⚠️ ' + esc(t('pcsWarn_' + w)) + '</p>').join('');
+        if (j.hostKey && j.hostKey.fingerprint) html += '<p class="ofs-note" style="margin:4px 0;">' + esc(t(j.hostKey.pinned ? 'pcsKeyPinned' : 'pcsKeyFirst')) + ' <code>' + esc(j.hostKey.fingerprint) + '</code></p>';
+        html += '<h3 class="ofs-h">' + esc(t('pcsRoleTitle')) + '</h3>' + p.roles.map((r, i) =>
+          '<label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-size:13px;margin:6px 0;"><input type="radio" name="pcRole" value="' + r + '" style="width:auto;margin-top:3px;"' + (i === 0 ? ' checked' : '') + ' onchange="pcRoleChanged()" /><span><strong>' + esc(t('pcsRole_' + r + 'Title')) + '</strong><br/><span style="color:var(--muted);">' + esc(t('pcsRole_' + r + 'Desc')) + '</span></span></label>').join('');
+        html += '<div class="form-grid" style="grid-template-columns:minmax(0,280px);margin-top:6px;"><div><label class="field-label" for="pcName">' + esc(t('pcsName')) + '</label><input id="pcName" value="' + esc(j.name) + '" /></div></div>';
+        if (j.via === 'tailscale') html += '<label id="pcTsOffRow" style="display:flex;gap:6px;align-items:center;cursor:pointer;font-size:12.5px;margin-top:8px;"><input type="checkbox" id="pcTsOff" style="width:auto;" checked /> <span id="pcTsOffText">' + esc(t('pcsTsOff')) + '</span></label>';
+        html += '<div class="ofs-msg" id="pcInstallMsg" role="status" aria-live="polite"></div>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;"><button onclick="pcInstall()" id="btnPcInstall">' + esc(t('pcsBtnGo')) + '</button><button class="secondary" onclick="pcCancel()">' + esc(t('pcsCancelBtn')) + '</button></div>';
+        html += '<p class="ofs-note" style="margin-top:8px;">' + esc(t('pcsReadyUntil')) + '</p>';
+      } else if (j.phase === 'installing') {
+        html += pcSteps(j, ['packages', 'node', 'code', 'role', 'finish']) + '<p class="ofs-note">' + esc(t('pcsInstalling')) + '</p>' + pcLog(j, Boolean(keep));
+      } else if (j.phase === 'done') {
+        const r = j.result || {};
+        let msg = r.role === 'helper' ? t('pcsDoneHelper').replace('{name}', r.helper || j.name)
+          : r.role === 'arbiter' ? t('pcsDoneArbiter').replace('{name}', j.name).replace('{url}', r.arbiterUrl || '')
+          : t('pcsDoneServer').replace('{name}', j.name).replace('{url}', r.dashboard || 'http://127.0.0.1:4099');
+        if (r.tailscaleSshOff) msg += ' ' + t('pcsDoneTsOff');
+        html += '<p>' + badge('success', '✓') + ' ' + esc(msg) + '</p>' + (r.role === 'helper' ? '<button class="secondary" onclick="goTo(&quot;pool&quot;, &quot;list&quot;)">' + esc(t('pcsGoHelpers')) + '</button>' : '') + pcLog(j, false);
+      } else {
+        const err = (currentLang === 'pt' && j.errorPt) || j.error || t('pcsCancelled');
+        html += pcSteps(j, ['connect', 'check', 'packages', 'node', 'code', 'role', 'finish'].filter(id => (j.steps.find(s => s.id === id) || {}).state !== 'skip'));
+        html += '<p>' + badge(j.phase === 'cancelled' ? '' : 'danger', j.phase === 'cancelled' ? '–' : '✗') + ' ' + esc(err) + '</p>';
+        if (j.errorCode && I18N[currentLang]['pcsHint_' + j.errorCode]) html += '<p class="ofs-note">' + esc(t('pcsHint_' + j.errorCode)) + '</p>';
+        if (j.plan && j.plan.problems && j.plan.problems.length) html += j.plan.problems.map(x => '<p class="ofs-note" style="margin:4px 0;">• ' + esc(t('pcsProblem_' + x)) + '</p>').join('');
+        html += pcLog(j, j.phase === 'failed' && ['packages', 'node', 'code', 'role'].some(id => (j.steps.find(s => s.id === id) || {}).state === 'fail'));
+        html += '<div style="margin-top:8px;"><button class="secondary" onclick="pcCloseForm(); loadPcs();">' + esc(t('pcsCloseBtn')) + '</button></div>';
+      }
+      box.innerHTML = card(html);
+      const pre = document.getElementById('pcLogPre');
+      if (pre) pre.scrollTop = pre.scrollHeight;
+      if (j.phase === 'ready') pcRoleChanged();
+    }
+    function pcRoleChanged() {
+      const r = (document.querySelector('input[name="pcRole"]:checked') || {}).value;
+      const box = document.getElementById('pcTsOff');
+      if (!box) return;
+      box.disabled = r === 'helper';
+      if (r === 'helper') box.checked = true;
+      document.getElementById('pcTsOffText').textContent = t(r === 'helper' ? 'pcsTsOffHelper' : 'pcsTsOff');
+    }
+    async function pcInstall() {
+      const res0 = await fetch('/api/pcs/job');
+      const cur = ((await res0.json().catch(() => ({}))) || {}).job;
+      if (!cur) return;
+      const role = (document.querySelector('input[name="pcRole"]:checked') || {}).value;
+      const ts = document.getElementById('pcTsOff');
+      const res = await fetch('/api/pcs/install', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: cur.id, role, name: document.getElementById('pcName').value.trim(), turnOffTailscaleSsh: ts ? ts.checked : false }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) { if (!d.confirmationRequired) ofsMsg('pcInstallMsg', (currentLang === 'pt' && d.errorPt) || d.error || ('HTTP ' + res.status), 'err'); return; }
+      renderPcJob(d.job);
+      pcPoll();
+    }
+    async function pcCancel() {
+      await fetch('/api/pcs/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      pcCloseForm();
+    }
+    // Back on the tab while a job runs (or waits for the confirmation): show it again.
+    async function pcResume() {
+      const res = await fetch('/api/pcs/job').catch(() => null);
+      const d = res && res.ok ? await res.json().catch(() => ({})) : {};
+      if (d.job && (d.job.phase === 'connecting' || d.job.phase === 'installing' || d.job.phase === 'ready')) { renderPcJob(d.job); if (d.job.phase !== 'ready') pcPoll(); }
+    }
+    async function loadConnections() {
+      const link = document.getElementById('cfTokenLink');
+      if (link) link.href = CF_TOKEN_TEMPLATE;
+      const res = await fetch('/api/connections');
+      if (!res.ok) return;
+      cnData = await res.json();
+      renderConnections();
+      renderNotify();
+    }
+    function renderConnections() {
+      if (!cnData) return;
+      const c = cnData.cloudflare || {};
+      const st = document.getElementById('cfStatus');
+      if (st) {
+        const conn = c.connectorHere === 'running' ? t('cnConnRunning') : c.connectorHere === 'stopped' ? t('cnConnStopped') : '';
+        st.innerHTML = c.ready
+          ? card(badge('success', t('cnCfReady')) + ' <strong>' + esc(c.baseDomain) + '</strong>' +
+              '<div style="color:var(--muted);margin-top:4px;">' + esc(t('cnCfReadyDesc').split('{domain}').join(c.baseDomain)) + (conn ? ' ' + esc(conn) : '') + '</div>' +
+              ((c.zeroTrustEmails || []).length ? '<div style="color:var(--muted);margin-top:4px;">' + esc(t('cnCfEmailsNow')) + ' ' + esc(c.zeroTrustEmails.join(', ')) + '</div>' : '') +
+              '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;"><button class="secondary" onclick="goTo(&#39;overview&#39;, &#39;expose&#39;)">' + esc(t('cnGoExpose')) + '</button>' +
+              '<button class="secondary" onclick="cfShowForm()">' + esc(t('cnChange')) + '</button></div>')
+          : card(badge('warning', t('notConfigured')) + ' <span style="color:var(--muted);">' + esc(c.tokenSaved ? t('cnCfHalf') : t('cnCfNone')) + '</span>');
+      }
+      const form = document.getElementById('cfForm');
+      if (form && !form.dataset.forced) form.style.display = c.ready ? 'none' : '';
+      const tok = document.getElementById('cfToken');
+      if (tok) tok.placeholder = c.tokenSaved ? t('keepSaved') : '';
+      if (c.zeroTrustEmails && document.getElementById('cfEmails') && !document.getElementById('cfEmails').value) document.getElementById('cfEmails').value = c.zeroTrustEmails.join(', ');
+      const g = cnData.github || {};
+      const gs = document.getElementById('ghStatus');
+      if (gs) gs.innerHTML = card(g.tokenSaved ? badge('success', t('cnGhSaved')) + ' <span style="color:var(--muted);">' + esc(t('cnGhSavedDesc')) + '</span>'
+        : badge('', t('cnGhNoToken')) + ' <span style="color:var(--muted);">' + esc(t('cnGhNoTokenDesc')) + '</span>');
+      const key = document.getElementById('ghSshKey');
+      if (key && lastStatus) key.textContent = lastStatus.sshPublicKey || '';
+      setNavCounter('tabCountConnect', (c.ready ? 1 : 0) + (g.tokenSaved ? 1 : 0), 'cntConnect');
+    }
+    function cfShowForm() {
+      const form = document.getElementById('cfForm');
+      form.dataset.forced = '1';
+      form.style.display = '';
+      document.getElementById('cfToken').focus();
+    }
+    async function cfDiscover() {
+      ofsMsg('cfMsg', t('cnChecking'), '');
+      document.getElementById('cfChoose').style.display = 'none';
+      const r = await ofsPost('/api/connections/cloudflare/discover', { token: document.getElementById('cfToken').value.trim() }, 'cfMsg');
+      if (!r) return;
+      cfFound = r;
+      const miss = (r.missing || []).map(function (m) { return t('cnMiss_' + m); });
+      if (!r.accounts.length || !r.zones.length) { ofsMsg('cfMsg', miss.join(' '), 'err'); return; }
+      ofsMsg('cfMsg', t('cnFound').split('{a}').join(String(r.accounts.length)).split('{z}').join(String(r.zones.length)) + (miss.length ? ' ' + miss.join(' ') : ''), miss.length ? 'err' : 'ok');
+      const prev = (cnData && cnData.cloudflare) || {};
+      document.getElementById('cfAccount').innerHTML = r.accounts.map(function (a) {
+        return '<option value="' + esc(a.id) + '"' + (a.id === prev.accountId ? ' selected' : '') + '>' + esc(a.name) + '</option>';
+      }).join('');
+      cfFillChoices();
+      document.getElementById('cfChoose').style.display = '';
+    }
+    function cfFillChoices() {
+      if (!cfFound) return;
+      const accId = document.getElementById('cfAccount').value;
+      const acc = cfFound.accounts.find(function (a) { return a.id === accId; }) || { tunnels: [] };
+      const prev = (cnData && cnData.cloudflare) || {};
+      const zones = cfFound.zones.filter(function (z) { return !z.accountId || z.accountId === accId; });
+      document.getElementById('cfDomain').innerHTML = zones.length
+        ? zones.map(function (z) { return '<option value="' + esc(z.name) + '"' + (z.name === prev.baseDomain ? ' selected' : '') + '>' + esc(z.name) + '</option>'; }).join('')
+        : '<option value="">' + esc(t('cnNoZoneHere')) + '</option>';
+      const opts = ['<option value="new">' + esc(t('cnNewTunnel')) + '</option>'].concat(acc.tunnels.map(function (tu) {
+        return '<option value="' + esc(tu.id) + '"' + (tu.id === prev.tunnelId ? ' selected' : '') + '>' + esc(tu.name) + ' (' + esc(t('cnTun_' + tu.status) || tu.status) + (tu.remote ? '' : ', ' + t('cnTunLocal')) + ')</option>';
+      }));
+      document.getElementById('cfTunnel').innerHTML = opts.join('');
+      cfTunnelHint();
+    }
+    function cfTunnelHint() {
+      const accId = document.getElementById('cfAccount').value;
+      const acc = (cfFound && cfFound.accounts.find(function (a) { return a.id === accId; })) || { tunnels: [] };
+      const id = document.getElementById('cfTunnel').value;
+      const tu = acc.tunnels.find(function (x) { return x.id === id; });
+      const note = document.getElementById('cfTunnelNote');
+      const row = document.getElementById('cfRunHereRow');
+      if (!tu) { note.textContent = t('cnNewTunnelNote'); row.style.display = 'none'; return; }
+      if (!tu.remote) { note.textContent = t('cnTunLocalNote'); row.style.display = 'none'; return; }
+      const idle = tu.status === 'inactive' || tu.status === 'down';
+      note.textContent = idle ? t('cnTunIdleNote') : t('cnTunLiveNote');
+      row.style.display = 'flex';
+      document.getElementById('cfRunHere').checked = idle;
+    }
+    async function cfSave() {
+      ofsMsg('cfSaveMsg', t('cnSaving'), '');
+      const btn = document.getElementById('btnCfSave');
+      btn.disabled = true;
+      try {
+        const r = await ofsPost('/api/connections/cloudflare', {
+          token: document.getElementById('cfToken').value.trim(),
+          accountId: document.getElementById('cfAccount').value,
+          baseDomain: document.getElementById('cfDomain').value,
+          tunnelId: document.getElementById('cfTunnel').value,
+          runHere: document.getElementById('cfRunHereRow').style.display !== 'none' && document.getElementById('cfRunHere').checked,
+          zeroTrustEmails: document.getElementById('cfEmails').value,
+        }, 'cfSaveMsg');
+        if (!r) { if (document.getElementById('cfSaveMsg').textContent === t('cnSaving')) ofsMsg('cfSaveMsg', '', ''); return; }
+        ofsMsg('cfSaveMsg', r.created ? t('cnSavedNew') : t('cnSaved'), 'ok');
+        document.getElementById('cfToken').value = '';
+        document.getElementById('cfChoose').style.display = 'none';
+        delete document.getElementById('cfForm').dataset.forced;
+        cnData = r.summary;
+        loadAll();
+        renderConnections();
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    function renderNotify() {
+      const n = (cnData && cnData.notify) || { configured: false };
+      const st = document.getElementById('ntStatus');
+      const form = document.getElementById('ntForm');
+      if (!st || !form) return;
+      st.innerHTML = n.configured
+        ? card(badge('success', t('ntOn')) + ' <span style="color:var(--muted);">' + esc(t('ntOnDesc').split('{host}').join(n.host || '?').split('{success}').join(n.onSuccess ? t('ntOnSuccessShort') : '')) + '</span>' +
+            '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;"><button class="secondary" onclick="ntShowForm()">' + esc(t('ntChange')) + '</button>' +
+            '<button class="secondary" onclick="ntClear()">' + esc(t('ntOff')) + '</button></div>')
+        : '';
+      if (!form.dataset.forced) form.style.display = n.configured ? 'none' : '';
+      document.getElementById('ntSuccess').checked = Boolean(n.onSuccess);
+    }
+    function ntShowForm() {
+      const form = document.getElementById('ntForm');
+      form.dataset.forced = '1';
+      form.style.display = '';
+      document.getElementById('ntUrl').focus();
+    }
+    async function ntSave() {
+      const url = document.getElementById('ntUrl').value.trim();
+      if (!url) return;
+      ofsMsg('ntMsg', t('ntSending'), '');
+      const r = await ofsPost('/api/connections/notify', { url, onSuccess: document.getElementById('ntSuccess').checked, lang: currentLang }, 'ntMsg');
+      if (!r) return;
+      document.getElementById('ntUrl').value = '';
+      delete document.getElementById('ntForm').dataset.forced;
+      ofsMsg('ntMsg', t('ntSaved'), 'ok');
+      loadConnections();
+      loadAll();
+    }
+    async function ntClear() {
+      if (!confirm(t('ntOffConfirm'))) return;
+      await fetch('/api/connections/notify', { method: 'DELETE' });
+      ofsMsg('ntMsg', '', '');
+      loadConnections();
+      loadAll();
+    }
+
+    async function ghSave() {
+      ofsMsg('ghMsg', t('cnChecking'), '');
+      const r = await ofsPost('/api/connections/github', { token: document.getElementById('ghToken').value.trim() }, 'ghMsg');
+      if (!r) return;
+      document.getElementById('ghToken').value = '';
+      ofsMsg('ghMsg', t('cnGhOk').split('{login}').join(r.login), 'ok');
+      ghRepos = null;
+      loadConnections();
+      loadAll();
+    }
+
+
+    // ---- Push notices: the saved GitHub token creates the webhook on each app's repository ----
+    let whRepos = null;
+    let whBusy = false;
+    function whAddress() {
+      const el = document.getElementById('whAddress');
+      if (el && !el.value && location.protocol === 'https:') el.value = location.origin;
+      return el ? el.value.trim() : '';
+    }
+    async function loadHooks() {
+      const note = document.getElementById('whAutoNote');
+      if (!note) return;
+      if (!cnData) { const r = await fetch('/api/connections'); if (r.ok) cnData = await r.json(); }
+      const on = Boolean(cnData && cnData.github && cnData.github.tokenSaved);
+      note.innerHTML = esc(t(on ? 'whAutoNoteOn' : 'whAutoNoteOff')) + (on ? '' : ' <a href="#connect/github" data-go-tab="connect" data-go-sub="github">' + esc(currentLang === 'pt' ? 'Abrir Conexões → GitHub' : 'Open Connections → GitHub') + '</a>');
+      document.querySelector('#whAuto .wh-form').style.display = on ? '' : 'none';
+      document.getElementById('whManual').open = !on;
+      if (!on) { document.getElementById('whRepos').innerHTML = ''; return; }
+      const address = whAddress();
+      if (!address) { ofsMsg('whMsg', '', ''); return; }
+      ofsMsg('whMsg', t('whChecking'), '');
+      const res = await fetch('/api/connections/github/webhooks?address=' + encodeURIComponent(address));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { ofsMsg('whMsg', (currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status), 'err'); whRepos = null; renderHooks(); return; }
+      ofsMsg('whMsg', '', '');
+      whRepos = data.repos || [];
+      renderHooks();
+    }
+    function renderHooks() {
+      const box = document.getElementById('whRepos');
+      if (!box) return;
+      if (!whRepos) { box.innerHTML = ''; return; }
+      if (!whRepos.length) { box.innerHTML = '<p class="ofs-note">' + esc(t('whNoRepos')) + '</p>'; return; }
+      const kind = { on: 'success', off: 'warning', denied: 'danger', error: 'warning' };
+      const label = { on: 'whStOn', off: 'whStOff', denied: 'whStDenied', error: 'whStError' };
+      const rows = whRepos.map(function (r) {
+        const failed = r.state === 'on' && typeof r.lastCode === 'number' && (r.lastCode < 200 || r.lastCode >= 300);
+        const hint = r.state === 'denied' ? t('whDeniedHint') : failed ? t('whLastFail').split('{code}').join(String(r.lastCode)) : '';
+        const btn = r.state === 'denied' ? '' : '<button class="secondary" ' + (whBusy ? 'disabled ' : '') + 'onclick="hookOn(' + esc(JSON.stringify(r.repo)).split('"').join('&quot;') + ')">' + esc(t(r.state === 'on' ? 'whBtnRedo' : 'whBtnOn')) + '</button>';
+        return '<div style="display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);">' +
+          '<div style="flex:1 1 220px;min-width:0;"><strong style="overflow-wrap:anywhere;">' + esc(r.repo) + '</strong> ' + badge(failed ? 'warning' : kind[r.state] || 'warning', t(label[r.state] || 'whStError')) +
+          '<div style="color:var(--muted);font-size:12px;">' + esc((r.apps || []).join(', ')) + '</div>' +
+          (hint ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(hint) + '</div>' : '') + '</div>' + btn + '</div>';
+      }).join('');
+      const pending = whRepos.filter(function (r) { return r.state === 'off'; }).length;
+      box.innerHTML = rows +
+        (pending > 1 ? '<button style="margin-top:10px;" ' + (whBusy ? 'disabled ' : '') + 'onclick="hookAll()">' + esc(t('whBtnAll')) + '</button>' : '');
+    }
+    async function hookOn(repo) {
+      if (whBusy) return false;
+      whBusy = true; renderHooks();
+      ofsMsg('whMsg', t('whWorking').split('{repo}').join(repo), '');
+      let ok = false;
+      try {
+        const r = await ofsPost('/api/connections/github/webhooks', { repo: repo, address: whAddress() }, 'whMsg');
+        if (r) {
+          ok = r.reach === 'ok';
+          const key = r.reach === 'ok' ? 'whOk' : r.reach === 'unreachable' ? 'whUnreachable' : 'whUnknown';
+          ofsMsg('whMsg', t(key).split('{repo}').join(repo).split('{code}').join(String(r.code || 0)), r.reach === 'ok' ? 'ok' : 'err');
+        }
+      } finally { whBusy = false; }
+      const msg = document.getElementById('whMsg');
+      const keep = msg ? [msg.textContent, msg.className] : null;
+      await loadHooks();
+      if (keep && msg) { msg.textContent = keep[0]; msg.className = keep[1]; }
+      return ok;
+    }
+    async function hookAll() {
+      const list = (whRepos || []).filter(function (r) { return r.state === 'off'; }).map(function (r) { return r.repo; });
+      for (const repo of list) { if (!(await hookOn(repo)) && document.getElementById('whMsg').className.indexOf('err') !== -1) break; }
     }
 
     async function loadOffsite() {
@@ -6528,13 +9293,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function loadAiTokens() {
       const res = await fetch('/api/tokens');
       if (!res.ok) return;
-      const items = (await res.json()).tokens || [];
+      const data = await res.json();
+      const items = data.tokens || [];
+      const use = data.mcpUse;
+      const usedLine = use ? '<p style="margin:0 0 10px;">' + esc(t(use.via === 'http' ? 'aiUsedHttp' : 'aiUsedStdio')) + ' ' + esc(new Date(use.lastUsedAt).toLocaleString()) + '</p>' : '';
       const names = { read: t('aiLvlReadShort'), deploy: t('aiLvlDeployShort'), destroy: t('aiLvlDestroyShort') };
-      document.getElementById('aiTokens').innerHTML = items.length
+      document.getElementById('aiTokens').innerHTML = usedLine + (items.length
         ? '<div class="field-label">' + esc(t('aiTokensTitle')) + '</div>' + items.map(k => card('<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;"><div><strong>' + esc(k.name) + '</strong> ' + badge('', names[k.level] || k.level) +
           '<div style="color:var(--muted);margin-top:4px;">' + esc(t('aiLastUsed')) + ' ' + esc(k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : t('never')) + '</div></div>' +
           '<button class="danger" onclick="revokeAiToken(&#39;' + esc(k.id) + '&#39;)">' + esc(t('aiRevoke')) + '</button></div>')).join('')
-        : '';
+        : '');
     }
     async function createAiToken() {
       const level = (document.querySelector('input[name="aiLevel"]:checked') || {}).value || 'deploy';
@@ -6560,45 +9328,169 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const res = await fetch('/api/status');
       if (!res.ok) return;
       lastStatus = await res.json();
+      liveResources = null;
       applyPreferences();
+      if (!resourcesTimer) resourcesTimer = setTimeout(pollResources, 15000);
     }
 
+    // Which app's variables: a list of apps instead of typing a "scope". "system" holds the dashboard's own keys.
+    const secChanged = {};
+    let secDetails = {};
+    function fillScopeSelect(apps) {
+      const sel = document.getElementById('secScope');
+      if (!sel) return;
+      const cur = sel.value || 'system';
+      const names = apps.map(function (a) { return a.name; }).sort();
+      sel.innerHTML = names.map(function (n) { return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('') +
+        '<option value="system">' + esc(t('secSystemScope')) + '</option>';
+      sel.value = names.indexOf(cur) !== -1 || cur === 'system' ? cur : (names[0] || 'system');
+    }
+    function renderSecApply() {
+      const box = document.getElementById('secApply');
+      if (!box) return;
+      const scope = document.getElementById('secScope').value || 'system';
+      const app = lastStatus && lastStatus.apps && lastStatus.apps[scope];
+      if (scope === 'system') { box.innerHTML = '<p class="ofs-note">' + esc(t('secSystemNote')) + '</p>'; return; }
+      const canRedeploy = app && app.repoUrl && app.runtimeType !== 'paasmcp-control-plane';
+      box.innerHTML = '<div class="preset-hint show sec-apply' + (secChanged[scope] ? ' changed' : '') + '" style="margin:0 0 12px;">' +
+        esc(t(secChanged[scope] ? 'secApplyChanged' : 'secApplyNote')) +
+        (canRedeploy ? ' <button class="' + (secChanged[scope] ? '' : 'secondary') + '" style="margin-left:6px;padding:4px 10px;font-size:12px;" onclick="redeployApp(&#39;' + esc(scope) + '&#39;)">' + esc(t('actionRedeploy')) + '</button>' : '') + '</div>';
+    }
     async function loadSecrets() {
-      const scope = document.getElementById('secScope').value.trim() || 'system';
+      const scope = document.getElementById('secScope').value || 'system';
+      renderSecApply();
       const res = await fetch('/api/secrets?scope=' + encodeURIComponent(scope));
       if (!res.ok) return;
       const data = await res.json();
+      secDetails = data.details || {};
       const entries = Object.entries(data.secrets || {});
       document.getElementById('secretsList').innerHTML = entries.length
-        ? entries.map(([k, v]) => \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;"><span>🔑 <strong>\${esc(k)}</strong> = <code>\${esc(v)}</code></span><button class="danger" style="padding:3px 9px;font-size:11px" onclick="delSecret('\${esc(scope)}','\${esc(k)}')">\${esc(t('btnRemoveSecret'))}</button></div>\`).join('')
+        ? entries.map(function (e) {
+            const k = e[0];
+            const d = secDetails[k] || {};
+            const sugg = d.suggested ? (d.suggested[currentLang] || d.suggested.en) : '';
+            const descHtml = d.description
+              ? '<div class="sec-desc">' + esc(d.description) + '</div>'
+              : sugg
+                ? '<div class="sec-desc sugg">' + esc(sugg) + ' <span class="sec-tag" title="' + esc(t('secDescDefaultTitle')) + '">' + esc(t('secDescDefault')) + '</span></div>'
+                : '<div class="sec-desc none">' + esc(t('secDescNone')) + '</div>';
+            const created = d.createdAt ? t('secCreated').split('{d}').join(secWhen(d.createdAt)) : t('secCreatedUnknown');
+            const updated = !d.updatedAt ? t('secUpdatedUnknown')
+              : d.updatedAt === d.createdAt ? t('secNeverChanged')
+              : t('secUpdated').split('{d}').join(secWhen(d.updatedAt));
+            return '<div class="sec-row"><div class="sec-main"><span class="sec-k"><strong>' + esc(k) + '</strong> <code>' + esc(e[1]) + '</code></span>' +
+              descHtml + '<div class="sec-dates">' + esc(created) + ' · ' + esc(updated) + '</div>' +
+              '<div class="sec-edit" id="secEdit-' + esc(k) + '" style="display:none;"></div></div>' +
+              '<span class="sec-act"><button class="secondary" onclick="editSecretDesc(&#39;' + esc(k) + '&#39;)">' + esc(t(d.description || sugg ? 'secDescEditBtn' : 'secDescBtn')) + '</button>' +
+              '<button class="secondary" onclick="editSecret(&#39;' + esc(k) + '&#39;)">' + esc(t('secChange')) + '</button>' +
+              '<button class="danger" onclick="delSecret(&#39;' + esc(scope) + '&#39;,&#39;' + esc(k) + '&#39;)">' + esc(t('btnRemoveSecret')) + '</button></span></div>';
+          }).join('')
         : '<div style="color:var(--muted);font-size:12.5px">' + esc(t('emptySecrets')) + '</div>';
+    }
+    function secWhen(iso) {
+      try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return String(iso || ''); }
+    }
+    // Inline editor under the key: starts from the current text, or from the built-in one so it can be tweaked.
+    function editSecretDesc(key) {
+      const box = document.getElementById('secEdit-' + key);
+      if (!box) return;
+      if (box.style.display !== 'none') { box.style.display = 'none'; box.innerHTML = ''; return; }
+      const d = secDetails[key] || {};
+      const start = d.description || (d.suggested ? (d.suggested[currentLang] || d.suggested.en) : '');
+      box.innerHTML = '<input maxlength="300" autocomplete="off" aria-label="' + esc(t('secDescLabel')) + '" placeholder="' + esc(t('secDescPh')) + '" />' +
+        '<button onclick="saveSecretDesc(&#39;' + esc(key) + '&#39;)">' + esc(t('secDescSave')) + '</button>' +
+        '<button class="secondary" onclick="editSecretDesc(&#39;' + esc(key) + '&#39;)">' + esc(t('secDescCancel')) + '</button>';
+      box.style.display = 'flex';
+      const input = box.querySelector('input');
+      input.value = start;
+      input.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') saveSecretDesc(key); if (ev.key === 'Escape') editSecretDesc(key); });
+      input.focus();
+    }
+    async function saveSecretDesc(key) {
+      const scope = document.getElementById('secScope').value || 'system';
+      const box = document.getElementById('secEdit-' + key);
+      const input = box && box.querySelector('input');
+      if (!input) return;
+      const res = await fetch('/api/secrets/description', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: scope, key: key, description: input.value })
+      });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) return alert(data.error || ('HTTP ' + res.status));
+      showToast(t('toastSecDescSaved'));
+      loadSecrets();
+    }
+    function editSecret(key) {
+      document.getElementById('secKey').value = key;
+      const v = document.getElementById('secVal');
+      v.value = '';
+      v.focus();
+    }
+    function markSecChanged(scope) {
+      if (scope !== 'system') secChanged[scope] = true;
+      renderSecApply();
     }
 
     async function saveSecret() {
-      const scope = document.getElementById('secScope').value.trim() || 'system';
+      const scope = document.getElementById('secScope').value || 'system';
       const key = document.getElementById('secKey').value.trim();
       const value = document.getElementById('secVal').value;
+      const description = document.getElementById('secDesc').value;
       if (!key) return;
       const res = await fetch('/api/secrets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scope, key, value })
+        body: JSON.stringify({ scope, key, value, description })
       });
       const data = await res.json();
-      if (!res.ok) return alert(data.error);
+      if (!res.ok) { loadSecrets(); return alert(data.error); }
       document.getElementById('secKey').value = '';
       document.getElementById('secVal').value = '';
+      document.getElementById('secDesc').value = '';
       showToast(t('toastSecretSaved'));
+      markSecChanged(scope);
+      loadSecrets();
+    }
+
+    async function saveDotenv() {
+      const scope = document.getElementById('secScope').value || 'system';
+      const box = document.getElementById('secDotenv');
+      if (!box.value.trim()) return;
+      const r = await ofsPost('/api/secrets', { scope: scope, dotenv: box.value }, 'secPasteMsg');
+      if (!r) return;
+      box.value = '';
+      ofsMsg('secPasteMsg', t('secPasteOk').split('{n}').join(String(r.saved.length)) +
+        (r.skipped && r.skipped.length ? ' ' + t('secPasteSkipped').split('{lines}').join(r.skipped.join(', ')) : ''), r.skipped && r.skipped.length ? 'err' : 'ok');
+      markSecChanged(scope);
       loadSecrets();
     }
 
     async function delSecret(scope, key) {
-      await fetch('/api/secrets', {
+      const res = await fetch('/api/secrets', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope, key })
       });
+      if (res.ok) markSecChanged(scope);
       loadSecrets();
+    }
+
+    async function redeployApp(name) {
+      if (!confirm(t('redeployConfirm').split('{app}').join(name))) return;
+      showToast(t('toastDeploying'));
+      setTimeout(pollDeploys, 800);
+      const res = await fetch('/api/apps/redeploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appName: name }) });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        const kind = data.failure && I18N.en['df_' + data.failure.kind] ? data.failure.kind : 'other';
+        alert(t('df_' + kind) + '\\n' + t('dfh_' + kind) + '\\n\\n' + String(data.error || ('HTTP ' + res.status)).slice(-1500));
+        return;
+      }
+      delete secChanged[name];
+      showToast(t('toastDeployDone') + name);
+      loadAll();
+      renderSecApply();
     }
 
     async function createDb() {
@@ -6610,9 +9502,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName, engine })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) return alert(t('bkErr') + '\\n\\n' + (data.error || ('HTTP ' + res.status)));
       showToast(t('toastDbCreated'));
+      // The address reaches the app only when it is published again (variables are written at deploy).
+      markSecChanged(appName);
+      const app = lastStatus && lastStatus.apps && lastStatus.apps[appName];
+      const box = document.getElementById('dbResult');
+      if (box) box.innerHTML = app && app.repoUrl
+        ? '<div class="dep-result ok" style="margin:0 0 14px;"><p style="margin:0 0 8px;">' + esc(t('dbRedeployNote').split('{app}').join(appName)) + '</p><div class="dep-result-actions"><button data-app="' + esc(appName) + '" onclick="redeployApp(this.dataset.app)">' + esc(t('actionRedeploy')) + '</button></div></div>'
+        : '';
       loadAll();
     }
 
@@ -6637,9 +9536,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backupId })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
-      showToast((data.ok ? '✅ ' : '⚠️ ') + data.detail);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) return alert(t('bkErr') + '\\n\\n' + (data.error || ('HTTP ' + res.status)));
+      const msg = I18N.en['bkTest_' + data.code] ? t('bkTest_' + data.code).split('{n}').join(String(data.count ?? '')) : data.detail;
+      showToast((data.ok ? '✅ ' : '⚠️ ') + msg);
     }
 
     async function restoreBackup(backupId) {
@@ -6648,9 +9548,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backupId })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
-      showToast('✅ Banco restaurado com sucesso (' + data.restoredBytes + ' bytes)!');
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { if (!data.confirmationRequired) alert(t('bkErr') + '\\n\\n' + (data.error || ('HTTP ' + res.status))); return; }
+      const engine = data.backup && data.backup.engine;
+      showToast('✅ ' + t(engine === 'volume' ? 'bkRestoredVolume' : 'bkRestoredDb') + (data.safetyBackupId ? ' ' + t('bkSafety') : ''));
+      loadAll();
     }
 
     async function generateInvite() {
@@ -6715,18 +9617,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const items = data.diagnostics || [];
         const checkedTime = data.checkedAt ? new Date(data.checkedAt).toLocaleTimeString() : '';
         document.getElementById('doctorReportBox').innerHTML = items.length
-          ? \`<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px;">\${esc(t('lastCheck'))} <strong>\${esc(checkedTime)}</strong> · \${esc(t('overallStatus'))} <span class="badge \${data.overallHealth === 'healthy' ? 'success' : data.overallHealth === 'warning' ? 'warning' : 'danger'}">\${esc((data.overallHealth || 'healthy').toUpperCase())}</span></div>\` +
+          ? \`<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px;">\${esc(t('lastCheck'))} <strong>\${esc(checkedTime)}</strong> · \${esc(t('overallStatus'))} <span class="badge \${data.overallHealth === 'healthy' ? 'success' : data.overallHealth === 'warning' ? 'warning' : 'danger'}">\${esc(t('sev_' + (data.overallHealth || 'healthy')))}</span></div>\` +
             items.map(d => \`
             <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
                 <strong>\${esc(d.target === 'server' ? t('doctorServer') : d.target)}</strong>
                 <div style="display:flex;gap:6px;align-items:center;">
-                  <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(d.severity.toUpperCase())}</span>
+                  <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(t('sev_' + d.severity))}</span>
                   \${d.severity !== 'healthy' && d.target !== 'server' ? \`<button class="secondary" style="padding:3px 9px;font-size:11px;" onclick="appAction('\${esc(d.target)}','restart')">\${esc(t('btnRestartContainer'))}</button>\` : ''}
                 </div>
               </div>
-              <div style="font-size:13px;margin-top:6px;">\${esc(d.summary)}</div>
-              \${d.recommendation ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(d.recommendation)}</div>\` : ''}
+              <div style="font-size:13px;margin-top:6px;">\${esc(docText(d, 'summary'))}</div>
+              \${docText(d, 'recommendation') ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(docText(d, 'recommendation'))}</div>\` : ''}
             </div>
           \`).join('')
           : '<div style="color:var(--muted);font-size:13px;">' + esc(t('emptyDoctor')) + '</div>';
@@ -6739,6 +9641,79 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           btn.textContent = t('btnRunDoctor');
         }
       }
+    }
+
+    // Publish screen: pick the repository from the GitHub list (like Vercel's import) when a token is saved.
+    let ghRepos = null;
+    let ghReposLoading = false;
+    async function renderRepoPick() {
+      const box = document.getElementById('depRepoPick');
+      if (!box || !lastStatus) return;
+      const hasToken = Boolean((lastStatus.systemSecretsConfigured || {}).GITHUB_TOKEN);
+      if (!hasToken) {
+        box.innerHTML = '<p class="ofs-note">' + esc(t('pickNoToken')) + ' <a href="#connect/github">' + esc(t('pickConnect')) + '</a></p>';
+        return;
+      }
+      if (ghRepos === null && !ghReposLoading) {
+        ghReposLoading = true;
+        box.innerHTML = '<p class="ofs-note">' + esc(t('pickLoading')) + '</p>';
+        try {
+          const res = await fetch('/api/connections/github/repos');
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok) { box.innerHTML = '<p class="ofs-note" style="color:var(--danger)">' + esc((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)) + '</p>'; ghReposLoading = false; return; }
+          ghRepos = data.repos || [];
+        } finally { ghReposLoading = false; }
+      }
+      if (!ghRepos) return;
+      if (!ghRepos.length) { box.innerHTML = '<p class="ofs-note">' + esc(t('pickEmpty')) + '</p>'; return; }
+      box.innerHTML = '<label class="field-label" for="depPick">' + esc(t('pickLabel')) + '</label>' +
+        '<select id="depPick" onchange="pickRepo(this.value)"><option value="">' + esc(t('pickChoose')) + '</option>' +
+        ghRepos.map(function (r) {
+          return '<option value="' + esc(r.fullName) + '">' + esc(r.fullName) + (r.private ? ' · ' + esc(t('pickPrivate')) : '') + (r.language ? ' · ' + esc(r.language) : '') + '</option>';
+        }).join('') + '</select><p class="ofs-note" id="depPickNote" style="margin-top:4px;"></p>';
+    }
+    function pickRepo(name) {
+      const r = (ghRepos || []).find(function (x) { return x.fullName === name; });
+      if (!r) return;
+      document.getElementById('depRepo').value = r.fullName;
+      document.getElementById('depBranch').value = r.defaultBranch || 'main';
+      const app = document.getElementById('depApp');
+      if (!app.value.trim()) app.value = r.fullName.split('/')[1].toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+      const note = document.getElementById('depPickNote');
+      if (note) note.textContent = r.private ? t('pickPrivateNote') : '';
+    }
+
+    // Result of a publish, in plain words: what happened and the next step (or what to fix).
+    function deployResultHtml(ok, appName, data) {
+      if (ok) {
+        const urls = ((data && data.app && data.app.domains) || []).map(function (d) { return d.url; }).filter(Boolean);
+        const a = esc(JSON.stringify(appName));
+        return '<div class="dep-result ok"><strong>' + esc(t('dfOkTitle').split('{app}').join(appName)) + '</strong>' +
+          (urls.length
+            ? '<p>' + esc(t('dfOkLive')) + ' ' + urls.map(function (u) { return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + esc(u) + '</a>'; }).join(', ') + '</p>'
+            : '<p>' + esc(t('dfOkNext')) + '</p>') +
+          '<div class="dep-result-actions">' +
+          (urls.length ? '' : '<button onclick="exposeNext(' + a + ')">' + esc(t('dfOkExpose')) + '</button>') +
+          '<button class="secondary" onclick="goTo(\\'overview\\', \\'list\\')">' + esc(t('dfOkList')) + '</button></div></div>';
+      }
+      const f = (data && data.failure) || {};
+      const kind = I18N.en['df_' + f.kind] ? f.kind : 'other';
+      const action = f.action || (kind === 'other' ? 'doctor' : '');
+      const go = { github: "goTo('connect', 'github')", options: 'openDeployOptions()', guide: "goTo('guide', 'firstapp')", trash: "goTo('overview', 'list')", doctor: "goTo('doctor')" }[action];
+      return '<div class="dep-result err"><strong>' + esc(t('df_' + kind)) + '</strong><p>' + esc(t('dfh_' + kind)) + '</p>' +
+        (go ? '<div class="dep-result-actions"><button class="secondary" onclick="' + go + '">' + esc(t('dfAct_' + action)) + '</button></div>' : '') +
+        '<details><summary>' + esc(t('dfDetails')) + '</summary><pre>' + esc((data && data.error) || '') + '</pre></details></div>';
+    }
+    function openDeployOptions() {
+      const d = document.querySelector('#tab-overview details.dep-more');
+      if (!d) return;
+      d.open = true;
+      d.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    function exposeNext(appName) {
+      goTo('overview', 'expose');
+      const el = document.getElementById('expApp');
+      if (el) { el.value = appName; el.focus(); }
     }
 
     async function deployNewApp() {
@@ -6759,6 +9734,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const btn = document.getElementById('btnDeploy');
       btn.textContent = t('toastDeploying');
       btn.disabled = true;
+      document.getElementById('depResult').innerHTML = '';
       try {
         setTimeout(pollDeploys, 800);
         const res = await fetch('/api/deploy', {
@@ -6766,13 +9742,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit, healthcheckPath, skipHealthcheck })
         });
-        const data = await res.json();
-        if (!res.ok) alert((/HealthcheckFailedError/.test(data.error) ? t('deployHealthFailed') + '\\n\\n' : 'Error: ') + data.error);
-        else {
+        const data = await res.json().catch(function () { return {}; });
+        const box = document.getElementById('depResult');
+        if (!res.ok) {
+          if (!data.failure && !data.error) data.error = 'HTTP ' + res.status;
+          box.innerHTML = deployResultHtml(false, appName, data);
+        } else {
           if (document.getElementById('depPoll').checked) await postJson('/api/poll', { appName, on: true });
+          box.innerHTML = deployResultHtml(true, appName, data);
           showToast(t('toastDeployDone') + appName);
           loadAll();
         }
+        box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       } finally {
         btn.textContent = t('btnDeploy');
         btn.disabled = false;
@@ -6789,8 +9770,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName, mode, subdomain })
       });
-      const data = await res.json();
-      if (!res.ok) return alert('Error: ' + data.error);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { if (!data.confirmationRequired) alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
       showToast(t('toastExposed') + data.url);
       loadAll();
     }
@@ -6802,21 +9783,31 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
 
+    let logsApp = '';
     async function appAction(appName, action) {
       const res = await fetch('/api/lifecycle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName, action })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        if (data.confirmationRequired) return;
+        const err = String(data.error || ('HTTP ' + res.status));
+        return alert(/No previous image snapshot/.test(err) ? t('lifeErrNoPrevious') : t('lifeErr') + '\\n\\n' + err);
+      }
       if (action === 'logs') {
+        logsApp = appName;
         const card = document.getElementById('logsCard');
         card.style.display = 'block';
-        document.getElementById('logsBox').textContent = data.output || '(empty logs)';
+        document.getElementById('logsTitle').textContent = t('logsTitle') + ' · ' + appName;
+        const out = String(data.output || '').trim();
+        document.getElementById('logsHint').textContent = out ? t('logsHint') : '';
+        document.getElementById('logsBox').textContent = out || t('logsEmpty');
         card.scrollIntoView({ behavior: 'smooth' });
       } else {
-        showToast('✅ ' + data.output);
+        const msg = I18N.en['life_' + action] ? t('life_' + action).split('{app}').join(appName) : String(data.output || '');
+        showToast('✅ ' + msg + (data.pool === 'updating' ? ' ' + t('lifePoolUpdating') : data.pool === 'failed' ? ' ' + t('lifePoolFailed') : ''));
         loadAll();
       }
     }
@@ -6836,13 +9827,19 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 }
 
 // Pinned base image; tools are installed once at build time, never on every start.
+// The tailscale command talks to the server's tailscaled through its socket (mounted when present).
+// It is optional: a mirror without it still builds the dashboard, and Tailscale then says how to do it by hand.
 const DASHBOARD_DOCKERFILE = `FROM node:22.11.0-alpine3.20
 RUN apk add --no-cache docker-cli docker-cli-compose git openssh-client
+RUN apk add --no-cache tailscale || true
 `;
 
 /** Builds the dashboard image once per Dockerfile version (tag = content hash). */
+/** The dashboard image's tag (it changes with its Dockerfile). */
+export const dashboardImageTag = () => `paasmcp/dashboard:${crypto.createHash("sha256").update(DASHBOARD_DOCKERFILE).digest("hex").slice(0, 12)}`;
+
 export function ensureDashboardImage(): string {
-  const tag = `paasmcp/dashboard:${crypto.createHash("sha256").update(DASHBOARD_DOCKERFILE).digest("hex").slice(0, 12)}`;
+  const tag = dashboardImageTag();
   try {
     execFileSync("docker", ["image", "inspect", tag], { stdio: "ignore" });
   } catch {
@@ -6870,6 +9867,7 @@ export function ensureDashboardBackgroundService(
   const projectRoot = run.dir;
 
   const image = ensureDashboardImage();
+  const tsDir = tailscaleSocketDir();
   const composePath = path.join(dashDir, "compose.yaml");
   const composeContent = `services:
   dashboard:
@@ -6886,7 +9884,7 @@ ${WATCHTOWER_OFF_COMPOSE}    working_dir: /app
     volumes:
       - ${projectRoot}:/app:ro
       - ${HOMELAB_ROOT}:${HOMELAB_ROOT}
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock${tsDir ? `\n      - ${tsDir}:${tsDir}` : ""}
     networks:
       - ${DOCKER_NETWORK}
 

@@ -478,6 +478,13 @@ volumes:
       const names = ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((x) => x.name);
       assert.ok(names.includes("paas_system_status"));
       assert.equal(names.includes("paas_app_deploy"), false);
+      // A real tool call marks "Connect your AI" as done; listing tools alone does not.
+      tokens.resetMcpUseThrottle();
+      assert.equal(tokens.readMcpUse(), null);
+      const used = await call({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "paas_approvals", arguments: {} } }, token);
+      assert.equal(used.status, 200);
+      assert.equal(tokens.readMcpUse()?.via, "http");
+      assert.equal(JSON.stringify(tokens.readMcpUse()).includes("paas_approvals"), false);
     } finally {
       srv.close();
     }
@@ -557,6 +564,7 @@ volumes:
       const vols = backup.backupAppVolumes("vol-app");
       assert.equal(vols.length, 1);
       assert.equal(vols[0].engine, "volume");
+      assert.equal(backup.testRestore(vols[0].id).code, "checked", "a code the dashboard says in its own words");
       assert.equal(backup.testRestore(vols[0].id).ok, true);
       assert.equal(database.restoreDatabase(vols[0].id).restored, true);
 
@@ -730,6 +738,22 @@ volumes:
       assert.equal(good.ok, true);
       assert.equal(good.url, url, "a pasted /arbiter suffix is dropped");
       assert.ok(good.nodes?.some((n) => n.isMe && n.secondsAgo === 0));
+      // Arbiter tab: where it runs, the takeover it recorded, and the watchdog's last contact.
+      assert.equal(good.about?.host, os.hostname());
+      assert.equal(good.about?.clusters, 1);
+      assert.ok(typeof good.latencyMs === "number");
+      assert.ok(good.owners?.some((o) => o.owner === "other-server" && o.epoch === 5), "the claim above is listed");
+      assert.ok(good.watch?.okAt, "watchTick records its last talk with the arbiter");
+      assert.equal(JSON.stringify(await (await fetch(`${url}/health`)).json()).includes(os.hostname()), false, "the unsigned probe reveals nothing");
+      // Install command: this cluster's key, a repository URL without credentials, nothing else.
+      const inst = arbiter.arbiterInstallCommand("https://user:ghp_secret@github.com/me/paasmcp.git");
+      assert.equal(inst.key, key);
+      assert.equal(inst.repoUrl, "https://github.com/me/paasmcp.git");
+      assert.ok(!inst.command.includes("ghp_secret") && inst.command.includes(`install-service --key ${key}`));
+      assert.equal(arbiter.publicRepoUrl("git@github.com:me/paasmcp.git"), "https://github.com/me/paasmcp.git");
+      assert.equal(arbiter.publicRepoUrl("https://x.com/a;rm -rf /"), arbiter.DEFAULT_REPO_URL);
+      assert.equal(arbiter.publicRepoUrl("file:///etc"), arbiter.DEFAULT_REPO_URL);
+      assert.equal(arbiter.publicRepoUrl(undefined), arbiter.DEFAULT_REPO_URL);
       const other = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", key: "0".repeat(64), stateFile: path.join(tempRoot, "arb2.json") });
       await new Promise((r) => other.once("listening", r));
       const otherPort = (other.address() as { port: number }).port;
@@ -1777,6 +1801,96 @@ volumes:
     );
     assert.deepEqual(parsed["paasmcp-a"], { cpu: 12.5, mem: 64, rxTotal: 1000, txTotal: 2_000_000 });
     assert.equal(parsed.x.cpu, null);
+
+    // Server resources: whole server vs. PaaSMCP's containers vs. the rest (resources.ts)
+    {
+      const resmod = await import("./resources.js");
+      const core = (user: number, idle: number) => ({ model: "x", speed: 1, times: { user, nice: 0, sys: 0, idle, irq: 0 } });
+      const a = resmod.cpuSample([core(100, 900), core(100, 900)], 0);
+      const b = resmod.cpuSample([core(400, 1100), core(200, 1300)], 1000);
+      // 400 busy of 1000 total across both cores = 40%
+      assert.equal(resmod.cpuPercentBetween(a, b), 40);
+      assert.equal(resmod.cpuPercentBetween(a, a), null);
+      assert.equal(resmod.memAvailableBytes("MemTotal: 1000 kB\nMemFree: 10 kB\nMemAvailable:  512 kB\n"), 512 * 1024);
+      assert.equal(resmod.memAvailableBytes("MemTotal: 1000 kB\n"), null);
+      resmod.resetCpuMemory();
+      const GiB = 1024 ** 3;
+      const stats = scale.parseDockerStats(
+        '{"Name":"paasmcp-blog","CPUPerc":"50.00%","MemUsage":"1GiB / 8GiB"}\n' +
+          '{"Name":"paasmcp-dashboard","CPUPerc":"10.00%","MemUsage":"512MiB / 8GiB"}\n' +
+          '{"Name":"other-thing","CPUPerc":"90.00%","MemUsage":"2GiB / 8GiB"}\n'
+      );
+      const cores = os.cpus().length;
+      const r = resmod.hostResources({
+        cpuBefore: { busy: 0, total: 0, at: 0 },
+        now: { busy: 800, total: 1000, at: 1000 },
+        stats,
+        statsRan: true,
+        totalMem: 8 * GiB,
+        availableMem: 4 * GiB,
+        disk: null,
+        load1: 0.5,
+      });
+      assert.equal(r.cpu.usedPercent, 80);
+      const paasCpu = Math.min(80, (0.6 / cores) * 100);
+      assert.equal(r.cpu.split?.paasmcp, Math.round(paasCpu * 10) / 10);
+      assert.equal(r.memory.usedBytes, 4 * GiB);
+      // Only paasmcp-* containers count for PaaSMCP; the other container falls under "others".
+      assert.equal(r.memory.split?.paasmcp, 1.5 * GiB);
+      assert.equal(r.memory.split?.others, 2.5 * GiB);
+      assert.deepEqual(r.top.map((c) => c.name), ["paasmcp-blog", "paasmcp-dashboard"]);
+      // PaaSMCP never shows more than the server uses (readings a moment apart).
+      const tight = resmod.hostResources({ now: { busy: 0, total: 0, at: 5000 }, stats, statsRan: true, totalMem: 8 * GiB, availableMem: 7.5 * GiB, disk: null });
+      assert.equal(tight.memory.split?.paasmcp, 0.5 * GiB);
+      assert.equal(tight.memory.split?.others, 0);
+      // Without docker stats there is no split, only the totals.
+      const noDocker = resmod.hostResources({ statsRan: false, totalMem: 8 * GiB, availableMem: 2 * GiB, disk: null });
+      assert.equal(noDocker.memory.split, null);
+      assert.equal(noDocker.cpu.split, null);
+
+      // Disk split and database sizes (usage.ts)
+      const usage = await import("./usage.js");
+      const du = usage.parseDuDepth1("100\t/r/apps/blog\n20\t/r/apps/shop\n130\t/r/apps\n", "/r/apps");
+      assert.deepEqual(du, { total: 130 * 1024, children: { blog: 100 * 1024, shop: 20 * 1024 } });
+      const df = JSON.stringify({
+        Images: [{ Repository: "paasmcp/blog", UniqueSize: "2MB" }, { Repository: "paasmcp/blog", UniqueSize: "1MB" }, { Repository: "alpine", UniqueSize: "9MB" }, { Repository: "paasmcp/ghost", UniqueSize: "5MB" }],
+        Volumes: [{ Labels: "a=b,com.docker.compose.project=blog", Size: "3MB" }, { Labels: "com.docker.compose.project=other", Size: "8MB" }],
+      });
+      assert.deepEqual(usage.dockerBytesPerApp(df, new Set(["blog", "shop"])), { blog: 6_000_000 });
+      assert.deepEqual(usage.dockerBytesPerApp("not json", new Set(["blog"])), {});
+      assert.deepEqual(usage.parsePgSizes(" postgres|7000\n db_blog|123456\nbad\n"), { postgres: 7000, db_blog: 123456 });
+      const ri = usage.parseRedisInfo("OK\r\n# Keyspace\r\ndb1:keys=12,expires=0\r\ndb3:keys=4,expires=1\r\n# Memory\r\nused_memory:1048576\r\n");
+      assert.deepEqual(ri, { keys: { db1: 12, db3: 4 }, usedMemoryBytes: 1048576 });
+      const MB = 1e6;
+      assert.equal(usage.limitLevel(79 * MB, 100), 0);
+      assert.equal(usage.limitLevel(80 * MB, 100), 80);
+      assert.equal(usage.limitLevel(101 * MB, 100), 100);
+      assert.equal(usage.limitLevel(500 * MB, undefined), 0);
+      const sizesA = [{ name: "blog-postgres", engine: "postgres" as const, appName: "blog", bytes: 85 * MB }];
+      const lim = { "blog-postgres": { warnSizeMb: 100 } };
+      const r1 = usage.limitEvents(sizesA, lim, {});
+      assert.deepEqual(r1.events.map((e) => e.level), [80]);
+      // Same level next round: no new notice.
+      assert.equal(usage.limitEvents(sizesA, lim, r1.warned).events.length, 0);
+      const r3 = usage.limitEvents([{ ...sizesA[0], bytes: 120 * MB }], lim, r1.warned);
+      assert.deepEqual(r3.events.map((e) => e.level), [100]);
+      // Back under 80% resets, so crossing again warns again.
+      const r4 = usage.limitEvents([{ ...sizesA[0], bytes: 10 * MB }], lim, r3.warned);
+      assert.deepEqual(r4.warned, {});
+      assert.match(usage.limitNoticeText(r3.events[0], "pt").text, /120 MB.*100 MB/);
+      // History: one point per hour at most.
+      const h0 = Date.now();
+      assert.equal(usage.appendDbHistory(sizesA, h0), true);
+      assert.equal(usage.appendDbHistory(sizesA, h0 + 60_000), false);
+      assert.equal(usage.appendDbHistory([{ ...sizesA[0], bytes: 90 * MB }], h0 + 3600_000), true);
+      assert.deepEqual(usage.readDbHistory(h0 + 3600_000).map((p) => p.s["blog-postgres"]), [85 * MB, 90 * MB]);
+      assert.equal(usage.appendDbHistory([{ name: "r", engine: "redis", appName: "x", bytes: null }], h0 + 7200_000), false);
+      assert.throws(() => usage.setDatabaseLimit("blog-postgres", 0), /whole number/);
+      assert.throws(() => usage.setDatabaseLimit("blog-postgres", 1.5), /whole number/);
+      assert.throws(() => usage.setDatabaseLimit("__proto__", 10), /not found/);
+      const disk = resmod.diskUsage(path.join(os.tmpdir(), "does-not-exist-paasmcp", "x"));
+      assert.ok(disk && disk.totalBytes > 0 && disk.freeBytes <= disk.totalBytes && disk.usedPercent >= 0 && disk.usedPercent <= 100);
+    }
 
     // Rule validation
     assert.throws(() => scale.validateRule({ targetCpu: 200 }), /targetCpu/);
@@ -3686,7 +3800,7 @@ volumes:
     }
   });
 
-  await t.test("42. Big backups go in parts, and this server's S3 can be published over HTTPS on the tunnel for keys used outside Tailscale", async () => {
+  await t.test("61. Big backups go in parts, and this server's S3 can be published over HTTPS on the tunnel for keys used outside Tailscale", async () => {
     const backup = await import("./backup.js");
     const offsite = await import("./offsite.js");
     const guard = await import("./guard.js");
@@ -3846,7 +3960,7 @@ volumes:
     }
   });
 
-  await t.test("43. App files at the person's own account: tested, same variables, guarded switch, never copied by the mirror", async () => {
+  await t.test("62. App files at the person's own account: tested, same variables, guarded switch, never copied by the mirror", async () => {
     const offsite = await import("./offsite.js");
     const storage = await import("./storage.js");
     const guard = await import("./guard.js");
@@ -3896,6 +4010,1033 @@ volumes:
     }
   });
 
+  await t.test("42. Connections: Cloudflare from one token (account, domain, tunnel found or created) and GitHub token check", async () => {
+    const conn = await import("./connections.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const http = await import("node:http");
+    const vm = await import("node:vm");
+    const ACC = "0123456789abcdef0123456789abcdef";
+    const CF_TOKEN = "t".repeat(40);
+    const GH_TOKEN = "github_pat_" + "g".repeat(30);
+    const tunnels: { id: string; name: string; status: string; remote_config: boolean }[] = [
+      { id: "11111111-2222-3333-4444-555555555555", name: "casa", status: "healthy", remote_config: true },
+      { id: "66666666-2222-3333-4444-555555555555", name: "old", status: "down", remote_config: false },
+    ];
+    let created = 0;
+    const seenAuth: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const u = new URL(req.url || "/", "http://x");
+        const p = u.pathname;
+        const auth = String(req.headers.authorization || "");
+        seenAuth.push(auth);
+        const ok = (r: unknown) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ success: true, result: r }));
+        if (p === "/gh/user") {
+          if (auth !== `Bearer ${GH_TOKEN}`) return res.writeHead(401).end("{}");
+          return res.writeHead(200).end(JSON.stringify({ login: "octo-cat", name: "Octo" }));
+        }
+        if (auth !== `Bearer ${CF_TOKEN}`) return res.writeHead(403).end(JSON.stringify({ success: false }));
+        if (p === "/accounts") return ok([{ id: ACC, name: "Home" }, { id: "not-an-id", name: "x" }]);
+        if (p === "/zones") return ok([{ id: "z1", name: "loja.dev", status: "active", account: { id: ACC } }, { id: "z2", name: "pending.dev", status: "pending", account: { id: ACC } }]);
+        if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "GET") return ok(tunnels);
+        if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "POST") {
+          const body = JSON.parse(raw);
+          assert.equal(body.config_src, "cloudflare", "only remotely managed tunnels take addresses from the API");
+          created++;
+          const tun = { id: "77777777-2222-3333-4444-555555555555", name: body.name, status: "inactive", remote_config: true };
+          tunnels.push(tun);
+          return ok(tun);
+        }
+        if (p.endsWith("/token")) return ok("eyJ" + "k".repeat(60));
+        if (p === `/accounts/${ACC}/access/apps`) return res.writeHead(403).end(JSON.stringify({ success: false }));
+        res.writeHead(404).end(JSON.stringify({ success: false }));
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const port = (srv.address() as { port: number }).port;
+    process.env.PAASMCP_CF_API_URL = `http://127.0.0.1:${port}`;
+    process.env.PAASMCP_GITHUB_API_URL = `http://127.0.0.1:${port}/gh`;
+    const before = config.loadState().cloudflare;
+    const sysBefore = vault.getSecrets("system");
+    try {
+      const st0 = config.loadState();
+      st0.cloudflare = { ...st0.cloudflare, accountId: "", tunnelId: "", baseDomain: "example.com" };
+      config.saveState(st0);
+      vault.deleteSecretKey("system", "CF_API_TOKEN");
+
+      // Bad or refused tokens: a clear message in Portuguese, nothing saved.
+      await assert.rejects(conn.discoverCloudflare("short"), (e: InstanceType<typeof conn.ConnectionError>) => /token/.test(e.pt));
+      await assert.rejects(conn.discoverCloudflare("x".repeat(40)), (e: InstanceType<typeof conn.ConnectionError>) => /recusou/.test(e.pt));
+      await assert.rejects(conn.discoverCloudflare(), /Paste the Cloudflare token first/);
+
+      const found = await conn.discoverCloudflare(CF_TOKEN);
+      assert.equal(found.accounts.length, 1, "ids that are not account ids are dropped");
+      assert.deepEqual(found.zones.map((z) => z.name), ["loja.dev"], "only active domains");
+      assert.equal(found.accounts[0].tunnels.length, 2);
+      assert.equal(found.accounts[0].tunnels[1].remote, false);
+      assert.deepEqual(found.missing, ["access"], "a token without Access is reported, not refused");
+      assert.equal(vault.getSecrets("system").CF_API_TOKEN, undefined, "checking saves nothing");
+
+      const noConfirm = () => assert.fail("first connection needs no confirmation");
+      await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "other.dev", tunnelId: "new" }, noConfirm), /DNS/);
+      await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "loja.dev", tunnelId: tunnels[1].id }, noConfirm), /local file/);
+      await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "loja.dev", tunnelId: "new", zeroTrustEmails: "a@b.com, nope" }, noConfirm), /Invalid email/);
+
+      // A new tunnel: created once, its connector files written here (token only in the 0600 .env).
+      const r = await conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "loja.dev", tunnelId: "new", zeroTrustEmails: "a@b.com; c@d.com" }, noConfirm);
+      assert.equal(r.created, true);
+      assert.equal(created, 1);
+      const st = config.loadState();
+      assert.equal(st.cloudflare.tunnelId, "77777777-2222-3333-4444-555555555555");
+      assert.equal(st.cloudflare.baseDomain, "loja.dev");
+      assert.deepEqual(st.cloudflare.zeroTrustEmails, ["a@b.com", "c@d.com"]);
+      assert.equal(vault.getSecrets("system").CF_API_TOKEN, CF_TOKEN);
+      assert.ok(vault.getSecrets("system").MAIN_TUNNEL_TOKEN?.startsWith("eyJ"));
+      const env = path.join(conn.MAIN_TUNNEL_DIR, ".env");
+      assert.equal(fs.statSync(env).mode & 0o777, 0o600);
+      const compose = fs.readFileSync(path.join(conn.MAIN_TUNNEL_DIR, "compose.yaml"), "utf-8");
+      assert.ok(compose.includes(config.DOCKER_NETWORK) && !compose.includes("eyJ"), "token stays out of the compose file");
+
+      // Saving "new" again reuses the same tunnel, without asking.
+      await conn.saveCloudflare({ accountId: ACC, baseDomain: "loja.dev", tunnelId: "new" }, noConfirm);
+      assert.equal(created, 1);
+      // Moving to another tunnel is confirmed.
+      let asked: Record<string, unknown> | undefined;
+      await conn.saveCloudflare({ accountId: ACC, baseDomain: "loja.dev", tunnelId: tunnels[0].id }, (p) => { asked = p; });
+      assert.equal(asked?.replacing, true);
+      assert.equal(config.loadState().cloudflare.tunnelId, tunnels[0].id);
+      const sum = conn.connectionsSummary() as { cloudflare: { ready: boolean; tokenSaved: boolean } };
+      assert.equal(sum.cloudflare.ready, true);
+      assert.ok(!JSON.stringify(sum).includes(CF_TOKEN), "the summary never carries the token");
+
+      // GitHub: refused, then accepted and saved.
+      vault.deleteSecretKey("system", "GITHUB_TOKEN");
+      await assert.rejects(conn.checkGitHub("github_pat_" + "x".repeat(30)), (e: InstanceType<typeof conn.ConnectionError>) => /recusou/.test(e.pt));
+      await assert.rejects(conn.checkGitHub("bad token!"), /GitHub token/);
+      const gh = await conn.checkGitHub(GH_TOKEN);
+      assert.equal(gh.login, "octo-cat");
+      assert.equal(gh.kind, "fine-grained");
+      assert.equal(vault.getSecrets("system").GITHUB_TOKEN, GH_TOKEN);
+
+      // Over HTTP: tokens never come back, errors carry Portuguese text, replacing asks first.
+      const dashToken = dashboard.getOrCreateDashboardToken();
+      const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+      await new Promise((r) => dsrv.once("listening", r));
+      const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+      try {
+        assert.equal((await fetch(`${baseUrl}/api/connections`)).status, 401);
+        const secret = totp.getDashboardTotpSecret();
+        const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+        const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+        const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+        const info = await (await fetch(`${baseUrl}/api/connections`, { headers: { cookie } })).text();
+        assert.ok(!info.includes(CF_TOKEN) && !info.includes(GH_TOKEN));
+        const disc = await (await post("/api/connections/cloudflare/discover", {})).text();
+        assert.ok(disc.includes("loja.dev") && !disc.includes(CF_TOKEN), "the saved token is used, not echoed");
+        const bad = await post("/api/connections/cloudflare/discover", { token: "nope" });
+        assert.equal(bad.status, 400);
+        assert.ok((await bad.json()).errorPt);
+        assert.equal((await post("/api/connections/cloudflare", { accountId: ACC, baseDomain: "loja.dev", tunnelId: "new" })).status, 409);
+        assert.equal((await post("/api/connections/cloudflare", { accountId: ACC, baseDomain: "loja.dev", tunnelId: "new", confirmed: true })).status, 200);
+        const ghr = await (await post("/api/connections/github", {})).json();
+        assert.equal(ghr.login, "octo-cat", "the saved GitHub token can be re-tested");
+        const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+        for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+        assert.ok(page.includes('id="tab-connect"') && page.includes("cfDiscover(") && page.includes("permissionGroupKeys"));
+      } finally {
+        dsrv.close();
+      }
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_CF_API_URL;
+      delete process.env.PAASMCP_GITHUB_API_URL;
+      const st = config.loadState();
+      st.cloudflare = before;
+      config.saveState(st);
+      vault.deleteSecretKey("system", "MAIN_TUNNEL_TOKEN");
+      if (sysBefore.CF_API_TOKEN) vault.setSecretEntries("system", { CF_API_TOKEN: sysBefore.CF_API_TOKEN }); else vault.deleteSecretKey("system", "CF_API_TOKEN");
+      if (sysBefore.GITHUB_TOKEN) vault.setSecretEntries("system", { GITHUB_TOKEN: sysBefore.GITHUB_TOKEN }); else vault.deleteSecretKey("system", "GITHUB_TOKEN");
+    }
+  });
+
+  await t.test("43. Tutorial: checklist and step-by-step guides have every text in both languages", async () => {
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes('id="tab-guide"') && page.includes('data-sub="tutorial"') && page.includes("home: ['start', 'tutorial']"));
+      const guides = [...page.matchAll(/^ {6}([a-z]+): \{ steps: (\d+),/gm)].map((m) => [m[1], Number(m[2])] as const);
+      assert.ok(guides.length >= 6, "guides found");
+      const twice = (key: string) => assert.equal(page.split(`"${key}":`).length - 1, 2, `${key} in pt and en`);
+      for (const [id, steps] of guides) {
+        twice(`guide_${id}`);
+        twice(`guide_${id}_lead`);
+        for (let i = 1; i <= steps; i++) { twice(`guide_${id}_s${i}`); twice(`guide_${id}_s${i}Desc`); }
+      }
+      const items = [...page.matchAll(/\{ id: '([a-z]+)', group: '([a-z]+)'/g)].map((m) => m[1]);
+      assert.ok(items.length >= 10);
+      for (const id of items) { twice(`tut_${id}`); twice(`tut_${id}Desc`); }
+      assert.ok(!page.includes("paasmcp config --account-id"), "no terminal commands left on the first-setup screen");
+      for (const jargon of ["Slug da Aplica", "Provisionar PostgreSQL 16", ">Engine<", "Criar Snapshot Criptografado", "Payload URL do Webhook", "Modo de Seguran"]) {
+        assert.ok(!page.includes(jargon), `plain words instead of: ${jargon}`);
+      }
+      // The deploy card keeps every field inside it (a stray closing tag once pushed the checkboxes out).
+      const deployCard = page.slice(page.indexOf('<div class="card" data-sub="deploy">'), page.indexOf('<div class="card" data-sub="expose">'));
+      assert.equal((deployCard.match(/<div[\s>]/g) || []).length, (deployCard.match(/<\/div>/g) || []).length);
+    } finally {
+      dsrv.close();
+    }
+  });
+
+  await t.test("44. App variables: pasting a .env file, and publishing again with the current variables", async () => {
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const parsed = vault.parseDotenv([
+      "# comment",
+      "",
+      "export STRIPE_KEY=sk_test_123",
+      'QUOTED="two words # not a comment"',
+      "SINGLE='a\\nb'",
+      'MULTI="line1\\nline2"',
+      "PLAIN=value # trailing comment",
+      "EMPTY=",
+      "not a variable",
+      "1BAD=x",
+      "SPACES = around ",
+    ].join("\r\n"));
+    assert.deepEqual(parsed.entries, {
+      STRIPE_KEY: "sk_test_123",
+      QUOTED: "two words # not a comment",
+      SINGLE: "a\\nb",
+      MULTI: "line1\nline2",
+      PLAIN: "value",
+      EMPTY: "",
+      SPACES: "around",
+    });
+    assert.deepEqual(parsed.skipped, [9, 10], "only line numbers, never the text");
+
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+      const r = await post("/api/secrets", { scope: "env-test-app", dotenv: "A_KEY=secret-value-1\nB_KEY=\"secret value 2\"\noops" });
+      assert.equal(r.status, 200);
+      const body = await r.text();
+      assert.ok(!body.includes("secret-value-1") && !body.includes("secret value 2"), "values never come back");
+      const j = JSON.parse(body);
+      assert.deepEqual(j.saved, ["A_KEY", "B_KEY"]);
+      assert.deepEqual(j.skipped, [3]);
+      assert.equal(vault.getSecrets("env-test-app").B_KEY, "secret value 2");
+      assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: "# nothing" })).status, 500);
+      assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: "X=" + "y".repeat(300 * 1024) })).status, 500);
+      const many = Array.from({ length: 301 }, (_, i) => `K${i}=v`).join("\n");
+      assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: many })).status, 500);
+      const missing = await post("/api/apps/redeploy", { appName: "no-such-app" });
+      assert.equal(missing.status, 500);
+      assert.match((await missing.json()).error, /not found/);
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes("saveDotenv(") && page.includes("redeployApp(") && page.includes('<select id="secScope"'));
+    } finally {
+      dsrv.close();
+      vault.deleteSecretKey("env-test-app", "A_KEY");
+      vault.deleteSecretKey("env-test-app", "B_KEY");
+    }
+  });
+
+  await t.test("45. GitHub token: never in the clone URL or .git/config, and the repository list for Publish", async () => {
+    const conn = await import("./connections.js");
+    const http = await import("node:http");
+    const TOKEN = "github_pat_" + "r".repeat(30);
+    const before = vault.getSecrets("system").GITHUB_TOKEN;
+    vault.setSecretEntries("system", { GITHUB_TOKEN: TOKEN });
+    const srv = http.createServer((req, res) => {
+      if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end("{}");
+      if ((req.url || "").startsWith("/gh/user/repos")) {
+        return res.writeHead(200).end(JSON.stringify([
+          { full_name: "octo/shop", private: true, default_branch: "trunk", pushed_at: "2026-11-05T00:00:00Z", language: "TypeScript" },
+          { full_name: "octo/bad name;rm", private: false, default_branch: "main" },
+          { full_name: "octo/site", private: false, default_branch: "--upload-pack=x" },
+        ]));
+      }
+      res.writeHead(404).end("{}");
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GITHUB_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}/gh`;
+    try {
+      const url = github.resolveGitUrl("octo/shop");
+      assert.equal(url, "https://github.com/octo/shop.git");
+      assert.ok(!url.includes(TOKEN));
+      const env = github.gitEnv();
+      const n = Number(process.env.GIT_CONFIG_COUNT || 0);
+      assert.equal(env.GIT_CONFIG_COUNT, String(n + 1), "added after the entries already there");
+      assert.equal(env[`GIT_CONFIG_KEY_${n}`], "http.https://github.com/.extraheader");
+      assert.equal(Buffer.from(String(env[`GIT_CONFIG_VALUE_${n}`]).replace("Authorization: Basic ", ""), "base64").toString(), `x-access-token:${TOKEN}`);
+      const repos = await conn.listGitHubRepos();
+      assert.deepEqual(repos.map((r) => r.fullName), ["octo/shop", "octo/site"], "odd names are dropped");
+      assert.equal(repos[0].private, true);
+      assert.equal(repos[0].defaultBranch, "trunk");
+      assert.equal(repos[1].defaultBranch, "main", "a branch that looks like an option falls back to main");
+      vault.deleteSecretKey("system", "GITHUB_TOKEN");
+      assert.equal(github.gitEnv().GIT_CONFIG_COUNT, process.env.GIT_CONFIG_COUNT, "no header without a token");
+      assert.equal(github.resolveGitUrl("octo/shop"), "git@github.com:octo/shop.git");
+      await assert.rejects(conn.listGitHubRepos(), /No GitHub token/);
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_GITHUB_API_URL;
+      if (before) vault.setSecretEntries("system", { GITHUB_TOKEN: before }); else vault.deleteSecretKey("system", "GITHUB_TOKEN");
+    }
+  });
+
+  await t.test("46. A failed publish is explained in plain words, with the raw error kept as details", async () => {
+    const help = await import("./deployhelp.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const hc = new deployer.HealthcheckFailedError("shop", { ok: false, reason: "HTTP 502", path: "/" } as never, "boom");
+    const cases: Array<[unknown, string, string | undefined]> = [
+      [hc, "healthcheck", "options"],
+      [new Error("Command failed: git clone ... fatal: Repository not found."), "access", "github"],
+      [new Error("fatal: could not read Username for 'https://github.com': terminal prompts disabled"), "access", "github"],
+      [new Error("warning: Could not find remote branch dev to clone.\nfatal: Remote branch dev not found in upstream origin"), "branch", undefined],
+      [new Error("Could not auto-detect stack in repository (no docker-compose.yml, ...)."), "stack", "guide"],
+      [new Error("Command failed: docker build -t x . (exit 137)\nKilled"), "memory", "options"],
+      [new Error("Command failed: docker build -t x . (exit 1)\nnpm ERR! missing script: build"), "build", undefined],
+      [new Error("fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com"), "network", undefined],
+      [new Error("App 'shop' is in the trash. Restore it (action 'restore') or purge it before deploying again."), "trash", "trash"],
+      [new Error("An app named 'x' already exists with other code. Pick another name."), "name", undefined],
+      [new Error("something else"), "other", undefined],
+    ];
+    for (const [err, kind, action] of cases) {
+      assert.deepEqual(help.explainDeployError(err), action ? { kind, action } : { kind }, String(err));
+    }
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      const twice = (key: string) => assert.equal(page.split(`"${key}":`).length - 1, 2, `${key} in pt and en`);
+      for (const [, kind] of cases) { twice(`df_${kind}`); twice(`dfh_${kind}`); }
+      for (const a of ["github", "options", "guide", "trash", "doctor"]) twice(`dfAct_${a}`);
+      for (const k of ["dfDetails", "dfOkTitle", "dfOkNext", "dfOkLive", "dfOkExpose", "dfOkList"]) twice(k);
+      assert.ok(!page.includes("HealthcheckFailedError"), "no guessing from the error's class name (it is not in the message)");
+      // App buttons (restart, stop, trash...) answer in the screen's language, not with the server's English text.
+      for (const a of ["restart", "stop", "start", "rollback", "destroy", "restore", "purge"]) twice(`life_${a}`);
+      for (const k of ["lifePoolUpdating", "lifePoolFailed", "lifeErrNoPrevious", "lifeErr", "logsEmpty", "logsHint", "actionRollbackTip"]) twice(k);
+      assert.ok(!page.includes("showToast('✅ ' + data.output)"));
+      // The app list speaks plainly: no bare 127.0.0.1 pill, no raw access mode, no English limits.
+      for (const k of ["bkKind_postgres", "bkKind_redis", "bkKind_volume", "bkTest_checked", "bkTest_pg_ok", "bkTest_volume_ok", "bkTest_redis_ok", "bkTest_redis_bad", "bkRestoredDb", "bkRestoredVolume", "bkSafety", "bkErr"]) twice(k);
+      assert.ok(!page.includes("Banco restaurado com sucesso ("), "no fixed Portuguese toast for every restore");
+      for (const k of ["nbNone", "nbRunning", "nbOk", "nbErr", "nbOffsiteOk", "nbOffsiteFailed", "nbOffsiteNone", "nbNext"]) twice(k);
+      for (const k of ["sub_connect_alerts", "ntTitle", "ntDesc", "ntHowNtfy", "ntHowDiscord", "ntHowSlack", "ntSave", "ntOnDesc", "tut_alerts", "tut_alertsDesc"]) twice(k);
+      for (const k of ["appNoAddressTip", "pillLocalOnly", "mode_public", "mode_zero-trust", "mode_tailscale", "limitsLabel"]) twice(k);
+      assert.ok(!page.includes("(Limits: "));
+      // Every doctor finding with a code has its text in both languages (the screen falls back to English otherwise).
+      const codes = ["app_registered", "app_ok", "app_oom", "app_down", "app_restarts", "app_missing", "app_missing_stopped", "dns_ok", "dns_fail", "wt_label_mode", "wt_all_labeled", "wt_unlabeled", "net_clash", "net_pool", "tunnel_net"];
+      for (const c of codes) twice(`doc_${c}`);
+      const src = ["deployer.ts", "hostcheck.ts"].map((f) => fs.readFileSync(path.join(process.cwd(), "src", f), "utf-8")).join("\n");
+      const used = new Set([...src.matchAll(/code: "([a-z_]+)"/g), ...src.matchAll(/\? "([a-z_]+)" : "([a-z_]+)"/g)].flatMap((m) => m.slice(1)).filter((c) => /^(app|dns|wt|net|tunnel)_/.test(c)));
+      for (const c of used) assert.ok(codes.includes(c), `doctor code ${c} has texts`);
+      const doc = deployer.runPaaSDoctor();
+      assert.ok(doc.diagnostics.every((d) => !d.code || codes.includes(d.code)));
+      // The route answers 422 with the kind, and the error itself, never a bare 500.
+      const res = await fetch(`${baseUrl}/api/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ appName: "nope-46", repoSource: "/no/such/folder-46" }) });
+      const data = (await res.json()) as { error: string; failure: { kind: string } };
+      assert.equal(res.status, 422);
+      assert.ok(data.error && data.failure && typeof data.failure.kind === "string");
+      // Ready-made apps (test 49 covers the files): the list, and a name that is taken is refused untouched.
+      const tpl = await import("./templates.js");
+      const st0 = config.loadState();
+      st0.apps["tpl-taken"] = { ...(Object.values(st0.apps)[0] || {}), name: "tpl-taken", repoUrl: "someone/else" } as never;
+      config.saveState(st0);
+      try {
+        const list = (await (await fetch(`${baseUrl}/api/templates`, { headers: { cookie } })).json()) as { templates: Array<{ id: string }> };
+        assert.equal(list.templates.length, tpl.TEMPLATES.length);
+        const tres = await fetch(`${baseUrl}/api/templates/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ id: "it-tools", appName: "tpl-taken" }) });
+        assert.equal(tres.status, 422);
+        assert.equal(((await tres.json()) as { failure: { kind: string } }).failure.kind, "name");
+        assert.equal(config.loadState().apps["tpl-taken"].repoUrl, "someone/else", "the existing app is untouched");
+        for (const t0 of tpl.TEMPLATES) for (const k of [`tpl_${t0.id}`, `tpl_${t0.id}Desc`]) twice(k);
+      } finally {
+        const st1 = config.loadState();
+        delete st1.apps["tpl-taken"];
+        config.saveState(st1);
+      }
+    } finally {
+      dsrv.close();
+    }
+  });
+
+  await t.test("47. Notices: a failed automatic publish reaches Discord/Slack/ntfy; the address is tested first and never shown", async () => {
+    const notify = await import("./notify.js");
+    const deploys = await import("./deploys.js");
+    const http = await import("node:http");
+    const got: Array<{ path: string; type: string; title: string; body: string }> = [];
+    let status = 200;
+    const srv = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        got.push({ path: req.url || "", type: String(req.headers["content-type"] || ""), title: String(req.headers.title || ""), body });
+        res.writeHead(status);
+        res.end();
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const base = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      // Who gets a notice: failures unless the person is on the dashboard; successes only automatic and when asked.
+      const on = { onSuccess: true, lang: "pt" as const };
+      assert.equal(notify.deployNoticeText({ app: "loja", trigger: "dashboard", ok: false }, on), undefined);
+      assert.match(notify.deployNoticeText({ app: "loja", trigger: "poll", ok: false, commit: "abcdef1234", error: "boom" }, on)!.text, /loja \(abcdef1\) falhou: boom/);
+      assert.ok(notify.deployNoticeText({ app: "loja", trigger: "webhook", ok: true }, on));
+      assert.equal(notify.deployNoticeText({ app: "loja", trigger: "cli", ok: true }, on), undefined);
+      assert.equal(notify.deployNoticeText({ app: "loja", trigger: "webhook", ok: true }, { onSuccess: false, lang: "en" }), undefined);
+      assert.match(notify.deployNoticeText({ app: "loja", trigger: "mcp", ok: false }, { onSuccess: false, lang: "en" })!.text, /Publishing loja failed/);
+      // Addresses: https only (loopback http allowed in tests), no user:password, kind by host.
+      assert.throws(() => notify.validateNotifyUrl("http://example.com/x"), /https/);
+      assert.throws(() => notify.validateNotifyUrl("https://u:p@ntfy.sh/x"), /user or password/);
+      assert.throws(() => notify.validateNotifyUrl("nope"), /Invalid/);
+      assert.equal(notify.notifyKind("https://discord.com/api/webhooks/1/abc"), "discord");
+      assert.equal(notify.notifyKind("https://hooks.slack.com/services/T/B/x"), "slack");
+      assert.equal(notify.notifyKind("https://ntfy.sh/meu-topico"), "ntfy");
+      // A failing test notice saves nothing.
+      status = 500;
+      await assert.rejects(notify.saveNotify({ url: `${base}/topic` }), (e: Error & { pt?: string }) => /did not go through/.test(e.message) && /não chegou/.test(e.pt || ""));
+      assert.equal(notify.notifySummary().configured, false);
+      status = 200;
+      const saved = await notify.saveNotify({ url: `${base}/topic-secreto`, onSuccess: false, lang: "pt" });
+      assert.equal(saved.configured, true);
+      assert.ok(!JSON.stringify(saved).includes("topic-secreto"), "the address itself is never returned");
+      assert.ok(!JSON.stringify((await import("./connections.js")).connectionsSummary()).includes("topic-secreto"));
+      assert.equal(got.length, 2);
+      assert.match(got[1].body, /Teste/);
+      assert.equal(got[1].title, "PaaSMCP");
+      // A failed automatic deploy sends one notice; a failed dashboard deploy does not.
+      got.length = 0;
+      deploys.startDeployRun({ app: "nt-a", trigger: "poll", branch: "main" }).fail(new Error("Command failed: docker build\nlog"));
+      deploys.startDeployRun({ app: "nt-a", trigger: "dashboard", branch: "main" }).fail(new Error("x"));
+      for (let i = 0; i < 50 && got.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(got.length, 1);
+      assert.match(got[0].body, /nt-a falhou: Command failed: docker build/);
+      assert.ok(/^[\x20-\x7e]*$/.test(got[0].title), "ntfy title header is plain ASCII");
+      notify.clearNotify();
+      assert.equal(notify.notifySummary().configured, false);
+      deploys.forgetDeploys("nt-a");
+    } finally {
+      srv.close();
+      notify.clearNotify();
+    }
+  });
+
+  await t.test("48. App watch: a notice when an app stops on its own (two rounds, not mid-deploy) and when it is back", async () => {
+    const w = await import("./appwatch.js");
+    const none = new Set<string>();
+    let r = w.watchRound(undefined, ["a", "b"], new Set(["a", "b"]), none);
+    assert.deepEqual(r.events, []);
+    // One missed round is a restart, not news; the second one is.
+    r = w.watchRound(r.next, ["a", "b"], new Set(["b"]), none);
+    assert.deepEqual(r.events, []);
+    r = w.watchRound(r.next, ["a", "b"], new Set(["b"]), none);
+    assert.deepEqual(r.events, [{ app: "a", kind: "down" }]);
+    r = w.watchRound(r.next, ["a", "b"], new Set(["b"]), none);
+    assert.deepEqual(r.events, [], "said once");
+    r = w.watchRound(r.next, ["a", "b"], new Set(["a", "b"]), none);
+    assert.deepEqual(r.events, [{ app: "a", kind: "back" }]);
+    // Mid-deploy the old container may be gone for a moment: no count, no notice.
+    r = w.watchRound(r.next, ["a", "b"], new Set(["a"]), new Set(["b"]));
+    r = w.watchRound(r.next, ["a", "b"], new Set(["a"]), new Set(["b"]));
+    assert.deepEqual(r.events, []);
+    // An app stopped from the dashboard is no longer expected, so it never gets a notice.
+    r = w.watchRound(r.next, ["a"], new Set(["a"]), none);
+    r = w.watchRound(r.next, ["a"], new Set(["a"]), none);
+    assert.deepEqual(r.events, []);
+    assert.match(w.watchNoticeText({ app: "loja", kind: "down" }, "pt").text, /loja parou/);
+    assert.match(w.watchNoticeText({ app: "loja", kind: "back" }, "en").text, /loja is running again/);
+    assert.equal(w.DOWN_ROUNDS, 2);
+  });
+
+  await t.test("49. Ready-made apps: pinned images, data in a named volume, and a name that is taken is refused", async () => {
+    const tpl = await import("./templates.js");
+    const YAMLmod = (await import("yaml")).default;
+    for (const t0 of tpl.TEMPLATES) {
+      assert.match(t0.image, /^[a-z0-9./-]+:[A-Za-z0-9._-]+$/, `${t0.id} has an exact tag`);
+      assert.ok(!/:latest$|:\d+$/.test(t0.image), `${t0.id} is not on a moving tag`);
+      const doc = YAMLmod.parse(tpl.templateCompose(t0));
+      assert.deepEqual(Object.keys(doc.services), ["app"]);
+      assert.deepEqual(doc.services.app.ports, [String(t0.port)], "only the container port: PaaSMCP binds it to 127.0.0.1");
+      if (t0.dataPath) assert.deepEqual(doc.services.app.volumes, [`data:${t0.dataPath}`]);
+    }
+    assert.throws(() => tpl.findTemplate("../etc"), /Unknown ready-made app/);
+    const { dir } = tpl.prepareTemplate("it-tools");
+    assert.ok(fs.existsSync(path.join(dir, "docker-compose.yml")));
+    assert.ok(dir.startsWith(tpl.TEMPLATES_DIR));
+  });
+
+  await t.test("50. Nightly backup without a systemd timer: due once a day from 3h, a mark that stops a second run", async () => {
+    const nightly = await import("./nightly.js");
+    const backup = await import("./backup.js");
+    const at = (h: number, m = 0) => new Date(2026, 10, 6, h, m);
+    assert.equal(nightly.nightlyDue(at(2, 59), undefined), false, "not before 3h");
+    assert.equal(nightly.nightlyDue(at(3, 0), undefined), true);
+    assert.equal(nightly.nightlyDue(at(3, 10), undefined, 30), false, "the dashboard waits until 3:30");
+    assert.equal(nightly.nightlyDue(at(3, 30), undefined, 30), true);
+    assert.equal(nightly.nightlyDue(at(14, 0), "2026-11-05"), true, "a dashboard that was off at night catches up");
+    assert.equal(nightly.nightlyDue(at(23, 0), "2026-11-06"), false, "once a day");
+    assert.equal(nightly.localDate(at(1)), "2026-11-06");
+    fs.rmSync(nightly.NIGHTLY_MARK, { force: true });
+    const first = await backup.runNightlyBackup(7, { ifDue: true });
+    assert.ok(!("skipped" in first));
+    const mark = nightly.readNightlyMark()!;
+    assert.equal(mark.date, nightly.localDate(new Date()));
+    assert.ok(mark.finishedAt && typeof mark.created === "number");
+    assert.ok(["ok", "failed", "not-configured"].includes(String(mark.offsite)), "off-site state recorded");
+    const second = await backup.runNightlyBackup(7, { ifDue: true });
+    assert.match(String((second as { skipped?: string }).skipped), /already ran today/);
+    // Without --if-due (a person or the systemd timer asked for it) it runs anyway.
+    assert.ok(!("skipped" in (await backup.runNightlyBackup(7))));
+    fs.rmSync(nightly.NIGHTLY_MARK, { force: true });
+  });
+
+  await t.test("51. Health probes from inside the dashboard container go to the app's address on the Docker network", async () => {
+    const before = process.env.PAASMCP_IN_DASHBOARD;
+    try {
+      delete process.env.PAASMCP_IN_DASHBOARD;
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/healthz", () => "172.20.0.9"), "http://127.0.0.1:4005/healthz", "on the host: the published loopback port");
+      process.env.PAASMCP_IN_DASHBOARD = "1";
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "172.20.0.9"), "http://172.20.0.9:3000/", "in the dashboard container: the container's own IP and port");
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "fd00::5"), "http://[fd00::5]:3000/");
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => ""), "http://127.0.0.1:4005/", "no address on the network (network_mode): falls back");
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "evil.example/x?"), "http://127.0.0.1:4005/", "only an IP is used");
+      const storage = await import("./storage.js");
+      const envBefore = { a: process.env.PAASMCP_GARAGE_ADMIN_URL, s: process.env.PAASMCP_GARAGE_S3_URL };
+      delete process.env.PAASMCP_GARAGE_ADMIN_URL;
+      delete process.env.PAASMCP_GARAGE_S3_URL;
+      try {
+        assert.equal(storage.garageAdminUrl(), "http://paasmcp-garage:3903", "Garage admin by name on the Docker network");
+        assert.equal(storage.localS3Url(), "http://paasmcp-garage:3900");
+        delete process.env.PAASMCP_IN_DASHBOARD;
+        assert.equal(storage.garageAdminUrl(), "http://127.0.0.1:3903", "on the host: loopback");
+        assert.equal(storage.localS3Url(), "http://127.0.0.1:3900");
+      } finally {
+        if (envBefore.a !== undefined) process.env.PAASMCP_GARAGE_ADMIN_URL = envBefore.a;
+        if (envBefore.s !== undefined) process.env.PAASMCP_GARAGE_S3_URL = envBefore.s;
+      }
+    } finally {
+      if (before === undefined) delete process.env.PAASMCP_IN_DASHBOARD; else process.env.PAASMCP_IN_DASHBOARD = before;
+    }
+  });
+
+  await t.test("52. Tailscale from the dashboard: a missing tailscale or socket says what to do, in both languages", async () => {
+    const { tailscaleServeError, ExposeError } = await import("./exposure.js");
+    const missing = Object.assign(new Error("spawnSync tailscale ENOENT"), { code: "ENOENT" });
+    const e1 = tailscaleServeError(missing, 8465, 4005) as InstanceType<typeof ExposeError>;
+    assert.ok(e1 instanceof ExposeError);
+    assert.match(e1.pt, /reinicie o painel/);
+    assert.match(e1.message, /sudo tailscale serve --bg --https=8465 http:\/\/127\.0\.0\.1:4005/);
+    const sock = Object.assign(new Error("Command failed"), { stderr: Buffer.from("failed to connect to local tailscaled; it doesn't appear to be running (sudo systemctl start tailscaled ?)") });
+    const e2 = tailscaleServeError(sock, 8465, 4005);
+    assert.ok(e2 instanceof ExposeError, "daemon not reachable: same advice");
+    const https = Object.assign(new Error("Command failed"), { stderr: "Serve is not enabled on your tailnet." });
+    assert.match((tailscaleServeError(https, 8465, 4005) as InstanceType<typeof ExposeError>).pt, /HTTPS Certificates/);
+    assert.match(tailscaleServeError(missing, 8465, 4005, true).message, /sudo tailscale serve --https=8465 off/, "taking it off: the command that turns it off");
+    const other = new Error("something else");
+    assert.equal(tailscaleServeError(other, 1, 2), other, "anything else goes through unchanged");
+    const { tailscaleSocketDir } = await import("./config.js");
+    assert.ok(tailscaleSocketDir() === undefined || tailscaleSocketDir() === "/var/run/tailscale");
+  });
+
+  await t.test("53. Taking an address off the air: tunnel route, tunnel DNS record and PaaSMCP's email gate go, nothing else", async () => {
+    const { removeAppAddress, ExposeError } = await import("./exposure.js");
+    const http = (await import("node:http")).default;
+    const guard = await import("./guard.js");
+    assert.equal(guard.assessRisk("app.unexpose", { appName: "shop", hostname: "shop.loja.dev" })?.level, "confirm");
+    const calls: string[] = [];
+    let putIngress: Array<{ hostname?: string; service: string }> = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const u = new URL(req.url || "/", "http://x");
+        const p = u.pathname;
+        calls.push(`${req.method} ${p}`);
+        const ok = (r: unknown) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ success: true, result: r }));
+        if (p === "/accounts/acc9/cfd_tunnel/tun9/configurations" && req.method === "GET") {
+          return ok({ config: { ingress: [{ hostname: "shop.loja.dev", service: "http://paasmcp-shop:3000" }, { hostname: "blog.loja.dev", service: "http://paasmcp-blog:80" }, { service: "http_status:404" }], "warp-routing": { enabled: false } } });
+        }
+        if (p === "/accounts/acc9/cfd_tunnel/tun9/configurations" && req.method === "PUT") {
+          const body = JSON.parse(raw);
+          assert.deepEqual(body.config["warp-routing"], { enabled: false }, "the rest of the tunnel settings stay");
+          putIngress = body.config.ingress;
+          return ok({});
+        }
+        if (p === "/zones") return ok([{ id: "z9" }]);
+        if (p === "/zones/z9/dns_records" && req.method === "GET") {
+          return ok([{ id: "r1", type: "CNAME", content: "tun9.cfargotunnel.com" }, { id: "r2", type: "TXT", content: "mine" }]);
+        }
+        if (p.startsWith("/zones/z9/dns_records/") && req.method === "DELETE") return ok({});
+        if (p === "/accounts/acc9/access/apps" && req.method === "GET") {
+          return ok([{ id: "a1", domain: "shop.loja.dev", name: "PaaSMCP - shop" }, { id: "a2", domain: "shop.loja.dev", name: "Made by hand" }]);
+        }
+        if (p.startsWith("/accounts/acc9/access/apps/") && req.method === "DELETE") return ok({});
+        res.writeHead(404).end(JSON.stringify({ success: false }));
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const before = config.loadState();
+    const apiBefore = process.env.PAASMCP_CF_API_URL;
+    const tokenBefore = vault.getSecrets("system").CF_API_TOKEN;
+    process.env.PAASMCP_CF_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const st = config.loadState();
+      const any = Object.values(st.apps)[0] as any;
+      st.apps.shop = { ...(any || {}), name: "shop", containerName: "paasmcp-shop", localPort: 4077, domains: [
+        { hostname: "shop.loja.dev", mode: "public", url: "https://shop.loja.dev" },
+        { hostname: "casa.tail1.ts.net:8460", mode: "tailscale", url: "https://casa.tail1.ts.net:8460" },
+      ] } as any;
+      st.cloudflare = { ...st.cloudflare, accountId: "acc9", tunnelId: "tun9", baseDomain: "loja.dev" };
+      delete (st as any).activeTunnel;
+      config.saveState(st);
+      vault.setSecretEntries("system", { CF_API_TOKEN: "t".repeat(40) });
+
+      await assert.rejects(removeAppAddress("shop", "evil.other.dev"), (e: Error) => e instanceof ExposeError && /não é um endereço/.test((e as InstanceType<typeof ExposeError>).pt));
+      assert.equal(calls.length, 0, "an address the app does not have is refused before anything is sent");
+
+      const r = await removeAppAddress("shop", "shop.loja.dev");
+      assert.equal(r.removed, "https://shop.loja.dev");
+      assert.deepEqual(putIngress.map((x) => x.hostname || x.service), ["blog.loja.dev", "http_status:404"], "only this route goes; the catch-all stays");
+      assert.ok(calls.includes("DELETE /zones/z9/dns_records/r1"), "the tunnel CNAME goes");
+      assert.ok(!calls.includes("DELETE /zones/z9/dns_records/r2"), "a record PaaSMCP did not make stays");
+      assert.ok(r.notes.some((n) => /TXT/.test(n)));
+      assert.ok(calls.includes("DELETE /accounts/acc9/access/apps/a1") && !calls.includes("DELETE /accounts/acc9/access/apps/a2"), "only PaaSMCP's own email gate goes");
+      assert.deepEqual(config.loadState().apps.shop.domains.map((d) => d.hostname), ["casa.tail1.ts.net:8460"], "the other address stays");
+
+      // Deleting the app for good first tries to take its addresses off; a failure is reported, never thrown.
+      const { releaseAddresses } = await import("./exposure.js");
+      assert.equal(await releaseAddresses("no-such-app"), "");
+      const pathBefore = process.env.PATH;
+      process.env.PATH = "/nonexistent";
+      try {
+        const note = await releaseAddresses("shop");
+        assert.match(note, /Could not take off the air: casa\.tail1\.ts\.net:8460/);
+      } finally {
+        process.env.PATH = pathBefore;
+      }
+      assert.equal(config.loadState().apps.shop.domains.length, 1, "an address that could not be removed stays listed");
+    } finally {
+      srv.close();
+      if (apiBefore === undefined) delete process.env.PAASMCP_CF_API_URL; else process.env.PAASMCP_CF_API_URL = apiBefore;
+      if (tokenBefore) vault.setSecretEntries("system", { CF_API_TOKEN: tokenBefore }); else vault.deleteSecretKey("system", "CF_API_TOKEN");
+      const st = config.loadState();
+      delete st.apps.shop;
+      st.cloudflare = before.cloudflare;
+      if (before.activeTunnel) st.activeTunnel = before.activeTunnel;
+      config.saveState(st);
+    }
+  });
+
+  await t.test("54. The trash empties itself: a notice 3 days before, never deleted without one, restore resets it", async () => {
+    const { trashPlan, trashDeleteDate, WARN_DAYS } = await import("./trashclean.js");
+    const day = 24 * 3600 * 1000;
+    const now = Date.parse("2026-12-31T04:00:00Z");
+    const ago = (d: number) => new Date(now - d * day).toISOString();
+    const plan = trashPlan([
+      { name: "fresh", trashedAt: ago(5) },
+      { name: "soon", trashedAt: ago(27) },
+      { name: "old-never-warned", trashedAt: ago(90) },
+      { name: "warned-yesterday", trashedAt: ago(40), trashWarnedAt: ago(1) },
+      { name: "due", trashedAt: ago(30), trashWarnedAt: ago(WARN_DAYS) },
+      { name: "running" },
+    ], now);
+    assert.deepEqual(plan.warn.sort(), ["old-never-warned", "soon"], "27 days in: the notice; an old app with no notice gets one first");
+    assert.deepEqual(plan.purge, ["due"], "deleted only after 30 days and 3 days after the notice");
+    assert.equal(trashDeleteDate({ name: "x", trashedAt: ago(90), trashWarnedAt: ago(0) }), new Date(now + WARN_DAYS * day).toISOString(), "never sooner than 3 days after the notice");
+    assert.equal(trashDeleteDate({ name: "x", trashedAt: ago(0) }), new Date(now + 30 * day).toISOString());
+
+    const { runTrashCleanup } = await import("./trashclean.js");
+    const before = process.env.PAASMCP_TRASH_AUTO;
+    process.env.PAASMCP_TRASH_AUTO = "0";
+    try {
+      assert.deepEqual(await runTrashCleanup(now), { warned: [], purged: [], errors: [] }, "PAASMCP_TRASH_AUTO=0 turns it off");
+    } finally {
+      if (before === undefined) delete process.env.PAASMCP_TRASH_AUTO; else process.env.PAASMCP_TRASH_AUTO = before;
+    }
+    const st = config.loadState();
+    const any = Object.values(st.apps)[0] as any;
+    st.apps.oldtrash = { ...(any || {}), name: "oldtrash", trashedAt: ago(28), trashDir: "/nonexistent-trash", domains: [] } as any;
+    delete (st.apps.oldtrash as any).trashWarnedAt;
+    config.saveState(st);
+    try {
+      const r = await runTrashCleanup(now);
+      assert.deepEqual(r.warned, ["oldtrash"]);
+      assert.ok(config.loadState().apps.oldtrash.trashWarnedAt, "the notice is remembered");
+      assert.deepEqual((await runTrashCleanup(now + day)).warned, [], "one notice only");
+    } finally {
+      const s2 = config.loadState();
+      delete s2.apps.oldtrash;
+      config.saveState(s2);
+    }
+  });
+
+  await t.test("55. Push notices from the dashboard: the saved token creates or fixes the webhook, only for this address", async () => {
+    const conn = await import("./connections.js");
+    const http = await import("node:http");
+    const TOKEN = "github_pat_" + "w".repeat(30);
+    const before = vault.getSecrets("system").GITHUB_TOKEN;
+    vault.setSecretEntries("system", { GITHUB_TOKEN: TOKEN });
+    const URL_HERE = "https://painel.example.com/api/webhooks/github";
+    const hooks: Record<string, { id: number; active: boolean; events: string[]; config: Record<string, string>; last_response?: { code: number } }[]> = {
+      "octo/shop": [
+        { id: 7, active: true, events: ["push"], config: { url: "https://other.example.com/hook" } },
+        { id: 8, active: false, events: ["issues"], config: { url: URL_HERE } },
+      ],
+      "octo/site": [],
+    };
+    const calls: string[] = [];
+    const now = new Date().toISOString();
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end("{}");
+        const m = (req.url || "").match(/^\/gh\/repos\/([^/]+\/[^/]+)\/hooks(?:\/(\d+))?(\/pings|\/deliveries)?/);
+        calls.push(`${req.method} ${req.url}`);
+        if (!m || !(m[1] in hooks)) return res.writeHead(404).end("{}");
+        const list = hooks[m[1]];
+        if (req.method === "GET" && !m[2]) return res.writeHead(200).end(JSON.stringify(list));
+        if (req.method === "POST" && !m[2]) {
+          const body = JSON.parse(raw);
+          const h = { id: 100 + list.length, active: body.active, events: body.events, config: body.config };
+          list.push(h);
+          return res.writeHead(201).end(JSON.stringify(h));
+        }
+        const h = list.find((x) => x.id === Number(m[2]));
+        if (!h) return res.writeHead(404).end("{}");
+        if (req.method === "PATCH") { const b = JSON.parse(raw); Object.assign(h, { active: b.active, events: b.events, config: b.config }); return res.writeHead(200).end(JSON.stringify(h)); }
+        if (m[3] === "/pings") return res.writeHead(204).end();
+        if (m[3] === "/deliveries") return res.writeHead(200).end(JSON.stringify([{ event: "ping", status_code: m[1] === "octo/shop" ? 200 : 530, delivered_at: now }]));
+        res.writeHead(404).end("{}");
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GITHUB_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}/gh`;
+    try {
+      assert.equal(conn.githubRepoOf("https://github.com/octo/shop.git"), "octo/shop");
+      assert.equal(conn.githubRepoOf("git@github.com:octo/site.git"), "octo/site");
+      assert.equal(conn.githubRepoOf("https://gitlab.com/octo/shop"), "");
+      assert.equal(conn.githubRepoOf("octo/../etc"), "");
+      assert.equal(conn.webhookAddress("painel.example.com/qualquer"), URL_HERE, "always the dashboard's own path");
+      for (const bad of ["http://painel.example.com", "https://192.168.0.10:4099", "https://localhost", "https://srv.local", "https://u:p@painel.example.com"]) {
+        assert.throws(() => conn.webhookAddress(bad), conn.ConnectionError, bad);
+      }
+      const apps = [
+        { name: "shop", repoUrl: "https://github.com/octo/shop" },
+        { name: "shop-admin", repoUrl: "git@github.com:octo/shop.git" },
+        { name: "site", repoUrl: "octo/site" },
+        { name: "secret", repoUrl: "octo/nope" },
+        { name: "local" },
+      ];
+      const listed = await conn.listRepoHooks(apps, "https://painel.example.com");
+      assert.deepEqual(listed.map((r) => [r.repo, r.state, r.apps.join(",")]), [
+        ["octo/shop", "off", "shop,shop-admin"],
+        ["octo/site", "off", "site"],
+        ["octo/nope", "denied", "secret"],
+      ], "a disabled hook without push counts as off; a repo the token cannot see is denied");
+
+      const fixed = await conn.ensureRepoHook("octo/shop", "https://painel.example.com", "s3cret");
+      assert.deepEqual(fixed, { repo: "octo/shop", created: false, reach: "ok", code: 200 });
+      assert.equal(hooks["octo/shop"].length, 2, "the hook already pointing here is fixed, not duplicated");
+      assert.deepEqual(hooks["octo/shop"][1].config, { url: URL_HERE, content_type: "json", secret: "s3cret", insecure_ssl: "0" });
+      assert.deepEqual(hooks["octo/shop"][1].events, ["push"]);
+      assert.equal(hooks["octo/shop"][0].config.url, "https://other.example.com/hook", "someone else's hook is left alone");
+      assert.ok(calls.includes("POST /gh/repos/octo/shop/hooks/8/pings"), "a fixed hook gets a test call");
+
+      const made = await conn.ensureRepoHook("https://github.com/octo/site.git", "painel.example.com", "s3cret");
+      assert.deepEqual(made, { repo: "octo/site", created: true, reach: "unreachable", code: 530 });
+      assert.equal(hooks["octo/site"].length, 1);
+      await assert.rejects(conn.ensureRepoHook("octo/nope", "painel.example.com", "x"), (e: InstanceType<typeof conn.ConnectionError>) => /Webhooks: Read and write/.test(e.pt));
+      assert.deepEqual((await conn.listRepoHooks(apps.slice(0, 3), "painel.example.com")).map((r) => r.state), ["on", "on"]);
+      vault.deleteSecretKey("system", "GITHUB_TOKEN");
+      await assert.rejects(conn.listRepoHooks(apps, "painel.example.com"), /No GitHub token/);
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_GITHUB_API_URL;
+      if (before) vault.setSecretEntries("system", { GITHUB_TOKEN: before }); else vault.deleteSecretKey("system", "GITHUB_TOKEN");
+    }
+  });
+
+  await t.test("56. Arbiter by code: a PC with PaaSMCP pairs with a server, the key only after the code matches, and the other server adopts it", async () => {
+    const arbiter = await import("./arbiter.js");
+    const mirror = await import("./mirror.js");
+    const judge = await import("./judge.js");
+    const active = await import("./active.js");
+    const judgeDir = path.join(tempRoot, "judge-pc");
+    process.env.PAASMCP_ARBITER_DIR = judgeDir;
+    process.env.PAASMCP_ARBITER_ENV_FILE = path.join(judgeDir, "keys.env");
+    const srv = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", keyFile: process.env.PAASMCP_ARBITER_ENV_FILE, stateFile: path.join(judgeDir, "state.json"), pairing: true });
+    await new Promise((r) => srv.once("listening", r));
+    const port = (srv.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${port}`;
+    const st0 = config.loadState();
+    const savedUrl = st0.mirror?.arbiterUrl;
+    try {
+      // Starts with no key: no cluster is accepted, and no code is open.
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter" });
+      await assert.rejects(() => arbiter.askArbiter(url, { op: "heartbeat", node: "x", epoch: 0 }), /HTTP 401/);
+      await assert.rejects(() => arbiter.pairWithArbiter("127.0.0.1", "123456", { port }), (e: Error & { code?: string }) => e.code === "notPairing");
+      // The PC opens a window; /health says so (and nothing else).
+      const w = arbiter.openArbiterPairing();
+      assert.match(w.code, /^\d{6}$/);
+      assert.equal(fs.statSync(path.join(judgeDir, "pairing.json")).mode & 0o777, 0o600);
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter", pairing: true });
+      // A wrong code: the server stops at the proof and never sends the key.
+      const wrong = w.code === "000000" ? "111111" : "000000";
+      await assert.rejects(() => arbiter.pairWithArbiter("127.0.0.1", wrong, { port }), (e: Error & { code?: string }) => e.code === "wrongCode");
+      assert.equal(fs.existsSync(process.env.PAASMCP_ARBITER_ENV_FILE), false, "nothing stored after a wrong code");
+      assert.equal(arbiter.arbiterPairingStatus().triesLeft, arbiter.PAIR_MAX_TRIES - 1);
+      // A key step with a nonce the PC never issued is refused.
+      const forged = await fetch(`${url}/pair`, { method: "POST", body: JSON.stringify({ step: "key", nonceA: "a".repeat(32), nonceC: "b".repeat(32), iv: "00", box: "AA==" }) });
+      assert.equal(forged.status, 403);
+      await assert.rejects(() => arbiter.pairWithArbiter("bad host;", w.code, { port }), (e: Error & { code?: string }) => e.code === "badHost");
+      // The right code: the key arrives, the window closes, and the arbiter serves the cluster at once.
+      const key = arbiter.deriveArbiterKey();
+      const out = await arbiter.pairWithArbiter("127.0.0.1", w.code, { port });
+      assert.equal(out.url, url);
+      assert.equal(out.cluster, arbiter.arbiterClusterId(key));
+      assert.equal(fs.readFileSync(process.env.PAASMCP_ARBITER_ENV_FILE, "utf-8"), `PAASMCP_ARBITER_KEY=${key}\n`);
+      assert.equal(fs.statSync(process.env.PAASMCP_ARBITER_ENV_FILE).mode & 0o777, 0o600);
+      assert.equal(arbiter.arbiterPairingStatus().open, false);
+      assert.equal((await arbiter.askArbiter(url, { op: "heartbeat", node: "x", epoch: 0 })).granted, true);
+      await assert.rejects(() => arbiter.pairWithArbiter("127.0.0.1", w.code, { port }), (e: Error & { code?: string }) => e.code === "notPairing", "a code works once");
+      // Too many tries close the window.
+      arbiter.openArbiterPairing();
+      for (let i = 0; i < arbiter.PAIR_MAX_TRIES; i++) await fetch(`${url}/pair`, { method: "POST", body: JSON.stringify({ step: "hello", nonceA: crypto.randomBytes(16).toString("hex") }) });
+      assert.equal(arbiter.arbiterPairingStatus().open, false);
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter" });
+      // Through mirror.ts: pairs, saves the address and checks it.
+      const w2 = arbiter.openArbiterPairing();
+      const paired = await mirror.pairArbiterAndSave("127.0.0.1", w2.code, { port });
+      assert.equal(paired.url, url);
+      assert.equal(config.loadState().mirror?.arbiterUrl, url);
+      assert.equal(paired.check.ok, true);
+      assert.equal(paired.check.about?.clusters, 1, "pairing twice keeps a single key");
+
+      // The other server adopts the arbiter from the control channel, only when it has none.
+      const manifest = active.buildActiveManifest({ ...config.loadState(), mirror: { ...(config.loadState().mirror || { epoch: 0, offers: {}, replicas: {} }), arbiterUrl: url } });
+      assert.equal(manifest.arbiterUrl, url);
+      {
+        const st = config.loadState();
+        const before = st.mirror;
+        st.mirror = { epoch: 0, offers: {}, replicas: { "judge-peer": { peerName: "judge-peer", peerNodeId: "node-judge-peer", peerHost: "100.64.0.77", container: "x", acceptedAt: new Date().toISOString() } as never } };
+        config.saveState(st);
+        const body = active.encodeManifest({ v: 1, nodeId: "node-judge-peer", epoch: 0, apps: {}, arbiterUrl: "http://100.64.0.50:4097" });
+        const r1 = await active.syncActivePeers({ read: () => body, deploy: async () => undefined as never, stop: () => undefined });
+        assert.equal(r1[0].arbiter, "http://100.64.0.50:4097");
+        assert.equal(config.loadState().mirror?.arbiterUrl, "http://100.64.0.50:4097", "a server without an arbiter adopts the other's");
+        const body2 = active.encodeManifest({ v: 1, nodeId: "node-judge-peer", epoch: 0, apps: {}, arbiterUrl: "http://100.64.0.99:4097" });
+        await active.syncActivePeers({ read: () => body2, deploy: async () => undefined as never, stop: () => undefined });
+        assert.equal(config.loadState().mirror?.arbiterUrl, "http://100.64.0.50:4097", "an address already set is never replaced");
+        const st2 = config.loadState();
+        st2.mirror = before;
+        config.saveState(st2);
+      }
+
+      // Candidates: every online device, those with a code first, the pair's own servers marked.
+      const fake = JSON.stringify({ Self: { TailscaleIPs: ["100.64.0.1"] }, Peer: {
+        a: { HostName: "cloud-graco-50", OS: "linux", Online: true, TailscaleIPs: ["100.64.0.50", "fd7a::1"] },
+        b: { HostName: "phone", OS: "android", Online: false, TailscaleIPs: ["100.64.0.60"] },
+      } });
+      const peers = judge.listTailscalePeers(fake);
+      assert.equal(peers.selfIp, "100.64.0.1");
+      assert.deepEqual(peers.peers.map((p) => [p.name, p.ip, p.online]), [["cloud-graco-50", "100.64.0.50", true], ["phone", "100.64.0.60", false]], "devices without PaaSMCP and offline ones stay listed");
+      const found = await judge.findJudgeCandidates(fake);
+      assert.deepEqual(found.devices.map((d) => d.name), ["cloud-graco-50"], "the candidate list keeps online devices only");
+      assert.equal(found.devices[0].arbiter, false);
+
+      // The arbiter container's code: the copied files import nothing else (so it runs with plain node).
+      const codeDir = judge.writeJudgeBundle();
+      const { spawnSync } = await import("node:child_process");
+      const run = spawnSync(process.execPath, ["--input-type=module", "-e", "await import(process.argv[1]); console.log('ok')", path.join(codeDir, "dist", "arbiter.js")], { encoding: "utf-8", env: { ...process.env, PAASMCP_ROOT: path.join(tempRoot, "bundle-root") } });
+      assert.equal(run.stdout.trim(), "ok", run.stderr);
+      // Starting it: one docker run with host network, its keys and state in the arbiter folder.
+      process.env.PAASMCP_ARBITER_HOST = "127.0.0.1";
+      process.env.PAASMCP_ARBITER_PORT = String(port);
+      const calls: string[][] = [];
+      const started = await judge.ensureLocalJudge((a) => calls.push(a));
+      assert.equal(started.started, false, "an arbiter already answers here: nothing is started");
+      assert.equal(calls.length, 0);
+      const opened = await judge.beJudge((a) => calls.push(a));
+      assert.match(opened.code, /^\d{6}$/);
+      const local = await judge.localJudgeStatus();
+      assert.equal(local.running, true);
+      assert.equal(local.pairing.open, true);
+      assert.deepEqual(local.clusters, [arbiter.arbiterClusterId(key)]);
+      judge.cancelJudgePairing();
+      assert.equal((await judge.localJudgeStatus()).pairing.open, false);
+      process.env.PAASMCP_ARBITER_PORT = "1";
+      const runs: string[][] = [];
+      await assert.rejects(() => judge.ensureLocalJudge((a) => runs.push(a)), /does not answer/);
+      const runArgs = runs.find((a) => a[0] === "run")!;
+      assert.ok(runArgs.includes("--network") && runArgs[runArgs.indexOf("--network") + 1] === "host");
+      assert.ok(runArgs.includes(`PAASMCP_ARBITER_ENV_FILE=${path.join(judgeDir, "keys.env")}`));
+      assert.ok(!runArgs.join(" ").includes(key), "the key never goes on the command line");
+      // Guard: stopping the arbiter here needs a confirmation.
+      assert.equal(guard.assessRisk("judge.stop", {})?.level, "confirm");
+    } finally {
+      srv.close();
+      for (const k of ["PAASMCP_ARBITER_DIR", "PAASMCP_ARBITER_ENV_FILE", "PAASMCP_ARBITER_HOST", "PAASMCP_ARBITER_PORT"]) delete process.env[k];
+      const st = config.loadState();
+      if (st.mirror) {
+        st.mirror.arbiterUrl = savedUrl;
+        config.saveState(st);
+      }
+    }
+  });
+
+  await t.test("57. PCs of the Tailscale: devices with and without PaaSMCP, phones and other people's devices never probed", async () => {
+    const pcs = await import("./pcinstall.js");
+    const judge = await import("./judge.js");
+    const net = await import("node:net");
+    const key = "ssh-ed25519 " + "A".repeat(68);
+    const fake = JSON.stringify({ Self: { TailscaleIPs: ["100.64.0.1"], UserID: 7 }, Peer: {
+      a: { HostName: "notebook", OS: "linux", Online: true, UserID: 7, TailscaleIPs: ["100.64.0.20"], sshHostKeys: [key + " root@notebook", "junk; rm -rf /"] },
+      b: { HostName: "cloud-graco-150", OS: "linux", Online: true, UserID: 7, TailscaleIPs: ["100.64.0.30"] },
+      c: { HostName: "phone", OS: "android", Online: true, UserID: 7, TailscaleIPs: ["100.64.0.40"] },
+      d: { HostName: "friend-pc", OS: "linux", Online: true, ShareeNode: true, UserID: 99, TailscaleIPs: ["100.64.0.50"] },
+      e: { HostName: "family-pc", OS: "linux", Online: true, UserID: 8, TailscaleIPs: ["100.64.0.60"] },
+      f: { HostName: "tagged-vm", OS: "linux", Online: false, UserID: 12345, Tags: ["tag:server", "bad tag"], TailscaleIPs: ["100.64.0.70"] },
+    } });
+    const peers = judge.listTailscalePeers(fake).peers;
+    assert.deepEqual(peers.find((p) => p.name === "notebook")?.sshHostKeys, [key], "only well-formed host keys are kept, without the comment");
+    assert.equal(peers.find((p) => p.name === "friend-pc")?.shared, true);
+    assert.equal(peers.find((p) => p.name === "family-pc")?.otherOwner, true);
+    assert.equal(peers.find((p) => p.name === "tagged-vm")?.otherOwner, undefined, "a tagged device has no owner to compare");
+    assert.deepEqual(peers.find((p) => p.name === "tagged-vm")?.tags, ["tag:server"]);
+
+    const st = config.loadState();
+    const savedPool = st.pool;
+    st.pool = { helpers: { nb: { name: "nb", ip: "100.64.0.30" } as never }, invites: {} } as never;
+    config.saveState(st);
+    try {
+      const r = await pcs.listTailnetPcs({ statusJson: fake, probe: false });
+      const by = Object.fromEntries(r.pcs.map((x) => [x.name, x]));
+      assert.equal(by.notebook.state, "installable");
+      assert.equal(by.notebook.hostKeysKnown, true);
+      assert.equal(by["cloud-graco-150"].state, "paasmcp");
+      assert.deepEqual(by["cloud-graco-150"].roles, ["helper"]);
+      assert.equal(by.phone.why, "notLinux");
+      assert.equal(by["friend-pc"].why, "shared");
+      assert.equal(by["family-pc"].why, "otherOwner");
+      assert.equal(by["tagged-vm"].state, "offline");
+      assert.equal(r.pcs[0].name, "notebook", "the ones PaaSMCP can go on come first");
+    } finally {
+      const s2 = config.loadState();
+      s2.pool = savedPool;
+      config.saveState(s2);
+    }
+
+    // SSH banner: which server answers on port 22.
+    assert.equal(pcs.sshKind("SSH-2.0-Tailscale"), "tailscale");
+    assert.equal(pcs.sshKind("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13"), "openssh");
+    assert.equal(pcs.sshKind(undefined), "closed");
+    const srv = net.createServer((c) => c.end("SSH-2.0-Tailscale\r\n"));
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const port = (srv.address() as { port: number }).port;
+    assert.equal(await pcs.sshBanner("127.0.0.1", port), "SSH-2.0-Tailscale");
+    srv.close();
+    assert.equal(await pcs.sshBanner("127.0.0.1", port, 300), undefined, "closed port: nothing answers");
+  });
+
+  await t.test("58. Installing on a PC: the check is parsed safely, the plan says what is missing, the root script quotes everything", async () => {
+    const r = await import("./pcremote.js");
+    const { spawnSync } = await import("node:child_process");
+    const out = [
+      "osId=ubuntu", "osLike=debian", "osVersion=24.04", "osName=Ubuntu 24.04.1 LTS", "arch=x86_64", "user=graco", "uid=1000",
+      "memMb=7800", "diskMb=90000", "systemd=1", "git=", "node=v18.19.1", "npm=", "docker=", "compose=", "tailscale=1.80.0",
+      "sshd=0", "paasmcp=", "sudo=password", "evil=$(rm -rf /)", "osName2=x",
+    ].join("\n");
+    const f = r.parseFacts(out);
+    assert.equal(f.osId, "ubuntu");
+    assert.equal(f.sudo, "password");
+    assert.equal(f.root, false);
+    assert.equal((f as unknown as Record<string, unknown>).evil, undefined, "unknown keys are dropped");
+    assert.equal(r.parseFacts("sudo=sure\nosName=\u0007bad\u001b[31m").sudo, "none", "an unknown sudo answer is no sudo");
+    const plan = r.planFor(f, { hasPair: false, localArch: "x64", havePassword: true });
+    assert.equal(plan.supported, true);
+    assert.deepEqual(plan.install, ["git", "docker", "compose", "node"]);
+    assert.deepEqual(plan.roles, ["server", "helper"], "arbiter only when this server has a pair");
+    assert.deepEqual(r.planFor({ ...f, arch: "aarch64" }, { hasPair: true, localArch: "x64", havePassword: true }).warnings, ["archDiffers"]);
+    assert.deepEqual(r.planFor(f, { hasPair: true, localArch: "x64", havePassword: false }).problems, ["sudoNeedsPassword"]);
+    assert.deepEqual(r.planFor({ ...f, osId: "fedora", osLike: "rhel", systemd: false, diskMb: 900 }, { hasPair: false, localArch: "x64", havePassword: true }).problems, ["notDebian", "systemd", "disk"]);
+    assert.equal(r.planFor({ ...f, osId: "linuxmint", osLike: "ubuntu debian" }, { hasPair: false, localArch: "x64", havePassword: true }).supported, true, "Debian family by ID_LIKE");
+
+    // Inputs: only what a login name / IP / PC name can be.
+    assert.throws(() => r.validateUser("-oProxyCommand=sh"));
+    assert.throws(() => r.validateUser("root;id"));
+    assert.equal(r.validateUser("graco"), "graco");
+    assert.throws(() => r.validateIp("100.64.0.300"));
+    assert.throws(() => r.validatePassword("a\nb"));
+    assert.equal(r.validatePcName("Notebook do Graco!"), "notebook-do-graco");
+
+    // The root script: valid bash, every value single-quoted, nothing from the PC in it.
+    const nasty = "https://github.com/a/b";
+    const script = r.installScript({ role: "helper", repoUrl: nasty, ref: "a".repeat(40), ip: "100.64.0.20", invite: "paasmcp-pool://AbC_d-e" + "x".repeat(40) });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pcs-"));
+    fs.writeFileSync(path.join(dir, "s.sh"), script);
+    // The dashboard's self-update runs these tests in its Alpine image, which has no bash: check with sh there.
+    const shell = spawnSync("bash", ["-c", "true"]).status === 0 ? "bash" : "sh";
+    assert.equal(spawnSync(shell, ["-n", path.join(dir, "s.sh")]).status, 0, `${shell} -n accepts the script`);
+    assert.match(script, /REF='a{40}'/);
+    assert.match(script, new RegExp(r.NODE_SHA256.x64));
+    assert.match(script, /sha256sum -c/);
+    assert.throws(() => r.installScript({ role: "server", repoUrl: "https://x/y'; rm -rf /'", ref: "main", ip: "100.64.0.20" }));
+    assert.throws(() => r.installScript({ role: "server", repoUrl: nasty, ref: "main;id", ip: "100.64.0.20" }));
+    assert.throws(() => r.installScript({ role: "helper", repoUrl: nasty, ref: "main", ip: "100.64.0.20", invite: "x'$(id)'" }));
+    assert.throws(() => r.installScript({ role: "root" as never, repoUrl: nasty, ref: "main", ip: "100.64.0.20" }));
+    fs.rmSync(dir, { recursive: true, force: true });
+
+    // sudo: the password goes on stdin, never in the command.
+    const pw = "s3cr'et pass";
+    const a = r.asRoot({ sudo: "password" }, "bash '/tmp/x.sh'", pw);
+    assert.equal(a.command.includes(pw), false);
+    assert.equal(a.stdin, pw + "\n");
+    assert.equal(r.asRoot({ sudo: "root" }, "id").command, "id");
+    assert.equal(r.asRoot({ sudo: "nopass" }, "id").command, "sudo -n id");
+    assert.equal(r.redact(`x ${pw} y ${r.shq(pw)}`, pw), "x ••• y •••");
+    assert.equal(r.shq("it's"), `'it'\\''s'`);
+
+    // ssh's complaints become codes the screen explains.
+    assert.equal(r.sshError("Host key verification failed.").code, "hostKey");
+    assert.equal(r.sshError("graco@100.64.0.20: Permission denied (publickey,password).").code, "auth");
+    assert.equal(r.sshError("ssh: connect to host 100.64.0.20 port 22: Connection refused").code, "unreachable");
+
+    // Only a PC from the list, and nothing without a valid user.
+    await assert.rejects(r.startPcCheck({ ip: "100.64.0.20", user: "bad user", by: "test" }), /user name/);
+    await assert.rejects(r.startPcCheck({ ip: "100.64.0.99", user: "graco", by: "test" }), (e: Error & { code?: string }) => e.code === "notInList");
+    r.resetPcJobs();
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
@@ -3903,6 +5044,159 @@ volumes:
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
     config.ensureDataDir(dir);
     fs.rmSync(path.join(config.PAAS_DATA_DIR, "owner-test"), { recursive: true, force: true });
+  });
+
+  await t.test("59. Vault keys: description and dates, kept encrypted, with built-in text for PaaSMCP's own keys", async () => {
+    const vm = await import("node:vm");
+    const vaultdocs = await import("./vaultdocs.js");
+    const scope = "meta-test-app";
+    // A key saved before date tracking: value only, no metadata file entry.
+    vault.saveSecrets(scope, { OLD_KEY: "old-value-123" });
+    let d = vaultdocs.listSecretDetails(scope);
+    assert.equal(d.OLD_KEY.createdAt, undefined, "no invented creation date");
+    assert.equal(d.OLD_KEY.updatedAt, undefined);
+
+    vault.setSecretEntries(scope, { NEW_KEY: "first-value-1" });
+    d = vaultdocs.listSecretDetails(scope);
+    assert.ok(d.NEW_KEY.createdAt && d.NEW_KEY.createdAt === d.NEW_KEY.updatedAt);
+    const created = d.NEW_KEY.createdAt;
+
+    // Same value again (a redeploy re-applying variables) is not a change.
+    await new Promise((r) => setTimeout(r, 5));
+    vault.setSecretEntries(scope, { NEW_KEY: "first-value-1" });
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.updatedAt, created);
+    vault.setSecretEntries(scope, { NEW_KEY: "second-value-2", OLD_KEY: "old-value-456" });
+    d = vaultdocs.listSecretDetails(scope);
+    assert.equal(d.NEW_KEY.createdAt, created);
+    assert.ok(d.NEW_KEY.updatedAt! > created!);
+    assert.equal(d.OLD_KEY.createdAt, undefined, "an old key changed now still has an unknown creation date");
+    assert.ok(d.OLD_KEY.updatedAt);
+
+    vault.setSecretDescription(scope, "NEW_KEY", "  Stripe da loja\n(produção)  ");
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.description, "Stripe da loja (produção)");
+    assert.throws(() => vault.setSecretDescription(scope, "NEW_KEY", "a chave é second-value-2"), /own value/);
+    assert.throws(() => vault.setSecretDescription(scope, "NEW_KEY", "x".repeat(301)), /too long/);
+    assert.throws(() => vault.setSecretDescription(scope, "MISSING_KEY", "x"), /No key/);
+    const metaFile = path.join(config.PAAS_VAULT_DIR, `${scope}.meta.enc.json`);
+    assert.ok(!fs.readFileSync(metaFile, "utf-8").includes("Stripe"), "descriptions are encrypted on disk");
+    vault.setSecretDescription(scope, "NEW_KEY", "");
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.description, undefined);
+
+    // Removing a key drops its metadata; adding it again starts over.
+    vault.setSecretDescription(scope, "NEW_KEY", "temporária");
+    vault.deleteSecretKey(scope, "NEW_KEY");
+    assert.equal(vault.getSecretMeta(scope).NEW_KEY, undefined);
+    vault.setSecretEntries(scope, { NEW_KEY: "third-value-3" });
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.description, undefined);
+
+    // Built-in text: system keys only in system, app keys only in apps.
+    vault.setSecretEntries(scope, { DATABASE_URL: "postgresql://u:p@h/db", GITHUB_TOKEN: "ghp_" + "z".repeat(20) });
+    d = vaultdocs.listSecretDetails(scope);
+    assert.ok(d.DATABASE_URL.suggested?.pt && d.DATABASE_URL.suggested?.en);
+    assert.equal(d.GITHUB_TOKEN.suggested, undefined, "an app's own GITHUB_TOKEN is not the dashboard's");
+    assert.ok(vaultdocs.listSecretDetails("system").DASHBOARD_TOKEN?.suggested || !vault.getSecrets("system").DASHBOARD_TOKEN);
+
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      // Its own client address: earlier tests already spent most of 127.0.0.1's login attempts.
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "203.0.113.58" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+      const add = await post("/api/secrets", { scope, key: "API_KEY", value: "value-from-form-9", description: "Chave da API de fotos" });
+      assert.equal(add.status, 200);
+      const desc = await post("/api/secrets/description", { scope, key: "API_KEY", description: "Fotos do catálogo" });
+      assert.equal(desc.status, 200);
+      const noAuth = await fetch(`${baseUrl}/api/secrets/description`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope, key: "API_KEY", description: "x" }) });
+      assert.equal(noAuth.status, 401);
+      const list = await (await fetch(`${baseUrl}/api/secrets?scope=${scope}`, { headers: { cookie } })).text();
+      assert.ok(!list.includes("value-from-form-9") && !list.includes("third-value-3"), "values never come back");
+      const j = JSON.parse(list);
+      assert.equal(j.details.API_KEY.description, "Fotos do catálogo");
+      assert.ok(j.details.API_KEY.createdAt);
+      assert.equal(j.details.OLD_KEY.createdAt, undefined);
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes("editSecretDesc(") && page.includes('id="secDesc"'));
+    } finally {
+      dsrv.close();
+      for (const k of Object.keys(vault.getSecrets(scope))) vault.deleteSecretKey(scope, k);
+    }
+  });
+
+  await t.test("60. MCP covers the dashboard's newer screens, with the same levels and confirmations", async () => {
+    const mcp = await import("./mcp-server.js");
+    const call = async (tool: string, args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => (await mcp.handleToolCall(tool, args, level)).content[0].text;
+    const callJson = async (tool: string, args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => JSON.parse(await call(tool, args, level));
+
+    const all = (await mcp.listToolsFor("destroy")).tools.map((x) => x.name);
+    for (const n of ["paas_app_templates", "paas_connections", "paas_usage", "paas_pcs"]) assert.ok(all.includes(n), n);
+    const readNames = (await mcp.listToolsFor("read")).tools.map((x) => x.name);
+    for (const n of ["paas_usage", "paas_connections", "paas_pcs"]) assert.ok(readNames.includes(n), `read lists ${n}`);
+    assert.equal(readNames.includes("paas_app_templates"), false);
+
+    // Ready-made apps: the list is free, publishing needs a deploy token.
+    const tl = await callJson("paas_app_templates", { action: "list" }, "deploy");
+    assert.ok(tl.templates.some((x: { id: string }) => x.id === "uptime-kuma"));
+    assert.match(await call("paas_app_templates", { action: "deploy", id: "uptime-kuma" }, "read"), /read-only tools/);
+
+    // An app from a repository: redeploy, auto-publish and taking an address off the air.
+    const st = config.loadState();
+    const base = Object.values(st.apps)[0];
+    st.apps["mcp-new"] = { ...base, name: "mcp-new", repoUrl: "acme/mcp-new", branch: "main", trashedAt: undefined, autoDeploy: undefined, domains: [{ hostname: "new.example.com", mode: "public", url: "https://new.example.com" }] };
+    st.databases["mcp-new-postgres"] = { name: "mcp-new-postgres", engine: "postgres", appName: "mcp-new" } as (typeof st.databases)[string];
+    config.saveState(st);
+    assert.match(await call("paas_app_lifecycle", { appName: "nobody-here", action: "redeploy" }, "deploy"), /not found/);
+    assert.equal((await callJson("paas_app_lifecycle", { appName: "mcp-new", action: "autodeploy_on" }, "deploy")).autoDeploy, "poll");
+    assert.equal(config.loadState().apps["mcp-new"].autoDeploy, "poll");
+    assert.equal((await callJson("paas_app_lifecycle", { appName: "mcp-new", action: "autodeploy_off" }, "deploy")).autoDeploy, undefined);
+    assert.match(await call("paas_app_lifecycle", { appName: "mcp-new", action: "unexpose" }, "destroy"), /'hostname' is required/);
+    assert.match(await call("paas_app_lifecycle", { appName: "mcp-new", action: "unexpose", hostname: "new.example.com" }, "deploy"), /level 'destroy'/);
+    const unexpose = await callJson("paas_app_lifecycle", { appName: "mcp-new", action: "unexpose", hostname: "new.example.com" }, "destroy");
+    assert.equal(unexpose.confirmationRequired, true);
+    assert.equal(config.loadState().apps["mcp-new"].domains.length, 1, "nothing changes before a person approves");
+
+    // Usage: reading is free, the warning size needs deploy; 0 clears it.
+    assert.match(await call("paas_usage", { action: "db_limit", name: "mcp-new-postgres", sizeMb: 500 }, "read"), /level 'deploy'/);
+    assert.equal((await callJson("paas_usage", { action: "db_limit", name: "mcp-new-postgres", sizeMb: 500 }, "deploy")).warnSizeMb, 500);
+    const us = await callJson("paas_usage", { days: 0 }, "read");
+    assert.equal(us.warnSizeMb["mcp-new-postgres"], 500);
+    assert.deepEqual(us.dailyHistory, []);
+    assert.equal((await callJson("paas_usage", { action: "db_limit", name: "mcp-new-postgres", sizeMb: 0 }, "deploy")).warnSizeMb, null);
+
+    // Connections: a summary without tokens; changes need deploy; webhooks only for app repositories.
+    vault.setSecretEntries("system", { GITHUB_TOKEN: "github_pat_" + "z".repeat(40) });
+    const conn = await call("paas_connections", { action: "status" }, "read");
+    assert.equal(JSON.parse(conn).github.tokenSaved, true);
+    assert.equal(conn.includes("zzzzzzzz"), false, "the token never comes back");
+    assert.match(await call("paas_connections", { action: "notify_set", url: "https://ntfy.sh/x" }, "read"), /level 'deploy'/);
+    assert.match(await call("paas_connections", { action: "webhook_on", repo: "someone/else", address: "https://painel.example.com" }, "deploy"), /No app here/);
+    vault.deleteSecretKey("system", "GITHUB_TOKEN");
+
+    // Judge and arbiter: stopping the judge needs a person; a bad arbiter address is refused.
+    assert.match(await call("paas_mirror", { action: "judge_stop" }, "deploy"), /level 'destroy'/);
+    assert.equal((await callJson("paas_mirror", { action: "judge_stop" }, "destroy")).confirmationRequired, true);
+    assert.match(await call("paas_mirror", { action: "arbiter_set", url: "http://100.64.0.9:4097" }, "deploy"), /level 'destroy'/);
+    assert.equal((await callJson("paas_mirror", { action: "arbiter_pair", host: "100.64.0.9", code: "123456" }, "destroy")).confirmationRequired, true);
+    assert.match(await call("paas_connections", { action: "github_repos" }, "read"), /level 'deploy'/);
+    assert.match(await call("paas_mirror", { action: "handback" }, "destroy"), /'peer' is required/);
+
+    // E-mail relay: status never shows the password; scale diary language needs deploy.
+    assert.ok("relay" in (await callJson("paas_email_provision", { action: "status" }, "deploy")));
+    assert.match(await call("paas_email_provision", { action: "test", to: "not an email" }, "deploy"), /Invalid recipient/);
+    assert.match(await call("paas_scale", { action: "language", language: "en" }, "read"), /level 'deploy'/);
+    assert.equal((await callJson("paas_scale", { action: "language", language: "pt" }, "deploy")).language, "pt");
+    const off = await callJson("paas_db_backup", { action: "offsite_status" }, "deploy");
+    assert.equal(typeof off.target.configured, "boolean");
+    assert.ok(Array.isArray(off.grants));
+    assert.equal(/secretAccessKey/i.test(JSON.stringify(off)), false);
+
+    const s2 = config.loadState();
+    delete s2.apps["mcp-new"];
+    delete s2.databases["mcp-new-postgres"];
+    config.saveState(s2);
   });
 
   fs.rmSync(tempRoot, { recursive: true, force: true });

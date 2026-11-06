@@ -17,6 +17,9 @@ export interface HostDiagnostic {
   summary: string;
   recommendation?: string;
   details?: Record<string, unknown>;
+  /** Stable id of this finding plus its values, so the dashboard can say it in the screen's language. */
+  code?: string;
+  vars?: Record<string, string | number>;
 }
 
 const TARGET = "server";
@@ -102,7 +105,7 @@ function dnsWorks(): boolean {
 
 function checkDns(): HostDiagnostic {
   if (dnsWorks()) {
-    return { target: TARGET, severity: "healthy", summary: `This server resolves names (${DNS_PROBE_HOST}).` };
+    return { target: TARGET, severity: "healthy", summary: `This server resolves names (${DNS_PROBE_HOST}).`, code: "dns_ok" };
   }
   return {
     target: TARGET,
@@ -110,6 +113,7 @@ function checkDns(): HostDiagnostic {
     summary: `This server cannot resolve names (${DNS_PROBE_HOST}). Cloudflare Tunnel, deploys, image pulls and the helper pool stop working without DNS.`,
     recommendation:
       "If the DNS server runs on this same machine (AdGuard Home, Pi-hole), check that it is up, and give the host a fallback so it never depends on it alone: in /etc/systemd/resolved.conf set FallbackDNS=1.1.1.1 9.9.9.9 and make /etc/resolv.conf point to systemd-resolved.",
+    code: "dns_fail",
   };
 }
 
@@ -147,6 +151,7 @@ function checkWatchtower(rows: ContainerRow[]): HostDiagnostic | undefined {
       target: TARGET,
       severity: "healthy",
       summary: "Watchtower runs here, but only updates containers marked for it, so it leaves PaaSMCP alone.",
+      code: "wt_label_mode",
     };
   }
   const state = loadState();
@@ -159,6 +164,7 @@ function checkWatchtower(rows: ContainerRow[]): HostDiagnostic | undefined {
       target: TARGET,
       severity: "healthy",
       summary: "Watchtower runs here and every PaaSMCP container carries the label that tells it to skip them.",
+      code: "wt_all_labeled",
     };
   }
   return {
@@ -167,6 +173,8 @@ function checkWatchtower(rows: ContainerRow[]): HostDiagnostic | undefined {
     summary: `Watchtower runs here and may restart ${unlabeled.length} PaaSMCP container(s) on its own: ${unlabeled.slice(0, 8).join(", ")}${unlabeled.length > 8 ? ", ..." : ""}. A surprise restart of Postgres or an app looks like an outage to the active-active watch and the scale decider.`,
     recommendation: `New PaaSMCP containers get the label ${WATCHTOWER_OFF_LABEL}; these older ones get it the next time PaaSMCP recreates them (an app on its next deploy). Until then, the simplest and safest fix: run Watchtower with WATCHTOWER_LABEL_ENABLE=true (or --label-enable) and label only the services you want it to update. Pause it while testing active-active or scaling.`,
     details: { containers: unlabeled },
+    code: "wt_unlabeled",
+    vars: { count: unlabeled.length, names: unlabeled.slice(0, 8).join(", ") + (unlabeled.length > 8 ? ", ..." : "") },
   };
 }
 
@@ -196,6 +204,8 @@ function checkNetworks(): HostDiagnostic | undefined {
       recommendation:
         'Move Docker to a range of its own: in /etc/docker/daemon.json add "default-address-pools": [{"base": "10.200.0.0/16", "size": 24}], restart Docker in a quiet moment, then recreate the network that clashes.',
       details: { clash },
+      code: "net_clash",
+      vars: { clash: clash.map((c) => `${c.docker} / ${c.host}`).join(", ") },
     };
   }
   const pool = defaultPoolUse(subnets);
@@ -207,6 +217,8 @@ function checkNetworks(): HostDiagnostic | undefined {
       recommendation:
         'Give Docker a range of its own before that happens: in /etc/docker/daemon.json add "default-address-pools": [{"base": "10.200.0.0/16", "size": 24}] and restart Docker in a quiet moment. It only affects networks created afterwards.',
       details: { used: pool.used, total: pool.total },
+      code: "net_pool",
+      vars: { used: pool.used, total: pool.total },
     };
   }
   return undefined;
@@ -227,6 +239,8 @@ function checkTunnelNetwork(rows: ContainerRow[]): HostDiagnostic | undefined {
     severity: "warning",
     summary: `The Cloudflare Tunnel container (${tunnels.map((t) => t.name).join(", ")}) is not on the '${DOCKER_NETWORK}' network. PaaSMCP sends public addresses to apps by container name on that network, so they would answer 502.`,
     recommendation: `Connect it: docker network connect ${DOCKER_NETWORK} ${tunnels[0].name} (and add the network to its compose file so it stays after a restart).`,
+    code: "tunnel_net",
+    vars: { names: tunnels.map((t) => t.name).join(", "), network: DOCKER_NETWORK, first: tunnels[0].name },
   };
 }
 
