@@ -78,12 +78,41 @@ function clusterKey(): Buffer {
   return Buffer.from(hex, "hex");
 }
 
+// The query goes on stdin, never in argv: it can carry the replication password, and a failed
+// execFileSync puts its whole command line in the error message (and `ps` shows argv meanwhile).
 function sql(container: string, query: string): string {
   return execFileSync(
     "docker",
-    ["exec", "-i", container, "psql", "-U", "paasmcp_admin", "-d", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-c", query],
-    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
+    ["exec", "-i", container, "psql", "-U", "paasmcp_admin", "-d", "postgres", "-tA", "-v", "ON_ERROR_STOP=1", "-f", "-"],
+    { encoding: "utf-8", input: query, stdio: ["pipe", "pipe", "pipe"] }
   ).trim();
+}
+
+/**
+ * The slot for one peer, reserving WAL from the moment it exists. A slot made without reserving
+ * holds nothing until the peer first connects, so a checkpoint in between (another copy's
+ * pg_basebackup forces one) can recycle the segment the new copy needs ("requested WAL segment …
+ * has already been removed"). An older unreserved, unused slot is dropped and made again.
+ */
+export function replicationSlotSql(slot: string): string[] {
+  if (!/^[a-z0-9_]{1,63}$/.test(slot)) throw new Error(`Invalid replication slot name '${slot}'.`);
+  return [
+    `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name='${slot}' AND restart_lsn IS NULL AND NOT active`,
+    `SELECT pg_create_physical_replication_slot('${slot}', true) WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='${slot}')`,
+  ];
+}
+
+/** docker run arguments for the first copy. The password travels in the environment only (`-e NAME` without a value). */
+export function basebackupCommand(offer: Pick<MirrorOffer, "host" | "port" | "slot" | "password">, dataDir: string, image: string): { args: string[]; env: NodeJS.ProcessEnv } {
+  return {
+    args: [
+      "run", "--rm", "--network", DOCKER_NETWORK, "-e", "PGPASSWORD",
+      "-v", `${dataDir}:/var/lib/postgresql/data`, image, "sh", "-c",
+      'pg_basebackup -h "$1" -p "$2" -U "$3" -D /var/lib/postgresql/data -R -X stream -S "$4" && chown -R postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data',
+      "sh", offer.host, String(offer.port), REPLICATOR, offer.slot,
+    ],
+    env: { ...process.env, PGPASSWORD: offer.password },
+  };
 }
 
 function detectTailscaleIp(): string {
@@ -137,16 +166,8 @@ networks:
 
 function basebackup(offer: MirrorOffer, dataDir: string): void {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  execFileSync(
-    "docker",
-    [
-      "run", "--rm", "--network", DOCKER_NETWORK, "-e", `PGPASSWORD=${offer.password}`,
-      "-v", `${dataDir}:/var/lib/postgresql/data`, PG_IMAGE_NOW(), "sh", "-c",
-      'pg_basebackup -h "$1" -p "$2" -U "$3" -D /var/lib/postgresql/data -R -X stream -S "$4" && chown -R postgres:postgres /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data',
-      "sh", offer.host, String(offer.port), REPLICATOR, offer.slot,
-    ],
-    { stdio: "pipe", timeout: 6 * 60 * 60 * 1000 }
-  );
+  const { args, env } = basebackupCommand(offer, dataDir, PG_IMAGE_NOW());
+  execFileSync("docker", args, { stdio: "pipe", env, timeout: 6 * 60 * 60 * 1000 });
 }
 
 // Old data is renamed, never deleted: it may hold the last writes of a server that died.
@@ -223,7 +244,7 @@ export async function offerMirror(opts: {
     else if (rebind) ensureSharedPostgresCluster(); // republish 5432 on the Tailscale IP
     sql(source, `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${REPLICATOR}') THEN CREATE ROLE ${REPLICATOR} WITH REPLICATION LOGIN; END IF; END $$;`);
     sql(source, `ALTER ROLE ${REPLICATOR} WITH PASSWORD '${password}'`);
-    sql(source, `SELECT pg_create_physical_replication_slot('${slot}') WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='${slot}')`);
+    for (const q of replicationSlotSql(slot)) sql(source, q);
     // The slot keeps WAL while the peer is offline; cap it so a long outage cannot fill this disk.
     sql(source, "ALTER SYSTEM SET max_slot_wal_keep_size = '10GB'");
     const hbaLine = `host replication ${REPLICATOR} ${peerCidr} scram-sha-256`;
