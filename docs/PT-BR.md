@@ -125,6 +125,8 @@ No cliente MCP (Claude Desktop/Code, Cursor, VS Code, Codex, clientes de modelos
 
 Suba o painel web interativo com suporte a temas **Escuro / Claro** e idiomas **PT-BR / EN**. O menu lateral (recolhível; vira gaveta no celular) agrupa as telas em Apps, Servidores, Integrações e Sistema, e as telas maiores se dividem em abas no topo (ex.: **Aplicações → Seus apps / Publicar um app / Deixar acessível / Escala automática / Diário do decisor / Publicar a cada push**). As seções do menu abrem e fecham, e a escolha fica lembrada. O endereço de cada aba fica na URL (`#overview/deploy`), então dá para favoritar e usar o botão voltar:
 
+**Apps prontos:** em **Aplicações → Publicar um app**, o quadro “Apps prontos” instala com um clique o Uptime Kuma (vigia sites), o Memos (anotações) e o IT Tools (ferramentas no navegador), sem repositório. A versão da imagem é fixa e testada, os dados ficam num volume que sobrevive às atualizações, e o app passa pelas mesmas regras de segurança de qualquer outro. No Uptime Kuma e no Memos, quem abre primeiro cria a conta de administrador: crie a sua logo ou dê o endereço “Só e-mails autorizados”.
+
 ```bash
 # Iniciar em 127.0.0.1:4099 e expor em https://paas.seudominio.com protegido por Zero Trust:
 paasmcp dashboard start --expose zero-trust --subdomain paas
