@@ -175,6 +175,16 @@ Automatic failover with only two servers would split the brain when the link bet
   normal heartbeat and explains the result: reachable, key accepted, clock in sync, which servers the
   arbiter hears and how long ago, and whether `mirror watch` runs here. `POST /api/mirror/arbiter` saves
   the address alone (the server that only sends a copy still needs it to heartbeat and be fenced).
+- Signed arbiter replies also carry `about` (`os.hostname()`, PaaSMCP version, start time, number of
+  clusters); `/health` stays anonymous. `checkArbiter` adds the round-trip time, the `owners` table with
+  names, and `watch`: `mirror watch` writes its last successful heartbeat and last failure to
+  `<data>/mirror-watch.json` every round. The dashboard's **Arbiter** tab shows all of it.
+- `POST /api/mirror/arbiter/install` (dashboard, authenticated, `Cache-Control: no-store`, audited as
+  `mirror.arbiter-key-shown`) returns `arbiterInstallCommand()`: clone/pull + build +
+  `arbiter install-service --key <k>`. The repository URL comes from the dashboard's followed repo or the
+  clone's `origin`, through `publicRepoUrl()` (https only, user/token stripped, SSH github.com turned into
+  https, anything odd falls back to the public repo), so no credential reaches the command. Since
+  `install-service` merges keys, the same command adds a cluster to an arbiter that already serves another.
 
 ### Active-active: an app on both servers (`src/active.ts`, `src/edge.ts`)
 

@@ -1,6 +1,7 @@
 import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { deploySummary } from "./deploys.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
+import { arbiterInstallCommand } from "./arbiter.js";
 import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
@@ -1005,6 +1006,16 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
         // Test the arbiter (the saved one, or ?url= typed in the form before saving). A plain heartbeat.
         if (pathname === "/api/mirror/arbiter" && req.method === "GET") return reply(await checkArbiter(url.searchParams.get("url") || undefined));
+        // The arbiter's install command with this cluster's key already in it (same as `paasmcp arbiter key`).
+        // POST and no-store: the key only works on the arbiter, but it should not sit in caches or history.
+        if (pathname === "/api/mirror/arbiter/install" && req.method === "POST") {
+          const repo = followStatus().repoUrl || originOf(path.resolve(path.dirname(new URL(import.meta.url).pathname), ".."));
+          const out = arbiterInstallCommand(repo);
+          audit({ event: "mirror.arbiter-key-shown", by: actor, cluster: out.cluster });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(out));
+          return true;
+        }
         if (pathname === "/api/mirror/arbiter" && req.method === "POST") {
           const body = await readJsonBody(req);
           return reply(setArbiterUrl(String(body.url || "")));
@@ -2850,36 +2861,61 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div style="margin-top:10px;"><button onclick="mirrorAccept()" data-i18n="btnMirrorAccept"></button></div>
             </div>
           </div>
+          <div class="card" data-sub="judge" id="judgeCard">
+            <div class="card-header"><h2 data-i18n="judgeTitle"></h2><p class="card-desc" data-i18n="judgeDesc"></p></div>
+            <div id="judgeInfoBox"></div>
+            <button class="secondary" onclick="loadArbiterStatus()" data-i18n="btnArbRefresh"></button>
+          </div>
+          <div class="card" data-sub="judge">
+            <div class="card-header"><h2 data-i18n="judgeHowTitle"></h2></div>
+            <ol style="margin:0 0 12px;padding-left:20px;font-size:13px;line-height:1.7;">
+              <li data-i18n="judgeHow1"></li>
+              <li data-i18n="judgeHow2"></li>
+              <li data-i18n="judgeHow3"></li>
+              <li data-i18n="judgeHow4"></li>
+            </ol>
+            <div id="judgeOwnersBox"></div>
+          </div>
+          <div class="card" data-sub="judge" id="judgeSetupCard">
+            <details id="judgeSetup" open>
+              <summary style="cursor:pointer;font-weight:600;font-size:15px;" id="judgeSetupTitle" data-i18n="judgeSetupTitle" onclick="this.parentNode.dataset.touched = '1'"></summary>
+              <p class="card-desc" data-i18n="judgeBefore" style="margin-top:10px;"></p>
+
+              <h3 data-i18n="autoStep1" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="autoStep1Desc"></p>
+
+              <h3 data-i18n="autoStep2" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="autoStep2Desc" style="margin-bottom:10px;"></p>
+              <button onclick="arbiterInstallCmd()" id="btnArbCmd" data-i18n="btnArbCmd"></button>
+              <div id="arbInstallBox" style="display:none;margin-top:10px;">
+                <pre id="arbInstallCmd" style="user-select:all;white-space:pre-wrap;word-break:break-all;"></pre>
+                <button class="secondary" onclick="copyText(document.getElementById('arbInstallCmd').textContent)" data-i18n="aiCopy"></button>
+                <p class="card-desc" data-i18n="autoStep2After" style="margin-top:10px;"></p>
+              </div>
+              <details style="margin-top:12px;font-size:12.5px;">
+                <summary style="cursor:pointer;" data-i18n="autoPrereqTitle"></summary>
+                <p class="card-desc" data-i18n="autoPrereqDesc" style="margin-top:8px;"></p>
+                <pre style="user-select:all;white-space:pre-wrap;word-break:break-all;">curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs git</pre>
+                <p class="card-desc" data-i18n="autoStep3Check" style="margin-top:8px;"></p>
+                <pre style="user-select:all;">curl http://$(tailscale ip -4):4097/health</pre>
+              </details>
+
+              <h3 data-i18n="autoStep3" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="autoStep3Desc" style="margin-bottom:10px;"></p>
+              <label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label>
+              <input id="mArbiter" placeholder="http://100.64.0.9:4097" />
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+                <button class="secondary" onclick="arbiterTest()" id="btnArbTest" data-i18n="btnArbTest"></button>
+                <button onclick="arbiterSave()" data-i18n="btnArbSave"></button>
+              </div>
+              <div id="arbTestBox" style="margin-top:10px;"></div>
+            </details>
+          </div>
           <div class="card" data-sub="auto">
             <div class="card-header"><h2 data-i18n="autoTitle"></h2><p class="card-desc" data-i18n="autoDesc"></p></div>
             <div id="arbStatusBox" style="margin-bottom:6px;"></div>
-            <p class="card-desc" data-i18n="autoBefore"></p>
-
-            <h3 data-i18n="autoStep1" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep1Desc"></p>
-
-            <h3 data-i18n="autoStep2" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep2Desc"></p>
-            <pre style="user-select:all;">sudo paasmcp arbiter key</pre>
-
-            <h3 data-i18n="autoStep3" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep3Desc"></p>
-            <pre id="arbInstallCmd" style="user-select:all;white-space:pre-wrap;word-break:break-all;"></pre>
-            <button class="secondary" onclick="copyText(document.getElementById('arbInstallCmd').textContent)" data-i18n="aiCopy"></button>
-            <p class="card-desc" data-i18n="autoStep3Check" style="margin-top:10px;"></p>
-            <pre style="user-select:all;">curl http://$(tailscale ip -4):4097/health</pre>
-            <p class="card-desc" data-i18n="autoStep3Shared" style="margin-top:10px;"></p>
-            <pre style="user-select:all;white-space:pre-wrap;word-break:break-all;" id="arbAddKeyCmd"></pre>
-
-            <h3 data-i18n="autoStep4" style="margin-top:16px;"></h3>
-            <p class="card-desc" data-i18n="autoStep4Desc" style="margin-bottom:10px;"></p>
-            <label class="field-label" for="mArbiter" data-i18n="lblArbiter"></label>
-            <input id="mArbiter" placeholder="http://100.64.0.9:4097" />
-            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
-              <button class="secondary" onclick="arbiterTest()" id="btnArbTest" data-i18n="btnArbTest"></button>
-              <button onclick="arbiterSave()" data-i18n="btnArbSave"></button>
-            </div>
-            <div id="arbTestBox" style="margin-top:10px;"></div>
+            <p class="card-desc"><span data-i18n="autoBefore"></span> <a href="javascript:void(0)" data-go-tab="mirror" data-go-sub="judge" data-i18n="autoGoJudge"></a></p>
 
             <h3 data-i18n="autoStep5" style="margin-top:16px;"></h3>
             <p class="card-desc" data-i18n="autoStep5Desc" style="margin-bottom:10px;"></p>
@@ -3696,52 +3732,82 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorAccepted": "Cópia iniciada.",
           "mirrorPromoted": "Apps assumidos.",
           "mirrorHandedBack": "Apps devolvidos. Agora assuma-os no outro servidor.",
+          "autoGoJudge": "Ver o juiz",
+          "judgeTitle": "⚖️ Juiz",
+          "judgeDesc": "Um terceiro aparelho que dá o voto de desempate na troca automática. Ele não guarda apps nem dados: só ouve os servidores e anota quem cuida dos dados de quem.",
+          "judgeState_none": "Não configurado",
+          "judgeState_ok": "Respondendo",
+          "judgeState_err": "Sem resposta",
+          "judgeNoneDesc": "Sem juiz, a troca automática fica desligada: se um servidor cair, você assume os apps dele à mão (aba “Cópia ao vivo”). Para configurar, siga os 3 passos abaixo.",
+          "judgeAddress": "Endereço",
+          "judgeWhere": "Onde roda",
+          "judgeOldArbiter": "versão antiga do juiz: rode de novo o comando do passo 2 no aparelho dele para ver o nome",
+          "judgeSince": "Ligado desde",
+          "judgeLatency": "Tempo de resposta",
+          "judgeLastWatch": "Último contato do vigia daqui",
+          "judgeWatchNever": "nunca: ligue o vigia (aba “Troca automática”, passo 2)",
+          "judgeWatchErr": "última falha {when}: {err}",
+          "judgeHears": "Servidores que ele ouve",
+          "judgeHeardNone": "nenhum ainda",
+          "judgeHeardAgo": "{who} {when}",
+          "judgeClusters": "Pares de servidores que ele atende",
+          "judgeHowTitle": "Como o juiz decide",
+          "judgeHow1": "Cada servidor avisa o juiz que está vivo a cada 15 segundos. Quem faz isso é o vigia de cada servidor.",
+          "judgeHow2": "Se um servidor some por mais de 1 minuto, o outro só assume os apps dele se o juiz também parou de ouvi-lo e a cópia parou de chegar. Se só a conexão entre os dois caiu, o juiz ainda ouve os dois e a troca não acontece.",
+          "judgeHow3": "O juiz deixa um único servidor assumir. Cada troca recebe um número maior que a anterior, e um pedido com número velho é recusado.",
+          "judgeHow4": "Quando o servidor que caiu volta, ele pergunta ao juiz, vê que outro assumiu e para os próprios apps até a devolução. Assim os dois nunca gravam dados diferentes.",
+          "judgeOwnersTitle": "Quem cuida dos dados agora",
+          "judgeOwnersNone": "Nenhuma troca registrada: cada servidor cuida dos próprios dados.",
+          "judgeOwnerLine": "Dados de {data}: com {owner} (troca nº {epoch})",
+          "judgeOwnerHome": "Dados de {data}: de volta com {owner} (troca nº {epoch})",
+          "judgeSetupTitle": "Configurar o juiz",
+          "judgeSetupRedo": "Trocar ou reinstalar o juiz",
+          "judgeBefore": "Antes de começar: os dois servidores precisam estar conectados (aba “Conectar”) e os três aparelhos na mesma rede Tailscale. Faça os passos uma vez, nesta ordem.",
+          "btnArbCmd": "Gerar comando de instalação",
+          "autoStep2After": "No fim, o comando mostra o endereço do juiz. Use-o no passo 3. A chave dentro do comando só serve para o juiz (não abre senhas, apps nem dados), mas não a passe para outras pessoas: quem tem a chave pode confundir o juiz.",
+          "autoPrereqTitle": "O aparelho ainda não tem Node.js ou Tailscale?",
+          "autoPrereqDesc": "O juiz precisa de Node.js 20 ou mais novo, git e o Tailscale na mesma conta dos servidores. Em Ubuntu ou Debian, estes comandos instalam o que falta:",
           "autoTitle": "Troca automática",
           "autoDesc": "Se o outro servidor sumir por mais de 1 minuto, este assume os apps dele sozinho. Para isso precisa de um juiz: um terceiro aparelho que dá o voto de desempate. Sem juiz, se só a conexão entre os dois cair, cada um acharia que o outro morreu e os dois gravariam dados diferentes.",
-          "autoBefore": "Antes de começar: a cópia já precisa estar funcionando (aparece “Cópia de …” na aba “Cópia ao vivo”) e os três aparelhos precisam estar na mesma rede Tailscale. Faça os passos abaixo uma vez, nesta ordem.",
+          "autoBefore": "Antes: a cópia precisa estar funcionando (aba “Cópia ao vivo”) e o juiz configurado e respondendo.",
           "autoStep1": "1. Escolha o aparelho do juiz",
-          "autoStep1Desc": "Qualquer aparelho ligado 24 horas que não seja nenhum dos dois servidores: um Raspberry Pi, uma VPS barata ou um PC velho. De preferência em outro lugar ou outra internet. Ele precisa de Node.js 20 ou mais novo e do Tailscale ligado na mesma conta. Não precisa de Docker e quase não usa memória.",
-          "autoStep2": "2. Pegue a chave do juiz (neste servidor)",
-          "autoStep2Desc": "No terminal deste servidor, rode o comando abaixo e copie a linha que aparecer (64 letras e números). Os dois servidores dão a mesma chave, porque ela vem do pareamento. Ela só serve para o juiz: não abre senhas, apps nem dados.",
-          "autoStep3": "3. Instale e ligue o juiz (no terceiro aparelho)",
-          "autoStep3Desc": "No terminal do aparelho do juiz, rode os comandos abaixo, trocando os dois trechos entre < >. O juiz passa a rodar sozinho, volta depois de reiniciar e atende só no endereço Tailscale do aparelho, porta 4097. No fim ele mostra o endereço para usar no passo 4.",
+          "autoStep1Desc": "Qualquer aparelho ligado 24 horas que não seja nenhum dos dois servidores: uma VM pequena na nuvem (como as gratuitas da Oracle), um Raspberry Pi ou um PC velho. De preferência em outro lugar ou outra internet. Não precisa de Docker e quase não usa memória.",
+          "autoStep2": "2. Instale o juiz no terceiro aparelho",
+          "autoStep2Desc": "Gere o comando abaixo, já com a chave deste par de servidores, e cole-o no terminal do aparelho do juiz. Ele baixa o PaaSMCP e deixa o juiz rodando como serviço: volta sozinho depois de reiniciar e atende só no endereço Tailscale do aparelho, porta 4097. Se o aparelho já é juiz de outro par de servidores, use o mesmo comando: o outro par continua.",
+          "autoStep3": "3. Informe o endereço do juiz (neste servidor e no outro)",
+          "autoStep3Desc": "É o endereço que o comando do passo 2 mostrou no fim, por exemplo http://100.64.0.9:4097. Clique em Testar: tem que aparecer “O juiz respondeu”. Depois Salvar. Faça o mesmo no painel do outro servidor, com o mesmo endereço.",
           "autoStep3Check": "Para conferir no próprio aparelho do juiz, rode o comando abaixo. Se responder {&quot;ok&quot;:true}, o juiz está no ar.",
-          "autoStep3Shared": "Se esse aparelho já é juiz de outro par de servidores, não instale de novo: rode só o comando abaixo. Cada par fica separado, com a própria chave.",
-          "autoRepoPlaceholder": "<mesmo repositório que você usou nos servidores>",
-          "autoKeyPlaceholder": "<chave do passo 2>",
-          "autoStep4": "4. Informe o endereço do juiz (neste servidor e no outro)",
-          "autoStep4Desc": "É http:// + o IP do Tailscale do aparelho do juiz + :4097, por exemplo http://100.64.0.9:4097. O IP aparece no app do Tailscale ou com “tailscale ip -4” no aparelho do juiz. Clique em Testar: tem que aparecer “O juiz respondeu”. Depois Salvar. Repita este passo no painel do outro servidor, com o mesmo endereço.",
           "btnArbTest": "Testar",
           "btnArbSave": "Salvar",
-          "autoStep5": "5. Escolha qual servidor este pode substituir",
+          "autoStep5": "1. Escolha qual servidor este pode substituir",
           "autoStep5Desc": "É o servidor cujos apps este vai assumir se ele cair. A lista mostra só os servidores dos quais este já guarda uma cópia. Ao ligar, o painel pede para digitar o nome para confirmar. Se a cópia é nos dois sentidos e você quer que qualquer um assuma o outro, faça este passo também no outro servidor.",
           "lblAutoPeer": "Servidor que este pode substituir",
           "autoNoCopy": "Nenhuma cópia recebida ainda (use “Receber cópia”, na aba “Cópia ao vivo”)",
           "autoNoPeer": "Escolha o servidor na lista. Se ela estiver vazia, este servidor ainda não guarda cópia de nenhum outro.",
-          "autoStep6": "6. Ligue o vigia (nos dois servidores)",
+          "autoStep6": "2. Ligue o vigia (nos dois servidores)",
           "autoStep6Desc": "O vigia conversa com o juiz a cada 15 segundos. É ele que avisa o juiz que o servidor está vivo, troca sozinho quando precisa e bloqueia o servidor que volta depois de ter sido substituído. Rode o comando abaixo no terminal de cada um dos dois servidores.",
-          "autoStep7": "7. Confira se está funcionando",
-          "autoStep7Desc": "O quadro no topo deste cartão mostra o que o juiz está ouvindo. Está pronto quando tudo fica verde: o juiz respondeu, ouviu este servidor e o outro há menos de 1 minuto, o vigia está rodando aqui e a troca está ligada. Se o outro servidor não aparece ou aparece com tempo alto, falta o passo 4 ou 6 nele.",
+          "autoStep7": "3. Confira se está funcionando",
+          "autoStep7Desc": "O quadro no topo deste cartão mostra o que o juiz está ouvindo. Está pronto quando tudo fica verde: o juiz respondeu, ouviu este servidor e o outro há menos de 1 minuto, o vigia está rodando aqui e a troca está ligada. Se o outro servidor não aparece ou aparece com tempo alto, falta informar o juiz (aba “Juiz”) ou ligar o vigia nele.",
           "btnArbRefresh": "Verificar de novo",
-          "arbNotSet": "Juiz ainda não informado (passo 4).",
+          "arbNotSet": "Juiz ainda não configurado (aba “Juiz”).",
           "arbOk": "O juiz respondeu e aceitou a chave",
           "arbThisServer": "este servidor",
           "arbHeard": "O juiz ouviu {who} há {s} s",
           "arbHeardOld": "mais de 1 minuto: o vigia está ligado nele?",
-          "arbPeerUnknown": "O juiz nunca ouviu {who}. Faça os passos 4 e 6 no painel e no terminal de {who}. Enquanto isso, se a cópia parar, este servidor assume.",
+          "arbPeerUnknown": "O juiz nunca ouviu {who}. Em {who}, informe o endereço do juiz (aba “Juiz”) e ligue o vigia (passo 2 daqui). Enquanto isso, se a cópia parar, este servidor assume.",
           "arbWatchOn": "Vigia rodando neste servidor",
-          "arbWatchOff": "Vigia desligado neste servidor (passo 6)",
+          "arbWatchOff": "Vigia desligado neste servidor (passo 2 da troca automática)",
           "arbAutoOn": "Troca automática ligada para: {who}",
-          "arbAutoOff": "Troca automática desligada neste servidor (passo 5)",
+          "arbAutoOff": "Troca automática desligada neste servidor (passo 1 da troca automática)",
           "arbAutoTag": "troca ligada",
           "arbReady": "✅ Troca automática pronta",
           "arbNotReady": "Ainda falta algo:",
           "arbErr_badUrl": "Endereço inválido. Use http://<IP do Tailscale do juiz>:4097",
-          "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Reinstale o juiz com a chave do passo 2.",
+          "arbErr_badKey": "O juiz respondeu, mas recusou a chave. Rode de novo, no aparelho do juiz, o comando do passo 2 (aba “Juiz”).",
           "arbErr_clock": "O juiz respondeu, mas o relógio dele está mais de 1 minuto diferente. Ligue o horário automático nos aparelhos.",
           "arbErr_notPaired": "Este servidor ainda não foi pareado com o outro: faça isso em Segundo servidor, aba “Conectar”.",
           "arbErr_notArbiter": "Algo respondeu nesse endereço, mas não é o juiz. Confira a porta (padrão 4097).",
-          "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 3), se o IP é o do Tailscale dele e se a porta é 4097.",
+          "arbErr_unreachable": "O juiz não respondeu. Confira se ele está ligado (passo 2 da aba “Juiz”), se o IP é o do Tailscale dele e se a porta é 4097.",
           "lblArbiter": "Endereço do juiz",
           "btnAutoOn": "Ligar",
           "btnAutoOff": "Desligar",
@@ -4015,52 +4081,82 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorAccepted": "Copy started.",
           "mirrorPromoted": "Apps taken over.",
           "mirrorHandedBack": "Apps handed back. Now take them over on the other server.",
+          "autoGoJudge": "See the arbiter",
+          "judgeTitle": "⚖️ Arbiter",
+          "judgeDesc": "A third device that casts the deciding vote for automatic takeover. It holds no apps or data: it only listens to the servers and records who looks after whose data.",
+          "judgeState_none": "Not set up",
+          "judgeState_ok": "Answering",
+          "judgeState_err": "Not answering",
+          "judgeNoneDesc": "Without an arbiter, automatic takeover stays off: if a server goes down, you take over its apps by hand (“Live copy” tab). To set it up, follow the 3 steps below.",
+          "judgeAddress": "Address",
+          "judgeWhere": "Runs on",
+          "judgeOldArbiter": "older arbiter: run the step 2 command again on its device to see its name",
+          "judgeSince": "Running since",
+          "judgeLatency": "Response time",
+          "judgeLastWatch": "Last contact from this server's watchdog",
+          "judgeWatchNever": "never: turn on the watchdog (“Automatic takeover” tab, step 2)",
+          "judgeWatchErr": "last failure {when}: {err}",
+          "judgeHears": "Servers it hears",
+          "judgeHeardNone": "none yet",
+          "judgeHeardAgo": "{who} {when}",
+          "judgeClusters": "Pairs of servers it serves",
+          "judgeHowTitle": "How the arbiter decides",
+          "judgeHow1": "Each server tells the arbiter it is alive every 15 seconds. Each server's watchdog does that.",
+          "judgeHow2": "If a server disappears for more than 1 minute, the other one only takes over its apps if the arbiter stopped hearing it too and the copy stopped arriving. If only the link between the two broke, the arbiter still hears both and no takeover happens.",
+          "judgeHow3": "The arbiter lets a single server take over. Each takeover gets a higher number than the last, and a request with an old number is refused.",
+          "judgeHow4": "When the server that went down comes back, it asks the arbiter, sees another one took over and stops its own apps until the handback. So the two never write different data.",
+          "judgeOwnersTitle": "Who looks after the data now",
+          "judgeOwnersNone": "No takeover recorded: each server looks after its own data.",
+          "judgeOwnerLine": "Data of {data}: with {owner} (takeover no. {epoch})",
+          "judgeOwnerHome": "Data of {data}: back with {owner} (takeover no. {epoch})",
+          "judgeSetupTitle": "Set up the arbiter",
+          "judgeSetupRedo": "Change or reinstall the arbiter",
+          "judgeBefore": "Before you start: both servers must be connected (“Connect” tab) and all three devices on the same Tailscale network. Do the steps once, in this order.",
+          "btnArbCmd": "Generate install command",
+          "autoStep2After": "At the end, the command prints the arbiter address. Use it in step 3. The key in the command only works for the arbiter (it opens no passwords, apps or data), but don't hand it to other people: whoever has it can confuse the arbiter.",
+          "autoPrereqTitle": "The device has no Node.js or Tailscale yet?",
+          "autoPrereqDesc": "The arbiter needs Node.js 20 or newer, git and Tailscale on the same account as the servers. On Ubuntu or Debian, these commands install what is missing:",
           "autoTitle": "Automatic takeover",
           "autoDesc": "If the other server disappears for more than 1 minute, this one takes over its apps. That needs an arbiter: a third device that casts the deciding vote. Without it, if only the link between the two breaks, each would think the other died and both would write different data.",
-          "autoBefore": "Before you start: the copy must already work (“Copy of …” shows in the “Live copy” tab) and all three devices must be on the same Tailscale network. Do the steps below once, in this order.",
+          "autoBefore": "Before: the copy must already work (“Live copy” tab) and the arbiter must be set up and answering.",
           "autoStep1": "1. Pick the arbiter device",
-          "autoStep1Desc": "Any device that stays on 24/7 and is neither of the two servers: a Raspberry Pi, a cheap VPS or an old PC. Ideally somewhere else or on another internet link. It needs Node.js 20 or newer and Tailscale on the same account. No Docker, and it barely uses memory.",
-          "autoStep2": "2. Get the arbiter key (on this server)",
-          "autoStep2Desc": "In this server's terminal, run the command below and copy the line it prints (64 letters and digits). Both servers print the same key, because it comes from the pairing. It only works for the arbiter: it opens no passwords, apps or data.",
-          "autoStep3": "3. Install and start the arbiter (on the third device)",
-          "autoStep3Desc": "In the arbiter device's terminal, run the commands below, replacing both parts between < >. The arbiter then runs on its own, comes back after a reboot and only answers on the device's Tailscale address, port 4097. At the end it prints the address to use in step 4.",
+          "autoStep1Desc": "Any device that stays on 24/7 and is neither of the two servers: a small cloud VM (like Oracle's free ones), a Raspberry Pi or an old PC. Ideally somewhere else or on another internet link. No Docker, and it barely uses memory.",
+          "autoStep2": "2. Install the arbiter on the third device",
+          "autoStep2Desc": "Generate the command below, with this pair's key already in it, and paste it in the arbiter device's terminal. It downloads PaaSMCP and keeps the arbiter running as a service: it comes back after a reboot and only answers on the device's Tailscale address, port 4097. If the device is already the arbiter for another pair of servers, use the same command: that pair keeps working.",
+          "autoStep3": "3. Enter the arbiter address (on this server and the other)",
+          "autoStep3Desc": "It is the address the step 2 command printed at the end, for example http://100.64.0.9:4097. Click Test: it must say “The arbiter answered”. Then Save. Do the same on the other server's dashboard, with the same address.",
           "autoStep3Check": "To check on the arbiter device itself, run the command below. If it answers {&quot;ok&quot;:true}, the arbiter is up.",
-          "autoStep3Shared": "If this device is already the arbiter for another pair of servers, don't install it again: just run the command below. Each pair stays separate, with its own key.",
-          "autoRepoPlaceholder": "<same repository you used on the servers>",
-          "autoKeyPlaceholder": "<key from step 2>",
-          "autoStep4": "4. Enter the arbiter address (on this server and the other)",
-          "autoStep4Desc": "It is http:// + the arbiter device's Tailscale IP + :4097, for example http://100.64.0.9:4097. The IP shows in the Tailscale app or with “tailscale ip -4” on the arbiter. Click Test: it must say “The arbiter answered”. Then Save. Repeat this step on the other server's dashboard, with the same address.",
           "btnArbTest": "Test",
           "btnArbSave": "Save",
-          "autoStep5": "5. Choose which server this one may replace",
+          "autoStep5": "1. Choose which server this one may replace",
           "autoStep5Desc": "The server whose apps this one takes over if it goes down. The list only shows servers this one already holds a copy of. Turning it on asks you to type the name to confirm. If the copy goes both ways and either should replace the other, do this step on the other server too.",
           "lblAutoPeer": "Server this one may replace",
           "autoNoCopy": "No copy received yet (use “Receive a copy”, in the “Live copy” tab)",
           "autoNoPeer": "Pick the server in the list. If it is empty, this server holds no copy of another one yet.",
-          "autoStep6": "6. Turn on the watchdog (on both servers)",
+          "autoStep6": "2. Turn on the watchdog (on both servers)",
           "autoStep6Desc": "The watchdog talks to the arbiter every 15 seconds. It tells the arbiter the server is alive, takes over when needed and blocks a server that comes back after being replaced. Run the command below in the terminal of each of the two servers.",
-          "autoStep7": "7. Check that it works",
-          "autoStep7Desc": "The box at the top of this card shows what the arbiter hears. It is ready when everything is green: the arbiter answered, heard this server and the other one less than 1 minute ago, the watchdog runs here and the takeover is on. If the other server is missing or shows a long time, step 4 or 6 is missing there.",
+          "autoStep7": "3. Check that it works",
+          "autoStep7Desc": "The box at the top of this card shows what the arbiter hears. It is ready when everything is green: the arbiter answered, heard this server and the other one less than 1 minute ago, the watchdog runs here and the takeover is on. If the other server is missing or shows a long time, it still needs the arbiter address (“Arbiter” tab) or its watchdog.",
           "btnArbRefresh": "Check again",
-          "arbNotSet": "No arbiter entered yet (step 4).",
+          "arbNotSet": "No arbiter set up yet (“Arbiter” tab).",
           "arbOk": "The arbiter answered and accepted the key",
           "arbThisServer": "this server",
           "arbHeard": "The arbiter heard {who} {s} s ago",
           "arbHeardOld": "over 1 minute: is the watchdog on there?",
-          "arbPeerUnknown": "The arbiter never heard {who}. Do steps 4 and 6 on {who}'s dashboard and terminal. Meanwhile, if the copy stops, this server takes over.",
+          "arbPeerUnknown": "The arbiter never heard {who}. On {who}, enter the arbiter address (“Arbiter” tab) and turn on the watchdog (step 2 here). Meanwhile, if the copy stops, this server takes over.",
           "arbWatchOn": "Watchdog running on this server",
-          "arbWatchOff": "Watchdog off on this server (step 6)",
+          "arbWatchOff": "Watchdog off on this server (automatic takeover, step 2)",
           "arbAutoOn": "Automatic takeover on for: {who}",
-          "arbAutoOff": "Automatic takeover off on this server (step 5)",
+          "arbAutoOff": "Automatic takeover off on this server (automatic takeover, step 1)",
           "arbAutoTag": "takeover on",
           "arbReady": "✅ Automatic takeover ready",
           "arbNotReady": "Something is still missing:",
           "arbErr_badUrl": "Invalid address. Use http://<arbiter Tailscale IP>:4097",
-          "arbErr_badKey": "The arbiter answered but refused the key. Reinstall it with the key from step 2.",
+          "arbErr_badKey": "The arbiter answered but refused the key. Run the step 2 command (“Arbiter” tab) again on the arbiter device.",
           "arbErr_clock": "The arbiter answered but its clock is more than 1 minute off. Turn on automatic time on the devices.",
           "arbErr_notPaired": "This server is not paired with the other one yet: do it under Second server, in the “Connect” tab.",
           "arbErr_notArbiter": "Something answered at that address, but it is not the arbiter. Check the port (default 4097).",
-          "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 3), that the IP is its Tailscale IP and that the port is 4097.",
+          "arbErr_unreachable": "The arbiter did not answer. Check that it is on (step 2 of the “Arbiter” tab), that the IP is its Tailscale IP and that the port is 4097.",
           "lblArbiter": "Arbiter address",
           "btnAutoOn": "Turn on",
           "btnAutoOff": "Turn off",
@@ -4563,6 +4659,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sub_databases_files": "Arquivos dos apps",
           "sub_mirror_connect": "Conectar",
           "sub_mirror_copy": "Cópia ao vivo",
+          "sub_mirror_judge": "Juiz",
           "sub_mirror_auto": "Troca automática",
           "sub_mirror_aa": "App nos dois",
           "sub_mirror_back": "Devolver apps",
@@ -4638,6 +4735,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sub_databases_files": "App files",
           "sub_mirror_connect": "Connect",
           "sub_mirror_copy": "Live copy",
+          "sub_mirror_judge": "Arbiter",
           "sub_mirror_auto": "Automatic takeover",
           "sub_mirror_aa": "App on both",
           "sub_mirror_back": "Give apps back",
@@ -5743,7 +5841,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       home: ['start', 'tutorial'],
       overview: ['list', 'deploy', 'expose', 'scale', 'diary', 'webhook'],
       databases: ['dbs', 'backups', 'offsite', 'files'],
-      mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
+      mirror: ['connect', 'copy', 'judge', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
       agents: ['connect', 'examples'],
       connect: ['cloudflare', 'github', 'alerts'],
@@ -6043,7 +6141,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const search = document.getElementById('appSearchInput');
       if (search) search.placeholder = t('appSearch');
       renderAi();
-      renderArbiterInstall();
       for (const k of I18N_KEYS) {
         const el = document.getElementById(k);
         if (el) {
@@ -6914,14 +7011,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     async function loadMirror() {
       const res = await fetch('/api/mirror');
-      if (!res.ok) return;
+      if (!res.ok) { loadArbiterStatus(); return; }
       const m = await res.json();
       mirrorLive = m;
       mirrorLiveAt = Date.now();
       let html = '';
       if (m.fenced) html += card(badge('danger', t('mirrorFenced')) + '<div style="margin-top:6px;">' + esc(t('mirrorFencedDesc')) + '</div>');
       html += card('<strong>' + esc(t('mirrorAuto')) + ':</strong> ' + ((m.auto || []).length ? badge('success', (m.auto || []).join(', ')) : badge('', t('off'))) +
-        ' · <strong>' + esc(t('mirrorArbiter')) + ':</strong> ' + (m.arbiterUrl ? esc(m.arbiterUrl) : esc(t('notConfigured'))));
+        ' · <strong>' + esc(t('mirrorArbiter')) + ':</strong> ' + (m.arbiterUrl ? esc(m.arbiterUrl) : esc(t('notConfigured'))) +
+        ' · <a href="javascript:void(0)" data-go-tab="mirror" data-go-sub="judge">' + esc(t(m.arbiterUrl ? 'autoGoJudge' : 'judgeSetupTitle')) + '</a>');
       (m.sending || []).forEach(o => {
         html += card('<strong>' + esc(t('mirrorSendingTo')) + ' ' + esc(o.peer) + '</strong> ' +
           (o.error ? badge('danger', o.error) : o.connected ? badge('success', t('connected')) : badge('warning', t('waitingPeer'))) +
@@ -6963,7 +7061,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         : '<option value="">' + esc(t('autoNoCopy')) + '</option>';
       if (keep && peers.includes(keep)) sel.value = keep;
       if (m.arbiterUrl && !document.getElementById('mArbiter').value) document.getElementById('mArbiter').value = m.arbiterUrl;
-      renderArbiterInstall();
       loadArbiterStatus();
       loadActive();
     }
@@ -6993,13 +7090,54 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const r = await postJson('/api/mirror/auto', { peer, on, arbiterUrl: document.getElementById('mArbiter').value.trim() || undefined });
       if (r) { showToast(t('saved')); loadMirror(); }
     }
-    function renderArbiterInstall() {
-      document.getElementById('arbInstallCmd').textContent =
-        'git clone ' + t('autoRepoPlaceholder') + ' paasmcp\\n' +
-        'cd paasmcp && npm install && npm run build\\n' +
-        'sudo node dist/cli.js arbiter install-service --key ' + t('autoKeyPlaceholder');
-      document.getElementById('arbAddKeyCmd').textContent =
-        'cd paasmcp && sudo node dist/cli.js arbiter add-key ' + t('autoKeyPlaceholder');
+    // Step 2 of the Arbiter tab: the install command with this pair's key already in it.
+    async function arbiterInstallCmd() {
+      const btn = document.getElementById('btnArbCmd');
+      btn.disabled = true;
+      try {
+        const r = await postJson('/api/mirror/arbiter/install', {});
+        if (!r) return;
+        document.getElementById('arbInstallCmd').textContent = r.command;
+        document.getElementById('arbInstallBox').style.display = 'block';
+      } finally { btn.disabled = false; }
+    }
+    // Arbiter tab: state, where it runs, last contact, what it hears and who looks after whose data.
+    function renderJudge(c) {
+      const info = document.getElementById('judgeInfoBox');
+      const owners = document.getElementById('judgeOwnersBox');
+      if (!info) return;
+      const row = (k, v) => '<div style="display:flex;gap:8px;flex-wrap:wrap;margin:4px 0;"><span style="color:var(--muted);min-width:180px;">' + esc(k) + '</span><span>' + v + '</span></div>';
+      const ago = (sec) => relTime(new Date(Date.now() - sec * 1000).toISOString());
+      const setup = document.getElementById('judgeSetup');
+      const ready = c.configured && c.ok;
+      if (setup && !setup.dataset.touched) setup.open = !ready;
+      document.getElementById('judgeSetupTitle').textContent = t(c.configured ? 'judgeSetupRedo' : 'judgeSetupTitle');
+      if (!c.configured) {
+        info.innerHTML = card(badge('', t('judgeState_none')) + '<div style="margin-top:6px;">' + esc(t('judgeNoneDesc')) + '</div>');
+        owners.innerHTML = '';
+        return;
+      }
+      let html = badge(c.ok ? 'success' : 'danger', t(c.ok ? 'judgeState_ok' : 'judgeState_err'));
+      if (!c.ok) html += '<div style="margin-top:6px;">' + esc(t('arbErr_' + (c.errorCode || 'unreachable'))) + '</div>';
+      html += '<div style="margin-top:8px;">' + row(t('judgeAddress'), esc(c.url || ''));
+      if (c.ok) {
+        const a = c.about;
+        html += row(t('judgeWhere'), a ? '<strong>' + esc(a.host) + '</strong>' + (a.version ? ' · PaaSMCP ' + esc(a.version) : '') : esc(t('judgeOldArbiter')));
+        if (a && a.startedAt) html += row(t('judgeSince'), esc(new Date(a.startedAt).toLocaleString()));
+        if (c.latencyMs != null) html += row(t('judgeLatency'), esc(c.latencyMs + ' ms'));
+        const heard = (c.nodes || []).map(n => esc(t('judgeHeardAgo').replace('{who}', n.isMe ? t('arbThisServer') + ' (' + n.name + ')' : n.name).replace('{when}', n.isMe ? t('relNow') : ago(n.secondsAgo))));
+        html += row(t('judgeHears'), heard.length ? heard.join('<br>') : esc(t('judgeHeardNone')));
+        if (a && a.clusters > 1) html += row(t('judgeClusters'), esc(String(a.clusters)));
+      }
+      const w = c.watch || {};
+      let watch = w.okAt ? relSpan(w.okAt) : esc(t('judgeWatchNever'));
+      if (w.errorAt && (!w.okAt || w.errorAt > w.okAt)) watch += '<br>' + badge('warning', '!') + ' ' + esc(t('judgeWatchErr').replace('{when}', relTime(w.errorAt)).replace('{err}', w.error || ''));
+      html += row(t('judgeLastWatch'), watch) + '</div>';
+      info.innerHTML = card(html);
+      if (!c.ok) { owners.innerHTML = ''; return; }
+      const list = c.owners || [];
+      owners.innerHTML = card('<strong>' + esc(t('judgeOwnersTitle')) + '</strong><div style="margin-top:4px;">' +
+        (list.length ? list.map(o => esc(t(o.owner === o.dataOf ? 'judgeOwnerHome' : 'judgeOwnerLine').replace('{data}', o.dataOf).replace('{owner}', o.owner).replace('{epoch}', String(o.epoch)))).join('<br>') : esc(t('judgeOwnersNone'))) + '</div>');
     }
     // Explains one arbiter check (GET /api/mirror/arbiter) in plain words: one line per thing to verify.
     function renderArbiterCheck(c, opts) {
@@ -7035,10 +7173,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function loadArbiterStatus() {
       const box = document.getElementById('arbStatusBox');
       box.innerHTML = card(esc(t('checking')));
+      const jb = document.getElementById('judgeInfoBox');
+      if (jb && !jb.innerHTML) jb.innerHTML = card(esc(t('checking')));
       const res = await fetch('/api/mirror/arbiter');
       const c = await res.json().catch(() => ({}));
       if (!res.ok) { box.innerHTML = card(badge('danger', c.error || 'error')); return; }
       box.innerHTML = renderArbiterCheck(c);
+      renderJudge(c);
       const input = document.getElementById('mArbiter');
       if (c.url && !input.value) input.value = c.url;
     }
