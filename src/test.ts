@@ -3980,6 +3980,51 @@ volumes:
     }
   });
 
+  await t.test("46. A failed publish is explained in plain words, with the raw error kept as details", async () => {
+    const help = await import("./deployhelp.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const hc = new deployer.HealthcheckFailedError("shop", { ok: false, reason: "HTTP 502", path: "/" } as never, "boom");
+    const cases: Array<[unknown, string, string | undefined]> = [
+      [hc, "healthcheck", "options"],
+      [new Error("Command failed: git clone ... fatal: Repository not found."), "access", "github"],
+      [new Error("fatal: could not read Username for 'https://github.com': terminal prompts disabled"), "access", "github"],
+      [new Error("warning: Could not find remote branch dev to clone.\nfatal: Remote branch dev not found in upstream origin"), "branch", undefined],
+      [new Error("Could not auto-detect stack in repository (no docker-compose.yml, ...)."), "stack", "guide"],
+      [new Error("Command failed: docker build -t x . (exit 137)\nKilled"), "memory", "options"],
+      [new Error("Command failed: docker build -t x . (exit 1)\nnpm ERR! missing script: build"), "build", undefined],
+      [new Error("fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com"), "network", undefined],
+      [new Error("App 'shop' is in the trash. Restore it (action 'restore') or purge it before deploying again."), "trash", "trash"],
+      [new Error("something else"), "other", undefined],
+    ];
+    for (const [err, kind, action] of cases) {
+      assert.deepEqual(help.explainDeployError(err), action ? { kind, action } : { kind }, String(err));
+    }
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      const twice = (key: string) => assert.equal(page.split(`"${key}":`).length - 1, 2, `${key} in pt and en`);
+      for (const [, kind] of cases) { twice(`df_${kind}`); twice(`dfh_${kind}`); }
+      for (const a of ["github", "options", "guide", "trash", "doctor"]) twice(`dfAct_${a}`);
+      for (const k of ["dfDetails", "dfOkTitle", "dfOkNext", "dfOkLive", "dfOkExpose", "dfOkList"]) twice(k);
+      assert.ok(!page.includes("HealthcheckFailedError"), "no guessing from the error's class name (it is not in the message)");
+      // The route answers 422 with the kind, and the error itself, never a bare 500.
+      const res = await fetch(`${baseUrl}/api/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ appName: "nope-46", repoSource: "/no/such/folder-46" }) });
+      const data = (await res.json()) as { error: string; failure: { kind: string } };
+      assert.equal(res.status, 422);
+      assert.ok(data.error && data.failure && typeof data.failure.kind === "string");
+    } finally {
+      dsrv.close();
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

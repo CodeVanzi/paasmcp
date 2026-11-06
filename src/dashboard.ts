@@ -14,6 +14,7 @@ import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, listGitHubRepos, saveCloudflare } from "./connections.js";
+import { explainDeployError } from "./deployhelp.js";
 import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
@@ -539,13 +540,21 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         }
 
+        // A failed deploy answers with the raw error plus what probably happened, for a plain-words card.
+        const deployFailed = (err: unknown) => {
+          res.writeHead(422, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err), failure: explainDeployError(err) }));
+          return true;
+        };
         if (pathname === "/api/deploy" && req.method === "POST") {
           const body = await readJsonBody(req);
           const trusted = typeof body.trusted === "boolean" ? body.trusted : undefined;
           if (trusted && !loadState().apps[sanitizeSlug(String(body.appName))]?.trusted) {
             confirmFromBody("app.trust", { appName: sanitizeSlug(String(body.appName)) }, body);
           }
-          const result = await deployApp({
+          let result;
+          try {
+            result = await deployApp({
             trigger: "dashboard",
             trusted,
             healthcheckPath: body.healthcheckPath ? String(body.healthcheckPath) : undefined,
@@ -559,7 +568,10 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             withRedis: Boolean(body.withRedis),
             memoryLimit: body.memoryLimit ? String(body.memoryLimit) : undefined,
             cpuLimit: body.cpuLimit ? String(body.cpuLimit) : undefined,
-          });
+            });
+          } catch (err) {
+            return deployFailed(err);
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
           return true;
@@ -572,7 +584,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const app = loadState().apps[slug];
           if (!app) throw new Error(`App '${slug}' not found.`);
           if (!app.repoUrl || app.runtimeType === "paasmcp-control-plane") throw new Error(`App '${slug}' has no code source to publish again.`);
-          const result = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, trigger: "dashboard" });
+          let result;
+          try {
+            result = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, trigger: "dashboard" });
+          } catch (err) {
+            return deployFailed(err);
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
           return true;
@@ -1189,6 +1206,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .dep-more { margin: 4px 0 14px; }
     .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
     .dep-pick { margin: -4px 0 14px; max-width: 520px; }
+    .dep-result { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 720px; }
+    .dep-result.ok { background: var(--success-soft); }
+    .dep-result.err { background: var(--danger-soft); }
+    .dep-result p { margin: 4px 0 8px; }
+    .dep-result-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .dep-result details { margin-top: 8px; }
+    .dep-result summary { cursor: pointer; font-size: 12.5px; }
+    .dep-result pre { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; font-size: 11.5px; margin: 6px 0 0; }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -2260,6 +2285,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 </label>
               </details>
               <button onclick="deployNewApp()" id="btnDeploy">🚀 Publicar</button>
+              <div id="depResult"></div>
             </div>
 
             <div class="card" data-sub="expose">
@@ -3377,7 +3403,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepPoll": "Atualizar sozinho quando eu mudar o código (confere a cada 2 min)",
           "lblDepStorage": "Criar espaço para arquivos",
           "lblDepEmail": "Deixar o app enviar e-mails",
-          "deployHealthFailed": "A nova versão não passou no teste e NÃO foi colocada no ar. A versão anterior continua funcionando. Veja o erro do app abaixo:",
           "emailTitle": "✉️ Envio de e-mails",
           "emailDesc": "E-mail enviado direto de casa cai no spam ou nem sai. Por isso o painel usa um serviço de envio, configurado uma vez para todos os apps.",
           "emailTip": "Sugestão: o Brevo tem plano gratuito de 300 e-mails por dia. Crie a conta, confirme seu domínio e copie os dados de SMTP. A senha fica cifrada e só é enviada por conexão segura.",
@@ -3697,7 +3722,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepPoll": "Update by itself when I change the code (checks every 2 min)",
           "lblDepStorage": "Create file space",
           "lblDepEmail": "Let the app send email",
-          "deployHealthFailed": "The new version failed its test and was NOT put live. The previous version is still running. The app's error is below:",
           "emailTitle": "✉️ Email sending",
           "emailDesc": "Email sent straight from home lands in spam or never leaves. So the dashboard uses a sending service, set up once for all apps.",
           "emailTip": "Tip: Brevo has a free plan with 300 emails a day. Create the account, verify your domain and copy the SMTP details. The password is encrypted and only sent over a secure connection.",
@@ -5018,6 +5042,69 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "pickEmpty": "The GitHub token sees no repository. Under Connections → GitHub, create a token with access to the repositories you will publish.",
       "pickNoToken": "Want to pick from a list, or publish private code?",
       "pickConnect": "Connect GitHub under Connections"
+    });
+
+    Object.assign(I18N.pt, {
+      "df_healthcheck": "A nova versão não respondeu e não foi para o ar.",
+      "dfh_healthcheck": "A versão anterior continua funcionando. O erro do app está nos detalhes. Se ele não é um site (um robô ou uma tarefa de fundo), marque “Não é um site” em Mais opções.",
+      "df_access": "Não consegui baixar o código.",
+      "dfh_access": "Confira o nome do repositório (dono/nome). Se ele é privado, conecte o GitHub.",
+      "df_branch": "Esse branch não existe no repositório.",
+      "dfh_branch": "Confira o nome do branch. Normalmente é main ou master.",
+      "df_stack": "Não reconheci o tipo do projeto.",
+      "dfh_stack": "O painel monta sozinho projetos Node, Python, Go, .NET e sites estáticos. Para outros, coloque um Dockerfile no repositório.",
+      "df_memory": "Faltou memória para montar ou rodar o app.",
+      "dfh_memory": "Aumente a memória máxima em Mais opções (por exemplo 1g) e publique de novo.",
+      "df_build": "A montagem do app falhou.",
+      "dfh_build": "Costuma ser um erro no código ou numa dependência. As últimas linhas dos detalhes mostram onde. Corrija no repositório e publique de novo.",
+      "df_network": "O servidor não conseguiu acessar a internet.",
+      "dfh_network": "Confira a conexão do servidor e tente de novo em alguns minutos.",
+      "df_trash": "Esse app está na lixeira.",
+      "dfh_trash": "Restaure ou apague de vez na lista Seus apps antes de publicar com esse nome.",
+      "df_other": "Não deu para publicar.",
+      "dfh_other": "O erro está nos detalhes. Se não ficar claro, o Diagnóstico confere o servidor.",
+      "dfDetails": "Detalhes técnicos",
+      "dfAct_github": "Conectar o GitHub",
+      "dfAct_options": "Abrir Mais opções",
+      "dfAct_guide": "Ver o guia",
+      "dfAct_trash": "Ver Seus apps",
+      "dfAct_doctor": "Abrir o Diagnóstico",
+      "dfOkTitle": "Publicado: {app}",
+      "dfOkNext": "Próximo passo: dar um endereço para abrir o app de qualquer lugar.",
+      "dfOkLive": "O app está no ar em:",
+      "dfOkExpose": "Dar um endereço",
+      "dfOkList": "Ver Seus apps"
+    });
+    Object.assign(I18N.en, {
+      "df_healthcheck": "The new version did not answer and was not put live.",
+      "dfh_healthcheck": "The previous version is still running. The app's error is in the details. If it is not a website (a bot or a background task), tick “Not a website” under More options.",
+      "df_access": "Could not download the code.",
+      "dfh_access": "Check the repository name (owner/name). If it is private, connect GitHub.",
+      "df_branch": "That branch does not exist in the repository.",
+      "dfh_branch": "Check the branch name. It is usually main or master.",
+      "df_stack": "Could not tell what kind of project this is.",
+      "dfh_stack": "The dashboard builds Node, Python, Go, .NET and static sites by itself. For anything else, add a Dockerfile to the repository.",
+      "df_memory": "Ran out of memory while building or running the app.",
+      "dfh_memory": "Raise the maximum memory under More options (for example 1g) and publish again.",
+      "df_build": "Building the app failed.",
+      "dfh_build": "This is usually an error in the code or in a dependency. The last lines of the details show where. Fix it in the repository and publish again.",
+      "df_network": "The server could not reach the internet.",
+      "dfh_network": "Check the server's connection and try again in a few minutes.",
+      "df_trash": "This app is in the trash.",
+      "dfh_trash": "Restore it or delete it for good in Your apps before publishing with this name.",
+      "df_other": "Could not publish.",
+      "dfh_other": "The error is in the details. If it is not clear, Diagnostics checks the server.",
+      "dfDetails": "Technical details",
+      "dfAct_github": "Connect GitHub",
+      "dfAct_options": "Open More options",
+      "dfAct_guide": "See the guide",
+      "dfAct_trash": "See Your apps",
+      "dfAct_doctor": "Open Diagnostics",
+      "dfOkTitle": "Published: {app}",
+      "dfOkNext": "Next step: give it an address so you can open it from anywhere.",
+      "dfOkLive": "The app is live at:",
+      "dfOkExpose": "Give it an address",
+      "dfOkList": "See Your apps"
     });
 
     function esc(str) {
@@ -7281,7 +7368,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       setTimeout(pollDeploys, 800);
       const res = await fetch('/api/apps/redeploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appName: name }) });
       const data = await res.json().catch(function () { return {}; });
-      if (!res.ok) { alert((/HealthcheckFailedError/.test(data.error || '') ? t('deployHealthFailed') + ' ' : '') + (data.error || ('HTTP ' + res.status))); return; }
+      if (!res.ok) {
+        const kind = data.failure && I18N.en['df_' + data.failure.kind] ? data.failure.kind : 'other';
+        alert(t('df_' + kind) + '\\n' + t('dfh_' + kind) + '\\n\\n' + String(data.error || ('HTTP ' + res.status)).slice(-1500));
+        return;
+      }
       delete secChanged[name];
       showToast(t('toastDeployDone') + name);
       loadAll();
@@ -7468,6 +7559,39 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (note) note.textContent = r.private ? t('pickPrivateNote') : '';
     }
 
+    // Result of a publish, in plain words: what happened and the next step (or what to fix).
+    function deployResultHtml(ok, appName, data) {
+      if (ok) {
+        const urls = ((data && data.app && data.app.domains) || []).map(function (d) { return d.url; }).filter(Boolean);
+        const a = esc(JSON.stringify(appName));
+        return '<div class="dep-result ok"><strong>' + esc(t('dfOkTitle').split('{app}').join(appName)) + '</strong>' +
+          (urls.length
+            ? '<p>' + esc(t('dfOkLive')) + ' ' + urls.map(function (u) { return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' + esc(u) + '</a>'; }).join(', ') + '</p>'
+            : '<p>' + esc(t('dfOkNext')) + '</p>') +
+          '<div class="dep-result-actions">' +
+          (urls.length ? '' : '<button onclick="exposeNext(' + a + ')">' + esc(t('dfOkExpose')) + '</button>') +
+          '<button class="secondary" onclick="goTo(\\'overview\\', \\'list\\')">' + esc(t('dfOkList')) + '</button></div></div>';
+      }
+      const f = (data && data.failure) || {};
+      const kind = I18N.en['df_' + f.kind] ? f.kind : 'other';
+      const action = f.action || (kind === 'other' ? 'doctor' : '');
+      const go = { github: "goTo('connect', 'github')", options: 'openDeployOptions()', guide: "goTo('guide', 'firstapp')", trash: "goTo('overview', 'list')", doctor: "goTo('doctor')" }[action];
+      return '<div class="dep-result err"><strong>' + esc(t('df_' + kind)) + '</strong><p>' + esc(t('dfh_' + kind)) + '</p>' +
+        (go ? '<div class="dep-result-actions"><button class="secondary" onclick="' + go + '">' + esc(t('dfAct_' + action)) + '</button></div>' : '') +
+        '<details><summary>' + esc(t('dfDetails')) + '</summary><pre>' + esc((data && data.error) || '') + '</pre></details></div>';
+    }
+    function openDeployOptions() {
+      const d = document.querySelector('#tab-overview details.dep-more');
+      if (!d) return;
+      d.open = true;
+      d.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    function exposeNext(appName) {
+      goTo('overview', 'expose');
+      const el = document.getElementById('expApp');
+      if (el) { el.value = appName; el.focus(); }
+    }
+
     async function deployNewApp() {
       const appName = document.getElementById('depApp').value.trim();
       const repoSource = document.getElementById('depRepo').value.trim();
@@ -7486,6 +7610,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const btn = document.getElementById('btnDeploy');
       btn.textContent = t('toastDeploying');
       btn.disabled = true;
+      document.getElementById('depResult').innerHTML = '';
       try {
         setTimeout(pollDeploys, 800);
         const res = await fetch('/api/deploy', {
@@ -7493,13 +7618,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit, healthcheckPath, skipHealthcheck })
         });
-        const data = await res.json();
-        if (!res.ok) alert((/HealthcheckFailedError/.test(data.error) ? t('deployHealthFailed') + '\\n\\n' : 'Error: ') + data.error);
-        else {
+        const data = await res.json().catch(function () { return {}; });
+        const box = document.getElementById('depResult');
+        if (!res.ok) {
+          if (!data.failure && !data.error) data.error = 'HTTP ' + res.status;
+          box.innerHTML = deployResultHtml(false, appName, data);
+        } else {
           if (document.getElementById('depPoll').checked) await postJson('/api/poll', { appName, on: true });
+          box.innerHTML = deployResultHtml(true, appName, data);
           showToast(t('toastDeployDone') + appName);
           loadAll();
         }
+        box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       } finally {
         btn.textContent = t('btnDeploy');
         btn.disabled = false;
