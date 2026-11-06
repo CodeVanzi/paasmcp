@@ -213,3 +213,35 @@ export function writeRuntimeEnvFile(
   });
   fs.writeFileSync(targetPath, lines.join("\n") + "\n", { mode: 0o600 });
 }
+
+
+/**
+ * Reads a pasted `.env` file (the format Railway, Render, Vercel and docker compose use): `KEY=value`
+ * lines, `export KEY=value`, `#` comments, single or double quotes (double quotes understand \n).
+ * Lines that are not a variable come back in `skipped` (line numbers only, never their text, since
+ * they may hold a secret).
+ */
+export function parseDotenv(text: string): { entries: Record<string, string>; skipped: number[] } {
+  const entries: Record<string, string> = {};
+  const skipped: number[] = [];
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  lines.forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    const m = line.replace(/^export\s+/, "").match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m) {
+      skipped.push(i + 1);
+      return;
+    }
+    let value = m[2];
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1).replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1);
+    } else {
+      value = value.replace(/\s+#.*$/, "").trim();
+    }
+    entries[m[1]] = value;
+  });
+  return { entries, skipped };
+}

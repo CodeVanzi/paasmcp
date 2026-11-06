@@ -3869,6 +3869,67 @@ volumes:
     }
   });
 
+  await t.test("44. App variables: pasting a .env file, and publishing again with the current variables", async () => {
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const parsed = vault.parseDotenv([
+      "# comment",
+      "",
+      "export STRIPE_KEY=sk_test_123",
+      'QUOTED="two words # not a comment"',
+      "SINGLE='a\\nb'",
+      'MULTI="line1\\nline2"',
+      "PLAIN=value # trailing comment",
+      "EMPTY=",
+      "not a variable",
+      "1BAD=x",
+      "SPACES = around ",
+    ].join("\r\n"));
+    assert.deepEqual(parsed.entries, {
+      STRIPE_KEY: "sk_test_123",
+      QUOTED: "two words # not a comment",
+      SINGLE: "a\\nb",
+      MULTI: "line1\nline2",
+      PLAIN: "value",
+      EMPTY: "",
+      SPACES: "around",
+    });
+    assert.deepEqual(parsed.skipped, [9, 10], "only line numbers, never the text");
+
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+      const r = await post("/api/secrets", { scope: "env-test-app", dotenv: "A_KEY=secret-value-1\nB_KEY=\"secret value 2\"\noops" });
+      assert.equal(r.status, 200);
+      const body = await r.text();
+      assert.ok(!body.includes("secret-value-1") && !body.includes("secret value 2"), "values never come back");
+      const j = JSON.parse(body);
+      assert.deepEqual(j.saved, ["A_KEY", "B_KEY"]);
+      assert.deepEqual(j.skipped, [3]);
+      assert.equal(vault.getSecrets("env-test-app").B_KEY, "secret value 2");
+      assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: "# nothing" })).status, 500);
+      assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: "X=" + "y".repeat(300 * 1024) })).status, 500);
+      const many = Array.from({ length: 301 }, (_, i) => `K${i}=v`).join("\n");
+      assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: many })).status, 500);
+      const missing = await post("/api/apps/redeploy", { appName: "no-such-app" });
+      assert.equal(missing.status, 500);
+      assert.match((await missing.json()).error, /not found/);
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes("saveDotenv(") && page.includes("redeployApp(") && page.includes('<select id="secScope"'));
+    } finally {
+      dsrv.close();
+      vault.deleteSecretKey("env-test-app", "A_KEY");
+      vault.deleteSecretKey("env-test-app", "B_KEY");
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

@@ -31,6 +31,7 @@ import {
   DASHBOARD_APP_NAME,
   ForbiddenActionError,
   listApprovals,
+  audit,
 } from "./guard.js";
 import {
   backupDatabase,
@@ -66,6 +67,7 @@ import {
   listMaskedSecrets,
   setSecretEntries,
   timingSafeCompare,
+  parseDotenv,
 } from "./vault.js";
 
 const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
@@ -405,6 +407,19 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/secrets" && req.method === "POST") {
           const body = await readJsonBody(req);
           const scope = String(body.scope || "system");
+          // A pasted .env file: every variable at once (Railway, Render and Vercel take the same format).
+          if (typeof body.dotenv === "string") {
+            if (body.dotenv.length > 256 * 1024) throw new Error("The pasted text is too long (256 KB at most).");
+            const { entries, skipped } = parseDotenv(body.dotenv);
+            const keys = Object.keys(entries);
+            if (!keys.length) throw new Error("No KEY=value line found in the pasted text.");
+            if (keys.length > 300) throw new Error("Too many variables at once (300 at most).");
+            const saved = setSecretEntries(scope, entries);
+            audit({ event: "secret.import", scope: sanitizeSlug(scope), keys: saved.length, by: actor });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ scope, saved, skipped, secrets: listMaskedSecrets(scope) }));
+            return true;
+          }
           const key = String(body.key || "").trim();
           const value = String(body.value || "");
           if (!key) throw new Error("Key is required");
@@ -546,6 +561,19 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             memoryLimit: body.memoryLimit ? String(body.memoryLimit) : undefined,
             cpuLimit: body.cpuLimit ? String(body.cpuLimit) : undefined,
           });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
+        // Publish again with what the app already has (same repository and branch): new passwords take effect.
+        if (pathname === "/api/apps/redeploy" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const slug = sanitizeSlug(String(body.appName || ""));
+          const app = loadState().apps[slug];
+          if (!app) throw new Error(`App '${slug}' not found.`);
+          if (!app.repoUrl || app.runtimeType === "paasmcp-control-plane") throw new Error(`App '${slug}' has no code source to publish again.`);
+          const result = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, trigger: "dashboard" });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
           return true;
@@ -1156,6 +1184,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .guide-step { font-size: 13.5px; line-height: 1.5; padding-left: 4px; }
     .guide-step::marker { font-weight: 700; color: var(--accent, var(--text)); }
     @media (max-width: 560px) { .tut-row { flex-wrap: wrap; } .tut-act { margin-left: 34px; } }
+    .sec-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 6px; border-radius: 8px; background: var(--bg-subtle); border: 1px solid var(--border); font-size: 12.5px; flex-wrap: wrap; }
+    .sec-k { min-width: 0; word-break: break-all; }
+    .sec-act { display: flex; gap: 6px; }
+    .sec-act button { padding: 3px 9px; font-size: 11px; }
+    .sec-apply.changed { color: var(--text); border-left: 3px solid var(--warning, #d97706); padding-left: 8px; }
+    .sec-paste summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+    .sec-paste textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -2348,33 +2383,39 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         <div class="tab-pane" id="tab-vault">
           <div class="card">
             <div class="card-header">
-              <h2 id="vaultTitle">🔐 Cofre Criptografado de Variáveis (AES-256-GCM Vault)</h2>
-              <p class="card-desc" id="vaultDesc">Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.</p>
+              <h2 id="vaultTitle"></h2>
+              <p class="card-desc" id="vaultDesc"></p>
             </div>
-            <div class="examples-bar">
-              <span id="lblVaultScopes">⚡ Escopos:</span>
-              <button class="chip" id="chipSystemScope" onclick="setVaultScope('system')">⚙️ system (Global Tokens)</button>
-              <span id="dynamicScopeChips"></span>
+            <div class="form-grid" style="grid-template-columns:minmax(0,320px);">
+              <div>
+                <label class="field-label" for="secScope" id="lblSecScope"></label>
+                <select id="secScope" onchange="loadSecrets()"><option value="system"></option></select>
+              </div>
             </div>
+            <div id="secApply"></div>
+            <h3 class="ofs-h" data-i18n="secListTitle"></h3>
+            <div id="secretsList"></div>
+            <h3 class="ofs-h" style="margin-top:18px;" data-i18n="secAddTitle"></h3>
             <div class="form-grid">
               <div>
-                <label class="field-label" id="lblSecScope">Escopo (system ou slug do app)</label>
-                <input id="secScope" placeholder="system" value="system" onchange="loadSecrets()" />
+                <label class="field-label" for="secKey" id="lblSecKey"></label>
+                <input id="secKey" placeholder="STRIPE_SECRET_KEY" autocomplete="off" spellcheck="false" />
               </div>
               <div>
-                <label class="field-label" id="lblSecKey">Chave (A-Z, 0-9, _)</label>
-                <input id="secKey" placeholder="ex: STRIPE_SECRET_KEY" />
-              </div>
-              <div>
-                <label class="field-label" id="lblSecVal">Valor Secreto</label>
-                <input id="secVal" type="password" placeholder="••••••••••••" />
+                <label class="field-label" for="secVal" id="lblSecVal"></label>
+                <input id="secVal" type="password" autocomplete="new-password" />
               </div>
             </div>
-            <div class="actions" style="margin-bottom:16px;">
-              <button onclick="saveSecret()" id="btnSaveSecret">💾 Criptografar & Salvar</button>
-              <button class="secondary" onclick="loadSecrets()" id="btnLoadSecrets">🔍 Recarregar Escopo</button>
+            <div class="actions" style="margin-bottom:6px;">
+              <button onclick="saveSecret()" id="btnSaveSecret"></button>
             </div>
-            <div id="secretsList"></div>
+            <details class="sec-paste" style="margin-top:14px;">
+              <summary data-i18n="secPasteTitle"></summary>
+              <p class="ofs-note" data-i18n="secPasteDesc" style="margin-top:8px;"></p>
+              <textarea id="secDotenv" rows="7" spellcheck="false" autocomplete="off" placeholder="DATABASE_URL=postgres://...&#10;STRIPE_SECRET_KEY=sk_live_...&#10;# comentários são ignorados"></textarea>
+              <div class="ofs-msg" id="secPasteMsg" role="status" aria-live="polite"></div>
+              <div style="margin-top:8px;"><button class="secondary" onclick="saveDotenv()" data-i18n="secPasteBtn"></button></div>
+            </details>
           </div>
         </div>
 
@@ -2970,14 +3011,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         optTS: "Tailscale Serve (Privado na Tailnet)",
         lblExpSub: "Subdomínio",
         btnExpose: "🔗 Publicar Endereço",
-        vaultTitle: "🔐 Cofre Criptografado de Variáveis (AES-256-GCM Vault)",
-        vaultDesc: "Cada escopo é criptografado em disco com IV aleatório de 96 bits e tag de autenticação GCM. Valores nunca são exibidos em texto aberto após salvos.",
-        lblVaultScopes: "⚡ Escopos:",
-        lblSecScope: "Escopo (system ou slug do app)",
-        lblSecKey: "Chave (A-Z, 0-9, _)",
-        lblSecVal: "Valor Secreto",
-        btnSaveSecret: "💾 Criptografar & Salvar",
-        btnLoadSecrets: "🔍 Recarregar Escopo",
+        vaultTitle: "Variáveis de cada app",
+        vaultDesc: "O que o código do app lê como variável de ambiente: chaves de serviços (Stripe, OpenAI...), senhas e endereços. Fica cifrado no disco e não aparece inteiro de novo depois de salvo.",
+        lblSecScope: "De qual app?",
+        lblSecKey: "Nome (letras, números e _)",
+        lblSecVal: "Valor",
+        btnSaveSecret: "Salvar",
         dbTitle: "🗄️ Provisionar Banco Multi-Tenant Isolado",
         dbDesc: "Cria banco, role exclusiva e injeta <code>DATABASE_URL</code> / <code>REDIS_URL</code> diretamente no Cofre do app.",
         lblDbApp: "Aplicação",
@@ -3041,7 +3080,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_compose: "Usa o <code>docker-compose.yml</code> do repositório. O serviço <code>web</code>, <code>app</code> ou <code>api</code> (ou o primeiro) recebe o tráfego. Opções inseguras como <code>privileged</code> são removidas.",
         presetHint_spa: "Vite, React ou Astro sem script <code>start</code>: o painel faz o build e serve os arquivos com nginx. Um <code>index.html</code> na raiz também funciona.",
         presetHint_dockerfile: "Para Rails, Laravel, Java ou qualquer outra stack: deixe um <code>Dockerfile</code> na raiz do repositório. A porta vem do <code>EXPOSE</code>.",
-        chipSystemScope: "⚙️ system (Tokens Globais)",
         followOn: "Atualiza sozinho",
         followOff: "Atualizar sozinho",
         followOnTitle: "Segue a branch {branch}: cada commit novo é compilado e testado antes de entrar. Clique para parar.",
@@ -3057,10 +3095,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         emptyDbs: "Nenhum banco provisionado ainda.",
         emptyBackups: "Nenhum snapshot criptografado criado ainda.",
         emptyPeers: "Nenhum servidor secundário pareado ainda.",
-        emptySecrets: "Nenhuma variável salva neste escopo.",
+        emptySecrets: "Nada salvo aqui ainda.",
         emptyDoctor: "Nenhum container registrado para diagnóstico.",
         actionExpose: "Expor",
-        actionEnv: "Senhas",
+        actionEnv: "Variáveis",
         actionLogs: "Logs",
         actionRestart: "Reiniciar",
         actionRollback: "Versão anterior",
@@ -3168,14 +3206,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         optTS: "Tailscale Serve (Private on Tailnet)",
         lblExpSub: "Subdomain",
         btnExpose: "🔗 Expose Address",
-        vaultTitle: "🔐 Encrypted Secret Vault (AES-256-GCM Vault)",
-        vaultDesc: "Each scope is encrypted on disk with random 96-bit IV and GCM auth tag. Values are never exposed in plaintext after save.",
-        lblVaultScopes: "⚡ Scopes:",
-        lblSecScope: "Scope (system or app slug)",
-        lblSecKey: "Key (A-Z, 0-9, _)",
-        lblSecVal: "Secret Value",
-        btnSaveSecret: "💾 Encrypt & Save",
-        btnLoadSecrets: "🔍 Reload Scope",
+        vaultTitle: "Each app's variables",
+        vaultDesc: "What the app's code reads as environment variables: service keys (Stripe, OpenAI...), passwords and addresses. Encrypted on disk and never shown in full again after saving.",
+        lblSecScope: "Which app?",
+        lblSecKey: "Name (letters, digits and _)",
+        lblSecVal: "Value",
+        btnSaveSecret: "Save",
         dbTitle: "🗄️ Provision Isolated Multi-Tenant Database",
         dbDesc: "Creates database, exclusive role, and injects <code>DATABASE_URL</code> / <code>REDIS_URL</code> directly into app Vault.",
         lblDbApp: "Application",
@@ -3239,7 +3275,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         presetHint_compose: "Uses the repository's <code>docker-compose.yml</code>. The <code>web</code>, <code>app</code> or <code>api</code> service (or the first one) gets the traffic. Unsafe options such as <code>privileged</code> are stripped.",
         presetHint_spa: "Vite, React or Astro without a <code>start</code> script: the dashboard builds it and serves the files with nginx. A root <code>index.html</code> works too.",
         presetHint_dockerfile: "For Rails, Laravel, Java or any other stack: put a <code>Dockerfile</code> at the repository root. The port comes from <code>EXPOSE</code>.",
-        chipSystemScope: "⚙️ system (Global Tokens)",
         followOn: "Auto-updates",
         followOff: "Auto-update",
         followOnTitle: "Follows branch {branch}: each new commit is built and tested before it goes live. Click to stop.",
@@ -3255,10 +3290,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         emptyDbs: "No databases provisioned yet.",
         emptyBackups: "No encrypted snapshots created yet.",
         emptyPeers: "No secondary servers paired yet.",
-        emptySecrets: "No variables stored in this scope.",
+        emptySecrets: "Nothing saved here yet.",
         emptyDoctor: "No containers registered for diagnostics.",
         actionExpose: "Expose",
-        actionEnv: "Secrets",
+        actionEnv: "Variables",
         actionLogs: "Logs",
         actionRestart: "Restart",
         actionRollback: "Previous version",
@@ -3341,8 +3376,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "deployDesc": "Informe o repositório do GitHub (ou uma pasta do servidor). O painel descobre a linguagem e monta tudo sozinho. As senhas do app ficam em Senhas e chaves.",
           "exposeTitle": "🌐 Deixar um app acessível",
           "exposeDesc": "Escolha quem pode abrir: qualquer pessoa na internet, só e-mails autorizados ou só a sua rede privada (Tailscale). Nenhuma porta do roteador é aberta.",
-          "vaultTitle": "🔐 Senhas e chaves dos apps",
-          "vaultDesc": "Guarde aqui as senhas e chaves que seus apps usam (ex.: chave do Stripe). Tudo fica cifrado no disco e não aparece de novo por inteiro depois de salvo. Use o nome do app como escopo; <code>system</code> é só para as chaves do próprio painel.",
           "dbTitle": "🗄️ Criar um banco de dados",
           "dbDesc": "Cada app ganha o seu próprio banco, separado dos outros. O endereço de conexão (<code>DATABASE_URL</code> ou <code>REDIS_URL</code>) entra sozinho nas senhas do app.",
           "backupsTitle": "🛡️ Cópias de segurança",
@@ -3667,8 +3700,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "deployDesc": "Enter the GitHub repository (or a folder on the server). The dashboard detects the language and builds everything. App passwords live in Passwords & keys.",
           "exposeTitle": "🌐 Make an app reachable",
           "exposeDesc": "Choose who can open it: anyone on the internet, only allowed emails, or only your private network (Tailscale). No router port is opened.",
-          "vaultTitle": "🔐 App passwords & keys",
-          "vaultDesc": "Store the passwords and keys your apps use (e.g. a Stripe key). Everything is encrypted on disk and never shown in full again after saving. Use the app name as scope; <code>system</code> is only for the dashboard's own keys.",
           "dbTitle": "🗄️ Create a database",
           "dbDesc": "Each app gets its own database, separate from the others. The connection address (<code>DATABASE_URL</code> or <code>REDIS_URL</code>) goes into the app's passwords automatically.",
           "backupsTitle": "🛡️ Backups",
@@ -4556,13 +4587,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
       'exposeTitle', 'exposeDesc', 'lblQuickFillExpose', 'chipModePublic', 'chipModeZT', 'chipModeTS', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
-      'vaultTitle', 'vaultDesc', 'lblVaultScopes', 'lblSecScope', 'lblSecKey', 'lblSecVal', 'btnSaveSecret', 'btnLoadSecrets',
+      'vaultTitle', 'vaultDesc', 'lblSecScope', 'lblSecKey', 'lblSecVal', 'btnSaveSecret',
       'dbTitle', 'dbDesc', 'lblDbApp', 'lblDbEngine', 'optDbPg', 'optDbRedis', 'btnCreateDb',
       'backupsTitle', 'backupsDesc', 'lblBakApp', 'lblBakEngine', 'optBakPg', 'optBakRedis', 'btnCreateBackup',
       'fedTitle', 'fedDesc', 'lblFedUrl', 'lblFedMode', 'optFedActive', 'optFedWarm', 'btnGenInvite', 'btnExportSync', 'lblJoinPeer', 'btnJoinPeer',
       'whTitle', 'whDesc', 'lblWhUrl', 'lblWhSecret', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
       'doctorTitle', 'doctorDesc', 'btnRunDoctor',
-      'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetDotnet', 'presetCompose', 'presetSpa', 'presetDockerfile', 'chipSystemScope',
+      'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetDotnet', 'presetCompose', 'presetSpa', 'presetDockerfile',
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
       'agentsTitle', 'agentsDesc', 'logsTitle', 'btnCloseLogs',
     ];
@@ -4921,6 +4952,41 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_github_s3": "With a token: create, test and name the repository",
       "guide_github_s3Desc": "Create a fine-grained token with only the repositories you will publish and Administration: Read and write. Paste it under Connections → GitHub, click Test and save, and type the repository so the dashboard adds the key.",
       "lead_guide": ""
+    });
+
+    Object.assign(I18N.pt, {
+      "secSystemScope": "Painel e integrações (system)",
+      "secSystemNote": "Chaves do próprio painel (Cloudflare, GitHub, cópias fora do servidor). Os apps não enxergam estas. Para mudar uma conexão, prefira a tela Conexões.",
+      "secApplyNote": "O app lê estas variáveis quando é publicado. Depois de mudar algo, publique de novo.",
+      "secApplyChanged": "Você mudou variáveis deste app. Elas valem depois de publicar de novo.",
+      "secListTitle": "Salvas",
+      "secAddTitle": "Adicionar ou trocar uma",
+      "secChange": "Trocar",
+      "secPasteTitle": "Colar um arquivo .env inteiro",
+      "secPasteDesc": "Cole o conteúdo do seu .env (uma linha NOME=valor por variável). Comentários com # e aspas funcionam. Variáveis com o mesmo nome são trocadas; as outras ficam como estão.",
+      "secPasteBtn": "Salvar todas",
+      "secPasteOk": "{n} variáveis salvas.",
+      "secPasteSkipped": "Ficaram de fora (não pareciam NOME=valor): linha {lines}.",
+      "actionRedeploy": "Publicar de novo",
+      "redeployTitle": "Monta e publica de novo o mesmo repositório e branch, com as variáveis atuais. A versão no ar continua até a nova passar no teste.",
+      "redeployConfirm": "Publicar {app} de novo com as variáveis atuais? A versão no ar continua funcionando até a nova passar no teste."
+    });
+    Object.assign(I18N.en, {
+      "secSystemScope": "Dashboard and integrations (system)",
+      "secSystemNote": "The dashboard's own keys (Cloudflare, GitHub, off-server backups). Apps do not see these. To change a connection, prefer the Connections screen.",
+      "secApplyNote": "The app reads these variables when it is published. After changing something, publish again.",
+      "secApplyChanged": "You changed this app's variables. They take effect after publishing again.",
+      "secListTitle": "Saved",
+      "secAddTitle": "Add or change one",
+      "secChange": "Change",
+      "secPasteTitle": "Paste a whole .env file",
+      "secPasteDesc": "Paste your .env content (one NAME=value line per variable). # comments and quotes work. Variables with the same name are replaced; the others stay as they are.",
+      "secPasteBtn": "Save all",
+      "secPasteOk": "{n} variables saved.",
+      "secPasteSkipped": "Left out (not NAME=value): line {lines}.",
+      "actionRedeploy": "Publish again",
+      "redeployTitle": "Builds and publishes the same repository and branch again, with the current variables. The live version stays until the new one passes the test.",
+      "redeployConfirm": "Publish {app} again with the current variables? The live version keeps working until the new one passes the test."
     });
 
     function esc(str) {
@@ -5378,6 +5444,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     function setVaultScope(scope) {
+      fillScopeSelect(Object.values((lastStatus && lastStatus.apps) || {}));
       document.getElementById('secScope').value = scope;
       loadSecrets();
       goTo('vault');
@@ -5624,7 +5691,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.getElementById('appsBadgeCount').textContent = apps.length + ' apps';
 
       document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
-      document.getElementById('dynamicScopeChips').innerHTML = apps.map(a => \`<button class="chip" onclick="setVaultScope('\${esc(a.name)}')">📦 \${esc(a.name)}</button>\`).join(' ');
+      fillScopeSelect(apps);
 
       const deploys = deployState || s.deploys || {};
       const tbody = document.getElementById('appsTable');
@@ -5722,6 +5789,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   <button class="secondary" onclick="setVaultScope('\${esc(a.name)}')">\${btnIcon('lock')}\${esc(t('actionEnv'))}</button>
                   <button class="secondary" onclick="appAction('\${esc(a.name)}','logs')">\${btnIcon('logs')}\${esc(t('actionLogs'))}</button>
                   <button class="secondary" onclick="appAction('\${esc(a.name)}','restart')">\${btnIcon('restart')}\${esc(t('actionRestart'))}</button>
+                  \${a.repoUrl && a.runtimeType !== 'paasmcp-control-plane' ? \`<button class="secondary" onclick="redeployApp('\${esc(a.name)}')" title="\${esc(t('redeployTitle'))}">\${btnIcon('sync')}\${esc(t('actionRedeploy'))}</button>\` : ''}
                   \${rollbackBtn}
                   \${followBtn}
                   \${a.trashedAt
@@ -7083,19 +7151,57 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       applyPreferences();
     }
 
+    // Which app's variables: a list of apps instead of typing a "scope". "system" holds the dashboard's own keys.
+    const secChanged = {};
+    function fillScopeSelect(apps) {
+      const sel = document.getElementById('secScope');
+      if (!sel) return;
+      const cur = sel.value || 'system';
+      const names = apps.map(function (a) { return a.name; }).sort();
+      sel.innerHTML = names.map(function (n) { return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('') +
+        '<option value="system">' + esc(t('secSystemScope')) + '</option>';
+      sel.value = names.indexOf(cur) !== -1 || cur === 'system' ? cur : (names[0] || 'system');
+    }
+    function renderSecApply() {
+      const box = document.getElementById('secApply');
+      if (!box) return;
+      const scope = document.getElementById('secScope').value || 'system';
+      const app = lastStatus && lastStatus.apps && lastStatus.apps[scope];
+      if (scope === 'system') { box.innerHTML = '<p class="ofs-note">' + esc(t('secSystemNote')) + '</p>'; return; }
+      const canRedeploy = app && app.repoUrl && app.runtimeType !== 'paasmcp-control-plane';
+      box.innerHTML = '<div class="preset-hint show sec-apply' + (secChanged[scope] ? ' changed' : '') + '" style="margin:0 0 12px;">' +
+        esc(t(secChanged[scope] ? 'secApplyChanged' : 'secApplyNote')) +
+        (canRedeploy ? ' <button class="' + (secChanged[scope] ? '' : 'secondary') + '" style="margin-left:6px;padding:4px 10px;font-size:12px;" onclick="redeployApp(&#39;' + esc(scope) + '&#39;)">' + esc(t('actionRedeploy')) + '</button>' : '') + '</div>';
+    }
     async function loadSecrets() {
-      const scope = document.getElementById('secScope').value.trim() || 'system';
+      const scope = document.getElementById('secScope').value || 'system';
+      renderSecApply();
       const res = await fetch('/api/secrets?scope=' + encodeURIComponent(scope));
       if (!res.ok) return;
       const data = await res.json();
       const entries = Object.entries(data.secrets || {});
       document.getElementById('secretsList').innerHTML = entries.length
-        ? entries.map(([k, v]) => \`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;"><span>🔑 <strong>\${esc(k)}</strong> = <code>\${esc(v)}</code></span><button class="danger" style="padding:3px 9px;font-size:11px" onclick="delSecret('\${esc(scope)}','\${esc(k)}')">\${esc(t('btnRemoveSecret'))}</button></div>\`).join('')
+        ? entries.map(function (e) {
+            const k = e[0];
+            return '<div class="sec-row"><span class="sec-k"><strong>' + esc(k) + '</strong> <code>' + esc(e[1]) + '</code></span>' +
+              '<span class="sec-act"><button class="secondary" onclick="editSecret(&#39;' + esc(k) + '&#39;)">' + esc(t('secChange')) + '</button>' +
+              '<button class="danger" onclick="delSecret(&#39;' + esc(scope) + '&#39;,&#39;' + esc(k) + '&#39;)">' + esc(t('btnRemoveSecret')) + '</button></span></div>';
+          }).join('')
         : '<div style="color:var(--muted);font-size:12.5px">' + esc(t('emptySecrets')) + '</div>';
+    }
+    function editSecret(key) {
+      document.getElementById('secKey').value = key;
+      const v = document.getElementById('secVal');
+      v.value = '';
+      v.focus();
+    }
+    function markSecChanged(scope) {
+      if (scope !== 'system') secChanged[scope] = true;
+      renderSecApply();
     }
 
     async function saveSecret() {
-      const scope = document.getElementById('secScope').value.trim() || 'system';
+      const scope = document.getElementById('secScope').value || 'system';
       const key = document.getElementById('secKey').value.trim();
       const value = document.getElementById('secVal').value;
       if (!key) return;
@@ -7109,16 +7215,44 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.getElementById('secKey').value = '';
       document.getElementById('secVal').value = '';
       showToast(t('toastSecretSaved'));
+      markSecChanged(scope);
+      loadSecrets();
+    }
+
+    async function saveDotenv() {
+      const scope = document.getElementById('secScope').value || 'system';
+      const box = document.getElementById('secDotenv');
+      if (!box.value.trim()) return;
+      const r = await ofsPost('/api/secrets', { scope: scope, dotenv: box.value }, 'secPasteMsg');
+      if (!r) return;
+      box.value = '';
+      ofsMsg('secPasteMsg', t('secPasteOk').split('{n}').join(String(r.saved.length)) +
+        (r.skipped && r.skipped.length ? ' ' + t('secPasteSkipped').split('{lines}').join(r.skipped.join(', ')) : ''), r.skipped && r.skipped.length ? 'err' : 'ok');
+      markSecChanged(scope);
       loadSecrets();
     }
 
     async function delSecret(scope, key) {
-      await fetch('/api/secrets', {
+      const res = await fetch('/api/secrets', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scope, key })
       });
+      if (res.ok) markSecChanged(scope);
       loadSecrets();
+    }
+
+    async function redeployApp(name) {
+      if (!confirm(t('redeployConfirm').split('{app}').join(name))) return;
+      showToast(t('toastDeploying'));
+      setTimeout(pollDeploys, 800);
+      const res = await fetch('/api/apps/redeploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appName: name }) });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { alert((/HealthcheckFailedError/.test(data.error || '') ? t('deployHealthFailed') + ' ' : '') + (data.error || ('HTTP ' + res.status))); return; }
+      delete secChanged[name];
+      showToast(t('toastDeployDone') + name);
+      loadAll();
+      renderSecApply();
     }
 
     async function createDb() {
