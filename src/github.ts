@@ -124,7 +124,9 @@ export function resolveGitUrl(repoSource: string): string {
   if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(gitUrl)) {
     const sysSecrets = getSecrets("system");
     if (sysSecrets.GITHUB_TOKEN) {
-      gitUrl = `https://x-access-token:${sysSecrets.GITHUB_TOKEN}@github.com/${gitUrl}.git`;
+      // The token never goes into the URL: it would be saved in the clone's .git/config (and copied
+      // into the app's image by a "COPY . ." Dockerfile). gitEnv() sends it as a header instead.
+      gitUrl = `https://github.com/${gitUrl}.git`;
     } else {
       gitUrl = `git@github.com:${gitUrl}.git`;
     }
@@ -134,10 +136,21 @@ export function resolveGitUrl(repoSource: string): string {
 
 export function gitEnv(): NodeJS.ProcessEnv {
   const keyInfo = getOrCreateSshDeployKey();
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_SSH_COMMAND: `ssh -i ${keyInfo.privateKeyPath} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new`,
   };
+  // A saved GitHub token reaches only github.com over HTTPS, as a header passed through the
+  // environment (not the command line, not the clone's config).
+  const token = getSecrets("system").GITHUB_TOKEN;
+  if (token) {
+    // Added after any GIT_CONFIG_* entries already in the environment (a proxy, for example).
+    const n = Math.max(0, Number.parseInt(String(env.GIT_CONFIG_COUNT || "0"), 10) || 0);
+    env.GIT_CONFIG_COUNT = String(n + 1);
+    env[`GIT_CONFIG_KEY_${n}`] = "http.https://github.com/.extraheader";
+    env[`GIT_CONFIG_VALUE_${n}`] = `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
+  }
+  return env;
 }
 
 export function cloneOrUpdateRepo(
@@ -163,6 +176,8 @@ export function cloneOrUpdateRepo(
   const env = gitEnv();
 
   if (fs.existsSync(path.join(targetDir, ".git"))) {
+    // Also cleans clones made before the token moved out of the URL.
+    execFileSync("git", ["remote", "set-url", "origin", gitUrl], { cwd: targetDir, env, stdio: "pipe" });
     execFileSync("git", ["fetch", "--all"], { cwd: targetDir, env, stdio: "pipe" });
     execFileSync("git", ["checkout", safeBranch], { cwd: targetDir, env, stdio: "pipe" });
     execFileSync("git", ["reset", "--hard", `origin/${safeBranch}`], {
