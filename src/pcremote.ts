@@ -29,8 +29,6 @@ import { followedCode, originOf, readFollow } from "./selfupdate.js";
 // already ties the IP to that device; when Tailscale knows its SSH host keys they are pinned, otherwise
 // the key is accepted on first use and its fingerprint is shown and recorded.
 
-const OFFLINE = () => process.env.PAASMCP_OFFLINE_TEST === "1";
-
 /** Node.js installed when the PC has none (or < 20) and apt has no 20+: official tarball, checksum pinned. */
 export const NODE_VERSION = "22.23.4";
 export const NODE_SHA256: Record<string, string> = {
@@ -830,4 +828,3 @@ export function resetPcJobs(): void {
   failures.clear();
 }
 
-export const _offline = OFFLINE;

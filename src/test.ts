@@ -4814,7 +4814,6 @@ volumes:
 
     // Only a PC from the list, and nothing without a valid user.
     await assert.rejects(r.startPcCheck({ ip: "100.64.0.20", user: "bad user", by: "test" }), /user name/);
-    process.env.PATH_SAVED = process.env.PATH;
     await assert.rejects(r.startPcCheck({ ip: "100.64.0.99", user: "graco", by: "test" }), (e: Error & { code?: string }) => e.code === "notInList");
     r.resetPcJobs();
   });
