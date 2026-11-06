@@ -4196,6 +4196,21 @@ volumes:
     fs.rmSync(nightly.NIGHTLY_MARK, { force: true });
   });
 
+  await t.test("51. Health probes from inside the dashboard container go to the app's address on the Docker network", () => {
+    const before = process.env.PAASMCP_IN_DASHBOARD;
+    try {
+      delete process.env.PAASMCP_IN_DASHBOARD;
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/healthz", () => "172.20.0.9"), "http://127.0.0.1:4005/healthz", "on the host: the published loopback port");
+      process.env.PAASMCP_IN_DASHBOARD = "1";
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "172.20.0.9"), "http://172.20.0.9:3000/", "in the dashboard container: the container's own IP and port");
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "fd00::5"), "http://[fd00::5]:3000/");
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => ""), "http://127.0.0.1:4005/", "no address on the network (network_mode): falls back");
+      assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "evil.example/x?"), "http://127.0.0.1:4005/", "only an IP is used");
+    } finally {
+      if (before === undefined) delete process.env.PAASMCP_IN_DASHBOARD; else process.env.PAASMCP_IN_DASHBOARD = before;
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
