@@ -2578,6 +2578,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 </div>
               </div>
               <button onclick="createDb()" id="btnCreateDb" style="margin-bottom:16px;">+ Provisionar Banco</button>
+              <div id="dbResult"></div>
               <div id="dbList"></div>
             </div>
 
@@ -3181,7 +3182,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         actionPurge: "Apagar de vez",
         trashedStatus: "Na lixeira desde ",
         toastSecretSaved: "✅ Segredo criptografado no Vault!",
-        toastDbCreated: "✅ Banco isolado provisionado!",
+        toastDbCreated: "✅ Banco criado.",
         toastBackupSaved: "📸 Backup criptografado salvo: ",
         toastDbRestored: "✅ Banco restaurado com sucesso",
         toastExposed: "🌐 Publicado em: ",
@@ -3325,7 +3326,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         actionPurge: "Delete for good",
         trashedStatus: "In the trash since ",
         toastSecretSaved: "✅ Secret encrypted in Vault!",
-        toastDbCreated: "✅ Isolated database provisioned!",
+        toastDbCreated: "✅ Database created.",
         toastBackupSaved: "📸 Encrypted backup saved: ",
         toastDbRestored: "✅ Database restored successfully",
         toastExposed: "🌐 Published at: ",
@@ -5510,6 +5511,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "bkErr": "Could not do that right now."
     });
 
+    Object.assign(I18N.pt, {
+      "dbGetsPg": "O app já recebe o endereço do banco em DATABASE_URL (em Variáveis). A senha fica guardada e cifrada.",
+      "dbGetsRedis": "O app já recebe o endereço do cache em REDIS_URL (em Variáveis).",
+      "dbRedeployNote": "Banco criado. Para {app} passar a usá-lo, publique de novo (leva o mesmo tempo de uma atualização)."
+    });
+    Object.assign(I18N.en, {
+      "dbGetsPg": "The app already gets the database address in DATABASE_URL (under Variables). The password is kept encrypted.",
+      "dbGetsRedis": "The app already gets the cache address in REDIS_URL (under Variables).",
+      "dbRedeployNote": "Database created. For {app} to use it, publish it again (takes as long as an update)."
+    });
+
     function fmtWhen(iso) {
       try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return String(iso || ''); }
     }
@@ -6367,7 +6379,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       const dbs = Object.values(s.databases || {});
       document.getElementById('dbList').innerHTML = dbs.length
-        ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;">🗄️ <strong>\${esc(d.name)}</strong> (\${esc(d.engine)}) → DB: <code>\${esc(d.dbName)}</code> | User: <code>\${esc(d.dbUser)}</code></div>\`).join('')
+        ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;" title="\${esc(d.dbName)} / \${esc(d.dbUser)}">🗄️ <strong>\${esc(d.appName)}</strong> · \${esc(t('bkKind_' + d.engine) || d.engine)}<br/><span style="color:var(--muted);">\${esc(t(d.engine === 'redis' ? 'dbGetsRedis' : 'dbGetsPg'))}</span></div>\`).join('')
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>';
 
       renderNightly(s.nightlyBackup);
@@ -7847,9 +7859,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName, engine })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) return alert(t('bkErr') + '\\n\\n' + (data.error || ('HTTP ' + res.status)));
       showToast(t('toastDbCreated'));
+      // The address reaches the app only when it is published again (variables are written at deploy).
+      markSecChanged(appName);
+      const app = lastStatus && lastStatus.apps && lastStatus.apps[appName];
+      const box = document.getElementById('dbResult');
+      if (box) box.innerHTML = app && app.repoUrl
+        ? '<div class="dep-result ok" style="margin:0 0 14px;"><p style="margin:0 0 8px;">' + esc(t('dbRedeployNote').split('{app}').join(appName)) + '</p><div class="dep-result-actions"><button data-app="' + esc(appName) + '" onclick="redeployApp(this.dataset.app)">' + esc(t('actionRedeploy')) + '</button></div></div>'
+        : '';
       loadAll();
     }
 
