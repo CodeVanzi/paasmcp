@@ -3041,7 +3041,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           <div class="card-header">
             <h2>
               <span id="logsTitle">📜 O que o app escreveu (logs)</span>
-              <button class="secondary" id="btnCloseLogs" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
+              <span style="display:flex;gap:6px;">
+                <button class="secondary" id="btnRefreshLogs" onclick="if (logsApp) appAction(logsApp, 'logs')" data-i18n="logsRefresh"></button>
+                <button class="secondary" id="btnCloseLogs" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
+              </span>
             </h2>
           </div>
           <p class="ofs-note" id="logsHint" style="margin:0 0 8px;"></p>
@@ -4757,7 +4760,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "tutGroup_grow": "Quando precisar de mais",
       "tutGroup_growDesc": "Mais segurança contra queda, mais força ou ajuda de uma IA.",
       "tut_app": "Publicar o primeiro app",
-      "tut_appDesc": "Informe o repositório do GitHub e o painel monta e liga o app.",
+      "tut_appDesc": "Informe o repositório do GitHub, ou instale um app pronto sem código, e o painel monta e liga o app.",
       "tut_address": "Dar um endereço ao app",
       "tut_addressDesc": "Pelo seu domínio (Cloudflare) ou só para você e sua família (Tailscale).",
       "tut_offsite": "Guardar cópias fora do servidor",
@@ -4767,7 +4770,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "tut_email": "Configurar o envio de e-mails",
       "tut_emailDesc": "Para os apps mandarem “esqueci a senha” e avisos. Leva 5 minutos com uma conta grátis.",
       "tut_backup": "Fazer uma cópia e testar",
-      "tut_backupDesc": "Faça uma cópia do banco e use “Testar” para ver se ela abre antes de precisar dela.",
+      "tut_backupDesc": "O painel já faz uma cópia toda noite. Use “Testar” numa delas para ver se ela abre antes de precisar.",
       "tut_doctor": "Rodar o diagnóstico",
       "tut_doctorDesc": "Procura problemas no servidor e nos apps e diz o que fazer. Vale rodar de vez em quando.",
       "tut_github": "Ligar o GitHub para código privado",
@@ -4861,7 +4864,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "tutGroup_grow": "When you need more",
       "tutGroup_growDesc": "More safety against outages, more power, or help from an AI.",
       "tut_app": "Publish your first app",
-      "tut_appDesc": "Enter the GitHub repository and the dashboard builds and starts the app.",
+      "tut_appDesc": "Enter the GitHub repository, or install a ready-made app with no code, and the dashboard builds and starts it.",
       "tut_address": "Give the app an address",
       "tut_addressDesc": "On your domain (Cloudflare) or only for you and your family (Tailscale).",
       "tut_offsite": "Keep backups off the server",
@@ -4871,7 +4874,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "tut_email": "Set up email sending",
       "tut_emailDesc": "So apps can send “forgot password” and notices. Takes 5 minutes with a free account.",
       "tut_backup": "Make a backup and test it",
-      "tut_backupDesc": "Back up the database and use “Test” to check it opens before you need it.",
+      "tut_backupDesc": "The dashboard already makes a copy every night. Use “Test” on one to check it opens before you need it.",
       "tut_doctor": "Run diagnostics",
       "tut_doctorDesc": "Looks for problems in the server and apps and says what to do. Worth running now and then.",
       "tut_github": "Connect GitHub for private code",
@@ -5474,6 +5477,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       box.className = 'bak-nightly' + (err ? ' err' : '');
       box.innerHTML = html;
     }
+
+    Object.assign(I18N.pt, { "logsRefresh": "↻ Atualizar" });
+    Object.assign(I18N.en, { "logsRefresh": "↻ Refresh" });
 
     function esc(str) {
       return String(str ?? '')
@@ -8072,6 +8078,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
 
+    let logsApp = '';
     async function appAction(appName, action) {
       const res = await fetch('/api/lifecycle', {
         method: 'POST',
@@ -8085,6 +8092,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         return alert(/No previous image snapshot/.test(err) ? t('lifeErrNoPrevious') : t('lifeErr') + '\\n\\n' + err);
       }
       if (action === 'logs') {
+        logsApp = appName;
         const card = document.getElementById('logsCard');
         card.style.display = 'block';
         document.getElementById('logsTitle').textContent = t('logsTitle') + ' · ' + appName;
