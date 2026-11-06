@@ -3973,6 +3973,59 @@ volumes:
     }
   });
 
+  await t.test("63. Turning on a PC of this network by hand (Wake-on-LAN): saved checked, listed, sent, never to the internet", async () => {
+    const wakepc = await import("./wakepc.js");
+    const wol = await import("./wol.js");
+    const pcs = await import("./pcinstall.js");
+    const mcp = await import("./mcp-server.js");
+    const before = config.loadState().wakeTargets;
+    try {
+      assert.throws(() => wakepc.addWakeTarget("Bad Name!", { mac: "94:de:80:f6:ed:00" }), /Tailscale name/);
+      assert.throws(() => wakepc.addWakeTarget("labserver", { mac: "nope" }));
+      assert.throws(() => wakepc.addWakeTarget("labserver", { mac: "94:de:80:f6:ed:00", broadcast: "8.8.8.255" }), /home or office network/);
+      assert.throws(() => wakepc.addWakeTarget("labserver", { mac: "94:de:80:f6:ed:00", port: 22 }), /port is 9/);
+      const rec = wakepc.addWakeTarget("labserver", { mac: "94-DE-80-F6-ED-00", by: "test" });
+      assert.equal(rec.mac, "94:de:80:f6:ed:00");
+      assert.equal(rec.broadcast, "255.255.255.255", "default: this server's own network");
+      assert.deepEqual(wakepc.listWakeTargets().map((x) => x.name), ["labserver"]);
+
+      // The PCs list marks it, so the dashboard shows “Turn on” while it is off.
+      const fake = JSON.stringify({ Self: { TailscaleIPs: ["100.64.0.1"], UserID: 7 }, Peer: {
+        a: { HostName: "labserver", OS: "linux", Online: false, UserID: 7, TailscaleIPs: ["100.64.0.9"] },
+        b: { HostName: "other", OS: "linux", Online: false, UserID: 7, TailscaleIPs: ["100.64.0.8"] },
+      } });
+      const list = (await pcs.listTailnetPcs({ statusJson: fake, probe: false })).pcs;
+      assert.equal(list.find((x) => x.name === "labserver")?.canWake, true);
+      assert.equal(list.find((x) => x.name === "other")?.canWake, undefined);
+
+      wol.offlineSent.length = 0;
+      const sent = await wakepc.wakeTarget("labserver", { by: "test" });
+      assert.equal(sent.to, "255.255.255.255:9");
+      assert.deepEqual(wol.offlineSent, [{ mac: "94:de:80:f6:ed:00", broadcast: "255.255.255.255", port: 9 }]);
+      await assert.rejects(wakepc.wakeTarget("other"), /not set up/);
+
+      // From the dashboard container: a short-lived container on the host network, values as argv only.
+      const args = wakepc.hostSenderArgs({ mac: "94:de:80:f6:ed:00", broadcast: "192.168.31.255", port: 9 }, "paasmcp/dashboard:abc");
+      assert.deepEqual(args.slice(0, 4), ["run", "--rm", "--network", "host"]);
+      assert.ok(args.includes("--cap-drop") && args.includes("--read-only"));
+      assert.deepEqual(args.slice(-3), ["94:de:80:f6:ed:00", "192.168.31.255", "9"]);
+      assert.throws(() => wakepc.hostSenderArgs({ mac: "94:de:80:f6:ed:00", broadcast: "1.2.3.255", port: 9 }, "x"), /home or office/);
+
+      // MCP: a read token lists, only a deploy token turns a PC on.
+      const call = async (args: Record<string, unknown>, lvl: "read" | "deploy") => (await mcp.handleToolCall("paas_pcs", args, lvl)).content[0].text;
+      assert.match(await call({ action: "wake", name: "labserver" }, "read"), /deploy/i, "a read token cannot turn a PC on");
+      assert.match(await call({ action: "wake", name: "labserver" }, "deploy"), /"sent": true/);
+
+      assert.deepEqual(wakepc.removeWakeTarget("labserver"), { name: "labserver", removed: true });
+      assert.deepEqual(wakepc.removeWakeTarget("labserver"), { name: "labserver", removed: false });
+    } finally {
+      const st = config.loadState();
+      if (before) st.wakeTargets = before;
+      else delete st.wakeTargets;
+      config.saveState(st);
+    }
+  });
+
   await t.test("62. App files at the person's own account: tested, same variables, guarded switch, never copied by the mirror", async () => {
     const offsite = await import("./offsite.js");
     const storage = await import("./storage.js");

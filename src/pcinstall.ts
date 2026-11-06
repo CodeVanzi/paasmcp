@@ -33,6 +33,8 @@ export interface TailnetPc {
   ssh?: PcSsh;
   /** Its Tailscale SSH host keys are known (the identity check needs no question). */
   hostKeysKnown?: boolean;
+  /** This server can turn it on by Wake-on-LAN ("Ligar", wakepc.ts). */
+  canWake?: boolean;
 }
 
 /** PCs installed from this dashboard (kept so the list knows them even before anything answers). */
@@ -128,6 +130,7 @@ export async function listTailnetPcs(opts: { statusJson?: string; probe?: boolea
   const { peers, selfIp, error } = listTailscalePeers(opts.statusJson);
   if (error) return { pcs: [], error };
   const known = knownPaasmcpIps();
+  const wakeable = new Set(Object.keys(loadState().wakeTargets || {}));
   const probe = opts.probe ?? !OFFLINE();
   const pcs = await Promise.all(
     peers.slice(0, 100).map(async (p): Promise<TailnetPc> => {
@@ -149,6 +152,7 @@ export async function listTailnetPcs(opts: { statusJson?: string; probe?: boolea
         roles: [...roles].sort(),
         ...(ssh ? { ssh } : {}),
         ...(p.sshHostKeys?.length ? { hostKeysKnown: true } : {}),
+        ...(wakeable.has(p.name.toLowerCase()) ? { canWake: true } : {}),
       };
     })
   );

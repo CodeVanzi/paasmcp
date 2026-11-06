@@ -383,6 +383,8 @@ export interface PaaSState {
   federation?: FederationConfig;
   /** PCs that run extra copies of apps (pool.ts). */
   pool?: PoolConfig;
+  /** PCs of the same home network this server turns on by hand, by Tailscale name (wakepc.ts). */
+  wakeTargets?: Record<string, WakeTargetRecord>;
   /** Measuring for automatic scaling (scale.ts). */
   scale?: {
     /** Language of the decision diary in the CLI, the MCP tool and the log (the dashboard follows its own switch). */
@@ -390,6 +392,14 @@ export interface PaaSState {
     /** Set by `paasmcp scale install-timer`. */
     timer?: { seconds: number; installedAt: string };
   };
+}
+
+export interface WakeTargetRecord {
+  mac: string;
+  /** Broadcast address of the PC's network (private ranges or 255.255.255.255). */
+  broadcast: string;
+  port: number;
+  addedAt: string;
 }
 
 export const HOMELAB_ROOT = process.env.PAASMCP_ROOT || "/opt/homelab";
