@@ -3686,6 +3686,158 @@ volumes:
     }
   });
 
+  await t.test("42. Connections: Cloudflare from one token (account, domain, tunnel found or created) and GitHub token check", async () => {
+    const conn = await import("./connections.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const http = await import("node:http");
+    const vm = await import("node:vm");
+    const ACC = "0123456789abcdef0123456789abcdef";
+    const CF_TOKEN = "t".repeat(40);
+    const GH_TOKEN = "github_pat_" + "g".repeat(30);
+    const tunnels: { id: string; name: string; status: string; remote_config: boolean }[] = [
+      { id: "11111111-2222-3333-4444-555555555555", name: "casa", status: "healthy", remote_config: true },
+      { id: "66666666-2222-3333-4444-555555555555", name: "old", status: "down", remote_config: false },
+    ];
+    let created = 0;
+    const seenAuth: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const u = new URL(req.url || "/", "http://x");
+        const p = u.pathname;
+        const auth = String(req.headers.authorization || "");
+        seenAuth.push(auth);
+        const ok = (r: unknown) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ success: true, result: r }));
+        if (p === "/gh/user") {
+          if (auth !== `Bearer ${GH_TOKEN}`) return res.writeHead(401).end("{}");
+          return res.writeHead(200).end(JSON.stringify({ login: "octo-cat", name: "Octo" }));
+        }
+        if (auth !== `Bearer ${CF_TOKEN}`) return res.writeHead(403).end(JSON.stringify({ success: false }));
+        if (p === "/accounts") return ok([{ id: ACC, name: "Home" }, { id: "not-an-id", name: "x" }]);
+        if (p === "/zones") return ok([{ id: "z1", name: "loja.dev", status: "active", account: { id: ACC } }, { id: "z2", name: "pending.dev", status: "pending", account: { id: ACC } }]);
+        if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "GET") return ok(tunnels);
+        if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "POST") {
+          const body = JSON.parse(raw);
+          assert.equal(body.config_src, "cloudflare", "only remotely managed tunnels take addresses from the API");
+          created++;
+          const tun = { id: "77777777-2222-3333-4444-555555555555", name: body.name, status: "inactive", remote_config: true };
+          tunnels.push(tun);
+          return ok(tun);
+        }
+        if (p.endsWith("/token")) return ok("eyJ" + "k".repeat(60));
+        if (p === `/accounts/${ACC}/access/apps`) return res.writeHead(403).end(JSON.stringify({ success: false }));
+        res.writeHead(404).end(JSON.stringify({ success: false }));
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const port = (srv.address() as { port: number }).port;
+    process.env.PAASMCP_CF_API_URL = `http://127.0.0.1:${port}`;
+    process.env.PAASMCP_GITHUB_API_URL = `http://127.0.0.1:${port}/gh`;
+    const before = config.loadState().cloudflare;
+    const sysBefore = vault.getSecrets("system");
+    try {
+      const st0 = config.loadState();
+      st0.cloudflare = { ...st0.cloudflare, accountId: "", tunnelId: "", baseDomain: "example.com" };
+      config.saveState(st0);
+      vault.deleteSecretKey("system", "CF_API_TOKEN");
+
+      // Bad or refused tokens: a clear message in Portuguese, nothing saved.
+      await assert.rejects(conn.discoverCloudflare("short"), (e: InstanceType<typeof conn.ConnectionError>) => /token/.test(e.pt));
+      await assert.rejects(conn.discoverCloudflare("x".repeat(40)), (e: InstanceType<typeof conn.ConnectionError>) => /recusou/.test(e.pt));
+      await assert.rejects(conn.discoverCloudflare(), /Paste the Cloudflare token first/);
+
+      const found = await conn.discoverCloudflare(CF_TOKEN);
+      assert.equal(found.accounts.length, 1, "ids that are not account ids are dropped");
+      assert.deepEqual(found.zones.map((z) => z.name), ["loja.dev"], "only active domains");
+      assert.equal(found.accounts[0].tunnels.length, 2);
+      assert.equal(found.accounts[0].tunnels[1].remote, false);
+      assert.deepEqual(found.missing, ["access"], "a token without Access is reported, not refused");
+      assert.equal(vault.getSecrets("system").CF_API_TOKEN, undefined, "checking saves nothing");
+
+      const noConfirm = () => assert.fail("first connection needs no confirmation");
+      await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "other.dev", tunnelId: "new" }, noConfirm), /DNS/);
+      await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "loja.dev", tunnelId: tunnels[1].id }, noConfirm), /local file/);
+      await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "loja.dev", tunnelId: "new", zeroTrustEmails: "a@b.com, nope" }, noConfirm), /Invalid email/);
+
+      // A new tunnel: created once, its connector files written here (token only in the 0600 .env).
+      const r = await conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "loja.dev", tunnelId: "new", zeroTrustEmails: "a@b.com; c@d.com" }, noConfirm);
+      assert.equal(r.created, true);
+      assert.equal(created, 1);
+      const st = config.loadState();
+      assert.equal(st.cloudflare.tunnelId, "77777777-2222-3333-4444-555555555555");
+      assert.equal(st.cloudflare.baseDomain, "loja.dev");
+      assert.deepEqual(st.cloudflare.zeroTrustEmails, ["a@b.com", "c@d.com"]);
+      assert.equal(vault.getSecrets("system").CF_API_TOKEN, CF_TOKEN);
+      assert.ok(vault.getSecrets("system").MAIN_TUNNEL_TOKEN?.startsWith("eyJ"));
+      const env = path.join(conn.MAIN_TUNNEL_DIR, ".env");
+      assert.equal(fs.statSync(env).mode & 0o777, 0o600);
+      const compose = fs.readFileSync(path.join(conn.MAIN_TUNNEL_DIR, "compose.yaml"), "utf-8");
+      assert.ok(compose.includes(config.DOCKER_NETWORK) && !compose.includes("eyJ"), "token stays out of the compose file");
+
+      // Saving "new" again reuses the same tunnel, without asking.
+      await conn.saveCloudflare({ accountId: ACC, baseDomain: "loja.dev", tunnelId: "new" }, noConfirm);
+      assert.equal(created, 1);
+      // Moving to another tunnel is confirmed.
+      let asked: Record<string, unknown> | undefined;
+      await conn.saveCloudflare({ accountId: ACC, baseDomain: "loja.dev", tunnelId: tunnels[0].id }, (p) => { asked = p; });
+      assert.equal(asked?.replacing, true);
+      assert.equal(config.loadState().cloudflare.tunnelId, tunnels[0].id);
+      const sum = conn.connectionsSummary() as { cloudflare: { ready: boolean; tokenSaved: boolean } };
+      assert.equal(sum.cloudflare.ready, true);
+      assert.ok(!JSON.stringify(sum).includes(CF_TOKEN), "the summary never carries the token");
+
+      // GitHub: refused, then accepted and saved.
+      vault.deleteSecretKey("system", "GITHUB_TOKEN");
+      await assert.rejects(conn.checkGitHub("github_pat_" + "x".repeat(30)), (e: InstanceType<typeof conn.ConnectionError>) => /recusou/.test(e.pt));
+      await assert.rejects(conn.checkGitHub("bad token!"), /GitHub token/);
+      const gh = await conn.checkGitHub(GH_TOKEN);
+      assert.equal(gh.login, "octo-cat");
+      assert.equal(gh.kind, "fine-grained");
+      assert.equal(vault.getSecrets("system").GITHUB_TOKEN, GH_TOKEN);
+
+      // Over HTTP: tokens never come back, errors carry Portuguese text, replacing asks first.
+      const dashToken = dashboard.getOrCreateDashboardToken();
+      const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+      await new Promise((r) => dsrv.once("listening", r));
+      const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+      try {
+        assert.equal((await fetch(`${baseUrl}/api/connections`)).status, 401);
+        const secret = totp.getDashboardTotpSecret();
+        const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+        const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+        const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+        const info = await (await fetch(`${baseUrl}/api/connections`, { headers: { cookie } })).text();
+        assert.ok(!info.includes(CF_TOKEN) && !info.includes(GH_TOKEN));
+        const disc = await (await post("/api/connections/cloudflare/discover", {})).text();
+        assert.ok(disc.includes("loja.dev") && !disc.includes(CF_TOKEN), "the saved token is used, not echoed");
+        const bad = await post("/api/connections/cloudflare/discover", { token: "nope" });
+        assert.equal(bad.status, 400);
+        assert.ok((await bad.json()).errorPt);
+        assert.equal((await post("/api/connections/cloudflare", { accountId: ACC, baseDomain: "loja.dev", tunnelId: "new" })).status, 409);
+        assert.equal((await post("/api/connections/cloudflare", { accountId: ACC, baseDomain: "loja.dev", tunnelId: "new", confirmed: true })).status, 200);
+        const ghr = await (await post("/api/connections/github", {})).json();
+        assert.equal(ghr.login, "octo-cat", "the saved GitHub token can be re-tested");
+        const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+        for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+        assert.ok(page.includes('id="tab-connect"') && page.includes("cfDiscover(") && page.includes("permissionGroupKeys"));
+      } finally {
+        dsrv.close();
+      }
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_CF_API_URL;
+      delete process.env.PAASMCP_GITHUB_API_URL;
+      const st = config.loadState();
+      st.cloudflare = before;
+      config.saveState(st);
+      vault.deleteSecretKey("system", "MAIN_TUNNEL_TOKEN");
+      if (sysBefore.CF_API_TOKEN) vault.setSecretEntries("system", { CF_API_TOKEN: sysBefore.CF_API_TOKEN }); else vault.deleteSecretKey("system", "CF_API_TOKEN");
+      if (sysBefore.GITHUB_TOKEN) vault.setSecretEntries("system", { GITHUB_TOKEN: sysBefore.GITHUB_TOKEN }); else vault.deleteSecretKey("system", "GITHUB_TOKEN");
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
