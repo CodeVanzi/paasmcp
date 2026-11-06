@@ -174,7 +174,22 @@ export interface TailscalePeer {
   ip: string;
   os?: string;
   online: boolean;
+  /** Shared into this network from another account (not one of the owner's own devices). */
+  shared?: boolean;
+  /** Belongs to another user of the network (a tagged device has no user and is not "other"). */
+  otherOwner?: boolean;
+  /** Tailscale tags (tag:...), when the device has any. */
+  tags?: string[];
+  /** SSH host keys the device told Tailscale about (only while its Tailscale SSH is on). */
+  sshHostKeys?: string[];
 }
+
+type RawPeer = {
+  HostName?: string; DNSName?: string; OS?: string; Online?: boolean; TailscaleIPs?: string[];
+  UserID?: number; ShareeNode?: boolean; Tags?: string[]; sshHostKeys?: string[];
+};
+const TAG_RE = /^tag:[A-Za-z0-9-]{1,60}$/;
+const HOST_KEY_RE = /^(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) [A-Za-z0-9+/]{40,1000}={0,3}$/;
 
 /**
  * The other devices of this Tailscale network, from `tailscale status --json` (`statusJson` in tests).
@@ -190,7 +205,7 @@ export function listTailscalePeers(statusJson?: string): { peers: TailscalePeer[
       return { peers: [], error: "noTailscale" };
     }
   }
-  let parsed: { Self?: { TailscaleIPs?: string[] }; Peer?: Record<string, { HostName?: string; DNSName?: string; OS?: string; Online?: boolean; TailscaleIPs?: string[] }> };
+  let parsed: { Self?: { TailscaleIPs?: string[]; UserID?: number }; Peer?: Record<string, RawPeer> };
   try {
     parsed = JSON.parse(raw);
   } catch {
@@ -202,6 +217,10 @@ export function listTailscalePeers(statusJson?: string): { peers: TailscalePeer[
       ip: (p.TailscaleIPs || []).find((x) => IPV4.test(x)) || "",
       ...(p.OS ? { os: String(p.OS).slice(0, 20) } : {}),
       online: p.Online !== false,
+      ...(p.ShareeNode === true ? { shared: true } : {}),
+      ...(!(p.Tags || []).length && typeof p.UserID === "number" && typeof parsed.Self?.UserID === "number" && p.UserID !== parsed.Self.UserID ? { otherOwner: true } : {}),
+      ...((p.Tags || []).length ? { tags: (p.Tags || []).filter((t) => TAG_RE.test(String(t))).slice(0, 20) } : {}),
+      ...((p.sshHostKeys || []).length ? { sshHostKeys: (p.sshHostKeys || []).map((k) => String(k).trim().split(/\s+/).slice(0, 2).join(" ")).filter((k) => HOST_KEY_RE.test(k)).slice(0, 10) } : {}),
     }))
     .slice(0, 200);
   return { peers, selfIp: (parsed.Self?.TailscaleIPs || []).find((x) => IPV4.test(x)) };

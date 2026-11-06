@@ -602,6 +602,17 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   suspend is shorter than the load sleeps with copies on it (the balancer stops sending it visits within
   about 6 s, and it is woken again while its copy is still wanted).
 
+## 10e-1. PCs of your Tailscale (`src/pcinstall.ts`)
+
+**Connections → PCs** lists every device of `tailscale status --json` (`listTailscalePeers`, which now
+also keeps `ShareeNode`, the owner compared with `Self.UserID`, valid tags and valid `sshHostKeys`) and
+marks each one: *runs PaaSMCP* (an IP this server already knows as the other server of a pair, a helper, a
+federation peer or a PC installed from this dashboard, or an arbiter answering on `:4097`), *no PaaSMCP*
+(online Linux device of the owner), *off*, or *not possible here* (not Linux, shared from another
+account, another user's device, no IPv4). Only online Linux devices of the owner are probed, with two
+read-only probes: the arbiter's `/health` and the first line of port 22 (`SSH-2.0-Tailscale` vs OpenSSH),
+which says how the dashboard could log in there. Nothing logs in anywhere.
+
 ## 10f. Dashboard layout (`src/dashboard.ts`)
 
 One page, three columns: a side menu, the page, and telemetry (host, resources, and a "quick health" box whose lines

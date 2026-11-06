@@ -3,6 +3,7 @@ import { deploySummary } from "./deploys.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { arbiterInstallCommand, PairError } from "./arbiter.js";
 import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { listTailnetPcs } from "./pcinstall.js";
 import { acceptMirror, checkArbiter, pairArbiterAndSave, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
@@ -1047,6 +1048,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
         // Pair with a PC that shows a code (its dashboard's “Be the arbiter of another pair”).
         if (pathname === "/api/mirror/arbiter/candidates" && req.method === "GET") return reply(await findJudgeCandidates());
+        if (pathname === "/api/pcs" && req.method === "GET") return reply(await listTailnetPcs());
         if (pathname === "/api/mirror/arbiter/pair" && req.method === "POST") {
           const body = await readJsonBody(req);
           try {
@@ -2836,6 +2838,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <button onclick="ntSave()" id="btnNtSave" data-i18n="ntSave"></button>
             </div>
             <div class="ofs-msg" id="ntMsg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="card" data-sub="pcs">
+            <div class="card-header">
+              <h2 data-i18n="pcsTitle"></h2>
+              <p class="card-desc" data-i18n="pcsDesc"></p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+              <button class="secondary" onclick="loadPcs()" id="btnPcsLoad" data-i18n="pcsRefresh"></button>
+            </div>
+            <div id="pcsBox"></div>
           </div>
         </div>
 
@@ -5046,7 +5058,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     Object.assign(I18N.pt, {
       "navConnect": "Conexões",
-      "lead_connect": "Ligue a Cloudflare e o GitHub uma vez, aqui mesmo. Nada de terminal nem de IDs para copiar.",
+      "lead_connect": "Ligue a Cloudflare e o GitHub uma vez, aqui mesmo, e veja os PCs da sua Tailscale. Nada de terminal nem de IDs para copiar.",
       "sub_connect_cloudflare": "Domínio (Cloudflare)",
       "sub_connect_github": "GitHub",
       "cntConnect": "{n} conexões ligadas",
@@ -5116,7 +5128,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
     Object.assign(I18N.en, {
       "navConnect": "Connections",
-      "lead_connect": "Connect Cloudflare and GitHub once, right here. No terminal, no ids to copy.",
+      "lead_connect": "Connect Cloudflare and GitHub once, right here, and see the PCs of your Tailscale. No terminal, no ids to copy.",
       "sub_connect_cloudflare": "Domain (Cloudflare)",
       "sub_connect_github": "GitHub",
       "cntConnect": "{n} connections on",
@@ -5814,6 +5826,56 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     Object.assign(I18N.pt, {
+      "sub_connect_pcs": "PCs",
+      "pcsTitle": "🖥️ PCs da sua Tailscale",
+      "pcsDesc": "Todos os aparelhos da sua rede Tailscale, e quais já têm o PaaSMCP. Daqui o painel só olha: não entra em nenhum PC.",
+      "pcsRefresh": "Procurar de novo",
+      "pcsLooking": "Procurando os aparelhos da Tailscale...",
+      "pcsNoTs": "O painel não achou a Tailscale neste servidor. Confira se ela está instalada e conectada (tailscale status).",
+      "pcsNone": "A Tailscale não mostra nenhum outro aparelho. Instale a Tailscale no outro PC e entre com a mesma conta.",
+      "pcsHas": "Tem PaaSMCP",
+      "pcsRole_pair": "o outro servidor do par",
+      "pcsRole_helper": "ajudante",
+      "pcsRole_federation": "servidor ligado",
+      "pcsRole_arbiter": "juiz",
+      "pcsRole_installed": "instalado por este painel",
+      "pcsCan": "Sem PaaSMCP",
+      "pcsOffline": "Desligado",
+      "pcsWhy_notLinux": "Não é Linux",
+      "pcsWhy_shared": "Compartilhado de outra conta",
+      "pcsWhy_otherOwner": "De outra pessoa da rede",
+      "pcsWhy_noIp": "Sem endereço Tailscale",
+      "pcsSsh_tailscale": "Entrada sem senha: o SSH da Tailscale está ligado nele.",
+      "pcsSsh_openssh": "Entrada com a senha do PC (SSH ligado).",
+      "pcsSsh_other": "Algo responde na porta do SSH, mas não parece um SSH conhecido.",
+      "pcsSsh_closed": "Nenhum SSH responde nele. Para instalar daqui, ligue o SSH da Tailscale (sudo tailscale set --ssh) ou o SSH comum (sudo apt install openssh-server)."
+    });
+    Object.assign(I18N.en, {
+      "sub_connect_pcs": "PCs",
+      "pcsTitle": "🖥️ PCs of your Tailscale",
+      "pcsDesc": "Every device of your Tailscale network, and which ones already run PaaSMCP. From here the dashboard only looks: it logs in nowhere.",
+      "pcsRefresh": "Look again",
+      "pcsLooking": "Looking for the Tailscale devices...",
+      "pcsNoTs": "The dashboard did not find Tailscale on this server. Check that it is installed and connected (tailscale status).",
+      "pcsNone": "Tailscale shows no other device. Install Tailscale on the other PC and sign in with the same account.",
+      "pcsHas": "Runs PaaSMCP",
+      "pcsRole_pair": "the other server of the pair",
+      "pcsRole_helper": "helper",
+      "pcsRole_federation": "linked server",
+      "pcsRole_arbiter": "arbiter",
+      "pcsRole_installed": "installed from this dashboard",
+      "pcsCan": "No PaaSMCP",
+      "pcsOffline": "Off",
+      "pcsWhy_notLinux": "Not Linux",
+      "pcsWhy_shared": "Shared from another account",
+      "pcsWhy_otherOwner": "Someone else's in the network",
+      "pcsWhy_noIp": "No Tailscale address",
+      "pcsSsh_tailscale": "Login without a password: Tailscale SSH is on there.",
+      "pcsSsh_openssh": "Login with the PC's password (SSH is on).",
+      "pcsSsh_other": "Something answers on the SSH port, but it does not look like a known SSH.",
+      "pcsSsh_closed": "No SSH answers there. To install from here, turn on Tailscale SSH (sudo tailscale set --ssh) or regular SSH (sudo apt install openssh-server)."
+    });
+    Object.assign(I18N.pt, {
       "sub_connect_alerts": "Avisos",
       "ntTitle": "🔔 Avisos no celular ou no chat",
       "ntDesc": "O painel avisa quando uma publicação automática (git push ou atualização sozinha) falha e quando um app para sozinho, e de novo quando ele volta. Assim você fica sabendo sem abrir o painel.",
@@ -6069,7 +6131,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       mirror: ['connect', 'copy', 'judge', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
       agents: ['connect', 'examples'],
-      connect: ['cloudflare', 'github', 'alerts'],
+      connect: ['cloudflare', 'github', 'alerts', 'pcs'],
     };
     let activeSubs = {};
     try { activeSubs = JSON.parse(localStorage.getItem('paasmcp_active_subs') || '{}') || {}; } catch { activeSubs = {}; }
@@ -6187,6 +6249,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       renderSubNav();
       if (tab === 'guide') { if (sub) currentGuide = sub; renderGuide(); }
       if (tab === 'overview' && currentSub('overview') === 'webhook' && (moved || mode === 'init')) loadHooks();
+      if (tab === 'connect' && currentSub('connect') === 'pcs' && (moved || mode === 'init')) loadPcs();
       const hash = '#' + tab + (subs ? '/' + currentSub(tab) : tab === 'guide' && currentGuide ? '/' + currentGuide : '');
       if (mode !== 'hash' && location.hash !== hash) {
         try {
@@ -7869,6 +7932,34 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!res.ok) { if (!data.confirmationRequired) alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
       showToast(t('toastUnexposed') + data.removed);
       loadAll();
+    }
+    // Connections > PCs: the devices of the Tailscale network, with and without PaaSMCP.
+    async function loadPcs() {
+      const box = document.getElementById('pcsBox');
+      const btn = document.getElementById('btnPcsLoad');
+      if (!box) return;
+      btn.disabled = true;
+      box.innerHTML = '<p class="card-desc">' + esc(t('pcsLooking')) + '</p>';
+      try {
+        const res = await fetch('/api/pcs');
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { box.innerHTML = badge('danger', d.error || 'error'); return; }
+        if (d.error) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNoTs')) + '</p>'; return; }
+        const list = d.pcs || [];
+        if (!list.length) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNone')) + '</p>'; return; }
+        box.innerHTML = list.map(pcRow).join('');
+      } finally { btn.disabled = false; }
+    }
+    function pcRow(x) {
+      let tag;
+      if (x.state === 'paasmcp') tag = badge('success', t('pcsHas')) + (x.roles || []).map(r => ' ' + badge('', t('pcsRole_' + r))).join('');
+      else if (x.state === 'installable') tag = badge('warning', t('pcsCan'));
+      else if (x.state === 'offline') tag = badge('', t('pcsOffline'));
+      else tag = badge('', t('pcsWhy_' + (x.why || 'notLinux')));
+      const ssh = x.state === 'installable' && x.ssh ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('pcsSsh_' + x.ssh)) + '</div>' : '';
+      return '<div class="pc-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border);">' +
+        '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip || '') + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + ssh + '</div>' +
+        '<div class="pc-actions" data-ip="' + esc(x.ip || '') + '"></div></div>';
     }
     async function loadConnections() {
       const link = document.getElementById('cfTokenLink');
