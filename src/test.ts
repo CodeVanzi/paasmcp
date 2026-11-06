@@ -3936,6 +3936,50 @@ volumes:
     }
   });
 
+  await t.test("45. GitHub token: never in the clone URL or .git/config, and the repository list for Publish", async () => {
+    const conn = await import("./connections.js");
+    const http = await import("node:http");
+    const TOKEN = "github_pat_" + "r".repeat(30);
+    const before = vault.getSecrets("system").GITHUB_TOKEN;
+    vault.setSecretEntries("system", { GITHUB_TOKEN: TOKEN });
+    const srv = http.createServer((req, res) => {
+      if (req.headers.authorization !== `Bearer ${TOKEN}`) return res.writeHead(401).end("{}");
+      if ((req.url || "").startsWith("/gh/user/repos")) {
+        return res.writeHead(200).end(JSON.stringify([
+          { full_name: "octo/shop", private: true, default_branch: "trunk", pushed_at: "2026-11-05T00:00:00Z", language: "TypeScript" },
+          { full_name: "octo/bad name;rm", private: false, default_branch: "main" },
+          { full_name: "octo/site", private: false, default_branch: "--upload-pack=x" },
+        ]));
+      }
+      res.writeHead(404).end("{}");
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GITHUB_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}/gh`;
+    try {
+      const url = github.resolveGitUrl("octo/shop");
+      assert.equal(url, "https://github.com/octo/shop.git");
+      assert.ok(!url.includes(TOKEN));
+      const env = github.gitEnv();
+      const n = Number(process.env.GIT_CONFIG_COUNT || 0);
+      assert.equal(env.GIT_CONFIG_COUNT, String(n + 1), "added after the entries already there");
+      assert.equal(env[`GIT_CONFIG_KEY_${n}`], "http.https://github.com/.extraheader");
+      assert.equal(Buffer.from(String(env[`GIT_CONFIG_VALUE_${n}`]).replace("Authorization: Basic ", ""), "base64").toString(), `x-access-token:${TOKEN}`);
+      const repos = await conn.listGitHubRepos();
+      assert.deepEqual(repos.map((r) => r.fullName), ["octo/shop", "octo/site"], "odd names are dropped");
+      assert.equal(repos[0].private, true);
+      assert.equal(repos[0].defaultBranch, "trunk");
+      assert.equal(repos[1].defaultBranch, "main", "a branch that looks like an option falls back to main");
+      vault.deleteSecretKey("system", "GITHUB_TOKEN");
+      assert.equal(github.gitEnv().GIT_CONFIG_COUNT, process.env.GIT_CONFIG_COUNT, "no header without a token");
+      assert.equal(github.resolveGitUrl("octo/shop"), "git@github.com:octo/shop.git");
+      await assert.rejects(conn.listGitHubRepos(), /No GitHub token/);
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_GITHUB_API_URL;
+      if (before) vault.setSecretEntries("system", { GITHUB_TOKEN: before }); else vault.deleteSecretKey("system", "GITHUB_TOKEN");
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

@@ -13,8 +13,7 @@ import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./a
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
-import { registerGitHubDeployKey } from "./github.js";
-import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, saveCloudflare } from "./connections.js";
+import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, listGitHubRepos, saveCloudflare } from "./connections.js";
 import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
@@ -822,11 +821,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           );
           return reply({ ...r, summary: connectionsSummary() });
         }
-        if (pathname === "/api/connections/github/key" && req.method === "POST") {
-          const body = await readJsonBody(req);
-          const r = await registerGitHubDeployKey(String(body.repo || ""));
-          return reply({ registered: r.registered, message: r.message });
-        }
+        if (pathname === "/api/connections/github/repos" && req.method === "GET") return reply({ repos: await listGitHubRepos() });
         if (pathname === "/api/connections/github" && req.method === "POST") {
           const body = await readJsonBody(req);
           return reply(await checkGitHub(body.token));
@@ -1193,6 +1188,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .sec-paste textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     .dep-more { margin: 4px 0 14px; }
     .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+    .dep-pick { margin: -4px 0 14px; max-width: 520px; }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -2218,6 +2214,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input id="depBranch" placeholder="main" value="main" />
                 </div>
               </div>
+              <div id="depRepoPick" class="dep-pick"></div>
               <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; font-size:12.5px; flex-wrap:wrap;">
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depPg" style="width:auto;" />
@@ -2571,13 +2568,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div><button onclick="ghSave()" id="btnGhSave" data-i18n="cnBtnGhSave"></button></div>
             </div>
             <div class="ofs-msg" id="ghMsg" role="status" aria-live="polite"></div>
-            <div id="ghKeyBox" style="display:none;margin-top:12px;">
-              <div class="form-grid" style="grid-template-columns:minmax(0,1fr) auto;align-items:end;">
-                <div><label class="field-label" for="ghRepo" data-i18n="cnGhRepo"></label><input id="ghRepo" placeholder="voce/meu-app" autocomplete="off" /></div>
-                <div><button class="secondary" onclick="ghKey()" data-i18n="cnBtnGhKey"></button></div>
-              </div>
-              <div class="ofs-msg" id="ghKeyMsg" role="status" aria-live="polite"></div>
-            </div>
           </div>
         </div>
 
@@ -4548,17 +4538,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "cnGhKeyTitle": "Opção 1: chave de leitura (mais segura)",
       "cnGhKeyDesc": "No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole a chave abaixo e deixe “Allow write access” desmarcado. Repita em cada repositório privado.",
       "cnBtnCopyKey": "Copiar chave",
-      "cnGhTokenTitle": "Opção 2: token (o painel cadastra a chave sozinho)",
-      "cnGhTokenDesc": "Crie um token “fine-grained”, escolha só os repositórios que vai publicar e dê a permissão Administration: Read and write. O painel usa o token só para cadastrar a chave de leitura nos repositórios que você indicar abaixo.",
+      "cnGhTokenTitle": "Opção 2: token (mais prático)",
+      "cnGhTokenDesc": "Crie um token “fine-grained”, escolha só os repositórios que vai publicar e dê a permissão Contents: Read-only. Com ele, Publicar um app mostra a lista dos seus repositórios e o painel baixa o código privado sozinho, sem colar chave em cada repositório.",
       "cnGhTokenLink": "Criar token no GitHub ↗",
       "cnGhToken": "Token do GitHub",
       "cnBtnGhSave": "Testar e salvar",
       "cnGhOk": "Token salvo. Ele é da conta @{login}.",
       "cnGhSaved": "Token salvo",
-      "cnGhSavedDesc": "Indique abaixo cada repositório privado e o painel cadastra a chave de leitura nele.",
-      "cnGhRepo": "Repositório privado (dono/nome)",
-      "cnBtnGhKey": "Cadastrar a chave",
-      "cnGhKeyOk": "Chave de leitura cadastrada em {repo}. Já dá para publicar.",
+      "cnGhSavedDesc": "Publicar um app já mostra a lista dos seus repositórios.",
       "cnGhNoToken": "Sem token",
       "cnGhNoTokenDesc": "Tudo bem para código público ou com a chave de leitura (opção 1).",
       "exposeNeedCf": "Para publicar com o seu domínio, ligue a Cloudflare em Conexões primeiro. O modo Tailscale funciona sem ela.",
@@ -4621,17 +4608,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "cnGhKeyTitle": "Option 1: read-only key (safest)",
       "cnGhKeyDesc": "On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste the key below and leave “Allow write access” unticked. Repeat for each private repository.",
       "cnBtnCopyKey": "Copy key",
-      "cnGhTokenTitle": "Option 2: token (the dashboard adds the key by itself)",
-      "cnGhTokenDesc": "Create a fine-grained token, pick only the repositories you will publish and give it Administration: Read and write. The dashboard only uses it to add the read-only key to the repositories you name below.",
+      "cnGhTokenTitle": "Option 2: token (easiest)",
+      "cnGhTokenDesc": "Create a fine-grained token, pick only the repositories you will publish and give it Contents: Read-only. With it, Publish an app lists your repositories and the dashboard fetches private code by itself, with no key to paste in each repository.",
       "cnGhTokenLink": "Create a token on GitHub ↗",
       "cnGhToken": "GitHub token",
       "cnBtnGhSave": "Test and save",
       "cnGhOk": "Token saved. It belongs to @{login}.",
       "cnGhSaved": "Token saved",
-      "cnGhSavedDesc": "Name each private repository below and the dashboard adds the read-only key to it.",
-      "cnGhRepo": "Private repository (owner/name)",
-      "cnBtnGhKey": "Add the key",
-      "cnGhKeyOk": "Read-only key added to {repo}. You can publish it now.",
+      "cnGhSavedDesc": "Publish an app now lists your repositories.",
       "cnGhNoToken": "No token",
       "cnGhNoTokenDesc": "Fine for public code or with the read-only key (option 1).",
       "exposeNeedCf": "To publish on your domain, connect Cloudflare under Connections first. Tailscale mode works without it.",
@@ -4735,11 +4719,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_github": "Ligar o GitHub para código privado",
       "guide_github_lead": "Só para repositórios privados. Uns 2 minutos.",
       "guide_github_s1": "Escolha entre chave e token",
-      "guide_github_s1Desc": "A chave de leitura é a mais segura: o servidor só consegue ler aquele repositório. O token poupa o trabalho de colar a chave em cada repositório.",
+      "guide_github_s1Desc": "A chave de leitura é a mais segura: o servidor só consegue ler aquele repositório. O token poupa o trabalho de colar a chave em cada repositório e mostra a lista dos seus repositórios ao publicar.",
       "guide_github_s2": "Com chave: cole no repositório",
       "guide_github_s2Desc": "Copie a chave em Conexões → GitHub. No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole e deixe “Allow write access” desmarcado.",
-      "guide_github_s3": "Com token: crie, teste e indique o repositório",
-      "guide_github_s3Desc": "Crie um token fine-grained só com os repositórios que vai publicar e a permissão Administration: Read and write. Cole em Conexões → GitHub, clique Testar e salvar, e escreva o repositório para o painel cadastrar a chave.",
+      "guide_github_s3": "Com token: crie e teste",
+      "guide_github_s3Desc": "Crie um token fine-grained só com os repositórios que vai publicar e a permissão Contents: Read-only. Cole em Conexões → GitHub e clique em Testar e salvar. Pronto: Publicar um app passa a mostrar a lista dos seus repositórios.",
       "lead_guide": ""
     });
     Object.assign(I18N.en, {
@@ -4839,11 +4823,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_github": "Connect GitHub for private code",
       "guide_github_lead": "Only for private repositories. About 2 minutes.",
       "guide_github_s1": "Choose between key and token",
-      "guide_github_s1Desc": "The read-only key is safest: the server can only read that repository. The token saves pasting the key into each repository.",
+      "guide_github_s1Desc": "The read-only key is safest: the server can only read that repository. The token saves pasting the key into each repository and lists your repositories when publishing.",
       "guide_github_s2": "With a key: paste it into the repository",
       "guide_github_s2Desc": "Copy the key under Connections → GitHub. On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste it and leave “Allow write access” unticked.",
-      "guide_github_s3": "With a token: create, test and name the repository",
-      "guide_github_s3Desc": "Create a fine-grained token with only the repositories you will publish and Administration: Read and write. Paste it under Connections → GitHub, click Test and save, and type the repository so the dashboard adds the key.",
+      "guide_github_s3": "With a token: create and test",
+      "guide_github_s3Desc": "Create a fine-grained token with only the repositories you will publish and Contents: Read-only. Paste it under Connections → GitHub and click Test and save. Done: Publish an app now lists your repositories.",
       "lead_guide": ""
     });
 
@@ -5013,6 +4997,27 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "sev_healthy": "All good",
       "sev_warning": "Warning",
       "sev_critical": "Problem"
+    });
+
+    Object.assign(I18N.pt, {
+      "pickLabel": "Ou escolha da sua lista do GitHub",
+      "pickChoose": "Escolha um repositório...",
+      "pickPrivate": "privado",
+      "pickPrivateNote": "Repositório privado: o painel baixa o código com o token salvo em Conexões.",
+      "pickLoading": "Buscando seus repositórios no GitHub...",
+      "pickEmpty": "O token do GitHub não enxerga nenhum repositório. Em Conexões → GitHub, crie um token com acesso aos repositórios que vai publicar.",
+      "pickNoToken": "Quer escolher da lista ou publicar código privado?",
+      "pickConnect": "Ligue o GitHub em Conexões"
+    });
+    Object.assign(I18N.en, {
+      "pickLabel": "Or pick from your GitHub list",
+      "pickChoose": "Pick a repository...",
+      "pickPrivate": "private",
+      "pickPrivateNote": "Private repository: the dashboard fetches the code with the token saved under Connections.",
+      "pickLoading": "Fetching your GitHub repositories...",
+      "pickEmpty": "The GitHub token sees no repository. Under Connections → GitHub, create a token with access to the repositories you will publish.",
+      "pickNoToken": "Want to pick from a list, or publish private code?",
+      "pickConnect": "Connect GitHub under Connections"
     });
 
     function esc(str) {
@@ -5351,6 +5356,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
       renderHome();
       renderExposeHint();
+      renderRepoPick();
       const search = document.getElementById('appSearchInput');
       if (search) search.placeholder = t('appSearch');
       renderAi();
@@ -6458,8 +6464,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const gs = document.getElementById('ghStatus');
       if (gs) gs.innerHTML = card(g.tokenSaved ? badge('success', t('cnGhSaved')) + ' <span style="color:var(--muted);">' + esc(t('cnGhSavedDesc')) + '</span>'
         : badge('', t('cnGhNoToken')) + ' <span style="color:var(--muted);">' + esc(t('cnGhNoTokenDesc')) + '</span>');
-      const kb = document.getElementById('ghKeyBox');
-      if (kb) kb.style.display = g.tokenSaved ? '' : 'none';
       const key = document.getElementById('ghSshKey');
       if (key && lastStatus) key.textContent = lastStatus.sshPublicKey || '';
       setNavCounter('tabCountConnect', (c.ready ? 1 : 0) + (g.tokenSaved ? 1 : 0), 'cntConnect');
@@ -6546,16 +6550,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!r) return;
       document.getElementById('ghToken').value = '';
       ofsMsg('ghMsg', t('cnGhOk').split('{login}').join(r.login), 'ok');
+      ghRepos = null;
       loadConnections();
       loadAll();
-    }
-    async function ghKey() {
-      const repo = document.getElementById('ghRepo').value.trim();
-      if (!repo) return;
-      ofsMsg('ghKeyMsg', t('cnChecking'), '');
-      const r = await ofsPost('/api/connections/github/key', { repo: repo }, 'ghKeyMsg');
-      if (!r) return;
-      ofsMsg('ghKeyMsg', r.registered ? t('cnGhKeyOk').split('{repo}').join(repo) : r.message, r.registered ? 'ok' : 'err');
     }
 
 
@@ -7429,6 +7426,46 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           btn.textContent = t('btnRunDoctor');
         }
       }
+    }
+
+    // Publish screen: pick the repository from the GitHub list (like Vercel's import) when a token is saved.
+    let ghRepos = null;
+    let ghReposLoading = false;
+    async function renderRepoPick() {
+      const box = document.getElementById('depRepoPick');
+      if (!box || !lastStatus) return;
+      const hasToken = Boolean((lastStatus.systemSecretsConfigured || {}).GITHUB_TOKEN);
+      if (!hasToken) {
+        box.innerHTML = '<p class="ofs-note">' + esc(t('pickNoToken')) + ' <a href="#connect/github">' + esc(t('pickConnect')) + '</a></p>';
+        return;
+      }
+      if (ghRepos === null && !ghReposLoading) {
+        ghReposLoading = true;
+        box.innerHTML = '<p class="ofs-note">' + esc(t('pickLoading')) + '</p>';
+        try {
+          const res = await fetch('/api/connections/github/repos');
+          const data = await res.json().catch(function () { return {}; });
+          if (!res.ok) { box.innerHTML = '<p class="ofs-note" style="color:var(--danger)">' + esc((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)) + '</p>'; ghReposLoading = false; return; }
+          ghRepos = data.repos || [];
+        } finally { ghReposLoading = false; }
+      }
+      if (!ghRepos) return;
+      if (!ghRepos.length) { box.innerHTML = '<p class="ofs-note">' + esc(t('pickEmpty')) + '</p>'; return; }
+      box.innerHTML = '<label class="field-label" for="depPick">' + esc(t('pickLabel')) + '</label>' +
+        '<select id="depPick" onchange="pickRepo(this.value)"><option value="">' + esc(t('pickChoose')) + '</option>' +
+        ghRepos.map(function (r) {
+          return '<option value="' + esc(r.fullName) + '">' + esc(r.fullName) + (r.private ? ' · ' + esc(t('pickPrivate')) : '') + (r.language ? ' · ' + esc(r.language) : '') + '</option>';
+        }).join('') + '</select><p class="ofs-note" id="depPickNote" style="margin-top:4px;"></p>';
+    }
+    function pickRepo(name) {
+      const r = (ghRepos || []).find(function (x) { return x.fullName === name; });
+      if (!r) return;
+      document.getElementById('depRepo').value = r.fullName;
+      document.getElementById('depBranch').value = r.defaultBranch || 'main';
+      const app = document.getElementById('depApp');
+      if (!app.value.trim()) app.value = r.fullName.split('/')[1].toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+      const note = document.getElementById('depPickNote');
+      if (note) note.textContent = r.private ? t('pickPrivateNote') : '';
     }
 
     async function deployNewApp() {

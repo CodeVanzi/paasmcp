@@ -289,3 +289,38 @@ export function connectionsSummary(): Record<string, unknown> {
     tailscaleDomain: state.tailscaleDomain || "",
   };
 }
+
+export interface GitHubRepo {
+  fullName: string;
+  private: boolean;
+  defaultBranch: string;
+  pushedAt: string;
+  language: string;
+}
+
+/** The repositories the saved GitHub token reaches, most recently changed first (for the Publish screen). */
+export async function listGitHubRepos(): Promise<GitHubRepo[]> {
+  const token = getSecrets("system").GITHUB_TOKEN || "";
+  if (!token) throw fail("No GitHub token saved.", "Nenhum token do GitHub salvo. Ligue em Conexões → GitHub.");
+  let res: Response;
+  try {
+    res = await fetch(`${ghApi()}/user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "paasmcp" },
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw fail("Could not reach GitHub from this server.", "Este servidor não conseguiu falar com o GitHub.");
+  }
+  if (res.status === 401) throw fail("GitHub refused the saved token.", "O GitHub recusou o token salvo. Ele pode ter expirado: salve um novo em Conexões → GitHub.");
+  if (!res.ok) throw fail(`GitHub answered HTTP ${res.status}.`, `O GitHub respondeu com erro (HTTP ${res.status}).`);
+  const list = (await res.json().catch(() => [])) as { full_name?: string; private?: boolean; default_branch?: string; pushed_at?: string; language?: string | null }[];
+  return (Array.isArray(list) ? list : [])
+    .filter((r) => /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(r.full_name || "")))
+    .map((r) => ({
+      fullName: String(r.full_name),
+      private: r.private === true,
+      defaultBranch: /^[A-Za-z0-9._\/-]{1,100}$/.test(String(r.default_branch || "")) ? String(r.default_branch) : "main",
+      pushedAt: String(r.pushed_at || ""),
+      language: String(r.language || "").slice(0, 40),
+    }));
+}
