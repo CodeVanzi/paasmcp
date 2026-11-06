@@ -431,3 +431,27 @@ export async function removeAppAddress(appName: string, hostname: string): Promi
   audit({ event: "app.unexpose", app: slug, hostname, mode: entry.mode });
   return { removed: entry.url, notes };
 }
+
+/**
+ * Before an app is deleted for good: takes its addresses off the air, so its tunnel route and DNS do
+ * not keep pointing at nothing. Never throws (the deletion goes on); says what it did or could not do.
+ */
+export async function releaseAddresses(appName: string): Promise<string> {
+  const app = loadState().apps[sanitizeSlug(appName)];
+  if (!app) return "";
+  const removable = app.domains.filter((d) => d.mode === "public" || d.mode === "zero-trust" || d.mode === "tailscale");
+  const done: string[] = [];
+  const failed: string[] = [];
+  for (const d of removable) {
+    try {
+      await removeAppAddress(app.name, d.hostname);
+      done.push(d.hostname);
+    } catch (err) {
+      failed.push(`${d.hostname} (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+  return [
+    done.length ? `Addresses taken off the air: ${done.join(", ")}.` : "",
+    failed.length ? `Could not take off the air: ${failed.join("; ")}. Remove them in Cloudflare or Tailscale.` : "",
+  ].filter(Boolean).join(" ");
+}

@@ -49,7 +49,7 @@ import {
   runPaaSDoctor,
   syncHomepageDashboard,
 } from "./deployer.js";
-import { exposeApplication, ExposeError, removeAppAddress } from "./exposure.js";
+import { exposeApplication, ExposeError, releaseAddresses, removeAppAddress } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -655,11 +655,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           if (action === "destroy" || action === "purge") {
             confirmFromBody(`app.${action}`, { appName: String(body.appName) }, body);
           }
+          const addressNote = action === "purge" && loadState().apps[sanitizeSlug(String(body.appName))]?.trashedAt ? await releaseAddresses(String(body.appName)) : "";
           const output = manageAppLifecycle(
             String(body.appName),
             action,
             body.tailLines ? Number(body.tailLines) : 120
-          );
+          ) + (addressNote ? `\n${addressNote}` : "");
           // Copies on helper PCs follow this server's copy, in the background.
           let poolNote = "";
           let pool: "updating" | "failed" | undefined;

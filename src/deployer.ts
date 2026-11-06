@@ -796,12 +796,15 @@ export type AppLifecycleAction =
   | "purge";
 
 /** Deletes apps that stayed in the trash longer than TRASH_RETENTION_DAYS (run daily from cron/timer). */
-export function purgeExpiredTrash(now = Date.now()): string[] {
+export function expiredTrashApps(now = Date.now()): string[] {
   const cutoff = now - TRASH_RETENTION_DAYS * 24 * 3600 * 1000;
-  const expired = Object.values(loadState().apps).filter(
-    (a) => a.trashedAt && Date.parse(a.trashedAt) < cutoff
-  );
-  return expired.map((a) => manageAppLifecycle(a.name, "purge"));
+  return Object.values(loadState().apps)
+    .filter((a) => a.trashedAt && Date.parse(a.trashedAt) < cutoff)
+    .map((a) => a.name);
+}
+
+export function purgeExpiredTrash(now = Date.now()): string[] {
+  return expiredTrashApps(now).map((name) => manageAppLifecycle(name, "purge"));
 }
 
 export function manageAppLifecycle(
