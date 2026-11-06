@@ -131,6 +131,32 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `Cria um convite de uso único para o PC '${helper}'. Quem rodar o convite num PC nos próximos 15 minutos deixa este servidor dar ordens a ele: rodar lá cópias dos apps que você escolher, com as variáveis deles (inclusive senhas). Na primeira vez, o Postgres, o Redis e o S3 deste servidor também passam a ser publicados no IP Tailscale dele (alguns segundos de reinício), para essas cópias alcançarem.`,
         params);
     }
+    case "pc.install": {
+      const pc = String(params.pc);
+      const role = String(params.role);
+      const what =
+        role === "helper"
+          ? [
+              ` Then the PC becomes a helper: it gets a one-use invite from this server, which can then run copies of the apps you choose there, with their variables (secrets included). The first time, this server's Postgres, Redis and S3 are also published on its Tailscale IP (a few seconds of restart).`,
+              ` Depois o PC vira ajudante: recebe um convite de uso único deste servidor, que passa a poder rodar lá cópias dos apps que você escolher, com as variáveis deles (inclusive senhas). Na primeira vez, o Postgres, o Redis e o S3 deste servidor também passam a ser publicados no IP Tailscale dele (alguns segundos de reinício).`,
+            ]
+          : role === "arbiter"
+            ? [
+                " Then the PC becomes the arbiter of this pair of servers: it receives the pair's arbiter key and its vote decides automatic takeovers.",
+                " Depois o PC vira juiz deste par de servidores: recebe a chave de juiz do par, e o voto dele decide as trocas automáticas.",
+              ]
+            : [
+                " Then the PC becomes an independent PaaSMCP server with its own dashboard (on 127.0.0.1:4099 there).",
+                " Depois o PC vira um servidor PaaSMCP independente, com painel próprio (em 127.0.0.1:4099 lá).",
+              ];
+      const ts = params.turnOffTailscaleSsh
+        ? [" At the end, Tailscale SSH is switched off on that PC.", " No fim, o SSH da Tailscale é desligado nesse PC."]
+        : ["", ""];
+      return risk(action, pc, "confirm",
+        `As root on the PC '${pc}', this installs what is missing (git, Docker, Node.js) from the system's packages and the PaaSMCP code of this server's version in ${"/opt/paasmcp"}.${what[0]}${ts[0]} The password is not kept.`,
+        `Como root no PC '${pc}', isto instala o que falta (git, Docker, Node.js) pelos pacotes do sistema e o código do PaaSMCP na versão deste servidor em /opt/paasmcp.${what[1]}${ts[1]} A senha não fica guardada.`,
+        params);
+    }
     case "pool.remove": {
       const helper = String(params.helper);
       return risk(action, helper, "confirm",

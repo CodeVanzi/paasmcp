@@ -4,6 +4,7 @@ import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./e
 import { arbiterInstallCommand, PairError } from "./arbiter.js";
 import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, stopLocalJudge } from "./judge.js";
 import { listTailnetPcs } from "./pcinstall.js";
+import { cancelPcJob, currentPcJob, PcInstallError, startPcCheck, startPcInstall, validatePcName } from "./pcremote.js";
 import { acceptMirror, checkArbiter, pairArbiterAndSave, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
@@ -1049,6 +1050,35 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         // Pair with a PC that shows a code (its dashboard's “Be the arbiter of another pair”).
         if (pathname === "/api/mirror/arbiter/candidates" && req.method === "GET") return reply(await findJudgeCandidates());
         if (pathname === "/api/pcs" && req.method === "GET") return reply(await listTailnetPcs());
+        if (pathname === "/api/pcs/job" && req.method === "GET") return reply({ job: currentPcJob() });
+        if (pathname === "/api/pcs/check" && req.method === "POST") {
+          // Logs in to the PC (Tailscale SSH or its password, kept in memory only) and runs the read-only check.
+          const body = await readJsonBody(req);
+          return reply({ job: await startPcCheck({ ip: body.ip, user: body.user, password: body.password, by: actor }) });
+        }
+        if (pathname === "/api/pcs/install" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const cur = currentPcJob();
+          if (!cur || cur.id !== String(body.jobId || "") || cur.phase !== "ready") throw new PcInstallError("expired", "This check is over. Log in to the PC again.", "Essa conferência acabou. Entre no PC de novo.");
+          const role = String(body.role || "");
+          const name = body.name ? validatePcName(body.name) : cur.name;
+          const turnOffTailscaleSsh = cur.via === "tailscale" && (role === "helper" || body.turnOffTailscaleSsh === true);
+          confirmFromBody("pc.install", { pc: name, ip: cur.ip, role, turnOffTailscaleSsh }, body);
+          return reply({
+            job: startPcInstall(
+              { jobId: body.jobId, role, name, turnOffTailscaleSsh: body.turnOffTailscaleSsh === true, by: actor },
+              {
+                createInvite: (n) => createInvite(n, { by: actor }),
+                addHelper: (n, ip) => addHelper(n, ip, { by: actor }),
+                pairArbiter: (ip, code) => pairArbiterAndSave(ip, code),
+              }
+            ),
+          });
+        }
+        if (pathname === "/api/pcs/cancel" && req.method === "POST") {
+          cancelPcJob();
+          return reply({ job: currentPcJob() });
+        }
         if (pathname === "/api/mirror/arbiter/pair" && req.method === "POST") {
           const body = await readJsonBody(req);
           try {
@@ -1145,13 +1175,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError || err instanceof PcInstallError;
         const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError).pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError | PcInstallError).pt } : {}),
+            ...(err instanceof PcInstallError ? { errorCode: err.code } : {}),
           })
         );
         return;
@@ -2847,6 +2878,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
               <button class="secondary" onclick="loadPcs()" id="btnPcsLoad" data-i18n="pcsRefresh"></button>
             </div>
+            <div id="pcsJobBox"></div>
             <div id="pcsBox"></div>
           </div>
         </div>
@@ -5827,8 +5859,80 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     Object.assign(I18N.pt, {
       "sub_connect_pcs": "PCs",
+      "pcsDesc": "Todos os aparelhos da sua rede Tailscale, e quais já têm o PaaSMCP. Num PC Linux sem PaaSMCP, o botão Instalar entra nele uma vez, confere o que ele tem e só instala depois da sua confirmação.",
+      "pcsBtnInstall": "Instalar o PaaSMCP",
+      "pcsFormTitle": "Instalar o PaaSMCP em {name}",
+      "pcsFormDesc": "O painel entra no PC pela Tailscale, confere o sistema e o que falta, e só instala depois que você escolher o papel e confirmar. A senha fica só na memória durante a instalação: não é salva em lugar nenhum.",
+      "pcsUser": "Usuário no PC",
+      "pcsPass": "Senha",
+      "pcsPassHint": "O usuário e a senha com que você entra nesse PC. O usuário precisa poder usar o sudo, e a mesma senha serve para ele.",
+      "pcsPassHintTs": "O SSH da Tailscale entra sem senha. Deixe a senha vazia se entrar como root; com outro usuário, digite a senha dele para o sudo.",
+      "pcsBtnCheck": "Entrar e conferir",
+      "pcsCancelBtn": "Cancelar",
+      "pcsCloseBtn": "Fechar",
+      "pcsAuthUrl": "A regra do SSH da sua Tailscale pede que você confirme a entrada:",
+      "pcsAuthOpen": "abrir a confirmação da Tailscale",
+      "pcsStep_connect": "Entrar no PC",
+      "pcsStep_check": "Conferir o PC (só leitura)",
+      "pcsStep_packages": "Instalar git e Docker que faltarem",
+      "pcsStep_node": "Node.js",
+      "pcsStep_code": "Baixar e montar o PaaSMCP desta versão",
+      "pcsStep_role": "Preparar o papel do PC",
+      "pcsStep_finish": "Terminar e sair do PC",
+      "pcsFactSystem": "Sistema",
+      "pcsFactSize": "Tamanho",
+      "pcsFactFree": "livres",
+      "pcsFactUser": "Usuário",
+      "pcsSudo_root": "é o root",
+      "pcsSudo_nopass": "sudo sem senha",
+      "pcsSudo_password": "sudo com a senha",
+      "pcsSudo_none": "sem sudo",
+      "pcsWillInstall": "Vai instalar o que falta: {list}, e o PaaSMCP em /opt/paasmcp.",
+      "pcsNothingMissing": "Nada falta além do PaaSMCP, que vai para /opt/paasmcp.",
+      "pcsPkg_git": "git",
+      "pcsPkg_docker": "Docker",
+      "pcsPkg_compose": "Docker Compose",
+      "pcsPkg_node": "Node.js 20 ou mais novo",
+      "pcsPkg_sshd": "servidor SSH",
+      "pcsWarn_diskLow": "Pouco espaço livre (menos de 4 GB): cabe o PaaSMCP, mas sobra pouco para apps.",
+      "pcsWarn_memLow": "Menos de 1 GB de memória: serve como juiz, mas não para rodar apps.",
+      "pcsWarn_archDiffers": "Esse PC tem outro tipo de processador (ARM ou x86) que este servidor: como ajudante, ele só recebe cópias de apps com imagem para ele.",
+      "pcsWarn_hasPaasmcp": "Já existe PaaSMCP em /opt/paasmcp nesse PC: ele vai para a versão deste servidor.",
+      "pcsKeyPinned": "Identidade do PC conferida com a chave que a Tailscale conhece dele:",
+      "pcsKeyFirst": "Chave do PC aceita nesta primeira entrada (a Tailscale já garante que esse IP é desse aparelho):",
+      "pcsRoleTitle": "O que esse PC vai ser",
+      "pcsRole_serverTitle": "Servidor independente",
+      "pcsRole_serverDesc": "Um PaaSMCP com painel próprio nesse PC, para publicar apps nele.",
+      "pcsRole_helperTitle": "Ajudante deste servidor",
+      "pcsRole_helperDesc": "Este servidor roda nele cópias dos apps que você escolher, quando precisar de mais força. Aparece em Ajudantes.",
+      "pcsRole_arbiterTitle": "Juiz deste par de servidores",
+      "pcsRole_arbiterDesc": "O voto de desempate da troca automática. Precisa ficar ligado 24 h e não pode ser um dos dois servidores.",
+      "pcsName": "Nome do PC no PaaSMCP",
+      "pcsTsOff": "Desligar o SSH da Tailscale nesse PC no fim (recomendado: ninguém entra mais sem senha)",
+      "pcsTsOffHelper": "O SSH da Tailscale vai ser desligado no fim: as ordens deste servidor para o ajudante passam pelo SSH comum, com a chave restrita que o ajudante aceita",
+      "pcsBtnGo": "Instalar",
+      "pcsReadyUntil": "Nada foi mudado no PC ainda. Esta conferência vale por 15 minutos.",
+      "pcsInstalling": "Isso leva de 3 a 15 minutos, conforme o que falta e a internet do PC. Pode sair desta tela: a instalação continua.",
+      "pcsLog": "Ver o registro",
+      "pcsDoneServer": "Pronto: {name} tem o PaaSMCP com painel próprio em {url} (no próprio PC). Para entrar nele, rode lá: sudo paasmcp dashboard token.",
+      "pcsDoneHelper": "Pronto: {name} já é ajudante e aparece em Ajudantes.",
+      "pcsDoneArbiter": "Pronto: {name} é o juiz deste par ({url}).",
+      "pcsDoneTsOff": "O SSH da Tailscale foi desligado nele.",
+      "pcsGoHelpers": "Abrir Ajudantes",
+      "pcsCancelled": "Cancelado. Nada foi instalado.",
+      "pcsHint_auth": "Confira o usuário e a senha. Pelo SSH da Tailscale, a regra de acesso (ACL) da sua Tailscale precisa deixar este servidor entrar como esse usuário. Depois de 3 erros, espere 10 minutos.",
+      "pcsHint_hostKey": "Pode ser que o PC tenha sido reinstalado. Se não foi, alguém pode estar se passando por ele: confira antes de tentar de novo.",
+      "pcsHint_unreachable": "Ligue o SSH no PC: sudo tailscale set --ssh (sem senha) ou sudo apt install openssh-server.",
+      "pcsHint_sudoPassword": "Esse usuário precisa poder usar o sudo, com a mesma senha que você digitou.",
+      "pcsHint_remote": "Veja no registro a última coisa que o PC respondeu. Dá para tentar de novo: os passos que já deram certo são pulados ou refeitos sem estragar nada.",
+      "pcsProblem_notDebian": "Por enquanto, a instalação pelo painel é só para Debian e Ubuntu.",
+      "pcsProblem_arch": "Tipo de processador sem suporte (precisa ser x86-64 ou ARM64).",
+      "pcsProblem_systemd": "O PC não usa systemd, que o Docker precisa para voltar sozinho depois de reiniciar.",
+      "pcsProblem_disk": "Menos de 1,5 GB livres no disco.",
+      "pcsProblem_noSudo": "Esse usuário não tem sudo. Entre como root ou com um usuário que tenha.",
+      "pcsProblem_sudoNeedsPassword": "O sudo desse usuário pede senha: digite a senha e confira de novo.",
+      "pcsProblem_tailscale": "A Tailscale não aparece nesse PC para esse usuário.",
       "pcsTitle": "🖥️ PCs da sua Tailscale",
-      "pcsDesc": "Todos os aparelhos da sua rede Tailscale, e quais já têm o PaaSMCP. Daqui o painel só olha: não entra em nenhum PC.",
       "pcsRefresh": "Procurar de novo",
       "pcsLooking": "Procurando os aparelhos da Tailscale...",
       "pcsNoTs": "O painel não achou a Tailscale neste servidor. Confira se ela está instalada e conectada (tailscale status).",
@@ -5852,8 +5956,80 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
     Object.assign(I18N.en, {
       "sub_connect_pcs": "PCs",
+      "pcsDesc": "Every device of your Tailscale network, and which ones already run PaaSMCP. On a Linux PC without PaaSMCP, the Install button logs in once, checks what it has, and only installs after you confirm.",
+      "pcsBtnInstall": "Install PaaSMCP",
+      "pcsFormTitle": "Install PaaSMCP on {name}",
+      "pcsFormDesc": "The dashboard logs in to the PC through Tailscale, checks the system and what is missing, and only installs after you pick the role and confirm. The password stays in memory during the install only: it is saved nowhere.",
+      "pcsUser": "User on the PC",
+      "pcsPass": "Password",
+      "pcsPassHint": "The user and password you log in with on that PC. The user must be allowed to use sudo, with the same password.",
+      "pcsPassHintTs": "Tailscale SSH needs no password. Leave it empty to log in as root; with another user, type its password for sudo.",
+      "pcsBtnCheck": "Log in and check",
+      "pcsCancelBtn": "Cancel",
+      "pcsCloseBtn": "Close",
+      "pcsAuthUrl": "Your Tailscale SSH rule asks you to confirm the login:",
+      "pcsAuthOpen": "open Tailscale's confirmation",
+      "pcsStep_connect": "Log in to the PC",
+      "pcsStep_check": "Check the PC (read-only)",
+      "pcsStep_packages": "Install the git and Docker it lacks",
+      "pcsStep_node": "Node.js",
+      "pcsStep_code": "Get and build PaaSMCP at this version",
+      "pcsStep_role": "Set up the PC's role",
+      "pcsStep_finish": "Finish and log out",
+      "pcsFactSystem": "System",
+      "pcsFactSize": "Size",
+      "pcsFactFree": "free",
+      "pcsFactUser": "User",
+      "pcsSudo_root": "is root",
+      "pcsSudo_nopass": "sudo without a password",
+      "pcsSudo_password": "sudo with the password",
+      "pcsSudo_none": "no sudo",
+      "pcsWillInstall": "It will install what is missing: {list}, and PaaSMCP in /opt/paasmcp.",
+      "pcsNothingMissing": "Nothing is missing but PaaSMCP, which goes to /opt/paasmcp.",
+      "pcsPkg_git": "git",
+      "pcsPkg_docker": "Docker",
+      "pcsPkg_compose": "Docker Compose",
+      "pcsPkg_node": "Node.js 20 or newer",
+      "pcsPkg_sshd": "SSH server",
+      "pcsWarn_diskLow": "Little free space (under 4 GB): PaaSMCP fits, but little is left for apps.",
+      "pcsWarn_memLow": "Under 1 GB of memory: fine as an arbiter, not for running apps.",
+      "pcsWarn_archDiffers": "This PC has another kind of processor (ARM or x86) than this server: as a helper it only gets copies of apps with an image for it.",
+      "pcsWarn_hasPaasmcp": "There is already PaaSMCP in /opt/paasmcp on this PC: it moves to this server's version.",
+      "pcsKeyPinned": "PC identity checked against the key Tailscale knows for it:",
+      "pcsKeyFirst": "PC key accepted on this first login (Tailscale already ensures this IP is that device):",
+      "pcsRoleTitle": "What this PC will be",
+      "pcsRole_serverTitle": "Independent server",
+      "pcsRole_serverDesc": "A PaaSMCP with its own dashboard on that PC, to publish apps on it.",
+      "pcsRole_helperTitle": "Helper of this server",
+      "pcsRole_helperDesc": "This server runs copies of the apps you choose on it when it needs more power. It shows up in Helpers.",
+      "pcsRole_arbiterTitle": "Arbiter of this pair of servers",
+      "pcsRole_arbiterDesc": "The tie-breaking vote for automatic takeover. It must stay on 24 h and cannot be one of the two servers.",
+      "pcsName": "PC name in PaaSMCP",
+      "pcsTsOff": "Turn off Tailscale SSH on that PC at the end (recommended: nobody logs in without a password any more)",
+      "pcsTsOffHelper": "Tailscale SSH will be turned off at the end: this server's orders to the helper go through regular SSH, with the restricted key the helper accepts",
+      "pcsBtnGo": "Install",
+      "pcsReadyUntil": "Nothing was changed on the PC yet. This check is valid for 15 minutes.",
+      "pcsInstalling": "This takes 3 to 15 minutes, depending on what is missing and the PC's internet. You can leave this screen: the install goes on.",
+      "pcsLog": "See the log",
+      "pcsDoneServer": "Done: {name} runs PaaSMCP with its own dashboard at {url} (on that PC). To sign in there, run on it: sudo paasmcp dashboard token.",
+      "pcsDoneHelper": "Done: {name} is a helper now and shows up in Helpers.",
+      "pcsDoneArbiter": "Done: {name} is the arbiter of this pair ({url}).",
+      "pcsDoneTsOff": "Tailscale SSH was turned off on it.",
+      "pcsGoHelpers": "Open Helpers",
+      "pcsCancelled": "Cancelled. Nothing was installed.",
+      "pcsHint_auth": "Check the user and password. With Tailscale SSH, your Tailscale access rules (ACL) must let this server in as that user. After 3 failures, wait 10 minutes.",
+      "pcsHint_hostKey": "The PC may have been reinstalled. If not, someone may be posing as it: check before trying again.",
+      "pcsHint_unreachable": "Turn SSH on there: sudo tailscale set --ssh (no password) or sudo apt install openssh-server.",
+      "pcsHint_sudoPassword": "That user must be allowed to use sudo, with the password you typed.",
+      "pcsHint_remote": "The log shows the last thing the PC answered. You can try again: steps that already worked are skipped or redone without harm.",
+      "pcsProblem_notDebian": "For now, installing from the dashboard is for Debian and Ubuntu only.",
+      "pcsProblem_arch": "Unsupported processor (it must be x86-64 or ARM64).",
+      "pcsProblem_systemd": "The PC does not use systemd, which Docker needs to come back after a reboot.",
+      "pcsProblem_disk": "Under 1.5 GB free on the disk.",
+      "pcsProblem_noSudo": "That user has no sudo. Log in as root or with a user that has it.",
+      "pcsProblem_sudoNeedsPassword": "That user's sudo asks for a password: type it and check again.",
+      "pcsProblem_tailscale": "Tailscale does not show up on that PC for that user.",
       "pcsTitle": "🖥️ PCs of your Tailscale",
-      "pcsDesc": "Every device of your Tailscale network, and which ones already run PaaSMCP. From here the dashboard only looks: it logs in nowhere.",
       "pcsRefresh": "Look again",
       "pcsLooking": "Looking for the Tailscale devices...",
       "pcsNoTs": "The dashboard did not find Tailscale on this server. Check that it is installed and connected (tailscale status).",
@@ -7948,9 +8124,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const list = d.pcs || [];
         if (!list.length) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNone')) + '</p>'; return; }
         box.innerHTML = list.map(pcRow).join('');
+        if (!document.getElementById('pcsJobBox').innerHTML) pcResume();
       } finally { btn.disabled = false; }
     }
     function pcRow(x) {
+      const canInstall = x.state === 'installable' || (x.state === 'paasmcp' && (x.roles || []).join() === 'installed');
       let tag;
       if (x.state === 'paasmcp') tag = badge('success', t('pcsHas')) + (x.roles || []).map(r => ' ' + badge('', t('pcsRole_' + r))).join('');
       else if (x.state === 'installable') tag = badge('warning', t('pcsCan'));
@@ -7959,7 +8137,144 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const ssh = x.state === 'installable' && x.ssh ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('pcsSsh_' + x.ssh)) + '</div>' : '';
       return '<div class="pc-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border);">' +
         '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip || '') + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + ssh + '</div>' +
-        '<div class="pc-actions" data-ip="' + esc(x.ip || '') + '"></div></div>';
+        '<div class="pc-actions">' + (canInstall ? '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" data-ip="' + esc(x.ip) + '" data-name="' + esc(x.name) + '" data-ssh="' + esc(x.ssh || '') + '" onclick="pcOpenForm(this.dataset)">' + esc(t('pcsBtnInstall')) + '</button>' : '') + '</div></div>';
+    }
+    // Installing PaaSMCP on one of those PCs: log in, check, pick the role, confirm, watch the steps.
+    let pcJobTimer = null;
+    let pcFormFor = null;
+    function pcOpenForm(d) {
+      pcFormFor = { ip: d.ip, name: d.name, ssh: d.ssh };
+      const viaTs = d.ssh === 'tailscale';
+      document.getElementById('pcsJobBox').innerHTML = card(
+        '<h3 class="ofs-h" style="margin-top:0;">' + esc(t('pcsFormTitle').replace('{name}', d.name)) + '</h3>' +
+        '<p class="ofs-note">' + esc(t('pcsFormDesc')) + '</p>' +
+        '<div class="form-grid">' +
+          '<div><label class="field-label" for="pcUser">' + esc(t('pcsUser')) + '</label><input id="pcUser" autocomplete="off" spellcheck="false" value="' + (viaTs ? 'root' : '') + '" /></div>' +
+          '<div><label class="field-label" for="pcPass">' + esc(t('pcsPass')) + '</label><input id="pcPass" type="password" autocomplete="new-password" /></div>' +
+        '</div>' +
+        '<p class="ofs-note" style="margin-top:6px;">' + esc(t(viaTs ? 'pcsPassHintTs' : 'pcsPassHint')) + '</p>' +
+        '<div class="ofs-msg" id="pcFormMsg" role="status" aria-live="polite"></div>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;"><button onclick="pcCheck()" id="btnPcCheck">' + esc(t('pcsBtnCheck')) + '</button>' +
+        '<button class="secondary" onclick="pcCloseForm()">' + esc(t('pcsCancelBtn')) + '</button></div>');
+      document.getElementById(viaTs ? 'pcPass' : 'pcUser').focus();
+    }
+    function pcCloseForm() { pcFormFor = null; document.getElementById('pcsJobBox').innerHTML = ''; }
+    async function pcCheck() {
+      const btn = document.getElementById('btnPcCheck');
+      const pass = document.getElementById('pcPass');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/pcs/check', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip: pcFormFor.ip, user: document.getElementById('pcUser').value.trim(), password: pass.value }) });
+        const d = await res.json().catch(() => ({}));
+        pass.value = '';
+        if (!res.ok) { ofsMsg('pcFormMsg', (currentLang === 'pt' && d.errorPt) || d.error || ('HTTP ' + res.status), 'err'); return; }
+        renderPcJob(d.job);
+        pcPoll();
+      } finally { if (document.getElementById('btnPcCheck')) btn.disabled = false; }
+    }
+    function pcPoll() {
+      clearTimeout(pcJobTimer);
+      pcJobTimer = setTimeout(async () => {
+        const res = await fetch('/api/pcs/job').catch(() => null);
+        const d = res && res.ok ? await res.json().catch(() => ({})) : {};
+        if (!d.job) return;
+        renderPcJob(d.job);
+        if (d.job.phase === 'connecting' || d.job.phase === 'installing') pcPoll();
+        else if (d.job.phase === 'done') loadPcs();
+      }, 2000);
+    }
+    const PC_STEP_ICON = { todo: '○', run: '⏳', ok: '✓', fail: '✗', skip: '–' };
+    function pcSteps(j, from) {
+      return '<ol class="ofs-note" style="list-style:none;padding:0;margin:8px 0;">' + j.steps.filter(s => from.indexOf(s.id) !== -1).map(s =>
+        '<li style="padding:2px 0;' + (s.state === 'fail' ? 'color:var(--danger);' : s.state === 'ok' ? 'color:var(--text);' : '') + '">' + PC_STEP_ICON[s.state] + ' ' + esc(t('pcsStep_' + s.id)) + '</li>').join('') + '</ol>';
+    }
+    function pcLog(j, open) {
+      if (!j.log || !j.log.length) return '';
+      return '<details' + (open ? ' open' : '') + ' style="margin-top:6px;"><summary class="ofs-note" style="cursor:pointer;">' + esc(t('pcsLog')) + '</summary><pre id="pcLogPre" style="max-height:260px;overflow:auto;font-size:11px;white-space:pre-wrap;word-break:break-all;">' + esc(j.log.join('\\n')) + '</pre></details>';
+    }
+    function pcFacts(f) {
+      const rows = [
+        [t('pcsFactSystem'), f.osName + ' · ' + f.arch],
+        [t('pcsFactSize'), Math.round(f.memMb / 1024 * 10) / 10 + ' GB RAM · ' + Math.round(f.diskMb / 1024) + ' GB ' + t('pcsFactFree')],
+        [t('pcsFactUser'), f.user + ' · ' + t('pcsSudo_' + f.sudo)],
+      ];
+      return '<table style="font-size:12.5px;margin:6px 0;">' + rows.map(r => '<tr><td style="color:var(--muted);padding:2px 12px 2px 0;">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>').join('') + '</table>';
+    }
+    function renderPcJob(j) {
+      const box = document.getElementById('pcsJobBox');
+      if (!box || !j) return;
+      const keep = box.querySelector('details[open]');
+      let html = '<h3 class="ofs-h" style="margin-top:0;">' + esc(t('pcsFormTitle').replace('{name}', j.name)) + ' <span style="color:var(--muted);font-weight:400;">' + esc(j.ip) + '</span></h3>';
+      if (j.phase === 'connecting') {
+        html += pcSteps(j, ['connect', 'check']);
+        if (j.authUrl) html += '<p class="ofs-note">' + esc(t('pcsAuthUrl')) + ' <a href="' + esc(j.authUrl) + '" target="_blank" rel="noreferrer">' + esc(t('pcsAuthOpen')) + '</a></p>';
+      } else if (j.phase === 'ready') {
+        const p = j.plan, f = j.facts;
+        html += pcFacts(f);
+        html += '<p class="ofs-note" style="margin:6px 0;">' + esc(p.install.length ? t('pcsWillInstall').replace('{list}', p.install.map(x => t('pcsPkg_' + x)).join(', ')) : t('pcsNothingMissing')) + '</p>';
+        html += (p.warnings || []).map(w => '<p class="ofs-note" style="margin:4px 0;">⚠️ ' + esc(t('pcsWarn_' + w)) + '</p>').join('');
+        if (j.hostKey && j.hostKey.fingerprint) html += '<p class="ofs-note" style="margin:4px 0;">' + esc(t(j.hostKey.pinned ? 'pcsKeyPinned' : 'pcsKeyFirst')) + ' <code>' + esc(j.hostKey.fingerprint) + '</code></p>';
+        html += '<h3 class="ofs-h">' + esc(t('pcsRoleTitle')) + '</h3>' + p.roles.map((r, i) =>
+          '<label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-size:13px;margin:6px 0;"><input type="radio" name="pcRole" value="' + r + '" style="width:auto;margin-top:3px;"' + (i === 0 ? ' checked' : '') + ' onchange="pcRoleChanged()" /><span><strong>' + esc(t('pcsRole_' + r + 'Title')) + '</strong><br/><span style="color:var(--muted);">' + esc(t('pcsRole_' + r + 'Desc')) + '</span></span></label>').join('');
+        html += '<div class="form-grid" style="grid-template-columns:minmax(0,280px);margin-top:6px;"><div><label class="field-label" for="pcName">' + esc(t('pcsName')) + '</label><input id="pcName" value="' + esc(j.name) + '" /></div></div>';
+        if (j.via === 'tailscale') html += '<label id="pcTsOffRow" style="display:flex;gap:6px;align-items:center;cursor:pointer;font-size:12.5px;margin-top:8px;"><input type="checkbox" id="pcTsOff" style="width:auto;" checked /> <span id="pcTsOffText">' + esc(t('pcsTsOff')) + '</span></label>';
+        html += '<div class="ofs-msg" id="pcInstallMsg" role="status" aria-live="polite"></div>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;"><button onclick="pcInstall()" id="btnPcInstall">' + esc(t('pcsBtnGo')) + '</button><button class="secondary" onclick="pcCancel()">' + esc(t('pcsCancelBtn')) + '</button></div>';
+        html += '<p class="ofs-note" style="margin-top:8px;">' + esc(t('pcsReadyUntil')) + '</p>';
+      } else if (j.phase === 'installing') {
+        html += pcSteps(j, ['packages', 'node', 'code', 'role', 'finish']) + '<p class="ofs-note">' + esc(t('pcsInstalling')) + '</p>' + pcLog(j, Boolean(keep));
+      } else if (j.phase === 'done') {
+        const r = j.result || {};
+        let msg = r.role === 'helper' ? t('pcsDoneHelper').replace('{name}', r.helper || j.name)
+          : r.role === 'arbiter' ? t('pcsDoneArbiter').replace('{name}', j.name).replace('{url}', r.arbiterUrl || '')
+          : t('pcsDoneServer').replace('{name}', j.name).replace('{url}', r.dashboard || 'http://127.0.0.1:4099');
+        if (r.tailscaleSshOff) msg += ' ' + t('pcsDoneTsOff');
+        html += '<p>' + badge('success', '✓') + ' ' + esc(msg) + '</p>' + (r.role === 'helper' ? '<button class="secondary" onclick="goTo(&quot;pool&quot;, &quot;list&quot;)">' + esc(t('pcsGoHelpers')) + '</button>' : '') + pcLog(j, false);
+      } else {
+        const err = (currentLang === 'pt' && j.errorPt) || j.error || t('pcsCancelled');
+        html += pcSteps(j, ['connect', 'check', 'packages', 'node', 'code', 'role', 'finish'].filter(id => (j.steps.find(s => s.id === id) || {}).state !== 'skip'));
+        html += '<p>' + badge(j.phase === 'cancelled' ? '' : 'danger', j.phase === 'cancelled' ? '–' : '✗') + ' ' + esc(err) + '</p>';
+        if (j.errorCode && I18N[currentLang]['pcsHint_' + j.errorCode]) html += '<p class="ofs-note">' + esc(t('pcsHint_' + j.errorCode)) + '</p>';
+        if (j.plan && j.plan.problems && j.plan.problems.length) html += j.plan.problems.map(x => '<p class="ofs-note" style="margin:4px 0;">• ' + esc(t('pcsProblem_' + x)) + '</p>').join('');
+        html += pcLog(j, j.phase === 'failed' && ['packages', 'node', 'code', 'role'].some(id => (j.steps.find(s => s.id === id) || {}).state === 'fail'));
+        html += '<div style="margin-top:8px;"><button class="secondary" onclick="pcCloseForm(); loadPcs();">' + esc(t('pcsCloseBtn')) + '</button></div>';
+      }
+      box.innerHTML = card(html);
+      const pre = document.getElementById('pcLogPre');
+      if (pre) pre.scrollTop = pre.scrollHeight;
+      if (j.phase === 'ready') pcRoleChanged();
+    }
+    function pcRoleChanged() {
+      const r = (document.querySelector('input[name="pcRole"]:checked') || {}).value;
+      const box = document.getElementById('pcTsOff');
+      if (!box) return;
+      box.disabled = r === 'helper';
+      if (r === 'helper') box.checked = true;
+      document.getElementById('pcTsOffText').textContent = t(r === 'helper' ? 'pcsTsOffHelper' : 'pcsTsOff');
+    }
+    async function pcInstall() {
+      const res0 = await fetch('/api/pcs/job');
+      const cur = ((await res0.json().catch(() => ({}))) || {}).job;
+      if (!cur) return;
+      const role = (document.querySelector('input[name="pcRole"]:checked') || {}).value;
+      const ts = document.getElementById('pcTsOff');
+      const res = await fetch('/api/pcs/install', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: cur.id, role, name: document.getElementById('pcName').value.trim(), turnOffTailscaleSsh: ts ? ts.checked : false }) });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) { if (!d.confirmationRequired) ofsMsg('pcInstallMsg', (currentLang === 'pt' && d.errorPt) || d.error || ('HTTP ' + res.status), 'err'); return; }
+      renderPcJob(d.job);
+      pcPoll();
+    }
+    async function pcCancel() {
+      await fetch('/api/pcs/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      pcCloseForm();
+    }
+    // Back on the tab while a job runs (or waits for the confirmation): show it again.
+    async function pcResume() {
+      const res = await fetch('/api/pcs/job').catch(() => null);
+      const d = res && res.ok ? await res.json().catch(() => ({})) : {};
+      if (d.job && (d.job.phase === 'connecting' || d.job.phase === 'installing' || d.job.phase === 'ready')) { renderPcJob(d.job); if (d.job.phase !== 'ready') pcPoll(); }
     }
     async function loadConnections() {
       const link = document.getElementById('cfTokenLink');
@@ -9275,8 +9590,11 @@ RUN apk add --no-cache tailscale || true
 `;
 
 /** Builds the dashboard image once per Dockerfile version (tag = content hash). */
+/** The dashboard image's tag (it changes with its Dockerfile). */
+export const dashboardImageTag = () => `paasmcp/dashboard:${crypto.createHash("sha256").update(DASHBOARD_DOCKERFILE).digest("hex").slice(0, 12)}`;
+
 export function ensureDashboardImage(): string {
-  const tag = `paasmcp/dashboard:${crypto.createHash("sha256").update(DASHBOARD_DOCKERFILE).digest("hex").slice(0, 12)}`;
+  const tag = dashboardImageTag();
   try {
     execFileSync("docker", ["image", "inspect", tag], { stdio: "ignore" });
   } catch {

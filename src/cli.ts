@@ -600,6 +600,12 @@ async function runCli() {
         const w = openArbiterPairing();
         console.log(JSON.stringify({ code: w.code, expiresAt: new Date(w.expiresAt).toISOString() }, null, 2));
         console.error(`Pairing code: ${w.code} (10 minutes). On one of the servers: Second server > Arbiter > “Easy way”, or 'paasmcp arbiter pair-with <this device's Tailscale IP> ${w.code}'.`);
+      } else if (sub === "be-judge") {
+        // On a PC with PaaSMCP: start the arbiter container here and open a pairing window (what the
+        // dashboard's "Be the arbiter of another pair" does; used when a server installs this PC).
+        const { beJudge } = await import("./judge.js");
+        const w = await beJudge();
+        console.log(JSON.stringify({ url: w.url, code: w.code, expiresAt: new Date(w.expiresAt).toISOString() }, null, 2));
       } else if (sub === "pair-with" && rest[1] && rest[2]) {
         // On a server: send the arbiter key to the device showing the code, then save its address.
         console.log(JSON.stringify(await pairArbiterAndSave(rest[1], rest[2]), null, 2));
@@ -621,7 +627,7 @@ async function runCli() {
       } else if (sub === "check") {
         console.log(JSON.stringify(await checkArbiter(rest[1]), null, 2));
       } else {
-        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|pair|pair-with <ip> <code>|add-key <key>|remove-key <cluster id>|clusters|check [url]>");
+        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|pair|be-judge|pair-with <ip> <code>|add-key <key>|remove-key <cluster id>|clusters|check [url]>");
       }
       break;
     }
@@ -738,6 +744,13 @@ async function runCli() {
           "Usage: paasmcp scale [status [app]]|auto on <app> [--min n] [--max n] [--yes]|auto off <app>|set <app> <copies> [--yes]|<app> <copies>|off <app>|tick [--quiet]|history <app> [--bucket 5]|diary [app] [--limit 50]|rule <app> [--min n] [--max n] [--target-cpu %] [--target-rps n] [--up-rounds n] [--down-after s] [--cooldown s] [--yes]|language <pt|en>|test <app> [--path /] [--max-concurrency 32] [--step-seconds 5] [--yes]|install-timer [--seconds 15]|uninstall-timer  (status/diary take --lang pt|en)"
         );
       }
+      break;
+    }
+
+    case "pcs": {
+      // The devices of the Tailscale network, with and without PaaSMCP (installing is done from the dashboard).
+      const { listTailnetPcs } = await import("./pcinstall.js");
+      console.log(JSON.stringify(await listTailnetPcs({ probe: !rest.includes("--no-probe") }), null, 2));
       break;
     }
 
@@ -1121,7 +1134,8 @@ Commands:
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
-  paasmcp arbiter <key|serve|install-service|pair|pair-with|add-key|remove-key|clusters|check>
+  paasmcp pcs [--no-probe]                           Devices of your Tailscale, with and without PaaSMCP (install them in the dashboard: Connections > PCs)
+  paasmcp arbiter <key|serve|install-service|pair|be-judge|pair-with|add-key|remove-key|clusters|check>
                                                     Third vote for automatic failover (one device can serve several clusters)
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
   paasmcp active tunnel <status|on|off>             Cloudflare Tunnel just for those apps, on both servers
