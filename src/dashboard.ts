@@ -8129,7 +8129,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
     function pcRow(x) {
       const busy = lastPcJob && lastPcJob.ip === x.ip && ['connecting', 'ready', 'installing'].indexOf(lastPcJob.phase) !== -1;
-      const canInstall = !busy && (x.state === 'installable' || (x.state === 'paasmcp' && (x.roles || []).join() === 'installed'));
+      const canInstall = !busy && x.ssh !== 'closed' && (x.state === 'installable' || (x.state === 'paasmcp' && (x.roles || []).join() === 'installed'));
       let tag;
       if (x.state === 'paasmcp') tag = badge('success', t('pcsHas')) + (x.roles || []).map(r => ' ' + badge('', t('pcsRole_' + r))).join('');
       else if (x.state === 'installable') tag = badge('warning', t('pcsCan'));
@@ -8198,7 +8198,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function pcFacts(f) {
       const rows = [
         [t('pcsFactSystem'), f.osName + ' · ' + f.arch],
-        [t('pcsFactSize'), Math.round(f.memMb / 1024 * 10) / 10 + ' GB RAM · ' + Math.round(f.diskMb / 1024) + ' GB ' + t('pcsFactFree')],
+        [t('pcsFactSize'), (f.memMb / 1024).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en', { maximumFractionDigits: 1 }) + ' GB RAM · ' + Math.round(f.diskMb / 1024) + ' GB ' + t('pcsFactFree')],
         [t('pcsFactUser'), f.user + ' · ' + t('pcsSudo_' + f.sudo)],
       ];
       return '<table style="font-size:12.5px;margin:6px 0;">' + rows.map(r => '<tr><td style="color:var(--muted);padding:2px 12px 2px 0;">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>').join('') + '</table>';

@@ -657,7 +657,9 @@ export async function startPcCheck(input: { ip: unknown; user: unknown; password
       const banner = sshKind(await sshBanner(ip, Number(process.env.PAASMCP_PC_SSH_PORT || 22), 4000));
       if (banner === "closed") throw fail("unreachable", "No SSH answers on that PC.", "Nenhum SSH responde nesse PC.");
       logLine(`ssh: ${banner}${c.pinned ? " (host key from Tailscale)" : ""}`);
-      my.via = await openConnection(c, { onAuthUrl: (u) => { if (job === my) my.authUrl = u; } });
+      await openConnection(c, { onAuthUrl: (u) => { if (job === my) my.authUrl = u; } });
+      // Tailscale SSH lets the login in by itself (a password typed for sudo does not change that).
+      my.via = banner === "tailscale" ? "tailscale" : "password";
       delete my.authUrl;
       my.hostKey = { fingerprint: hostFingerprint(c), pinned: c.pinned };
       failures.delete(ip);
