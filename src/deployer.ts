@@ -370,6 +370,39 @@ export class HealthcheckFailedError extends Error {
   }
 }
 
+/** IP of a container on the PaaSMCP Docker network ('' when it has none). */
+function containerIp(name: string): string {
+  try {
+    return execFileSync(
+      "docker",
+      ["inspect", "-f", `{{with index .NetworkSettings.Networks "${DOCKER_NETWORK}"}}{{.IPAddress}}{{end}}`, name],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Where this process reaches a container's HTTP port for a health probe. Normally the host loopback
+ * port it publishes. Inside the dashboard container, 127.0.0.1 is the dashboard itself, so the probe
+ * goes to the container's own address on the Docker network instead (by IP: during the swap the
+ * candidate also answers for the production name).
+ */
+export function probeUrl(
+  container: string,
+  internalPort: number,
+  hostPort: number,
+  probePath: string,
+  ipOf: (name: string) => string = containerIp
+): string {
+  if (process.env.PAASMCP_IN_DASHBOARD === "1") {
+    const ip = ipOf(container);
+    if (/^[0-9a-f.:]+$/i.test(ip)) return `http://${ip.includes(":") ? `[${ip}]` : ip}:${internalPort}${probePath}`;
+  }
+  return `http://127.0.0.1:${hostPort}${probePath}`;
+}
+
 /** A free loopback port picked by the kernel (closed again right away; docker binds it next). */
 export function findFreeLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -621,7 +654,7 @@ networks:
         primaryService
       );
       const result = await waitForHealthy({
-        url: `http://127.0.0.1:${candidatePort}${probePath}`,
+        url: probeUrl(candidateName, internalPort, candidatePort, probePath),
         timeoutMs,
         isAlive: () => containerRunning(candidateName),
       });
@@ -653,7 +686,7 @@ networks:
     compose("up", "-d", "--no-build", "--remove-orphans");
     if (healthcheck) {
       const settled = await waitForHealthy({
-        url: `http://127.0.0.1:${localPort}${probePath}`,
+        url: probeUrl(containerName, internalPort, localPort, probePath),
         timeoutMs,
         isAlive: () => containerRunning(containerName),
       });
