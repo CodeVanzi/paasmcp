@@ -326,3 +326,202 @@ export async function listGitHubRepos(): Promise<GitHubRepo[]> {
       language: String(r.language || "").slice(0, 40),
     }));
 }
+
+// ---- GitHub push notices (webhooks) set up from the dashboard ----
+//
+// With the saved token, the dashboard creates (or fixes) the webhook on each repository its apps come
+// from, so nobody copies an address and a secret into GitHub by hand. The token needs one more
+// permission for this, Webhooks: Read and write; without it the screen says so and the manual steps
+// stay. Only hooks pointing at this dashboard's own address are ever touched.
+
+const HOOK_PATH = "/api/webhooks/github";
+const REPO_RE = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+
+/** "owner/name" for an app's repository when it is on github.com, otherwise "". */
+export function githubRepoOf(repoUrl: unknown): string {
+  const s = String(repoUrl || "")
+    .trim()
+    .replace(/^https?:\/\/(www\.)?github\.com\//i, "")
+    .replace(/^git@github\.com:/i, "")
+    .replace(/^ssh:\/\/git@github\.com\//i, "")
+    .replace(/\.git$/i, "")
+    .replace(/\/+$/, "");
+  return REPO_RE.test(s) && !s.split("/").some((p) => p === "." || p === "..") ? s : "";
+}
+
+/**
+ * The address GitHub will call: https, a real public name (GitHub cannot reach a LAN address or
+ * localhost), always ending in the dashboard's webhook path.
+ */
+export function webhookAddress(given: unknown): string {
+  const raw = String(given || "").trim();
+  let u: URL;
+  try {
+    u = new URL(raw.includes("://") ? raw : `https://${raw}`);
+  } catch {
+    throw fail("That is not a web address.", "Isso não é um endereço da internet. Use algo como https://painel.seudominio.com.");
+  }
+  if (u.protocol !== "https:") throw fail("The address must start with https://.", "O endereço precisa começar com https:// (o GitHub só avisa por conexão segura).");
+  if (u.username || u.password) throw fail("The address must not carry a user or password.", "O endereço não pode ter usuário ou senha.");
+  const host = u.hostname.toLowerCase();
+  const local = /^(localhost|.*\.(local|lan|internal|home|home\.arpa|localdomain))$/.test(host);
+  const ip = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":") || host.startsWith("[");
+  if (local || ip || !HOSTNAME_RE.test(host)) {
+    throw fail("GitHub cannot reach this address: use the dashboard's internet name.", "O GitHub não alcança este endereço. Use o nome do painel na internet (ex.: https://painel.seudominio.com), não um IP ou nome da rede de casa.");
+  }
+  return `https://${host}${u.port ? `:${u.port}` : ""}${HOOK_PATH}`;
+}
+
+interface GhHook {
+  id?: number;
+  active?: boolean;
+  events?: string[];
+  config?: { url?: string; content_type?: string };
+  last_response?: { code?: number | null; status?: string | null };
+}
+
+async function gh<T>(token: string, method: string, route: string, body?: unknown): Promise<{ status: number; data: T }> {
+  let res: Response;
+  try {
+    res = await fetch(`${ghApi()}${route}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "paasmcp", ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw fail("Could not reach GitHub from this server.", "Este servidor não conseguiu falar com o GitHub.");
+  }
+  const data = (await res.json().catch(() => ({}))) as T;
+  return { status: res.status, data };
+}
+
+function savedToken(): string {
+  const token = getSecrets("system").GITHUB_TOKEN || "";
+  if (!token) throw fail("No GitHub token saved.", "Nenhum token do GitHub salvo. Ligue em Conexões → GitHub.");
+  return token;
+}
+
+const sameHookUrl = (a: unknown, b: string) => String(a || "").replace(/\/+$/, "").toLowerCase() === b.toLowerCase();
+
+export type HookState = "on" | "off" | "denied" | "error";
+export interface RepoHook {
+  repo: string;
+  apps: string[];
+  state: HookState;
+  /** HTTP code of GitHub's last call to the dashboard (0 = could not connect), when known. */
+  lastCode?: number;
+}
+
+function deniedOrError(status: number): HookState {
+  if (status === 401) throw fail("GitHub refused the saved token.", "O GitHub recusou o token salvo. Ele pode ter expirado: salve um novo em Conexões → GitHub.");
+  return status === 403 || status === 404 ? "denied" : "error";
+}
+
+async function findHook(token: string, repo: string, url: string): Promise<{ status: number; hook?: GhHook }> {
+  const r = await gh<GhHook[]>(token, "GET", `/repos/${repo}/hooks?per_page=100`);
+  if (r.status !== 200) return { status: r.status };
+  const hook = (Array.isArray(r.data) ? r.data : []).find((h) => sameHookUrl(h.config?.url, url));
+  return { status: 200, hook };
+}
+
+const lastCodeOf = (h?: GhHook) => (h && typeof h.last_response?.code === "number" ? h.last_response.code : undefined);
+
+/** For each GitHub repository the apps come from: is the push notice to this dashboard set up? */
+export async function listRepoHooks(apps: { name: string; repoUrl?: string }[], address: unknown): Promise<RepoHook[]> {
+  const url = webhookAddress(address);
+  const token = savedToken();
+  const byRepo = new Map<string, string[]>();
+  for (const a of apps) {
+    const repo = githubRepoOf(a.repoUrl);
+    if (!repo) continue;
+    const key = repo.toLowerCase();
+    byRepo.set(key, [...(byRepo.get(key) || []), a.name]);
+  }
+  const repos = [...byRepo.keys()].slice(0, 50);
+  const names = new Map(apps.map((a) => [githubRepoOf(a.repoUrl).toLowerCase(), githubRepoOf(a.repoUrl)]));
+  return Promise.all(
+    repos.map(async (key): Promise<RepoHook> => {
+      const repo = names.get(key) || key;
+      const base = { repo, apps: byRepo.get(key) || [] };
+      try {
+        const f = await findHook(token, repo, url);
+        if (f.status !== 200) return { ...base, state: deniedOrError(f.status) };
+        if (!f.hook) return { ...base, state: "off" };
+        const pushes = f.hook.active !== false && (f.hook.events || []).some((e) => e === "push" || e === "*");
+        return { ...base, state: pushes ? "on" : "off", lastCode: lastCodeOf(f.hook) };
+      } catch (err) {
+        if (err instanceof ConnectionError && /refused/.test(err.message)) throw err;
+        return { ...base, state: "error" };
+      }
+    })
+  );
+}
+
+export interface HookResult {
+  repo: string;
+  created: boolean;
+  /** "ok": GitHub reached the dashboard; "unreachable": it tried and could not; "unknown": no answer yet. */
+  reach: "ok" | "unreachable" | "unknown";
+  code?: number;
+}
+
+const waitMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Creates the push notice on one repository, or fixes the one already pointing here (new secret,
+ * push event, json, active), then asks GitHub for a test call and reports whether it arrived.
+ */
+export async function ensureRepoHook(repoGiven: unknown, address: unknown, secret: string): Promise<HookResult> {
+  const repo = githubRepoOf(repoGiven);
+  if (!repo) throw fail("That is not a GitHub repository.", "Isso não é um repositório do GitHub.");
+  const url = webhookAddress(address);
+  const token = savedToken();
+  const deniedMsg = () =>
+    fail(
+      `The saved token cannot manage webhooks on ${repo}.`,
+      `O token salvo não pode criar o aviso em ${repo}. No GitHub, edite o token e dê a permissão Webhooks: Read and write (token clássico: admin:repo_hook), e confira se ${repo} está na lista de repositórios dele.`
+    );
+  const f = await findHook(token, repo, url);
+  if (f.status !== 200) {
+    if (deniedOrError(f.status) === "denied") throw deniedMsg();
+    throw fail(`GitHub answered HTTP ${f.status}.`, `O GitHub respondeu com erro (HTTP ${f.status}).`);
+  }
+  const config = { url, content_type: "json", secret, insecure_ssl: "0" };
+  let id: number;
+  const created = !f.hook;
+  const started = Date.now();
+  if (f.hook && typeof f.hook.id === "number") {
+    const r = await gh<GhHook>(token, "PATCH", `/repos/${repo}/hooks/${f.hook.id}`, { active: true, events: ["push"], config });
+    if (r.status !== 200) {
+      if (deniedOrError(r.status) === "denied") throw deniedMsg();
+      throw fail(`GitHub answered HTTP ${r.status}.`, `O GitHub respondeu com erro (HTTP ${r.status}).`);
+    }
+    id = f.hook.id;
+    await gh(token, "POST", `/repos/${repo}/hooks/${id}/pings`).catch(() => undefined);
+  } else {
+    const r = await gh<GhHook>(token, "POST", `/repos/${repo}/hooks`, { name: "web", active: true, events: ["push"], config });
+    if (r.status !== 201 || typeof r.data.id !== "number") {
+      if (r.status === 422) throw fail("GitHub would not add the webhook.", "O GitHub não aceitou o aviso (talvez o repositório já tenha 20 webhooks).");
+      if (deniedOrError(r.status) === "denied") throw deniedMsg();
+      throw fail(`GitHub answered HTTP ${r.status}.`, `O GitHub respondeu com erro (HTTP ${r.status}).`);
+    }
+    id = r.data.id; // GitHub sends its own test call (ping) right after creating it.
+  }
+  audit({ event: "connect.github.webhook", repo, created });
+
+  // Wait a few seconds for the test call to land, reading GitHub's own record of it.
+  const tries = OFFLINE() ? 1 : 6;
+  for (let i = 0; i < tries; i++) {
+    if (!OFFLINE()) await waitMs(1500);
+    const d = await gh<{ event?: string; status_code?: number; delivered_at?: string }[]>(token, "GET", `/repos/${repo}/hooks/${id}/deliveries?per_page=5`).catch(() => undefined);
+    const ping = d && d.status === 200 && Array.isArray(d.data)
+      ? d.data.find((x) => x.event === "ping" && Date.parse(String(x.delivered_at || "")) >= started - 30_000)
+      : undefined;
+    if (ping && typeof ping.status_code === "number") {
+      const code = ping.status_code;
+      return { repo, created, reach: code >= 200 && code < 300 ? "ok" : "unreachable", code };
+    }
+  }
+  return { repo, created, reach: "unknown" };
+}

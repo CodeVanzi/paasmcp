@@ -13,7 +13,7 @@ import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./a
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
-import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, listGitHubRepos, saveCloudflare } from "./connections.js";
+import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, ensureRepoHook, githubRepoOf, listGitHubRepos, listRepoHooks, saveCloudflare } from "./connections.js";
 import { explainDeployError } from "./deployhelp.js";
 import { prepareTemplate, TEMPLATES } from "./templates.js";
 import { clearNotify, NotifyError, notifySummary, saveNotify } from "./notify.js";
@@ -892,6 +892,20 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return reply({ ...r, summary: connectionsSummary() });
         }
         if (pathname === "/api/connections/github/repos" && req.method === "GET") return reply({ repos: await listGitHubRepos() });
+        // Push notices: the saved token creates or fixes the webhook on the apps' repositories.
+        if (pathname === "/api/connections/github/webhooks" && req.method === "GET") {
+          const apps = Object.values(loadState().apps).map((a) => ({ name: a.name, repoUrl: a.repoUrl }));
+          return reply({ repos: await listRepoHooks(apps, url.searchParams.get("address")) });
+        }
+        if (pathname === "/api/connections/github/webhooks" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          // Only repositories that an app here is published from: the token may reach many more.
+          const repo = githubRepoOf(body.repo).toLowerCase();
+          if (!repo || !Object.values(loadState().apps).some((a) => githubRepoOf(a.repoUrl).toLowerCase() === repo)) {
+            throw new ConnectionError("No app here is published from this repository.", "Nenhum app daqui é publicado deste repositório.");
+          }
+          return reply(await ensureRepoHook(body.repo, body.address, getOrCreateWebhookSecret()));
+        }
         if (pathname === "/api/connections/github" && req.method === "POST") {
           const body = await readJsonBody(req);
           return reply(await checkGitHub(body.token));
@@ -2473,22 +2487,35 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <h2 id="whTitle">⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH</h2>
               <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
             </div>
-            <div style="margin-bottom:14px;">
-              <span class="field-label" data-i18n="whLblUrl"></span>
-              <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
-            </div>
-            <div style="margin-bottom:16px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-                <span class="field-label" data-i18n="whLblSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
-                <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
+            <div id="whAuto">
+              <h3 class="ofs-h" data-i18n="whAutoTitle"></h3>
+              <p class="ofs-note" id="whAutoNote"></p>
+              <div class="wh-form" style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;">
+                <div style="flex:1 1 240px;min-width:0;"><label class="field-label" for="whAddress" data-i18n="whLblAddress"></label><input id="whAddress" type="url" autocomplete="off" spellcheck="false" placeholder="https://painel.seudominio.com" /></div>
+                <div><button class="secondary" onclick="loadHooks()" data-i18n="whBtnCheck"></button></div>
               </div>
-              <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
+              <div class="ofs-msg" id="whMsg" role="status" aria-live="polite"></div>
+              <div id="whRepos" style="margin-top:8px;"></div>
             </div>
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-              <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
-              <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
-            </div>
-            <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
+            <details id="whManual" style="margin-top:16px;">
+              <summary style="cursor:pointer;font-weight:600;font-size:14px;" data-i18n="whManualTitle"></summary>
+              <div style="margin:12px 0 14px;">
+                <span class="field-label" data-i18n="whLblUrl"></span>
+                <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
+              </div>
+              <div style="margin-bottom:16px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+                  <span class="field-label" data-i18n="whLblSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
+                  <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
+                </div>
+                <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <span class="field-label" id="lblSshKey" style="margin:0;">Chave SSH Pública de Deploy (Ed25519):</span>
+                <button class="chip" onclick="copySshKey()" id="btnCopySsh">📋 Copiar Chave SSH</button>
+              </div>
+              <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
+            </details>
           </div>
         </div>
 
@@ -4682,7 +4709,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "cnGhKeyDesc": "No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole a chave abaixo e deixe “Allow write access” desmarcado. Repita em cada repositório privado.",
       "cnBtnCopyKey": "Copiar chave",
       "cnGhTokenTitle": "Opção 2: token (mais prático)",
-      "cnGhTokenDesc": "Crie um token “fine-grained”, escolha só os repositórios que vai publicar e dê a permissão Contents: Read-only. Com ele, Publicar um app mostra a lista dos seus repositórios e o painel baixa o código privado sozinho, sem colar chave em cada repositório.",
+      "cnGhTokenDesc": "Crie um token “fine-grained”, escolha só os repositórios que vai publicar e dê a permissão Contents: Read-only. Com ele, Publicar um app mostra a lista dos seus repositórios e o painel baixa o código privado sozinho, sem colar chave em cada repositório. Quer publicar a cada push sem copiar nada? Dê também Webhooks: Read and write.",
       "cnGhTokenLink": "Criar token no GitHub ↗",
       "cnGhToken": "Token do GitHub",
       "cnBtnGhSave": "Testar e salvar",
@@ -4752,7 +4779,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "cnGhKeyDesc": "On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste the key below and leave “Allow write access” unticked. Repeat for each private repository.",
       "cnBtnCopyKey": "Copy key",
       "cnGhTokenTitle": "Option 2: token (easiest)",
-      "cnGhTokenDesc": "Create a fine-grained token, pick only the repositories you will publish and give it Contents: Read-only. With it, Publish an app lists your repositories and the dashboard fetches private code by itself, with no key to paste in each repository.",
+      "cnGhTokenDesc": "Create a fine-grained token, pick only the repositories you will publish and give it Contents: Read-only. With it, Publish an app lists your repositories and the dashboard fetches private code by itself, with no key to paste in each repository. Want to publish on every push with nothing to copy? Also give Webhooks: Read and write.",
       "cnGhTokenLink": "Create a token on GitHub ↗",
       "cnGhToken": "GitHub token",
       "cnBtnGhSave": "Test and save",
@@ -4846,7 +4873,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_autoupdate_s1": "Mais simples: marque “Atualizar sozinho”",
       "guide_autoupdate_s1Desc": "Ao publicar o app, marque “Atualizar sozinho quando eu mudar o código”. O servidor olha o GitHub a cada 2 minutos. Funciona em qualquer rede, sem configurar mais nada.",
       "guide_autoupdate_s2": "Mais rápido: aviso do GitHub (webhook)",
-      "guide_autoupdate_s2Desc": "O GitHub avisa o servidor na hora. Só funciona se o painel tiver um endereço na internet. A tela “Publicar a cada push” mostra o endereço e o segredo para colar no GitHub (Settings → Webhooks).",
+      "guide_autoupdate_s2Desc": "O GitHub avisa o servidor na hora. Só funciona se o painel tiver um endereço na internet. Com o GitHub ligado em Conexões, a tela “Publicar a cada push” cria o aviso com um clique; sem isso, ela mostra o endereço e o segredo para colar no GitHub.",
       "guide_autoupdate_s3": "Nada quebra no meio",
       "guide_autoupdate_s3Desc": "A versão nova só entra depois de responder ao teste. Se falhar, a atual continua no ar e a linha do app mostra o motivo.",
       "guide_email": "Configurar o envio de e-mails",
@@ -4950,7 +4977,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_autoupdate_s1": "Simplest: tick “Update by itself”",
       "guide_autoupdate_s1Desc": "When publishing, tick “Update by itself when I change the code”. The server checks GitHub every 2 minutes. Works on any network, nothing else to set up.",
       "guide_autoupdate_s2": "Faster: GitHub notice (webhook)",
-      "guide_autoupdate_s2Desc": "GitHub tells the server right away. Only works if the dashboard has an internet address. The “Publish on every push” screen shows the address and the secret to paste into GitHub (Settings → Webhooks).",
+      "guide_autoupdate_s2Desc": "GitHub tells the server right away. Only works if the dashboard has an internet address. With GitHub connected under Connections, the “Publish on every push” screen creates the notice in one click; without it, it shows the address and the secret to paste into GitHub.",
       "guide_autoupdate_s3": "Nothing breaks halfway",
       "guide_autoupdate_s3Desc": "The new version only goes live after it answers the test. If it fails, the current one stays live and the app's row shows why.",
       "guide_email": "Set up email sending",
@@ -5053,7 +5080,28 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "whLblUrl": "Endereço para colar no GitHub (Settings → Webhooks → Add webhook, campo Payload URL; Content type: application/json; evento: Just the push event)",
       "whLblSecret": "Segredo (campo Secret do mesmo formulário)",
       "btnRevealWhSecret": "👁️ Mostrar e copiar",
-      "lblSshKey": "Chave de leitura para repositório privado (também em Conexões → GitHub)",
+      "lblSshKey": "Chave de leitura para repositório privado (só se não usar o token do GitHub)",
+      "whAutoTitle": "Ligar pelo painel",
+      "whAutoNoteOn": "O painel cria o aviso no GitHub de cada repositório que tem app publicado aqui, sem copiar nada. O token precisa da permissão Webhooks: Read and write, além de Contents: Read-only. Dá para acrescentar editando o token no GitHub, sem criar outro.",
+      "whAutoNoteOff": "Ligue o GitHub em Conexões → GitHub e o painel faz isto sozinho. Sem isso, use o passo a passo abaixo.",
+      "whLblAddress": "Endereço do painel na internet",
+      "whBtnCheck": "Conferir repositórios",
+      "whChecking": "Conferindo no GitHub...",
+      "whNoRepos": "Nenhum app daqui vem de um repositório do GitHub ainda.",
+      "whStOn": "Ligado",
+      "whStOff": "Desligado",
+      "whStDenied": "Sem acesso",
+      "whStError": "Não deu para conferir",
+      "whDeniedHint": "O token não alcança este repositório ou não tem a permissão Webhooks: Read and write.",
+      "whLastFail": "A última chamada do GitHub não chegou ao painel (código {code}).",
+      "whBtnOn": "Ligar",
+      "whBtnRedo": "Ligar de novo",
+      "whBtnAll": "Ligar em todos",
+      "whWorking": "Ligando em {repo} e testando...",
+      "whOk": "Pronto: o GitHub avisou o painel e ele respondeu. Cada push em {repo} publica sozinho.",
+      "whUnreachable": "O aviso foi criado em {repo}, mas o teste do GitHub não chegou ao painel (código {code}). Confira se o endereço abre de fora de casa. Se o painel está publicado como “Só e-mails autorizados”, o GitHub fica barrado no login: use “Atualizar sozinho” ao publicar o app.",
+      "whUnknown": "O aviso foi criado em {repo}. O GitHub ainda não mostrou o resultado do teste: confira de novo em alguns segundos.",
+      "whManualTitle": "Fazer à mão no GitHub",
       "btnCopySsh": "📋 Copiar chave",
       "dbTitle": "🗄️ Criar um banco de dados",
       "lblDbApp": "App",
@@ -5119,7 +5167,28 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "whLblUrl": "Address to paste on GitHub (Settings → Webhooks → Add webhook, Payload URL field; Content type: application/json; event: Just the push event)",
       "whLblSecret": "Secret (the Secret field on the same form)",
       "btnRevealWhSecret": "👁️ Show and copy",
-      "lblSshKey": "Read-only key for a private repository (also under Connections → GitHub)",
+      "lblSshKey": "Read-only key for a private repository (only if you do not use the GitHub token)",
+      "whAutoTitle": "Turn on from the dashboard",
+      "whAutoNoteOn": "The dashboard creates the notice on GitHub for each repository with an app published here, with nothing to copy. The token needs the Webhooks: Read and write permission, besides Contents: Read-only. You can add it by editing the token on GitHub, no new token needed.",
+      "whAutoNoteOff": "Connect GitHub under Connections → GitHub and the dashboard does this by itself. Without it, use the steps below.",
+      "whLblAddress": "Dashboard's internet address",
+      "whBtnCheck": "Check repositories",
+      "whChecking": "Checking on GitHub...",
+      "whNoRepos": "No app here comes from a GitHub repository yet.",
+      "whStOn": "On",
+      "whStOff": "Off",
+      "whStDenied": "No access",
+      "whStError": "Could not check",
+      "whDeniedHint": "The token does not reach this repository or lacks the Webhooks: Read and write permission.",
+      "whLastFail": "GitHub's last call did not reach the dashboard (code {code}).",
+      "whBtnOn": "Turn on",
+      "whBtnRedo": "Turn on again",
+      "whBtnAll": "Turn on for all",
+      "whWorking": "Turning on for {repo} and testing...",
+      "whOk": "Done: GitHub called the dashboard and it answered. Every push to {repo} publishes by itself.",
+      "whUnreachable": "The notice was created on {repo}, but GitHub's test did not reach the dashboard (code {code}). Check that the address opens from outside your home network. If the dashboard is published as “Only allowed emails”, GitHub is stopped at the login: use “Update by itself” when publishing the app.",
+      "whUnknown": "The notice was created on {repo}. GitHub has not shown the test result yet: check again in a few seconds.",
+      "whManualTitle": "Do it by hand on GitHub",
       "btnCopySsh": "📋 Copy key",
       "dbTitle": "🗄️ Create a database",
       "lblDbApp": "App",
@@ -5724,6 +5793,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       currentTab = tab;
       renderSubNav();
       if (tab === 'guide') { if (sub) currentGuide = sub; renderGuide(); }
+      if (tab === 'overview' && currentSub('overview') === 'webhook' && (moved || mode === 'init')) loadHooks();
       const hash = '#' + tab + (subs ? '/' + currentSub(tab) : tab === 'guide' && currentGuide ? '/' + currentGuide : '');
       if (mode !== 'hash' && location.hash !== hash) {
         try {
@@ -7189,6 +7259,77 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
 
+
+    // ---- Push notices: the saved GitHub token creates the webhook on each app's repository ----
+    let whRepos = null;
+    let whBusy = false;
+    function whAddress() {
+      const el = document.getElementById('whAddress');
+      if (el && !el.value && location.protocol === 'https:') el.value = location.origin;
+      return el ? el.value.trim() : '';
+    }
+    async function loadHooks() {
+      const note = document.getElementById('whAutoNote');
+      if (!note) return;
+      if (!cnData) { const r = await fetch('/api/connections'); if (r.ok) cnData = await r.json(); }
+      const on = Boolean(cnData && cnData.github && cnData.github.tokenSaved);
+      note.innerHTML = esc(t(on ? 'whAutoNoteOn' : 'whAutoNoteOff')) + (on ? '' : ' <a href="#connect/github" data-go-tab="connect" data-go-sub="github">' + esc(currentLang === 'pt' ? 'Abrir Conexões → GitHub' : 'Open Connections → GitHub') + '</a>');
+      document.querySelector('#whAuto .wh-form').style.display = on ? '' : 'none';
+      document.getElementById('whManual').open = !on;
+      if (!on) { document.getElementById('whRepos').innerHTML = ''; return; }
+      const address = whAddress();
+      if (!address) { ofsMsg('whMsg', '', ''); return; }
+      ofsMsg('whMsg', t('whChecking'), '');
+      const res = await fetch('/api/connections/github/webhooks?address=' + encodeURIComponent(address));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { ofsMsg('whMsg', (currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status), 'err'); whRepos = null; renderHooks(); return; }
+      ofsMsg('whMsg', '', '');
+      whRepos = data.repos || [];
+      renderHooks();
+    }
+    function renderHooks() {
+      const box = document.getElementById('whRepos');
+      if (!box) return;
+      if (!whRepos) { box.innerHTML = ''; return; }
+      if (!whRepos.length) { box.innerHTML = '<p class="ofs-note">' + esc(t('whNoRepos')) + '</p>'; return; }
+      const kind = { on: 'success', off: 'warning', denied: 'danger', error: 'warning' };
+      const label = { on: 'whStOn', off: 'whStOff', denied: 'whStDenied', error: 'whStError' };
+      const rows = whRepos.map(function (r) {
+        const failed = r.state === 'on' && typeof r.lastCode === 'number' && (r.lastCode < 200 || r.lastCode >= 300);
+        const hint = r.state === 'denied' ? t('whDeniedHint') : failed ? t('whLastFail').split('{code}').join(String(r.lastCode)) : '';
+        const btn = r.state === 'denied' ? '' : '<button class="secondary" ' + (whBusy ? 'disabled ' : '') + 'onclick="hookOn(' + esc(JSON.stringify(r.repo)).split('"').join('&quot;') + ')">' + esc(t(r.state === 'on' ? 'whBtnRedo' : 'whBtnOn')) + '</button>';
+        return '<div style="display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);">' +
+          '<div style="flex:1 1 220px;min-width:0;"><strong style="overflow-wrap:anywhere;">' + esc(r.repo) + '</strong> ' + badge(failed ? 'warning' : kind[r.state] || 'warning', t(label[r.state] || 'whStError')) +
+          '<div style="color:var(--muted);font-size:12px;">' + esc((r.apps || []).join(', ')) + '</div>' +
+          (hint ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(hint) + '</div>' : '') + '</div>' + btn + '</div>';
+      }).join('');
+      const pending = whRepos.filter(function (r) { return r.state === 'off'; }).length;
+      box.innerHTML = rows +
+        (pending > 1 ? '<button style="margin-top:10px;" ' + (whBusy ? 'disabled ' : '') + 'onclick="hookAll()">' + esc(t('whBtnAll')) + '</button>' : '');
+    }
+    async function hookOn(repo) {
+      if (whBusy) return false;
+      whBusy = true; renderHooks();
+      ofsMsg('whMsg', t('whWorking').split('{repo}').join(repo), '');
+      let ok = false;
+      try {
+        const r = await ofsPost('/api/connections/github/webhooks', { repo: repo, address: whAddress() }, 'whMsg');
+        if (r) {
+          ok = r.reach === 'ok';
+          const key = r.reach === 'ok' ? 'whOk' : r.reach === 'unreachable' ? 'whUnreachable' : 'whUnknown';
+          ofsMsg('whMsg', t(key).split('{repo}').join(repo).split('{code}').join(String(r.code || 0)), r.reach === 'ok' ? 'ok' : 'err');
+        }
+      } finally { whBusy = false; }
+      const msg = document.getElementById('whMsg');
+      const keep = msg ? [msg.textContent, msg.className] : null;
+      await loadHooks();
+      if (keep && msg) { msg.textContent = keep[0]; msg.className = keep[1]; }
+      return ok;
+    }
+    async function hookAll() {
+      const list = (whRepos || []).filter(function (r) { return r.state === 'off'; }).map(function (r) { return r.repo; });
+      for (const repo of list) { if (!(await hookOn(repo)) && document.getElementById('whMsg').className.indexOf('err') !== -1) break; }
+    }
 
     async function loadOffsite() {
       const res = await fetch('/api/offsite');
