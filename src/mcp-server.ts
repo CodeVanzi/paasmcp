@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readNightlyMark } from "./nightly.js";
 import { deploySummary } from "./deploys.js";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
@@ -122,6 +123,8 @@ export function getSystemStatusSummary(includeMetrics = true) {
     containerMetrics,
     databases: state.databases,
     backups: listDatabaseBackups(),
+    /** Last nightly backup run (dashboard loop or systemd timer). */
+    nightlyBackup: readNightlyMark() || null,
     storage: Object.values(state.storage || {}),
     mirror: state.mirror,
   };
