@@ -218,10 +218,13 @@ export function testRestore(backupId: string): {
   ok: boolean;
   plainBytes: number;
   detail: string;
+  /** For the dashboard's own words: what was checked, and how many tables/entries were found. */
+  code: "checked" | "pg_ok" | "volume_ok" | "redis_ok" | "redis_bad";
+  count?: number;
 } {
   const { backup, plain } = readVerifiedBackup(backupId);
   const base = { backupId: backup.id, engine: backup.engine, plainBytes: plain.length };
-  if (OFFLINE()) return { ...base, ok: true, detail: "Checksum and decryption OK (offline test mode)." };
+  if (OFFLINE()) return { ...base, ok: true, detail: "Checksum and decryption OK (offline test mode).", code: "checked" };
 
   if (backup.engine === "postgres") {
     const tempDb = `restoretest_${crypto.randomBytes(4).toString("hex")}`;
@@ -239,7 +242,7 @@ export function testRestore(backupId: string): {
         "psql", "-tA", "-U", "paasmcp_admin", "-d", tempDb, "-c",
         "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')",
       ]).trim();
-      return { ...base, ok: true, detail: `Loaded into a temporary database: ${tables} table(s).` };
+      return { ...base, ok: true, detail: `Loaded into a temporary database: ${tables} table(s).`, code: "pg_ok", count: Number(tables) || 0 };
     } finally {
       exec(["dropdb", "-U", "paasmcp_admin", "--if-exists", tempDb]);
     }
@@ -247,10 +250,10 @@ export function testRestore(backupId: string): {
   if (backup.engine === "volume") {
     const files = execFileSync("tar", ["tzf", "-"], { input: plain, encoding: "utf-8", maxBuffer: 256 * 1024 * 1024 })
       .split("\n").filter(Boolean).length;
-    return { ...base, ok: true, detail: `Archive opens: ${files} entr${files === 1 ? "y" : "ies"}.` };
+    return { ...base, ok: true, detail: `Archive opens: ${files} entr${files === 1 ? "y" : "ies"}.`, code: "volume_ok", count: files };
   }
   const isRdb = plain.subarray(0, 5).toString("ascii") === "REDIS";
-  return { ...base, ok: isRdb, detail: isRdb ? "Redis RDB header OK." : "Not a Redis RDB file." };
+  return { ...base, ok: isRdb, detail: isRdb ? "Redis RDB header OK." : "Not a Redis RDB file.", code: isRdb ? "redis_ok" : "redis_bad" };
 }
 
 // ---------------------------------------------------------------------------

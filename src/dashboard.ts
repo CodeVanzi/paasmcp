@@ -3190,7 +3190,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         toastBundleGen: "📦 Bundle criptografado gerado",
         toastHandshakeDone: "🤝 Handshake concluído com o nó primário!",
         copiedToast: "✅ Copiado para a área de transferência!",
-        btnRestoreDump: "⏪ Restaurar Dump",
+        btnRestoreDump: "⏪ Restaurar",
         btnTestRestore: "🧪 Testar",
         offsiteLabel: "fora do servidor",
         btnRemoveSecret: "Remover",
@@ -3334,7 +3334,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         toastBundleGen: "📦 Encrypted bundle generated",
         toastHandshakeDone: "🤝 Handshake completed with primary node!",
         copiedToast: "✅ Copied to clipboard!",
-        btnRestoreDump: "⏪ Restore Dump",
+        btnRestoreDump: "⏪ Restore",
         btnTestRestore: "🧪 Test",
         offsiteLabel: "off-site",
         btnRemoveSecret: "Remove",
@@ -5481,6 +5481,46 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     Object.assign(I18N.pt, { "logsRefresh": "↻ Atualizar" });
     Object.assign(I18N.en, { "logsRefresh": "↻ Refresh" });
 
+    Object.assign(I18N.pt, {
+      "bkKind_postgres": "banco PostgreSQL",
+      "bkKind_redis": "cache Redis",
+      "bkKind_volume": "arquivos do app",
+      "bkTest_checked": "A cópia abre: conferida e decifrada.",
+      "bkTest_pg_ok": "A cópia abre: carregada num banco temporário, {n} tabela(s).",
+      "bkTest_volume_ok": "A cópia abre: {n} arquivo(s) e pasta(s).",
+      "bkTest_redis_ok": "A cópia do Redis abre.",
+      "bkTest_redis_bad": "Essa cópia não parece um arquivo do Redis.",
+      "bkRestoredDb": "Banco restaurado.",
+      "bkRestoredVolume": "Arquivos do app restaurados.",
+      "bkSafety": "Antes, o painel guardou uma cópia de como estava, para desfazer se preciso.",
+      "bkErr": "Não deu para fazer isso agora."
+    });
+    Object.assign(I18N.en, {
+      "bkKind_postgres": "PostgreSQL database",
+      "bkKind_redis": "Redis cache",
+      "bkKind_volume": "app files",
+      "bkTest_checked": "The copy opens: checked and decrypted.",
+      "bkTest_pg_ok": "The copy opens: loaded into a temporary database, {n} table(s).",
+      "bkTest_volume_ok": "The copy opens: {n} file(s) and folder(s).",
+      "bkTest_redis_ok": "The Redis copy opens.",
+      "bkTest_redis_bad": "This copy does not look like a Redis file.",
+      "bkRestoredDb": "Database restored.",
+      "bkRestoredVolume": "App files restored.",
+      "bkSafety": "First, the dashboard kept a copy of how it was, to undo if needed.",
+      "bkErr": "Could not do that right now."
+    });
+
+    function fmtWhen(iso) {
+      try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return String(iso || ''); }
+    }
+    function fmtSize(bytes) {
+      const n = Number(bytes) || 0;
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+      return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    }
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -6336,8 +6376,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         ? backups.map(b => \`
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12px;gap:8px;flex-wrap:wrap;">
             <div>
-              🔒 <strong>\${esc(b.id)}</strong> (\${esc(b.engine)})<br/>
-              <span style="color:var(--muted);">\${esc(t('sizeLabel'))} \${esc(b.sizeBytes)} bytes · SHA256: <code>\${esc((b.sha256 || '').slice(0, 12))}...</code>\${b.offsiteKey ? ' · ☁️ ' + esc(t('offsiteLabel')) : ''}</span>
+              🔒 <strong>\${esc(b.appName)}</strong> · \${esc(t('bkKind_' + b.engine) || b.engine)}\${b.engine === 'volume' ? ' (' + esc(b.databaseName) + ')' : ''} · \${esc(fmtWhen(b.createdAt))}<br/>
+              <span style="color:var(--muted);" title="\${esc(b.id)} · SHA256 \${esc(b.sha256 || '')}">\${esc(fmtSize(b.sizeBytes))}\${b.offsiteKey ? ' · ☁️ ' + esc(t('offsiteLabel')) : ''}</span>
             </div>
             <span>
               <button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="testBackup('\${esc(b.id)}')">\${esc(t('btnTestRestore'))}</button>
@@ -7834,9 +7874,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backupId })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
-      showToast((data.ok ? '✅ ' : '⚠️ ') + data.detail);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) return alert(t('bkErr') + '\\n\\n' + (data.error || ('HTTP ' + res.status)));
+      const msg = I18N.en['bkTest_' + data.code] ? t('bkTest_' + data.code).split('{n}').join(String(data.count ?? '')) : data.detail;
+      showToast((data.ok ? '✅ ' : '⚠️ ') + msg);
     }
 
     async function restoreBackup(backupId) {
@@ -7845,9 +7886,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ backupId })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
-      showToast('✅ Banco restaurado com sucesso (' + data.restoredBytes + ' bytes)!');
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { if (!data.confirmationRequired) alert(t('bkErr') + '\\n\\n' + (data.error || ('HTTP ' + res.status))); return; }
+      const engine = data.backup && data.backup.engine;
+      showToast('✅ ' + t(engine === 'volume' ? 'bkRestoredVolume' : 'bkRestoredDb') + (data.safetyBackupId ? ' ' + t('bkSafety') : ''));
+      loadAll();
     }
 
     async function generateInvite() {

@@ -557,6 +557,7 @@ volumes:
       const vols = backup.backupAppVolumes("vol-app");
       assert.equal(vols.length, 1);
       assert.equal(vols[0].engine, "volume");
+      assert.equal(backup.testRestore(vols[0].id).code, "checked", "a code the dashboard says in its own words");
       assert.equal(backup.testRestore(vols[0].id).ok, true);
       assert.equal(database.restoreDatabase(vols[0].id).restored, true);
 
@@ -4021,6 +4022,8 @@ volumes:
       for (const k of ["lifePoolUpdating", "lifePoolFailed", "lifeErrNoPrevious", "lifeErr", "logsEmpty", "logsHint", "actionRollbackTip"]) twice(k);
       assert.ok(!page.includes("showToast('✅ ' + data.output)"));
       // The app list speaks plainly: no bare 127.0.0.1 pill, no raw access mode, no English limits.
+      for (const k of ["bkKind_postgres", "bkKind_redis", "bkKind_volume", "bkTest_checked", "bkTest_pg_ok", "bkTest_volume_ok", "bkTest_redis_ok", "bkTest_redis_bad", "bkRestoredDb", "bkRestoredVolume", "bkSafety", "bkErr"]) twice(k);
+      assert.ok(!page.includes("Banco restaurado com sucesso ("), "no fixed Portuguese toast for every restore");
       for (const k of ["nbNone", "nbRunning", "nbOk", "nbErr", "nbOffsiteOk", "nbOffsiteFailed", "nbOffsiteNone", "nbNext"]) twice(k);
       for (const k of ["sub_connect_alerts", "ntTitle", "ntDesc", "ntHowNtfy", "ntHowDiscord", "ntHowSlack", "ntSave", "ntOnDesc", "tut_alerts", "tut_alertsDesc"]) twice(k);
       for (const k of ["appNoAddressTip", "pillLocalOnly", "mode_public", "mode_zero-trust", "mode_tailscale", "limitsLabel"]) twice(k);
