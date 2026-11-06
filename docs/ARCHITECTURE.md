@@ -250,6 +250,15 @@ There is still **one writer**: the origin's Postgres.
 
 - Nightly systemd timer (`paasmcp backup install-timer`): database dumps, named volumes, upload to any
   S3-compatible bucket (`BACKUP_S3_*` in the `system` vault scope), signed with native SigV4.
+- Where they go is set per provider (`src/offsite.ts`): `buildOffsiteTarget` turns the few fields a provider
+  asks for (R2 account id, S3/B2/Wasabi region, Google HMAC key, a custom endpoint, or the access code of
+  another PaaSMCP) into a full S3 destination; `saveOffsiteTarget` writes, reads back and deletes a test file
+  first, then asks a person only when a working destination is replaced (guard `backup.target`). Plain
+  http is accepted only for private, loopback and Tailscale addresses.
+- The other direction: `createBackupGrant` (guard `backup.grant`, confirm) gives another computer its own
+  bucket and key on this server's Garage, with an optional quota, reachable on the Tailscale IP (only the
+  S3 port; `state.backupShare.bindIp` when no mirror or helper pool published it). The secret is returned
+  once and never stored outside Garage; `revokeBackupGrant` deletes the key and keeps the data.
 - Local copies are pruned **only after** they exist off-site. `backup test <id>` restores into a
   scratch container to prove the backup actually opens.
 

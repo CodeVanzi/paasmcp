@@ -13,6 +13,7 @@ import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./a
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
+import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -726,6 +727,50 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         if (pathname === "/api/backups/sync" && req.method === "POST") return reply(await syncOffsite());
 
+        // Off-site destination (receiving side) and keys for other computers (providing side).
+        if (pathname === "/api/offsite" && req.method === "GET") {
+          return reply({ target: offsiteSummary(), grants: await listBackupGrants() });
+        }
+        if (pathname === "/api/offsite/target" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const r = await saveOffsiteTarget(
+            {
+              provider: String(body.provider || ""),
+              accountId: body.accountId ? String(body.accountId) : undefined,
+              region: body.region ? String(body.region) : undefined,
+              endpoint: body.endpoint ? String(body.endpoint) : undefined,
+              bucket: body.bucket ? String(body.bucket) : undefined,
+              accessKeyId: body.accessKeyId ? String(body.accessKeyId) : undefined,
+              secretAccessKey: body.secretAccessKey ? String(body.secretAccessKey) : undefined,
+              prefix: body.prefix ? String(body.prefix) : undefined,
+              code: body.code ? String(body.code) : undefined,
+            },
+            (params) => confirmFromBody("backup.target", params, body)
+          );
+          return reply(r);
+        }
+        if (pathname === "/api/offsite/test" && req.method === "POST") return reply(await retestOffsiteTarget());
+        if (pathname === "/api/offsite/clear" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await clearOffsiteTarget((params) => confirmFromBody("backup.target.clear", params, body)));
+        }
+        if (pathname === "/api/offsite/grants" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const r = await createBackupGrant(
+            String(body.name || ""),
+            { maxGb: body.maxGb === undefined || body.maxGb === "" || body.maxGb === null ? undefined : Number(body.maxGb) },
+            (params) => confirmFromBody("backup.grant", params, body)
+          );
+          // The secret is in this answer only: never cached, never logged.
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(r));
+          return true;
+        }
+        if (pathname === "/api/offsite/grants/revoke" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await revokeBackupGrant(String(body.name || "")));
+        }
+
         if (pathname === "/api/storage" && req.method === "GET") return reply({ storage: listStorage() });
         if (pathname === "/api/storage" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -868,10 +913,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           );
           return;
         }
-        res.writeHead(err instanceof ForbiddenActionError ? 403 : 500, { "Content-Type": "application/json" });
+        // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
+        const status = err instanceof ForbiddenActionError ? 403 : err instanceof OffsiteError ? 400 : 500;
+        res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
+            ...(err instanceof OffsiteError ? { errorPt: err.pt } : {}),
           })
         );
         return;
@@ -1048,6 +1096,17 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     }
     button.chip:hover, button.chip.selected { background: var(--accent); color: #07090e; }
     [data-theme="light"] button.chip:hover, [data-theme="light"] button.chip.selected { color: #ffffff; }
+    .ofs-h { font-size: 14px; margin: 14px 0 6px; }
+    .ofs-note { font-size: 12.5px; color: var(--muted); margin: 0 0 8px; line-height: 1.5; }
+    .ofs-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+    .ofs-chips button.chip { font-size: 12px; padding: 6px 12px; }
+    .ofs-msg { font-size: 12.5px; margin-top: 8px; line-height: 1.5; }
+    .ofs-msg.err { color: var(--danger); }
+    .ofs-msg.ok { color: var(--success, #22c55e); }
+    .ofs-secret { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; padding: 8px 10px; border-radius: 8px; background: var(--bg-subtle); border: 1px solid var(--border); margin: 4px 0 8px; }
+    .ofs-kv { display: grid; grid-template-columns: max-content 1fr auto; gap: 4px 10px; align-items: center; font-size: 12.5px; }
+    .ofs-kv code { word-break: break-all; }
+    @media (max-width: 560px) { .ofs-kv { grid-template-columns: 1fr auto; } .ofs-kv .k { grid-column: 1 / -1; color: var(--muted); } }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -2288,10 +2347,35 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <h2 data-i18n="offsiteTitle"></h2>
               <p class="card-desc" data-i18n="offsiteDesc"></p>
             </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;">
-              <button onclick="syncOffsiteNow()" id="btnSyncOffsite" data-i18n="btnSyncOffsite"></button>
+            <h3 class="ofs-h" data-i18n="ofsSendTitle"></h3>
+            <div id="ofsCurrent"></div>
+            <div id="ofsForm" style="display:none;">
+              <p class="ofs-note" data-i18n="ofsPickProvider"></p>
+              <div id="ofsProviders" class="ofs-chips"></div>
+              <div id="ofsFields"></div>
+              <div class="ofs-msg" id="ofsMsg" role="status" aria-live="polite"></div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+                <button onclick="saveOffsiteUi()" id="btnOfsSave" data-i18n="ofsBtnSave"></button>
+                <button class="secondary" onclick="closeOffsiteForm()" id="btnOfsCancel" data-i18n="ofsBtnCancel" style="display:none;"></button>
+              </div>
             </div>
-            <details style="margin-top:10px;font-size:12.5px;color:var(--muted);"><summary data-i18n="detailsTech"></summary><p data-i18n="offsiteTech"></p></details>
+            <h3 class="ofs-h" style="margin-top:22px;" data-i18n="ofsGiveTitle"></h3>
+            <p class="ofs-note" data-i18n="ofsGiveDesc"></p>
+            <div id="ofsGrants"></div>
+            <div class="form-grid" style="margin-top:8px;">
+              <div>
+                <label class="field-label" for="ofsGrantName" data-i18n="ofsGrantName"></label>
+                <input id="ofsGrantName" placeholder="ex: notebook" autocomplete="off" />
+              </div>
+              <div>
+                <label class="field-label" for="ofsGrantGb" data-i18n="ofsGrantGb"></label>
+                <input id="ofsGrantGb" type="number" min="1" step="1" placeholder="50" />
+              </div>
+            </div>
+            <div class="ofs-msg" id="ofsGrantMsg" role="status" aria-live="polite"></div>
+            <div style="margin-top:10px;"><button class="secondary" onclick="createGrantUi()" id="btnOfsGrant" data-i18n="ofsBtnGrant"></button></div>
+            <div id="ofsGrantResult"></div>
+            <details style="margin-top:14px;font-size:12.5px;color:var(--muted);"><summary data-i18n="detailsTech"></summary><p data-i18n="offsiteTech"></p></details>
           </div>
           <div class="card" data-sub="files">
             <div class="card-header">
@@ -3242,10 +3326,68 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "detailsTech": "Detalhes técnicos",
           "offsiteTitle": "☁️ Cópias fora do servidor",
           "offsiteDesc": "Toda noite o servidor faz as cópias e manda para um serviço de armazenamento externo. As cópias locais só são apagadas depois de chegarem lá.",
-          "offsiteTech": "Qualquer serviço compatível com S3 (Backblaze B2, Cloudflare R2, Wasabi ou o segundo servidor). Configure BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID e BACKUP_S3_SECRET_ACCESS_KEY no escopo system de Senhas e chaves. Horário automático: paasmcp backup install-timer.",
+          "offsiteTech": "As cópias já saem cifradas (AES-256-GCM) deste servidor, então o serviço guarda só dados ilegíveis. O destino fica no cofre, escopo system (BACKUP_S3_*). Pela linha de comando: paasmcp backup target set <serviço>. Horário automático: paasmcp backup install-timer. As chaves geradas aqui são do Garage deste servidor e só funcionam pela Tailscale.",
           "btnSyncOffsite": "☁️ Enviar cópias agora",
           "offsiteDone": "Cópias enviadas:",
           "offsiteFailed": "falharam:",
+          "ofsSendTitle": "Para onde mandar as cópias deste servidor",
+          "ofsPickProvider": "Escolha onde você tem conta. Só aparecem os campos que esse serviço pede: é copiar e colar.",
+          "ofsProvPaasmcp": "Outro PaaSMCP",
+          "ofsProvCustom": "Outro (MinIO, S3 compatível)",
+          "ofsF_accountId": "ID da conta",
+          "ofsF_region": "Região",
+          "ofsF_endpoint": "Endereço do servidor",
+          "ofsF_bucket": "Nome do bucket",
+          "ofsF_accessKeyId": "Access Key ID",
+          "ofsF_secretAccessKey": "Secret Access Key",
+          "ofsF_code": "Código de acesso",
+          "ofsF_prefix": "Pasta dentro do bucket",
+          "ofsF_gcs_accessKeyId": "Access key (HMAC)",
+          "ofsF_gcs_secretAccessKey": "Secret (HMAC)",
+          "ofsF_b2_accessKeyId": "keyID",
+          "ofsF_b2_secretAccessKey": "applicationKey",
+          "ofsF_custom_region": "Região (se o serviço pedir)",
+          "ofsHint_r2": "No painel da Cloudflare, em R2: o ID da conta aparece na página do R2 (pode colar o endereço \\"S3 API\\" inteiro). A chave sai em Gerenciar tokens de API > Criar token, com permissão de leitura e gravação de objetos nesse bucket.",
+          "ofsHint_s3": "No console da AWS, em IAM > Usuários > Credenciais de segurança > Criar chave de acesso. Dê ao usuário acesso só a esse bucket.",
+          "ofsHint_gcs": "No Google Cloud, em Cloud Storage > Configurações > Interoperabilidade: crie uma chave HMAC para uma conta de serviço com acesso a esse bucket.",
+          "ofsHint_b2": "Na Backblaze, em Application Keys > Add a New Application Key, só para esse bucket. A região é o meio do Endpoint do bucket (s3.us-west-004.backblazeb2.com → us-west-004).",
+          "ofsHint_wasabi": "No console da Wasabi, em Access Keys > Create New Access Key. A região é a do bucket.",
+          "ofsHint_paasmcp": "Cole o código que o outro PaaSMCP gerou em \\"Guardar cópias de outro computador aqui\\". Os dois precisam estar na mesma conta Tailscale.",
+          "ofsHint_custom": "Qualquer serviço compatível com S3, como MinIO ou Garage. Use https://, ou http:// só dentro da sua rede ou da Tailscale.",
+          "ofsMore": "Mais opções",
+          "ofsBtnSave": "Testar e salvar",
+          "ofsBtnCancel": "Cancelar",
+          "ofsTesting": "Testando: gravando, lendo e apagando um arquivinho no destino…",
+          "ofsSaved": "✅ Destino testado e salvo. As cópias vão para lá toda noite.",
+          "ofsNoDelete": "(A chave grava mas não apaga; as cópias funcionam assim mesmo.)",
+          "ofsTestOk": "✅ O destino respondeu: gravou e leu o arquivo de teste.",
+          "ofsActive": "Ativo",
+          "ofsFolder": "pasta",
+          "ofsKey": "chave",
+          "ofsTestedAt": "testado em",
+          "ofsBtnTest": "Testar",
+          "ofsBtnChange": "Trocar destino",
+          "ofsBtnStop": "Parar de enviar",
+          "ofsSending": "Enviando…",
+          "ofsGiveTitle": "Guardar cópias de outro computador aqui",
+          "ofsGiveDesc": "Gera uma chave que outro PaaSMCP, um computador ou um app usa para guardar cópias num bucket só dele neste servidor, pela Tailscale. Ele não enxerga mais nada daqui, e você pode revogar a chave quando quiser.",
+          "ofsGrantName": "Nome de quem vai usar",
+          "ofsGrantGb": "Limite em GB (vazio = sem limite)",
+          "ofsBtnGrant": "Gerar chave",
+          "ofsNeedName": "Dê um nome, por exemplo notebook ou servidor-casa.",
+          "ofsGrantReady": "Chave criada.",
+          "ofsGrantOnce": "Ela aparece só agora: copie antes de fechar. Se perder, revogue e gere outra.",
+          "ofsGrantCodeLabel": "Para outro PaaSMCP: cole este código lá, em \\"Outro PaaSMCP\\"",
+          "ofsCopyCode": "Copiar código",
+          "ofsCopy": "Copiar",
+          "ofsDoneHide": "Já copiei, esconder",
+          "ofsGrantFields": "Para outro programa (rclone, restic, app): os campos separados",
+          "ofsGrantInternal": "Um app que roda neste mesmo servidor usa o endereço interno:",
+          "ofsStored": "guardando",
+          "ofsLimit": "limite",
+          "ofsRevoked": "Revogada",
+          "ofsBtnRevoke": "Revogar",
+          "ofsRevokedMsg": "A chave de {name} não funciona mais. O que já foi guardado continua aqui.",
           "storageTitle": "🗂️ Arquivos dos apps",
           "storageDesc": "Espaço para fotos, PDFs e uploads. Cada app ganha o seu, com chave própria; as bibliotecas comuns (boto3, AWS SDK) funcionam sem mudar código.",
           "storageNone": "Nenhum app com espaço de arquivos ainda.",
@@ -3523,10 +3665,68 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "detailsTech": "Technical details",
           "offsiteTitle": "☁️ Backups off the server",
           "offsiteDesc": "Every night the server makes backups and sends them to external storage. Local copies are only deleted after they arrive there.",
-          "offsiteTech": "Any S3-compatible service (Backblaze B2, Cloudflare R2, Wasabi or the second server). Set BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID and BACKUP_S3_SECRET_ACCESS_KEY in the system scope of Passwords & keys. Nightly schedule: paasmcp backup install-timer.",
+          "offsiteTech": "Backups leave this server already encrypted (AES-256-GCM), so the service only keeps unreadable data. The destination lives in the vault, system scope (BACKUP_S3_*). From the command line: paasmcp backup target set <provider>. Nightly schedule: paasmcp backup install-timer. Keys made here belong to this server's Garage and only work over Tailscale.",
           "btnSyncOffsite": "☁️ Send backups now",
           "offsiteDone": "Backups sent:",
           "offsiteFailed": "failed:",
+          "ofsSendTitle": "Where this server's backups go",
+          "ofsPickProvider": "Pick where you have an account. Only the fields that service needs show up: just copy and paste.",
+          "ofsProvPaasmcp": "Another PaaSMCP",
+          "ofsProvCustom": "Other (MinIO, S3 compatible)",
+          "ofsF_accountId": "Account ID",
+          "ofsF_region": "Region",
+          "ofsF_endpoint": "Server address",
+          "ofsF_bucket": "Bucket name",
+          "ofsF_accessKeyId": "Access Key ID",
+          "ofsF_secretAccessKey": "Secret Access Key",
+          "ofsF_code": "Access code",
+          "ofsF_prefix": "Folder inside the bucket",
+          "ofsF_gcs_accessKeyId": "Access key (HMAC)",
+          "ofsF_gcs_secretAccessKey": "Secret (HMAC)",
+          "ofsF_b2_accessKeyId": "keyID",
+          "ofsF_b2_secretAccessKey": "applicationKey",
+          "ofsF_custom_region": "Region (if the service asks)",
+          "ofsHint_r2": "In the Cloudflare dashboard, under R2: the account ID is on the R2 page (you can paste the whole \\"S3 API\\" address). The key comes from Manage API tokens > Create token, with object read and write on this bucket.",
+          "ofsHint_s3": "In the AWS console, under IAM > Users > Security credentials > Create access key. Give the user access to this bucket only.",
+          "ofsHint_gcs": "In Google Cloud, under Cloud Storage > Settings > Interoperability: create an HMAC key for a service account that can use this bucket.",
+          "ofsHint_b2": "At Backblaze, under Application Keys > Add a New Application Key, for this bucket only. The region is the middle of the bucket's Endpoint (s3.us-west-004.backblazeb2.com → us-west-004).",
+          "ofsHint_wasabi": "In the Wasabi console, under Access Keys > Create New Access Key. The region is the bucket's.",
+          "ofsHint_paasmcp": "Paste the code the other PaaSMCP made under \\"Keep another computer's backups here\\". Both must be on the same Tailscale account.",
+          "ofsHint_custom": "Any S3-compatible service, like MinIO or Garage. Use https://, or http:// only inside your network or Tailscale.",
+          "ofsMore": "More options",
+          "ofsBtnSave": "Test and save",
+          "ofsBtnCancel": "Cancel",
+          "ofsTesting": "Testing: writing, reading and deleting a tiny file at the destination…",
+          "ofsSaved": "✅ Destination tested and saved. Backups go there every night.",
+          "ofsNoDelete": "(The key can write but not delete; backups work anyway.)",
+          "ofsTestOk": "✅ The destination answered: it saved and read the test file.",
+          "ofsActive": "Active",
+          "ofsFolder": "folder",
+          "ofsKey": "key",
+          "ofsTestedAt": "tested",
+          "ofsBtnTest": "Test",
+          "ofsBtnChange": "Change destination",
+          "ofsBtnStop": "Stop sending",
+          "ofsSending": "Sending…",
+          "ofsGiveTitle": "Keep another computer's backups here",
+          "ofsGiveDesc": "Makes a key that another PaaSMCP, a computer or an app uses to keep backups in a bucket of its own on this server, over Tailscale. It sees nothing else here, and you can revoke the key any time.",
+          "ofsGrantName": "Name of who will use it",
+          "ofsGrantGb": "Limit in GB (empty = no limit)",
+          "ofsBtnGrant": "Make key",
+          "ofsNeedName": "Give it a name, for example laptop or home-server.",
+          "ofsGrantReady": "Key created.",
+          "ofsGrantOnce": "It shows only now: copy it before closing. If you lose it, revoke it and make another.",
+          "ofsGrantCodeLabel": "For another PaaSMCP: paste this code there, under \\"Another PaaSMCP\\"",
+          "ofsCopyCode": "Copy code",
+          "ofsCopy": "Copy",
+          "ofsDoneHide": "Copied, hide it",
+          "ofsGrantFields": "For another program (rclone, restic, an app): the separate fields",
+          "ofsGrantInternal": "An app on this same server uses the internal address:",
+          "ofsStored": "storing",
+          "ofsLimit": "limit",
+          "ofsRevoked": "Revoked",
+          "ofsBtnRevoke": "Revoke",
+          "ofsRevokedMsg": "{name}'s key no longer works. What it already stored stays here.",
           "storageTitle": "🗂️ App files",
           "storageDesc": "Space for photos, PDFs and uploads. Each app gets its own, with its own key; common libraries (boto3, AWS SDK) work without code changes.",
           "storageNone": "No app has file space yet.",
@@ -4604,7 +4804,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'agents') { renderAi(); loadAiTokens(); }
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
-      if (tabName === 'databases') loadStorage();
+      if (tabName === 'databases') { loadStorage(); loadOffsite(); }
       if (tabName === 'overview') loadScale();
       if (tabName === 'pool') loadPool(true);
     }
@@ -5585,13 +5785,202 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const r = await postJson('/api/storage', { appName });
       if (r) { showToast(t('storageDone')); loadStorage(); }
     }
+    // ---- Off-site backups: one form per provider, secrets typed here and never shown back ----
+    // Fields each provider needs, in order. Labels and hints are in I18N (ofsF_<field>, ofsHint_<provider>).
+    const OFS_PROVIDERS = [
+      ['r2', 'Cloudflare R2', ['accountId', 'bucket', 'accessKeyId', 'secretAccessKey']],
+      ['s3', 'Amazon S3', ['region', 'bucket', 'accessKeyId', 'secretAccessKey']],
+      ['gcs', 'Google Cloud', ['bucket', 'accessKeyId', 'secretAccessKey']],
+      ['b2', 'Backblaze B2', ['region', 'bucket', 'accessKeyId', 'secretAccessKey']],
+      ['wasabi', 'Wasabi', ['region', 'bucket', 'accessKeyId', 'secretAccessKey']],
+      ['paasmcp', null, ['code']],
+      ['custom', null, ['endpoint', 'region', 'bucket', 'accessKeyId', 'secretAccessKey']],
+    ];
+    const OFS_PLACEHOLDER = { r2: { accountId: '0123456789abcdef0123456789abcdef' }, s3: { region: 'us-east-1' }, b2: { region: 'us-west-004' }, wasabi: { region: 'us-east-1' }, custom: { endpoint: 'https://minio.example.com', region: 'us-east-1' } };
+    let ofsProvider = 'r2';
+    let ofsData = null;
+
+    function ofsLabel(p, f) {
+      const specific = t('ofsF_' + p + '_' + f);
+      return specific !== 'ofsF_' + p + '_' + f ? specific : t('ofsF_' + f);
+    }
+    function ofsMsg(id, text, kind) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text || '';
+      el.className = 'ofs-msg' + (kind ? ' ' + kind : '');
+    }
+    // Same as postJson, but the error goes next to the button instead of a browser pop-up.
+    async function ofsPost(url, body, msgId) {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { if (!data.confirmationRequired) ofsMsg(msgId, (currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status), 'err'); return null; }
+      return data;
+    }
+
+    async function loadOffsite() {
+      const res = await fetch('/api/offsite');
+      if (!res.ok) return;
+      ofsData = await res.json();
+      renderOffsiteCurrent();
+      renderGrants();
+    }
+
+    function renderOffsiteCurrent() {
+      const box = document.getElementById('ofsCurrent');
+      const tg = (ofsData && ofsData.target) || { configured: false };
+      if (!tg.configured) {
+        box.innerHTML = '';
+        openOffsiteForm(false);
+        return;
+      }
+      const name = tg.provider === 'paasmcp' ? t('ofsProvPaasmcp') : tg.provider === 'custom' ? t('ofsProvCustom') : tg.providerName;
+      box.innerHTML = card(
+        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
+        '<div><strong>' + esc(name) + '</strong> · ' + esc(tg.bucket) + ' <span style="color:var(--muted)">(' + esc(tg.host) + ')</span>' +
+        '<div style="color:var(--muted);margin-top:4px;">' + esc(t('ofsFolder')) + ' <code>' + esc(tg.prefix) + '/</code> · ' + esc(t('ofsKey')) + ' <code>' + esc(tg.accessKeyHint) + '</code>' +
+        (tg.testedAt ? ' · ' + esc(t('ofsTestedAt')) + ' ' + esc(new Date(tg.testedAt).toLocaleString()) : '') + '</div></div>' +
+        badge('success', t('ofsActive')) + '</div>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">' +
+        '<button onclick="syncOffsiteNow()" id="btnSyncOffsite">' + esc(t('btnSyncOffsite')) + '</button>' +
+        '<button class="secondary" onclick="testOffsiteUi()" id="btnOfsTest">' + esc(t('ofsBtnTest')) + '</button>' +
+        '<button class="secondary" onclick="openOffsiteForm(true)">' + esc(t('ofsBtnChange')) + '</button>' +
+        '<button class="danger" onclick="clearOffsiteUi()">' + esc(t('ofsBtnStop')) + '</button></div>' +
+        '<div class="ofs-msg" id="ofsCurMsg" role="status" aria-live="polite"></div>');
+      document.getElementById('ofsForm').style.display = 'none';
+    }
+
+    function openOffsiteForm(changing) {
+      document.getElementById('ofsForm').style.display = 'block';
+      document.getElementById('btnOfsCancel').style.display = changing ? '' : 'none';
+      const tg = ofsData && ofsData.target;
+      if (changing && tg && tg.provider) ofsProvider = tg.provider;
+      renderOffsiteProviders();
+      ofsMsg('ofsMsg', '');
+    }
+    function closeOffsiteForm() { document.getElementById('ofsForm').style.display = 'none'; ofsMsg('ofsMsg', ''); }
+
+    function renderOffsiteProviders() {
+      document.getElementById('ofsProviders').innerHTML = OFS_PROVIDERS.map(([id, name]) =>
+        '<button type="button" class="chip' + (id === ofsProvider ? ' selected' : '') + '" aria-pressed="' + (id === ofsProvider) + '" onclick="pickOffsiteProvider(&#39;' + id + '&#39;)">' +
+        esc(name || (id === 'paasmcp' ? t('ofsProvPaasmcp') : t('ofsProvCustom'))) + '</button>').join('');
+      renderOffsiteFields();
+    }
+    function pickOffsiteProvider(id) { ofsProvider = id; renderOffsiteProviders(); ofsMsg('ofsMsg', ''); }
+
+    function renderOffsiteFields() {
+      const def = OFS_PROVIDERS.find((x) => x[0] === ofsProvider);
+      const ph = OFS_PLACEHOLDER[ofsProvider] || {};
+      const field = (f) => {
+        const id = 'ofs_' + f;
+        const label = '<label class="field-label" for="' + id + '">' + esc(ofsLabel(ofsProvider, f)) + '</label>';
+        if (f === 'code') return '<div style="grid-column:1/-1;">' + label + '<textarea id="' + id + '" rows="3" autocomplete="off" spellcheck="false" placeholder="paasmcp-backup:1:…"></textarea></div>';
+        const secret = f === 'secretAccessKey';
+        return '<div>' + label + '<input id="' + id + '" ' + (secret ? 'type="password" autocomplete="new-password"' : 'autocomplete="off"') +
+          ' spellcheck="false" placeholder="' + esc(ph[f] || '') + '" /></div>';
+      };
+      document.getElementById('ofsFields').innerHTML =
+        '<p class="ofs-note">' + esc(t('ofsHint_' + ofsProvider)) + '</p>' +
+        '<div class="form-grid">' + def[2].map(field).join('') + '</div>' +
+        (ofsProvider === 'paasmcp' ? '' : '<details style="margin-top:6px;font-size:12.5px;"><summary style="color:var(--muted)">' + esc(t('ofsMore')) + '</summary>' +
+          '<div style="margin-top:8px;max-width:420px;"><label class="field-label" for="ofs_prefix">' + esc(t('ofsF_prefix')) + '</label><input id="ofs_prefix" autocomplete="off" spellcheck="false" placeholder="paasmcp/' + esc((lastStatus && lastStatus.hostname) || 'servidor') + '" /></div></details>');
+    }
+
+    async function saveOffsiteUi() {
+      const def = OFS_PROVIDERS.find((x) => x[0] === ofsProvider);
+      const body = { provider: ofsProvider };
+      for (const f of def[2].concat(['prefix'])) {
+        const el = document.getElementById('ofs_' + f);
+        if (el && el.value.trim()) body[f] = el.value.trim();
+      }
+      const btn = document.getElementById('btnOfsSave');
+      btn.disabled = true;
+      ofsMsg('ofsMsg', t('ofsTesting'));
+      try {
+        const r = await ofsPost('/api/offsite/target', body, 'ofsMsg');
+        if (!r) { if (document.getElementById('ofsMsg').textContent === t('ofsTesting')) ofsMsg('ofsMsg', ''); return; }
+        // Typed secrets leave the page as soon as they are saved.
+        document.querySelectorAll('#ofsFields input, #ofsFields textarea').forEach((el) => { el.value = ''; });
+        showToast(t('ofsSaved') + (r.test && !r.test.deleted ? ' ' + t('ofsNoDelete') : ''));
+        await loadOffsite();
+        loadAll();
+      } finally { btn.disabled = false; }
+    }
+
+    async function testOffsiteUi() {
+      const btn = document.getElementById('btnOfsTest');
+      btn.disabled = true;
+      ofsMsg('ofsCurMsg', t('ofsTesting'));
+      try {
+        const r = await ofsPost('/api/offsite/test', {}, 'ofsCurMsg');
+        if (r) { await loadOffsite(); ofsMsg('ofsCurMsg', t('ofsTestOk') + (r.test && !r.test.deleted ? ' ' + t('ofsNoDelete') : ''), 'ok'); }
+      } finally { if (document.getElementById('btnOfsTest')) document.getElementById('btnOfsTest').disabled = false; }
+    }
+
+    async function clearOffsiteUi() {
+      const r = await ofsPost('/api/offsite/clear', {}, 'ofsCurMsg');
+      if (r) { await loadOffsite(); loadAll(); }
+    }
+
     async function syncOffsiteNow() {
       const btn = document.getElementById('btnSyncOffsite');
-      btn.disabled = true;
+      if (btn) btn.disabled = true;
+      ofsMsg('ofsCurMsg', t('ofsSending'));
       try {
-        const r = await postJson('/api/backups/sync', {});
-        if (r) showToast(t('offsiteDone') + ' ' + r.uploaded.length + (r.failed.length ? ' · ' + t('offsiteFailed') + ' ' + r.failed.length : ''));
+        const r = await ofsPost('/api/backups/sync', {}, 'ofsCurMsg');
+        if (r) ofsMsg('ofsCurMsg', t('offsiteDone') + ' ' + r.uploaded.length + (r.failed.length ? ' · ' + t('offsiteFailed') + ' ' + r.failed.length + ' (' + r.failed[0].error + ')' : ''), r.failed.length ? 'err' : 'ok');
+      } finally { if (btn) btn.disabled = false; }
+    }
+
+    function fmtBytes(n) {
+      if (typeof n !== 'number') return '';
+      const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+      return (i ? n.toFixed(1) : String(n)) + ' ' + u[i];
+    }
+
+    function renderGrants() {
+      const grants = (ofsData && ofsData.grants) || [];
+      document.getElementById('ofsGrants').innerHTML = grants.map((g) => card(
+        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
+        '<div><strong>' + esc(g.name) + '</strong> · <code>' + esc(g.bucket) + '</code>' +
+        '<div style="color:var(--muted);margin-top:4px;">' + esc(t('ofsKey')) + ' <code>' + esc(String(g.accessKeyId).slice(0, 6)) + '…</code>' +
+        (typeof g.bytes === 'number' ? ' · ' + esc(t('ofsStored')) + ' ' + esc(fmtBytes(g.bytes)) + (g.maxGb ? ' / ' + esc(g.maxGb) + ' GB' : '') : (g.maxGb ? ' · ' + esc(t('ofsLimit')) + ' ' + esc(g.maxGb) + ' GB' : '')) +
+        ' · ' + esc(new Date(g.createdAt).toLocaleDateString()) + '</div></div>' +
+        (g.revokedAt ? badge('warning', t('ofsRevoked')) : '<button class="danger" onclick="revokeGrantUi(&#39;' + esc(g.name) + '&#39;)">' + esc(t('ofsBtnRevoke')) + '</button>') +
+        '</div>')).join('');
+    }
+
+    async function createGrantUi() {
+      const name = document.getElementById('ofsGrantName').value.trim();
+      const gb = document.getElementById('ofsGrantGb').value.trim();
+      if (!name) { ofsMsg('ofsGrantMsg', t('ofsNeedName'), 'err'); return; }
+      const btn = document.getElementById('btnOfsGrant');
+      btn.disabled = true;
+      ofsMsg('ofsGrantMsg', '');
+      try {
+        const r = await ofsPost('/api/offsite/grants', { name, maxGb: gb || undefined }, 'ofsGrantMsg');
+        if (!r) return;
+        document.getElementById('ofsGrantName').value = '';
+        const a = r.access;
+        const row = (k, v) => '<span class="k">' + esc(k) + '</span><code>' + esc(v) + '</code><button class="secondary chip" onclick="copyText(this.dataset.v)" data-v="' + esc(v) + '">' + esc(t('ofsCopy')) + '</button>';
+        document.getElementById('ofsGrantResult').innerHTML = card(
+          '<strong>' + esc(t('ofsGrantReady')) + '</strong>' +
+          '<p class="ofs-note" style="margin-top:6px;">' + esc(t('ofsGrantOnce')) + '</p>' +
+          '<div class="field-label">' + esc(t('ofsGrantCodeLabel')) + '</div>' +
+          '<div class="ofs-secret" id="ofsGrantCode">' + esc(r.code) + '</div>' +
+          '<div style="display:flex;gap:8px;flex-wrap:wrap;"><button onclick="copyText(document.getElementById(&#39;ofsGrantCode&#39;).textContent)">' + esc(t('ofsCopyCode')) + '</button>' +
+          '<button class="secondary" onclick="document.getElementById(&#39;ofsGrantResult&#39;).innerHTML=&#39;&#39;">' + esc(t('ofsDoneHide')) + '</button></div>' +
+          '<details style="margin-top:10px;"><summary style="color:var(--muted);font-size:12.5px;">' + esc(t('ofsGrantFields')) + '</summary><div class="ofs-kv" style="margin-top:8px;">' +
+          row('Endpoint', a.endpoint) + row('Bucket', a.bucket) + row('Access Key ID', a.accessKeyId) + row('Secret Access Key', a.secretAccessKey) + row(t('ofsF_region'), a.region) +
+          '</div><p class="ofs-note" style="margin-top:8px;">' + esc(t('ofsGrantInternal')) + ' <code>' + esc(r.internalEndpoint) + '</code></p></details>');
+        await loadOffsite();
       } finally { btn.disabled = false; }
+    }
+
+    async function revokeGrantUi(name) {
+      const r = await ofsPost('/api/offsite/grants/revoke', { name }, 'ofsGrantMsg');
+      if (r) { ofsMsg('ofsGrantMsg', t('ofsRevokedMsg').replace('{name}', name), 'ok'); loadOffsite(); }
     }
 
     // ---- Scale: 24 h of measurements and the decision rehearsal ----

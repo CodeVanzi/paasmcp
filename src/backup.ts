@@ -80,13 +80,13 @@ function requireOffsite(): OffsiteConfig {
   const cfg = getOffsiteConfig();
   if (!cfg) {
     throw new Error(
-      "Off-site backup is not configured. Set BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET, BACKUP_S3_ACCESS_KEY_ID and BACKUP_S3_SECRET_ACCESS_KEY in the 'system' vault scope (optional: BACKUP_S3_REGION, BACKUP_S3_PREFIX)."
+      "Off-site backup is not configured. Choose where to send them in the dashboard (Databases > Off-server backups) or with 'paasmcp backup target set <provider>'."
     );
   }
   return cfg;
 }
 
-async function s3Request(cfg: OffsiteConfig, method: "PUT" | "GET", key: string, body?: Buffer): Promise<Buffer> {
+export async function s3Request(cfg: OffsiteConfig, method: "PUT" | "GET" | "DELETE", key: string, body?: Buffer): Promise<Buffer> {
   // Path-style addressing: the one style every S3-compatible server accepts.
   const url = new URL(`${cfg.endpoint}/${cfg.bucket}/${key.split("/").map(encodeURIComponent).join("/")}`);
   const payloadHash = sha256Hex(body || "");
