@@ -57,6 +57,8 @@ export interface ActiveManifest {
   apps: Record<string, ActiveManifestApp>;
   /** Tunnel for apps on both servers (activetunnel.ts), when it is on: its token and the hostnames it serves. */
   tunnel?: { token: string; hostnames?: string[] };
+  /** The arbiter this server uses: the other server adopts it when it has none yet. */
+  arbiterUrl?: string;
 }
 
 function clusterKey(): Buffer {
@@ -95,6 +97,7 @@ export function buildActiveManifest(
   return {
     v: 1, nodeId: state.federation?.nodeId || "primary", epoch: state.mirror?.epoch || 0, apps,
     ...(token ? { tunnel: { token, hostnames: Object.keys(state.activeTunnel?.routes || {}).sort() } } : {}),
+    ...(state.mirror?.arbiterUrl ? { arbiterUrl: state.mirror.arbiterUrl } : {}),
   };
 }
 
@@ -503,6 +506,8 @@ export interface ActiveSyncResult {
   stopped: string[];
   /** What happened to this server's copy of the origin's tunnel connector. */
   tunnel?: "started" | "updated" | "removed";
+  /** The arbiter address adopted from the origin. */
+  arbiter?: string;
   errors: { app: string; error: string }[];
 }
 
@@ -557,6 +562,18 @@ export async function syncActivePeers(
       out.status = "skipped";
       out.detail = `the manifest is from epoch ${manifest.epoch}, older than this server's`;
       continue;
+    }
+
+    // The arbiter the origin uses: this server adopts it when it has none yet (one less step to do by
+    // hand). An address already set here is never replaced: changing it stays a person's choice.
+    if (typeof manifest.arbiterUrl === "string" && /^https?:\/\/[a-zA-Z0-9.:[\]-]+$/.test(manifest.arbiterUrl)) {
+      const now = loadState();
+      if (now.mirror && !now.mirror.arbiterUrl) {
+        now.mirror.arbiterUrl = manifest.arbiterUrl;
+        saveState(now);
+        audit({ event: "mirror.arbiter-from-peer", peer: rec.peerName, url: manifest.arbiterUrl });
+        out.arbiter = manifest.arbiterUrl;
+      }
     }
 
     // The origin's tunnel for apps on both servers: its connector runs here too (or goes away).

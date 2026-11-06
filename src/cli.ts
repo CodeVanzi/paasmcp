@@ -12,8 +12,8 @@ import {
   withStateLock,
 } from "./config.js";
 import {
-  addArbiterKey, arbiterClusterId, deriveArbiterKey, installArbiterService, listArbiterClusters, parseArbiterKeys, removeArbiterKey,
-  resolveArbiterHost, startArbiterServer,
+  addArbiterKey, ARBITER_ENV_FILE, arbiterClusterId, deriveArbiterKey, installArbiterService, listArbiterClusters, openArbiterPairing, parseArbiterKeys, removeArbiterKey, serveArbiter,
+  resolveArbiterHost,
 } from "./arbiter.js";
 import { ensurePollSchedule, installPollTimer, pollRepos, remoteHead, setPolling } from "./poller.js";
 import {
@@ -39,6 +39,7 @@ import {
   promoteMirror,
   retireCopy,
   checkArbiter,
+  pairArbiterAndSave,
   setAutoFailover,
   watchTick,
 } from "./mirror.js";
@@ -585,14 +586,23 @@ async function runCli() {
         console.error(`This cluster's id on the arbiter: ${arbiterClusterId(key)}. An arbiter that already serves another cluster takes it with 'paasmcp arbiter add-key <key>'.`);
       } else if (sub === "serve") {
         const keys = parseArbiterKeys(getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY);
-        const hostFlag = getFlagValue(rest, "--host");
-        if (!keys.length || !hostFlag) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP|tailscale> [--port 4097] --key <key>[,<key of another cluster>...] (or PAASMCP_ARBITER_KEY)");
-        const host = resolveArbiterHost(hostFlag);
-        const port = Number(getFlagValue(rest, "--port") || 4097);
-        startArbiterServer({ port, host, keys });
-        console.error(`Arbiter listening on http://${host}:${port}/arbiter for ${keys.length} cluster(s): ${keys.map(arbiterClusterId).join(", ")}`);
-        console.error(`On the servers, use the arbiter address http://${host}:${port}`);
+        const hostFlag = getFlagValue(rest, "--host") || process.env.PAASMCP_ARBITER_HOST;
+        if (!hostFlag) throw new Error("Usage: paasmcp arbiter serve --host <Tailscale IP|tailscale> [--port 4097] [--key <key>[,<key of another cluster>...]] (or PAASMCP_ARBITER_KEY; more keys arrive in the key file with 'arbiter pair')");
+        const port = Number(getFlagValue(rest, "--port") || process.env.PAASMCP_ARBITER_PORT || 4097);
+        const srv = serveArbiter({ host: hostFlag, port, keys });
+        await new Promise((r) => srv.once("listening", r));
+        const addr = srv.address() as { address: string; port: number };
+        console.error(`Arbiter listening on http://${addr.address}:${addr.port}/arbiter for ${keys.length || "the"} cluster(s) given, plus the ones in ${ARBITER_ENV_FILE()}`);
+        console.error(`On the servers, use the arbiter address http://${addr.address}:${addr.port}`);
         await new Promise(() => {});
+      } else if (sub === "pair") {
+        // On the arbiter device: open a 10-minute window and show the code to type on one of the servers.
+        const w = openArbiterPairing();
+        console.log(JSON.stringify({ code: w.code, expiresAt: new Date(w.expiresAt).toISOString() }, null, 2));
+        console.error(`Pairing code: ${w.code} (10 minutes). On one of the servers: Second server > Arbiter > “Easy way”, or 'paasmcp arbiter pair-with <this device's Tailscale IP> ${w.code}'.`);
+      } else if (sub === "pair-with" && rest[1] && rest[2]) {
+        // On a server: send the arbiter key to the device showing the code, then save its address.
+        console.log(JSON.stringify(await pairArbiterAndSave(rest[1], rest[2]), null, 2));
       } else if (sub === "install-service") {
         const key = getFlagValue(rest, "--key") || process.env.PAASMCP_ARBITER_KEY;
         if (!key) throw new Error("Usage: sudo paasmcp arbiter install-service --key <from 'paasmcp arbiter key'> [--host tailscale] [--port 4097]");
@@ -611,7 +621,7 @@ async function runCli() {
       } else if (sub === "check") {
         console.log(JSON.stringify(await checkArbiter(rest[1]), null, 2));
       } else {
-        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|add-key <key>|remove-key <cluster id>|clusters|check [url]>");
+        throw new Error("Usage: paasmcp arbiter <key|serve|install-service|pair|pair-with <ip> <code>|add-key <key>|remove-key <cluster id>|clusters|check [url]>");
       }
       break;
     }
@@ -1111,7 +1121,7 @@ Commands:
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
-  paasmcp arbiter <key|serve|install-service|add-key|remove-key|clusters|check>
+  paasmcp arbiter <key|serve|install-service|pair|pair-with|add-key|remove-key|clusters|check>
                                                     Third vote for automatic failover (one device can serve several clusters)
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
   paasmcp active tunnel <status|on|off>             Cloudflare Tunnel just for those apps, on both servers

@@ -1,8 +1,9 @@
 import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { deploySummary } from "./deploys.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
-import { arbiterInstallCommand } from "./arbiter.js";
-import { acceptMirror, checkArbiter, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
+import { arbiterInstallCommand, PairError } from "./arbiter.js";
+import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { acceptMirror, checkArbiter, pairArbiterAndSave, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
 import { setPolling } from "./poller.js";
 import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setDiaryLanguage, setScaleRule } from "./scale.js";
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
@@ -1040,7 +1041,45 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
         if (pathname === "/api/mirror/arbiter" && req.method === "POST") {
           const body = await readJsonBody(req);
-          return reply(setArbiterUrl(String(body.url || "")));
+          const saved = setArbiterUrl(String(body.url || ""));
+          tellPeerAboutArbiter();
+          return reply(saved);
+        }
+        // Pair with a PC that shows a code (its dashboard's “Be the arbiter of another pair”).
+        if (pathname === "/api/mirror/arbiter/candidates" && req.method === "GET") return reply(await findJudgeCandidates());
+        if (pathname === "/api/mirror/arbiter/pair" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          try {
+            const out = await pairArbiterAndSave(String(body.host || ""), String(body.code || ""));
+            tellPeerAboutArbiter();
+            return reply(out);
+          } catch (err) {
+            if (!(err instanceof PairError)) throw err;
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message, errorCode: err.code }));
+            return true;
+          }
+        }
+        // This PC as the arbiter of another pair.
+        if (pathname === "/api/judge" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(await localJudgeStatus()));
+          return true;
+        }
+        if (pathname === "/api/judge/open" && req.method === "POST") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(await beJudge()));
+          return true;
+        }
+        if (pathname === "/api/judge/cancel" && req.method === "POST") {
+          cancelJudgePairing();
+          return reply({ ok: true });
+        }
+        if (pathname === "/api/judge/stop" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          confirmFromBody("judge.stop", {}, body);
+          stopLocalJudge();
+          return reply({ ok: true });
         }
         // App on both servers (active.ts) and the self-hosted entry (edge.ts).
         if (pathname === "/api/active" && req.method === "GET") {
@@ -1144,6 +1183,15 @@ function escapeHtmlServer(s?: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+/** The other server learns the arbiter address through the control channel (it adopts it if it has none). */
+function tellPeerAboutArbiter(): void {
+  import("./active.js")
+    .then(({ publishActiveState }) => publishActiveState())
+    .catch(() => {
+      // no copy goes to the other server yet: it is set there by hand
+    });
 }
 
 function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = false): string {
@@ -2908,6 +2956,26 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <summary style="cursor:pointer;font-weight:600;font-size:15px;" id="judgeSetupTitle" data-i18n="judgeSetupTitle" onclick="this.parentNode.dataset.touched = '1'"></summary>
               <p class="card-desc" data-i18n="judgeBefore" style="margin-top:10px;"></p>
 
+              <h3 data-i18n="pairEasyTitle" style="margin-top:16px;"></h3>
+              <p class="card-desc" data-i18n="pairEasyDesc" style="margin-bottom:10px;"></p>
+              <button class="secondary" onclick="judgeFind()" id="btnJudgeFind" data-i18n="btnJudgeFind"></button>
+              <div id="judgeFindBox" style="margin-top:10px;"></div>
+              <div class="form-grid" style="margin-top:6px;">
+                <div>
+                  <label class="field-label" for="pairHost" data-i18n="lblPairHost"></label>
+                  <input id="pairHost" placeholder="100.64.0.9" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="pairCode" data-i18n="lblPairCode"></label>
+                  <input id="pairCode" inputmode="numeric" maxlength="7" placeholder="123456" autocomplete="off" />
+                </div>
+              </div>
+              <div style="margin-top:10px;"><button onclick="judgePair()" id="btnJudgePair" data-i18n="btnJudgePair"></button></div>
+              <div id="judgePairBox" style="margin-top:10px;"></div>
+
+              <h3 data-i18n="pairManualTitle" style="margin-top:22px;padding-top:14px;border-top:1px solid var(--border);"></h3>
+              <p class="card-desc" data-i18n="pairManualDesc"></p>
+
               <h3 data-i18n="autoStep1" style="margin-top:16px;"></h3>
               <p class="card-desc" data-i18n="autoStep1Desc"></p>
 
@@ -2938,6 +3006,10 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-ge
               </div>
               <div id="arbTestBox" style="margin-top:10px;"></div>
             </details>
+          </div>
+          <div class="card" data-sub="judge" id="judgeLocalCard">
+            <div class="card-header"><h2 data-i18n="judgeLocalTitle"></h2><p class="card-desc" data-i18n="judgeLocalDesc"></p></div>
+            <div id="judgeLocalBox"></div>
           </div>
           <div class="card" data-sub="auto">
             <div class="card-header"><h2 data-i18n="autoTitle"></h2><p class="card-desc" data-i18n="autoDesc"></p></div>
@@ -3760,12 +3832,48 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorPromoted": "Apps assumidos.",
           "mirrorHandedBack": "Apps devolvidos. Agora assuma-os no outro servidor.",
           "autoGoJudge": "Ver o juiz",
+          "pairEasyTitle": "Jeito fácil: um PC que já tem o PaaSMCP",
+          "pairEasyDesc": "No PC que vai ser o juiz, abra o painel dele, aba Juiz, e clique em “Ser juiz de outro par”. Ele mostra um código de 6 números. Aqui, escolha esse PC na lista (ou digite o IP do Tailscale dele) e digite o código. A chave vai cifrada e só depois que o PC prova que mostra o mesmo código. Se o outro servidor recebe cópia deste, ele passa a usar o mesmo juiz sozinho.",
+          "btnJudgeFind": "Procurar PCs na Tailscale",
+          "judgeFinding": "Procurando…",
+          "judgeFindNoTs": "Não deu para ler a lista da Tailscale aqui. Digite o IP do Tailscale do PC abaixo.",
+          "judgeFindNone": "Nenhum outro aparelho ligado na Tailscale.",
+          "judgeFindHint": "Aparecem todos os aparelhos ligados; os que mostram um código vêm primeiro.",
+          "judgeTagCode": "mostrando código",
+          "judgeTagArbiter": "já é juiz",
+          "judgeTagPair": "servidor deste par",
+          "btnJudgePick": "Usar este",
+          "lblPairHost": "IP do Tailscale do PC",
+          "lblPairCode": "Código que aparece nele",
+          "btnJudgePair": "Parear com o juiz",
+          "pairDone": "Pareado. {host} é o juiz deste par ({url}).",
+          "pairErr_badHost": "Endereço inválido: use o IP do Tailscale do PC (100.x.x.x) ou o nome dele.",
+          "pairErr_badCode": "O código tem 6 números.",
+          "pairErr_unreachable": "O PC não respondeu. Confira se ele está ligado, na Tailscale, e mostrando um código.",
+          "pairErr_notArbiter": "Algo respondeu nesse endereço, mas não é um juiz do PaaSMCP.",
+          "pairErr_notPairing": "Esse PC não está mostrando código (ou o código venceu). Clique de novo em “Ser juiz de outro par” lá.",
+          "pairErr_wrongCode": "O código não confere com o que aparece nesse PC. Depois de 5 erros ele precisa gerar outro.",
+          "pairManualTitle": "Ou instale num aparelho sem PaaSMCP",
+          "pairManualDesc": "Para uma VM ou um Raspberry que não roda o PaaSMCP. Dá para usar o comando abaixo e, no passo 3, o endereço; ou rodar “paasmcp arbiter pair” no aparelho e parear pelo código acima.",
+          "judgeLocalTitle": "Este PC como juiz de outro par",
+          "judgeLocalDesc": "Use num PC que fica ligado 24 horas e não é nenhum dos dois servidores do par. O juiz roda num contêiner pequeno, atende só na Tailscale e volta sozinho depois de reiniciar.",
+          "judgeLocalNoTs": "Este PC não tem endereço Tailscale. Instale o Tailscale e entre na mesma conta dos servidores.",
+          "judgeLocalOn": "Juiz ligado",
+          "judgeLocalOff": "Este PC não é juiz de nenhum par",
+          "judgeLocalPairs": "atende {n} pares",
+          "judgeLocalPairs1": "atende 1 par",
+          "judgeLocalCodeIntro": "No painel de um dos servidores do par, aba Juiz, escolha este PC e digite:",
+          "judgeLocalCodeMeta": "IP deste PC: {ip} · vale até {until} · some sozinho quando o servidor parear",
+          "btnBeJudge": "Ser juiz de outro par",
+          "judgeLocalStarting": "Ligando o juiz…",
+          "btnJudgeCancel": "Cancelar código",
+          "btnJudgeStop": "Parar de ser juiz",
           "judgeTitle": "⚖️ Juiz",
           "judgeDesc": "Um terceiro aparelho que dá o voto de desempate na troca automática. Ele não guarda apps nem dados: só ouve os servidores e anota quem cuida dos dados de quem.",
           "judgeState_none": "Não configurado",
           "judgeState_ok": "Respondendo",
           "judgeState_err": "Sem resposta",
-          "judgeNoneDesc": "Sem juiz, a troca automática fica desligada: se um servidor cair, você assume os apps dele à mão (aba “Cópia ao vivo”). Para configurar, siga os 3 passos abaixo.",
+          "judgeNoneDesc": "Sem juiz, a troca automática fica desligada: se um servidor cair, você assume os apps dele à mão (aba “Cópia ao vivo”). Para configurar, veja abaixo.",
           "judgeAddress": "Endereço",
           "judgeWhere": "Onde roda",
           "judgeOldArbiter": "versão antiga do juiz: rode de novo o comando do passo 2 no aparelho dele para ver o nome",
@@ -4109,12 +4217,48 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "mirrorPromoted": "Apps taken over.",
           "mirrorHandedBack": "Apps handed back. Now take them over on the other server.",
           "autoGoJudge": "See the arbiter",
+          "pairEasyTitle": "Easy way: a PC that already runs PaaSMCP",
+          "pairEasyDesc": "On the PC that will be the arbiter, open its dashboard, Arbiter tab, and click “Be the arbiter of another pair”. It shows a 6-digit code. Here, pick that PC in the list (or type its Tailscale IP) and type the code. The key travels encrypted, and only after the PC proves it shows the same code. If the other server receives a copy of this one, it starts using the same arbiter by itself.",
+          "btnJudgeFind": "Look for PCs on Tailscale",
+          "judgeFinding": "Looking…",
+          "judgeFindNoTs": "Could not read the Tailscale list here. Type the PC's Tailscale IP below.",
+          "judgeFindNone": "No other device is online on Tailscale.",
+          "judgeFindHint": "Every online device shows up; those showing a code come first.",
+          "judgeTagCode": "showing a code",
+          "judgeTagArbiter": "already an arbiter",
+          "judgeTagPair": "server of this pair",
+          "btnJudgePick": "Use this one",
+          "lblPairHost": "PC's Tailscale IP",
+          "lblPairCode": "Code shown on it",
+          "btnJudgePair": "Pair with the arbiter",
+          "pairDone": "Paired. {host} is this pair's arbiter ({url}).",
+          "pairErr_badHost": "Invalid address: use the PC's Tailscale IP (100.x.x.x) or its name.",
+          "pairErr_badCode": "The code has 6 digits.",
+          "pairErr_unreachable": "The PC did not answer. Check that it is on, on Tailscale, and showing a code.",
+          "pairErr_notArbiter": "Something answered at that address, but it is not a PaaSMCP arbiter.",
+          "pairErr_notPairing": "That PC is not showing a code (or it expired). Click “Be the arbiter of another pair” there again.",
+          "pairErr_wrongCode": "The code does not match the one on that PC. After 5 misses it needs a new one.",
+          "pairManualTitle": "Or install it on a device without PaaSMCP",
+          "pairManualDesc": "For a VM or a Raspberry that does not run PaaSMCP. Use the command below and the address in step 3; or run “paasmcp arbiter pair” on the device and pair with the code above.",
+          "judgeLocalTitle": "This PC as the arbiter of another pair",
+          "judgeLocalDesc": "Use it on a PC that stays on 24/7 and is neither of the pair's two servers. The arbiter runs in a small container, answers only on Tailscale and comes back after a reboot.",
+          "judgeLocalNoTs": "This PC has no Tailscale address. Install Tailscale and sign in with the servers' account.",
+          "judgeLocalOn": "Arbiter on",
+          "judgeLocalOff": "This PC is not the arbiter of any pair",
+          "judgeLocalPairs": "serves {n} pairs",
+          "judgeLocalPairs1": "serves 1 pair",
+          "judgeLocalCodeIntro": "On the dashboard of one of the pair's servers, Arbiter tab, pick this PC and type:",
+          "judgeLocalCodeMeta": "This PC's IP: {ip} · valid until {until} · goes away by itself once the server pairs",
+          "btnBeJudge": "Be the arbiter of another pair",
+          "judgeLocalStarting": "Starting the arbiter…",
+          "btnJudgeCancel": "Cancel code",
+          "btnJudgeStop": "Stop being an arbiter",
           "judgeTitle": "⚖️ Arbiter",
           "judgeDesc": "A third device that casts the deciding vote for automatic takeover. It holds no apps or data: it only listens to the servers and records who looks after whose data.",
           "judgeState_none": "Not set up",
           "judgeState_ok": "Answering",
           "judgeState_err": "Not answering",
-          "judgeNoneDesc": "Without an arbiter, automatic takeover stays off: if a server goes down, you take over its apps by hand (“Live copy” tab). To set it up, follow the 3 steps below.",
+          "judgeNoneDesc": "Without an arbiter, automatic takeover stays off: if a server goes down, you take over its apps by hand (“Live copy” tab). To set it up, see below.",
           "judgeAddress": "Address",
           "judgeWhere": "Runs on",
           "judgeOldArbiter": "older arbiter: run the step 2 command again on its device to see its name",
@@ -7227,7 +7371,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     async function loadMirror() {
       const res = await fetch('/api/mirror');
-      if (!res.ok) { loadArbiterStatus(); return; }
+      if (!res.ok) { loadArbiterStatus(); loadJudgeLocal(); return; }
       const m = await res.json();
       mirrorLive = m;
       mirrorLiveAt = Date.now();
@@ -7278,6 +7422,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (keep && peers.includes(keep)) sel.value = keep;
       if (m.arbiterUrl && !document.getElementById('mArbiter').value) document.getElementById('mArbiter').value = m.arbiterUrl;
       loadArbiterStatus();
+      loadJudgeLocal();
       loadActive();
     }
     async function mirrorOffer() {
@@ -7306,6 +7451,91 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const r = await postJson('/api/mirror/auto', { peer, on, arbiterUrl: document.getElementById('mArbiter').value.trim() || undefined });
       if (r) { showToast(t('saved')); loadMirror(); }
     }
+    // Arbiter tab, easy way: list the PCs of the Tailscale network and pair with the one showing a code.
+    async function judgeFind() {
+      const btn = document.getElementById('btnJudgeFind');
+      const box = document.getElementById('judgeFindBox');
+      btn.disabled = true;
+      box.innerHTML = card(esc(t('judgeFinding')));
+      try {
+        const res = await fetch('/api/mirror/arbiter/candidates');
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { box.innerHTML = card(badge('danger', d.error || 'error')); return; }
+        if (d.error) { box.innerHTML = card(esc(t('judgeFindNoTs'))); return; }
+        const list = d.devices || [];
+        if (!list.length) { box.innerHTML = card(esc(t('judgeFindNone'))); return; }
+        box.innerHTML = card(list.map(x => {
+          const tag = x.inPair ? badge('', t('judgeTagPair')) : x.pairing ? badge('success', t('judgeTagCode')) : x.arbiter ? badge('', t('judgeTagArbiter')) : '';
+          const pick = x.inPair ? '' : '<button class="secondary" style="padding:3px 10px;font-size:12px;" data-ip="' + esc(x.ip) + '" onclick="judgePick(this.dataset.ip)">' + esc(t('btnJudgePick')) + '</button>';
+          return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:5px 0;border-bottom:1px solid var(--border);">' +
+            '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip) + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + '</div>' + pick + '</div>';
+        }).join('') + '<div style="color:var(--muted);font-size:12px;margin-top:6px;">' + esc(t('judgeFindHint')) + '</div>');
+      } finally { btn.disabled = false; }
+    }
+    function judgePick(ip) {
+      document.getElementById('pairHost').value = ip;
+      document.getElementById('pairCode').focus();
+    }
+    async function judgePair() {
+      const host = document.getElementById('pairHost').value.trim();
+      const code = document.getElementById('pairCode').value.trim();
+      const box = document.getElementById('judgePairBox');
+      const btn = document.getElementById('btnJudgePair');
+      btn.disabled = true;
+      box.innerHTML = card(esc(t('checking')));
+      try {
+        const res = await fetch('/api/mirror/arbiter/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ host, code }) });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { box.innerHTML = card(badge('danger', '✗') + ' ' + esc(d.errorCode ? t('pairErr_' + d.errorCode) : (d.error || 'error'))); return; }
+        document.getElementById('pairCode').value = '';
+        document.getElementById('mArbiter').value = d.url;
+        box.innerHTML = card(badge('success', '✓') + ' ' + esc(t('pairDone').replace('{host}', d.host).replace('{url}', d.url)));
+        showToast(t('saved'));
+        loadMirror();
+      } finally { btn.disabled = false; }
+    }
+    // This PC as the arbiter of another pair: state, the code to type on the server, stop.
+    let judgeLocalTimer = null;
+    async function loadJudgeLocal() {
+      const box = document.getElementById('judgeLocalBox');
+      if (!box) return;
+      const res = await fetch('/api/judge');
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { box.innerHTML = card(badge('danger', j.error || 'error')); return; }
+      renderJudgeLocal(j);
+    }
+    function renderJudgeLocal(j) {
+      const box = document.getElementById('judgeLocalBox');
+      clearTimeout(judgeLocalTimer);
+      if (j.problem === 'noTailscale') { box.innerHTML = card(badge('warning', '!') + ' ' + esc(t('judgeLocalNoTs'))); return; }
+      const n = (j.clusters || []).length;
+      let html = '<div>' + (j.running
+        ? badge('success', t('judgeLocalOn')) + ' ' + esc(t(n === 1 ? 'judgeLocalPairs1' : 'judgeLocalPairs').replace('{n}', String(n))) + ' · ' + esc(j.url || '')
+        : badge('', t('judgeLocalOff'))) + '</div>';
+      const p = j.pairing || {};
+      if (p.open) {
+        const until = new Date(p.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        html += '<div style="margin-top:12px;">' + esc(t('judgeLocalCodeIntro')) + '</div>' +
+          '<div style="font-size:34px;font-weight:700;letter-spacing:6px;font-family:var(--mono, monospace);margin:6px 0;user-select:all;">' + esc(p.code) + '</div>' +
+          '<div style="color:var(--muted);font-size:12.5px;">' + esc(t('judgeLocalCodeMeta').replace('{ip}', j.ip || '').replace('{until}', until)) + '</div>' +
+          '<div style="margin-top:10px;"><button class="secondary" onclick="judgeLocalCancel()">' + esc(t('btnJudgeCancel')) + '</button></div>';
+        judgeLocalTimer = setTimeout(loadJudgeLocal, 5000); // closes by itself once the server paired
+      } else {
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;"><button onclick="judgeLocalOpen()" id="btnBeJudge">' + esc(t('btnBeJudge')) + '</button>' +
+          (j.container ? '<button class="secondary" onclick="judgeLocalStop()">' + esc(t('btnJudgeStop')) + '</button>' : '') + '</div>';
+      }
+      box.innerHTML = card(html);
+    }
+    async function judgeLocalOpen() {
+      const btn = document.getElementById('btnBeJudge');
+      if (btn) { btn.disabled = true; btn.textContent = t('judgeLocalStarting'); }
+      const r = await postJson('/api/judge/open', {});
+      if (!r && btn) { btn.disabled = false; btn.textContent = t('btnBeJudge'); }
+      loadJudgeLocal();
+    }
+    async function judgeLocalCancel() { await postJson('/api/judge/cancel', {}); loadJudgeLocal(); }
+    async function judgeLocalStop() { if (await postJson('/api/judge/stop', {})) { showToast(t('saved')); loadJudgeLocal(); } }
+
     // Step 2 of the Arbiter tab: the install command with this pair's key already in it.
     async function arbiterInstallCmd() {
       const btn = document.getElementById('btnArbCmd');

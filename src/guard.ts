@@ -89,6 +89,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "This server's database is stopped, moved aside (kept on disk, not deleted) and replaced by a read-only copy of the server that took over. Its apps stay stopped until you hand back.",
         "O banco deste servidor é parado, movido para o lado (fica guardado no disco, não é apagado) e trocado por uma cópia só de leitura do servidor que assumiu. Os apps daqui ficam parados até a devolução.",
         params);
+    case "judge.stop":
+      return risk(action, "arbiter", "confirm",
+        "This PC stops being an arbiter. The pairs of servers it serves lose their arbiter: no automatic takeover until they get another one (their apps keep running).",
+        "Este PC deixa de ser juiz. Os pares de servidores que ele atende ficam sem juiz: sem troca automática até ganharem outro (os apps continuam rodando).",
+        params);
     case "mirror.retire":
       return risk(action, subject, "confirm",
         `This server stops following '${subject}' for good: the copies of its apps here stop and its copy of the database stays on disk, read-only. Do this on every server that did NOT take over '${subject}'. A new offer rebuilds the copy later.`,

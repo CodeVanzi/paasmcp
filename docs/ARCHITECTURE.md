@@ -185,6 +185,25 @@ Automatic failover with only two servers would split the brain when the link bet
   clone's `origin`, through `publicRepoUrl()` (https only, user/token stripped, SSH github.com turned into
   https, anything odd falls back to the public repo), so no credential reaches the command. Since
   `install-service` merges keys, the same command adds a cluster to an arbiter that already serves another.
+- **Pairing by code** (`src/arbiter.ts`, `src/judge.ts`). On the arbiter device, `openArbiterPairing()`
+  (`paasmcp arbiter pair`, or the dashboard's “Be the arbiter of another pair”) writes
+  `<data>/arbiter/pairing.json` (0600): a 6-digit code, 10 minutes, 5 tries. While it is open, `/health`
+  adds `pairing: true` and `POST /pair` answers. The server (`pairWithArbiter`, `arbiter pair-with`,
+  dashboard `POST /api/mirror/arbiter/pair`) sends a nonce; the arbiter answers with its own nonce and
+  `HMAC(scrypt(code), nonces)` (each hello costs a try), so a device that does not show the code never gets
+  anything. Then the key goes sealed with AES-256-GCM under `scrypt(code)` (nonces as AAD); the arbiter
+  stores it in its key file, closes the window and serves the cluster at once (`startArbiterServer`
+  re-reads `keyFile` when it changes, and can start with no key). Tailscale authenticates and encrypts
+  the link; the code is the person confirming both ends.
+- **A PC with PaaSMCP as arbiter** (`src/judge.ts`): `ensureLocalJudge` starts container
+  `paasmcp-arbiter` (`node:22` alpine, host network, `--restart unless-stopped`, 128 MB) unless an
+  arbiter already answers on this PC's Tailscale IP. Its code is a copy of `JUDGE_FILES` (arbiter.js and
+  the built-in-only modules it imports; a test runs the copy) in `<data>/arbiter/code`, so a dashboard
+  update never removes it; keys and state live next to it. `findJudgeCandidates` lists the online devices
+  of `tailscale status --json` (`listTailscalePeers`, which keeps every device) and probes `:4097/health`.
+- The control-channel manifest (`active.ts`) carries `arbiterUrl`; the other server adopts it in
+  `syncActivePeers` only when it has none (audited `mirror.arbiter-from-peer`). Saving or pairing an
+  arbiter in the dashboard republishes the manifest.
 
 ### Active-active: an app on both servers (`src/active.ts`, `src/edge.ts`)
 
