@@ -4022,6 +4022,14 @@ volumes:
       // The app list speaks plainly: no bare 127.0.0.1 pill, no raw access mode, no English limits.
       for (const k of ["appNoAddressTip", "pillLocalOnly", "mode_public", "mode_zero-trust", "mode_tailscale", "limitsLabel"]) twice(k);
       assert.ok(!page.includes("(Limits: "));
+      // Every doctor finding with a code has its text in both languages (the screen falls back to English otherwise).
+      const codes = ["app_registered", "app_ok", "app_oom", "app_down", "app_restarts", "app_missing", "app_missing_stopped", "dns_ok", "dns_fail", "wt_label_mode", "wt_all_labeled", "wt_unlabeled", "net_clash", "net_pool", "tunnel_net"];
+      for (const c of codes) twice(`doc_${c}`);
+      const src = ["deployer.ts", "hostcheck.ts"].map((f) => fs.readFileSync(path.join(process.cwd(), "src", f), "utf-8")).join("\n");
+      const used = new Set([...src.matchAll(/code: "([a-z_]+)"/g), ...src.matchAll(/\? "([a-z_]+)" : "([a-z_]+)"/g)].flatMap((m) => m.slice(1)).filter((c) => /^(app|dns|wt|net|tunnel)_/.test(c)));
+      for (const c of used) assert.ok(codes.includes(c), `doctor code ${c} has texts`);
+      const doc = deployer.runPaaSDoctor();
+      assert.ok(doc.diagnostics.every((d) => !d.code || codes.includes(d.code)));
       // The route answers 422 with the kind, and the error itself, never a bare 500.
       const res = await fetch(`${baseUrl}/api/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ appName: "nope-46", repoSource: "/no/such/folder-46" }) });
       const data = (await res.json()) as { error: string; failure: { kind: string } };

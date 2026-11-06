@@ -5163,6 +5163,69 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "limitsLabel": "Limit: {mem} memory, {cpu} CPU"
     });
 
+    Object.assign(I18N.pt, {
+      "doc_app_registered": "Registrado, respondendo só neste servidor (porta {port}).",
+      "doc_app_ok": "Ligado e saudável (porta {port} neste servidor).",
+      "doc_app_oom": "O app foi derrubado por falta de memória.",
+      "docr_app_oom": "Aumente a memória máxima em Publicar um app → Mais opções e publique de novo, ou reduza o uso de memória do app.",
+      "doc_app_down": "O app não está rodando (estado {status}, código de saída {exitCode}).",
+      "docr_app_down": "Abra os Logs do app para ver o erro. Confira as Variáveis (falta alguma senha?) ou use Voltar versão.",
+      "doc_app_restarts": "O app está ligado, mas já reiniciou sozinho {count} vezes.",
+      "docr_app_restarts": "Abra os Logs para ver por que ele cai de vez em quando.",
+      "doc_app_missing": "O app não foi encontrado no Docker.",
+      "docr_app_missing": "Use Publicar de novo na lista Seus apps para recriá-lo.",
+      "doc_app_missing_stopped": "O app está parado e não existe no Docker agora.",
+      "doc_dns_ok": "O servidor resolve nomes da internet (DNS funcionando).",
+      "doc_dns_fail": "O servidor não consegue resolver nomes da internet (DNS). Sem isso, endereço público, publicação e PCs ajudantes param.",
+      "docr_dns_fail": "Se o DNS roda nesta mesma máquina (AdGuard Home, Pi-hole), confira se ele está ligado e dê ao servidor um DNS reserva: em /etc/systemd/resolved.conf coloque FallbackDNS=1.1.1.1 9.9.9.9 e faça o /etc/resolv.conf apontar para o systemd-resolved.",
+      "doc_wt_label_mode": "O Watchtower roda aqui, mas só atualiza o que foi marcado para ele, então não mexe no PaaSMCP.",
+      "doc_wt_all_labeled": "O Watchtower roda aqui e todos os contêineres do PaaSMCP estão marcados para ele pular.",
+      "doc_wt_unlabeled": "O Watchtower roda aqui e pode reiniciar sozinho {count} contêiner(es) do PaaSMCP: {names}. Um reinício surpresa do banco ou de um app parece uma queda.",
+      "docr_wt_unlabeled": "Os contêineres novos já saem marcados; esses antigos ganham a marca na próxima publicação. Até lá, o mais simples: rode o Watchtower com WATCHTOWER_LABEL_ENABLE=true e marque só o que você quer que ele atualize.",
+      "doc_net_clash": "Uma rede do Docker cobre uma rede deste servidor ({clash}). O tráfego para esses endereços vai para o Docker em vez da rede de casa ou do Tailscale.",
+      "docr_net_clash": "Dê ao Docker uma faixa própria: em /etc/docker/daemon.json adicione \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}], reinicie o Docker num momento calmo e recrie a rede que conflita.",
+      "doc_net_pool": "O Docker já usou {used} das suas {total} redes padrão. As próximas vêm de 192.168.x.0/20, que pode cobrir a rede de casa.",
+      "docr_net_pool": "Antes disso, dê ao Docker uma faixa própria: em /etc/docker/daemon.json adicione \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}] e reinicie o Docker num momento calmo. Só vale para redes criadas depois.",
+      "doc_tunnel_net": "O contêiner do Cloudflare Tunnel ({names}) não está na rede {network}, então os endereços públicos responderiam com erro 502.",
+      "docr_tunnel_net": "Ligue-o à rede: docker network connect {network} {first} (e adicione a rede no compose dele para continuar depois de reiniciar)."
+    });
+    Object.assign(I18N.en, {
+      "doc_app_registered": "Registered, answering only on this server (port {port}).",
+      "doc_app_ok": "Running and healthy (port {port} on this server).",
+      "doc_app_oom": "The app was stopped for running out of memory.",
+      "docr_app_oom": "Raise the maximum memory under Publish an app → More options and publish again, or make the app use less memory.",
+      "doc_app_down": "The app is not running (state {status}, exit code {exitCode}).",
+      "docr_app_down": "Open the app's Logs to see the error. Check its Variables (a missing password?) or use Roll back.",
+      "doc_app_restarts": "The app is running, but has restarted on its own {count} times.",
+      "docr_app_restarts": "Open the Logs to see why it falls over now and then.",
+      "doc_app_missing": "The app was not found in Docker.",
+      "docr_app_missing": "Use Publish again in Your apps to recreate it.",
+      "doc_app_missing_stopped": "The app is stopped and does not exist in Docker right now.",
+      "doc_dns_ok": "This server resolves internet names (DNS works).",
+      "doc_dns_fail": "This server cannot resolve internet names (DNS). Without it, public addresses, publishing and helper PCs stop working.",
+      "docr_dns_fail": "If the DNS server runs on this same machine (AdGuard Home, Pi-hole), check that it is up and give the server a fallback: in /etc/systemd/resolved.conf set FallbackDNS=1.1.1.1 9.9.9.9 and make /etc/resolv.conf point to systemd-resolved.",
+      "doc_wt_label_mode": "Watchtower runs here, but only updates what is marked for it, so it leaves PaaSMCP alone.",
+      "doc_wt_all_labeled": "Watchtower runs here and every PaaSMCP container is marked for it to skip.",
+      "doc_wt_unlabeled": "Watchtower runs here and may restart {count} PaaSMCP container(s) on its own: {names}. A surprise restart of the database or an app looks like an outage.",
+      "docr_wt_unlabeled": "New containers are already marked; these older ones get the mark on their next publish. Until then, the simplest fix: run Watchtower with WATCHTOWER_LABEL_ENABLE=true and mark only what you want it to update.",
+      "doc_net_clash": "A Docker network covers one of this server's networks ({clash}). Traffic to those addresses goes into Docker instead of the home network or Tailscale.",
+      "docr_net_clash": "Give Docker a range of its own: in /etc/docker/daemon.json add \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}], restart Docker in a quiet moment, then recreate the clashing network.",
+      "doc_net_pool": "Docker has used {used} of its {total} default networks. The next ones come from 192.168.x.0/20, which can cover a home network.",
+      "docr_net_pool": "Before that happens, give Docker a range of its own: in /etc/docker/daemon.json add \\"default-address-pools\\": [{\\"base\\": \\"10.200.0.0/16\\", \\"size\\": 24}] and restart Docker in a quiet moment. It only affects networks created afterwards.",
+      "doc_tunnel_net": "The Cloudflare Tunnel container ({names}) is not on the {network} network, so public addresses would answer with error 502.",
+      "docr_tunnel_net": "Connect it: docker network connect {network} {first} (and add the network to its compose file so it stays after a restart)."
+    });
+
+    // A doctor finding in the screen's language when it carries a known code; the server's English text otherwise.
+    function docText(d, field) {
+      const key = (field === 'summary' ? 'doc_' : 'docr_') + (d.code || '');
+      if (!d.code || !I18N.en['doc_' + d.code]) return field === 'summary' ? d.summary : d.recommendation;
+      if (!I18N.en[key]) return field === 'summary' ? d.summary : '';
+      let txt = t(key);
+      for (const [k, v] of Object.entries(d.vars || {})) txt = txt.split('{' + k + '}').join(String(v));
+      return txt;
+    }
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -7561,8 +7624,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   \${d.severity !== 'healthy' && d.target !== 'server' ? \`<button class="secondary" style="padding:3px 9px;font-size:11px;" onclick="appAction('\${esc(d.target)}','restart')">\${esc(t('btnRestartContainer'))}</button>\` : ''}
                 </div>
               </div>
-              <div style="font-size:13px;margin-top:6px;">\${esc(d.summary)}</div>
-              \${d.recommendation ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(d.recommendation)}</div>\` : ''}
+              <div style="font-size:13px;margin-top:6px;">\${esc(docText(d, 'summary'))}</div>
+              \${docText(d, 'recommendation') ? \`<div style="font-size:12px;color:var(--accent-text);margin-top:4px;">💡 \${esc(docText(d, 'recommendation'))}</div>\` : ''}
             </div>
           \`).join('')
           : '<div style="color:var(--muted);font-size:13px;">' + esc(t('emptyDoctor')) + '</div>';
