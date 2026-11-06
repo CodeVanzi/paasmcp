@@ -32,6 +32,8 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
    - Antes de cada deploy, a imagem funcional anterior é salva como `paasmcp/<app>:previous`. Se o novo deploy apresentar problema, `paasmcp rollback <app>` reverte em 1 segundo sem precisar recompilar.
    - O `paas_doctor` inspeciona containers parados, mortes por falta de memória (`OOMKilled`), contadores de crash e métricas em tempo real (`docker stats`).
    - No painel, o quadro **Uso de Recursos** mostra o processador agora, a memória e o disco do servidor inteiro, separando o que o **PaaSMCP** usa (seus apps, os bancos e o próprio painel) do que **outros** usam (o sistema e programas fora do PaaSMCP), e quanto está livre. Atualiza a cada 15 segundos e mostra os números do servidor mesmo com o painel rodando em contêiner.
+   - O disco também é dividido: apps (código, volumes e imagem), bancos, cópias e lixeira, arquivos e outros. Essa divisão é medida em segundo plano a cada 10 minutos.
+   - Na tela **Bancos**, cada banco mostra o tamanho, quanto ele representa do total e um gráfico de crescimento (até 90 dias), em modo compacto ou com gráficos maiores. Os bancos dividem um Postgres só, então nenhum tem espaço reservado: você pode definir um **tamanho de aviso** por banco, e o painel mostra a porcentagem usada e manda um aviso (Conexões → Avisos) em 80% e 100%, sem travar o app.
 7. **Auto-Deploy via GitHub Webhook (`HMAC-SHA256`):**
    - Endpoint integrado `/api/webhooks/github` que valida a assinatura `X-Hub-Signature-256` em tempo constante (`timingSafeEqual`) e reconstrói automaticamente o app quando você dá `git push` na branch configurada.
 8. **Dois servidores em espelho (`node`, `mirror` / `paas_mirror`):**

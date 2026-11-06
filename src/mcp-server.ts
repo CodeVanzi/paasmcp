@@ -63,6 +63,7 @@ import {
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
 import { levelAllows, TokenLevel } from "./tokens.js";
 import { cpuSample, hostResources } from "./resources.js";
+import { readLatestUsage } from "./usage.js";
 import { DiaryLang, parseDockerStats, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setScaleRule } from "./scale.js";
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy } from "./pool.js";
@@ -80,12 +81,19 @@ import {
 } from "./vault.js";
 
 /** One `docker stats` call feeds both the per-app numbers and the server split; CPU is read around it. */
+function diskSplit() {
+  const u = readLatestUsage();
+  return u && u.disk ? { measuredAt: u.measuredAt, ...u.disk } : null;
+}
+
 export function resourceSnapshot(includeMetrics = true) {
   const cpuBefore = cpuSample();
   const out = includeMetrics ? readDockerStats() : "";
   return {
     containerMetrics: includeMetrics ? getContainerMetrics(out) : {},
     resources: hostResources({ cpuBefore, stats: parseDockerStats(out), statsRan: includeMetrics && out.trim() !== "" }),
+    /** Disk split measured in the background every 10 minutes (usage.ts); null until the first round. */
+    diskSplit: diskSplit(),
   };
 }
 
@@ -94,7 +102,7 @@ export function getSystemStatusSummary(includeMetrics = true) {
   const state = loadState();
   const keyInfo = getOrCreateSshDeployKey();
   const sysSecrets = listMaskedSecrets("system");
-  const { containerMetrics, resources } = resourceSnapshot(includeMetrics);
+  const { containerMetrics, resources, diskSplit } = resourceSnapshot(includeMetrics);
 
   let diskFree = "unknown";
   try {
@@ -116,6 +124,7 @@ export function getSystemStatusSummary(includeMetrics = true) {
     rootDisk: diskFree,
     /** Whole server vs. PaaSMCP's containers vs. everything else (resources.ts). */
     resources,
+    diskSplit,
     paasDataDir: PAAS_DATA_DIR,
     paasAppsDir: PAAS_APPS_DIR,
     paasBackupsDir: PAAS_BACKUPS_DIR,

@@ -211,6 +211,8 @@ export interface DatabaseRecord {
   port: number;
   localPort: number;
   createdAt: string;
+  /** Warning size in MB of 1,000,000 bytes (Postgres): the dashboard shows the share used and sends a notice at 80% and 100%. */
+  warnSizeMb?: number;
 }
 
 export interface BackupRecord {

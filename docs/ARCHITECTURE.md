@@ -607,6 +607,21 @@ uses `MemAvailable`; the disk is the one holding `PAASMCP_ROOT` (`statfs`, no `d
 container. The card refreshes every 15 s from `GET /api/resources` while the page is visible. PaaSMCP's share is
 capped at the server's total, since the two readings come from different sources a moment apart.
 
+The disk line is split too: apps (code folders, app volumes, the part of each `paasmcp/<app>` image no other image
+shares), databases (Postgres and Redis folders), backups and trash, app files (Garage), others. Walking folders takes
+a while, so `src/usage.ts` measures it in the background every 10 minutes (`du -k -x -d 1`, `docker system df -v`),
+writes `usage/latest.json`, and the card reads that file (`diskSplit`). Folders sum to at most the disk's used space,
+in case Docker's data sits on another disk.
+
+The same round asks Postgres for each database's size (`pg_database_size`) and Redis for keys per logical database
+(password sent on stdin, never on a command line), and once an hour appends the sizes to `usage/db-history.ndjson`
+(90 days) for the growth charts on the Databases page (compact sparklines or full charts, `paasmcp_db_view`). The
+databases share one Postgres, so nothing is reserved per database: a database can get a **warning size**
+(`warnSizeMb` on its record, `POST /api/databases/limit`, 1 MB = 1,000,000 bytes); the page shows the share used and
+the round sends a notice (notify.ts) when it crosses 80% and 100% (`usage/db-warned.json`; dropping below 80% re-arms
+it). Nothing is blocked. `GET /api/usage?refresh=1` measures now (at most once every 30 s); `PAASMCP_USAGE=0`
+turns the loop off.
+
 ## 11. Environment variables
 
 | Variable | Default | Purpose |

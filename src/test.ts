@@ -1840,6 +1840,47 @@ volumes:
       const noDocker = resmod.hostResources({ statsRan: false, totalMem: 8 * GiB, availableMem: 2 * GiB, disk: null });
       assert.equal(noDocker.memory.split, null);
       assert.equal(noDocker.cpu.split, null);
+
+      // Disk split and database sizes (usage.ts)
+      const usage = await import("./usage.js");
+      const du = usage.parseDuDepth1("100\t/r/apps/blog\n20\t/r/apps/shop\n130\t/r/apps\n", "/r/apps");
+      assert.deepEqual(du, { total: 130 * 1024, children: { blog: 100 * 1024, shop: 20 * 1024 } });
+      const df = JSON.stringify({
+        Images: [{ Repository: "paasmcp/blog", UniqueSize: "2MB" }, { Repository: "paasmcp/blog", UniqueSize: "1MB" }, { Repository: "alpine", UniqueSize: "9MB" }, { Repository: "paasmcp/ghost", UniqueSize: "5MB" }],
+        Volumes: [{ Labels: "a=b,com.docker.compose.project=blog", Size: "3MB" }, { Labels: "com.docker.compose.project=other", Size: "8MB" }],
+      });
+      assert.deepEqual(usage.dockerBytesPerApp(df, new Set(["blog", "shop"])), { blog: 6_000_000 });
+      assert.deepEqual(usage.dockerBytesPerApp("not json", new Set(["blog"])), {});
+      assert.deepEqual(usage.parsePgSizes(" postgres|7000\n db_blog|123456\nbad\n"), { postgres: 7000, db_blog: 123456 });
+      const ri = usage.parseRedisInfo("OK\r\n# Keyspace\r\ndb1:keys=12,expires=0\r\ndb3:keys=4,expires=1\r\n# Memory\r\nused_memory:1048576\r\n");
+      assert.deepEqual(ri, { keys: { db1: 12, db3: 4 }, usedMemoryBytes: 1048576 });
+      const MB = 1e6;
+      assert.equal(usage.limitLevel(79 * MB, 100), 0);
+      assert.equal(usage.limitLevel(80 * MB, 100), 80);
+      assert.equal(usage.limitLevel(101 * MB, 100), 100);
+      assert.equal(usage.limitLevel(500 * MB, undefined), 0);
+      const sizesA = [{ name: "blog-postgres", engine: "postgres" as const, appName: "blog", bytes: 85 * MB }];
+      const lim = { "blog-postgres": { warnSizeMb: 100 } };
+      const r1 = usage.limitEvents(sizesA, lim, {});
+      assert.deepEqual(r1.events.map((e) => e.level), [80]);
+      // Same level next round: no new notice.
+      assert.equal(usage.limitEvents(sizesA, lim, r1.warned).events.length, 0);
+      const r3 = usage.limitEvents([{ ...sizesA[0], bytes: 120 * MB }], lim, r1.warned);
+      assert.deepEqual(r3.events.map((e) => e.level), [100]);
+      // Back under 80% resets, so crossing again warns again.
+      const r4 = usage.limitEvents([{ ...sizesA[0], bytes: 10 * MB }], lim, r3.warned);
+      assert.deepEqual(r4.warned, {});
+      assert.match(usage.limitNoticeText(r3.events[0], "pt").text, /120 MB.*100 MB/);
+      // History: one point per hour at most.
+      const h0 = Date.now();
+      assert.equal(usage.appendDbHistory(sizesA, h0), true);
+      assert.equal(usage.appendDbHistory(sizesA, h0 + 60_000), false);
+      assert.equal(usage.appendDbHistory([{ ...sizesA[0], bytes: 90 * MB }], h0 + 3600_000), true);
+      assert.deepEqual(usage.readDbHistory(h0 + 3600_000).map((p) => p.s["blog-postgres"]), [85 * MB, 90 * MB]);
+      assert.equal(usage.appendDbHistory([{ name: "r", engine: "redis", appName: "x", bytes: null }], h0 + 7200_000), false);
+      assert.throws(() => usage.setDatabaseLimit("blog-postgres", 0), /whole number/);
+      assert.throws(() => usage.setDatabaseLimit("blog-postgres", 1.5), /whole number/);
+      assert.throws(() => usage.setDatabaseLimit("__proto__", 10), /not found/);
       const disk = resmod.diskUsage(path.join(os.tmpdir(), "does-not-exist-paasmcp", "x"));
       assert.ok(disk && disk.totalBytes > 0 && disk.freeBytes <= disk.totalBytes && disk.usedPercent >= 0 && disk.usedPercent <= 100);
     }
