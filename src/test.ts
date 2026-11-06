@@ -4225,6 +4225,24 @@ volumes:
     }
   });
 
+  await t.test("52. Tailscale from the dashboard: a missing tailscale or socket says what to do, in both languages", async () => {
+    const { tailscaleServeError, ExposeError } = await import("./exposure.js");
+    const missing = Object.assign(new Error("spawnSync tailscale ENOENT"), { code: "ENOENT" });
+    const e1 = tailscaleServeError(missing, 8465, 4005) as InstanceType<typeof ExposeError>;
+    assert.ok(e1 instanceof ExposeError);
+    assert.match(e1.pt, /reinicie o painel/);
+    assert.match(e1.message, /sudo tailscale serve --bg --https=8465 http:\/\/127\.0\.0\.1:4005/);
+    const sock = Object.assign(new Error("Command failed"), { stderr: Buffer.from("failed to connect to local tailscaled; it doesn't appear to be running (sudo systemctl start tailscaled ?)") });
+    const e2 = tailscaleServeError(sock, 8465, 4005);
+    assert.ok(e2 instanceof ExposeError, "daemon not reachable: same advice");
+    const https = Object.assign(new Error("Command failed"), { stderr: "Serve is not enabled on your tailnet." });
+    assert.match((tailscaleServeError(https, 8465, 4005) as InstanceType<typeof ExposeError>).pt, /HTTPS Certificates/);
+    const other = new Error("something else");
+    assert.equal(tailscaleServeError(other, 1, 2), other, "anything else goes through unchanged");
+    const { tailscaleSocketDir } = await import("./config.js");
+    assert.ok(tailscaleSocketDir() === undefined || tailscaleSocketDir() === "/var/run/tailscale");
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
