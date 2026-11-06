@@ -3838,6 +3838,37 @@ volumes:
     }
   });
 
+  await t.test("43. Tutorial: checklist and step-by-step guides have every text in both languages", async () => {
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes('id="tab-guide"') && page.includes('data-sub="tutorial"') && page.includes("home: ['start', 'tutorial']"));
+      const guides = [...page.matchAll(/^ {6}([a-z]+): \{ steps: (\d+),/gm)].map((m) => [m[1], Number(m[2])] as const);
+      assert.ok(guides.length >= 6, "guides found");
+      const twice = (key: string) => assert.equal(page.split(`"${key}":`).length - 1, 2, `${key} in pt and en`);
+      for (const [id, steps] of guides) {
+        twice(`guide_${id}`);
+        twice(`guide_${id}_lead`);
+        for (let i = 1; i <= steps; i++) { twice(`guide_${id}_s${i}`); twice(`guide_${id}_s${i}Desc`); }
+      }
+      const items = [...page.matchAll(/\{ id: '([a-z]+)', group: '([a-z]+)'/g)].map((m) => m[1]);
+      assert.ok(items.length >= 10);
+      for (const id of items) { twice(`tut_${id}`); twice(`tut_${id}Desc`); }
+      assert.ok(!page.includes("paasmcp config --account-id"), "no terminal commands left on the first-setup screen");
+    } finally {
+      dsrv.close();
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
