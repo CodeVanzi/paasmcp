@@ -89,6 +89,12 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "This server's database is stopped, moved aside (kept on disk, not deleted) and replaced by a read-only copy of the server that took over. Its apps stay stopped until you hand back.",
         "O banco deste servidor é parado, movido para o lado (fica guardado no disco, não é apagado) e trocado por uma cópia só de leitura do servidor que assumiu. Os apps daqui ficam parados até a devolução.",
         params);
+    case "mirror.arbiter":
+      // Only the MCP asks this: on the dashboard and the CLI a person is already the one choosing the judge.
+      return risk(action, "arbiter", "confirm",
+        `This server will use ${String(params.url || params.host)} as its judge (arbiter): pairing hands it this pair's arbiter key, and its vote decides automatic takeovers and stops (fences) a server whose data moved.`,
+        `Este servidor vai usar ${String(params.url || params.host)} como juiz: o pareamento entrega a ele a chave deste par, e o voto dele decide as trocas automáticas e pode parar um servidor cujos dados mudaram de lugar.`,
+        params);
     case "judge.stop":
       return risk(action, "arbiter", "confirm",
         "This PC stops being an arbiter. The pairs of servers it serves lose their arbiter: no automatic takeover until they get another one (their apps keep running).",
