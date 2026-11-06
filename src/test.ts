@@ -4019,6 +4019,9 @@ volumes:
       for (const a of ["restart", "stop", "start", "rollback", "destroy", "restore", "purge"]) twice(`life_${a}`);
       for (const k of ["lifePoolUpdating", "lifePoolFailed", "lifeErrNoPrevious", "lifeErr", "logsEmpty", "logsHint", "actionRollbackTip"]) twice(k);
       assert.ok(!page.includes("showToast('✅ ' + data.output)"));
+      // The app list speaks plainly: no bare 127.0.0.1 pill, no raw access mode, no English limits.
+      for (const k of ["appNoAddressTip", "pillLocalOnly", "mode_public", "mode_zero-trust", "mode_tailscale", "limitsLabel"]) twice(k);
+      assert.ok(!page.includes("(Limits: "));
       // The route answers 422 with the kind, and the error itself, never a bare 500.
       const res = await fetch(`${baseUrl}/api/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ appName: "nope-46", repoSource: "/no/such/folder-46" }) });
       const data = (await res.json()) as { error: string; failure: { kind: string } };

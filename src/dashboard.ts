@@ -3105,7 +3105,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnRemoveSecret: "Remover",
         sizeLabel: "Tamanho:",
         stoppedStatus: "Parado",
-        onDemandStatus: "Sob demanda",
+        onDemandStatus: "Sem medição de uso agora",
         depPhase_detected: "🔔 Nova versão no repositório",
         depPhase_fetching: "⬇️ Baixando o código",
         depPhase_building: "🔨 Montando a imagem",
@@ -3249,7 +3249,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnRemoveSecret: "Remove",
         sizeLabel: "Size:",
         stoppedStatus: "Stopped",
-        onDemandStatus: "On demand",
+        onDemandStatus: "No usage reading right now",
         depPhase_detected: "🔔 New version in the repository",
         depPhase_fetching: "⬇️ Fetching the code",
         depPhase_building: "🔨 Building the image",
@@ -5144,6 +5144,25 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "actionRollbackTip": "Goes back to the version published before this one, in seconds"
     });
 
+    Object.assign(I18N.pt, {
+      "appNoAddressTip": "Este app ainda não tem endereço. Clique para dar um.",
+      "pillLocalOnly": "Só neste servidor",
+      "mode_public": "público",
+      "mode_zero-trust": "só e-mails autorizados",
+      "mode_tailscale": "só a minha rede",
+      "mode_local": "rede de casa",
+      "limitsLabel": "Limite: {mem} de memória, {cpu} CPU"
+    });
+    Object.assign(I18N.en, {
+      "appNoAddressTip": "This app has no address yet. Click to give it one.",
+      "pillLocalOnly": "Only on this server",
+      "mode_public": "public",
+      "mode_zero-trust": "authorized emails only",
+      "mode_tailscale": "my network only",
+      "mode_local": "home network",
+      "limitsLabel": "Limit: {mem} memory, {cpu} CPU"
+    });
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -5882,7 +5901,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
           // Main domain / access link
           const mainDomain = (a.domains || [])[0];
-          const appLink = mainDomain ? mainDomain.url : \`http://127.0.0.1:\${a.localPort}\`;
+          // Without an address, 127.0.0.1 only opens on the server itself: elsewhere the name leads to "Endereço".
+          const onServer = /^(127\\.|localhost$|\\[::1\\]$)/.test(location.hostname);
+          const appLink = mainDomain ? mainDomain.url : (onServer ? \`http://127.0.0.1:\${a.localPort}\` : '');
 
           // Language dot color
           let langColor = '#8b949e';
@@ -5908,7 +5929,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             ? \`<span><strong>CPU:</strong> \${esc(m.cpuPercent)}</span> · <span><strong>RAM:</strong> \${esc(m.memUsage)}</span>\`
             : \`<span style="color:var(--muted);">\${esc(a.status === 'stopped' ? t('stoppedStatus') : t('onDemandStatus'))}</span>\`;
           const limitsHtml = (a.memoryLimit || a.cpuLimit)
-            ? \`<span>(Limits: \${esc(a.memoryLimit || '-')} / \${esc(a.cpuLimit || '-')} CPU)</span>\`
+            ? \`<span>\${esc(t('limitsLabel').split('{mem}').join(a.memoryLimit || '-').split('{cpu}').join(a.cpuLimit || '-'))}</span>\`
             : '';
           const cp = s.controlPlane || {};
           const followBtn = a.runtimeType === 'paasmcp-control-plane'
@@ -5924,9 +5945,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           const domainPills = (a.domains || []).map(dom => \`
             <span class="app-badge-pill">
               <a href="\${esc(dom.url)}" target="_blank" rel="noopener noreferrer">\${btnIcon('globe')} \${esc(dom.url)}</a>
-              <span class="badge" style="padding:1px 5px;font-size:9.5px;">\${esc(dom.mode)}</span>
+              <span class="badge" style="padding:1px 5px;font-size:9.5px;">\${esc(I18N.en['mode_' + dom.mode] ? t('mode_' + dom.mode) : dom.mode)}</span>
             </span>
-          \`).join('') || \`<span class="app-badge-pill">🔒 127.0.0.1:\${esc(a.localPort)}</span>\`;
+          \`).join('') || \`<span class="app-badge-pill" title="127.0.0.1:\${esc(a.localPort)}">🔒 \${esc(t('pillLocalOnly'))}</span>\`;
 
           const dbPills = (a.databases || []).map(db => \`
             <span class="app-badge-pill" style="font-size:11px;">🗄️ \${esc(db)}</span>
@@ -5936,7 +5957,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <div class="app-entry-row">
               <div class="app-row-top">
                 <div class="app-row-main-identity">
-                  <a href="\${esc(appLink)}" target="_blank" rel="noopener noreferrer" class="app-row-name-link">
+                  <a \${appLink ? \`href="\${esc(appLink)}" target="_blank" rel="noopener noreferrer"\` : \`href="#" onclick="selectAppForExpose('\${esc(a.name)}'); return false;" title="\${esc(t('appNoAddressTip'))}"\`} class="app-row-name-link">
                     <span class="status-dot \${dotClass}"></span>
                     <span>\${esc(a.name)}</span>
                   </a>
