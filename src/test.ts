@@ -4026,6 +4026,23 @@ volumes:
     }
   });
 
+  await t.test("64. The server's own name, not the dashboard container's id", async () => {
+    const os = await import("node:os");
+    const was = process.env.PAASMCP_HOST_NAME;
+    try {
+      process.env.PAASMCP_HOST_NAME = "oracle150";
+      assert.equal(config.hostName(), "oracle150");
+      process.env.PAASMCP_HOST_NAME = "bad name; rm -rf /";
+      assert.equal(config.hostName(), os.hostname(), "an invalid override is ignored");
+      delete process.env.PAASMCP_HOST_NAME;
+      assert.equal(config.hostName(), os.hostname(), "outside the dashboard container: the machine's own name");
+      assert.equal(config.HOST_HOSTNAME_FILE, "/etc/paasmcp-host/hostname");
+    } finally {
+      if (was === undefined) delete process.env.PAASMCP_HOST_NAME;
+      else process.env.PAASMCP_HOST_NAME = was;
+    }
+  });
+
   await t.test("62. App files at the person's own account: tested, same variables, guarded switch, never copied by the mirror", async () => {
     const offsite = await import("./offsite.js");
     const storage = await import("./storage.js");

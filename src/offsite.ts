@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
-import { BackupGrantRecord, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp } from "./config.js";
+import { BackupGrantRecord, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp, hostName } from "./config.js";
 import { getOffsiteConfig, OffsiteConfig, s3Request } from "./backup.js";
 import { APP_S3_KEYS, appS3Variables, createBucketWithKey, ensureGarage, GARAGE_INTERNAL_ENDPOINT, GARAGE_REGION, garageAdmin } from "./storage.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
@@ -165,7 +165,7 @@ export function buildOffsiteTarget(input: OffsiteInput): OffsiteTarget {
 
 function getOffsiteConfigPrefixDefault(): string {
   // Same default as backup.ts getOffsiteConfig.
-  return `paasmcp/${sanitizeSlug(os.hostname())}`;
+  return `paasmcp/${sanitizeSlug(hostName())}`;
 }
 
 /** Writes, reads back and deletes a small file, so a wrong key or bucket shows up now, not at night. */

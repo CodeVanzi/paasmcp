@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, updatePlatformConfig, writeFileAtomic, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, updatePlatformConfig, writeFileAtomic, WATCHTOWER_OFF_COMPOSE, hostName } from "./config.js";
 import { audit } from "./guard.js";
 import { CLOUDFLARED_IMAGE, validTunnelToken } from "./activetunnel.js";
 import { notifySummary } from "./notify.js";
@@ -209,7 +209,7 @@ export async function saveCloudflare(choice: CloudflareChoice, confirm: (params:
   if (!account.tunnelsReadable) throw fail("The token lacks the Cloudflare Tunnel permission.", "Falta a permissão Cloudflare Tunnel: Edit no token.");
 
   // "new" reuses the tunnel this server created before (same name), so saving twice creates one tunnel.
-  const newName = `paasmcp-${sanitizeSlug(os.hostname()) || "server"}`.slice(0, 60);
+  const newName = `paasmcp-${sanitizeSlug(hostName()) || "server"}`.slice(0, 60);
   const reuse = wanted === "new" ? account.tunnels.find((t) => t.name === newName) : undefined;
   const prev = loadState().cloudflare;
   const replacing = Boolean(prev.tunnelId && prev.baseDomain && prev.baseDomain !== "example.com") &&

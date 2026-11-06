@@ -10,6 +10,7 @@ import {
   PAAS_BACKUPS_DIR,
   sanitizeSlug,
   saveState,
+  hostName,
 } from "./config.js";
 import { backupDatabase } from "./database.js";
 import { localDate, readNightlyMark, writeNightlyMark } from "./nightly.js";
@@ -74,7 +75,7 @@ export function getOffsiteConfig(): OffsiteConfig | null {
     accessKeyId: s.BACKUP_S3_ACCESS_KEY_ID,
     secretAccessKey: s.BACKUP_S3_SECRET_ACCESS_KEY,
     region: s.BACKUP_S3_REGION || "auto",
-    prefix: (s.BACKUP_S3_PREFIX || `paasmcp/${sanitizeSlug(os.hostname())}`).replace(/^\/+|\/+$/g, ""),
+    prefix: (s.BACKUP_S3_PREFIX || `paasmcp/${sanitizeSlug(hostName())}`).replace(/^\/+|\/+$/g, ""),
   };
 }
 

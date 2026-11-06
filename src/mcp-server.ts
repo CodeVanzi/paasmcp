@@ -20,6 +20,7 @@ import {
   saveState,
   updatePlatformConfig,
   withStateLock,
+  hostName,
 } from "./config.js";
 import {
   assessRisk,
@@ -125,7 +126,7 @@ export function getSystemStatusSummary(includeMetrics = true) {
   }
 
   return {
-    hostname: os.hostname(),
+    hostname: hostName(),
     platform: `${os.type()} ${os.release()} (${os.arch()})`,
     cpus: os.cpus().length,
     totalMemGb: +(os.totalmem() / 1024 ** 3).toFixed(2),

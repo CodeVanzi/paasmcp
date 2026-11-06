@@ -29,7 +29,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, HOST_HOSTNAME_FILE, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
@@ -7286,6 +7286,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       const elHostname = document.getElementById('topHostname');
       if (elHostname) elHostname.textContent = s.hostname || '-';
+      // The server's name in the tab too: with several servers open, each tab says which one it is.
+      if (s.hostname) document.title = s.hostname + ' · PaaSMCP';
 
       const elHealth = document.getElementById('topHealthBadge');
       if (elHealth) elHealth.textContent = isPt ? 'Sistema Online' : 'System Online';
@@ -9904,7 +9906,7 @@ ${WATCHTOWER_OFF_COMPOSE}    working_dir: /app
     volumes:
       - ${projectRoot}:/app:ro
       - ${HOMELAB_ROOT}:${HOMELAB_ROOT}
-      - /var/run/docker.sock:/var/run/docker.sock${tsDir ? `\n      - ${tsDir}:${tsDir}` : ""}
+      - /var/run/docker.sock:/var/run/docker.sock${tsDir ? `\n      - ${tsDir}:${tsDir}` : ""}${fs.existsSync("/etc/hostname") ? `\n      - /etc/hostname:${HOST_HOSTNAME_FILE}:ro` : ""}
     networks:
       - ${DOCKER_NETWORK}
 

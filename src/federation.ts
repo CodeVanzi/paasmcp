@@ -7,6 +7,7 @@ import {
   loadState,
   sanitizeSlug,
   saveState,
+  hostName,
 } from "./config.js";
 import { deployApp } from "./deployer.js";
 import { getOrCreateSshDeployKey } from "./github.js";
@@ -159,7 +160,7 @@ export function generateFederationJoinToken(opts: {
   if (!state.federation) {
     state.federation = {
       nodeId: `node-${crypto.randomBytes(4).toString("hex")}`,
-      nodeName: opts.nodeName || os.hostname(),
+      nodeName: opts.nodeName || hostName(),
       role: "primary",
       redundancyMode: mode,
       peers: {},
@@ -247,7 +248,7 @@ export function registerFederationPeer(peer: {
   if (!state.federation) {
     state.federation = {
       nodeId: `node-${crypto.randomBytes(4).toString("hex")}`,
-      nodeName: os.hostname(),
+      nodeName: hostName(),
       role: "primary",
       redundancyMode: peer.mode,
       peers: {},

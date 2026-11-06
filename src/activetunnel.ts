@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, ownOffers, PaaSState, sanitizeSlug, saveState, writeFileAtomic, WATCHTOWER_OFF_COMPOSE, hostName } from "./config.js";
 import { audit } from "./guard.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
 
@@ -299,7 +299,7 @@ export async function enableActiveTunnel(opts: { waitMs?: number; probe?: (url: 
   if (state.activeTunnelCopy) throw new Error("This server runs the other server's tunnel copy: turn the tunnel on on the server where the apps come from.");
   let at = state.activeTunnel;
   if (!at) {
-    const name = `paasmcp-active-${sanitizeSlug(state.federation?.nodeName && state.federation.nodeName !== "primary-node" ? state.federation.nodeName : os.hostname())}`.slice(0, 60);
+    const name = `paasmcp-active-${sanitizeSlug(state.federation?.nodeName && state.federation.nodeName !== "primary-node" ? state.federation.nodeName : hostName())}`.slice(0, 60);
     const existing = await cf<{ id: string; name: string }[]>("GET", `/accounts/${accountId}/cfd_tunnel?name=${encodeURIComponent(name)}&is_deleted=false`);
     const tunnel = existing?.[0] || (await cf<{ id: string; name: string }>("POST", `/accounts/${accountId}/cfd_tunnel`, { name, config_src: "cloudflare" }));
     if (!tunnel?.id || !ID_RE.test(tunnel.id)) throw new Error("Cloudflare did not return a tunnel id.");
