@@ -154,7 +154,7 @@ O PaaSMCP convive com o resto do servidor. Depois de instalar, rode `paasmcp doc
 
 ### Primeira configuração e credenciais
 
-No painel, **Início → Tutorial** mostra o que já foi feito e o que ainda dá para fazer (os itens se marcam sozinhos), com guias passo a passo em páginas próprias (`#guide/firstapp`, `address`, `offsite`, `autoupdate`, `email`, `github`). As integrações externas são opcionais. Bootstrap, deploy de pastas locais, repositórios públicos, bancos locais e uso do painel não precisam de token Cloudflare ou GitHub. Guarde credenciais em **Cofre → escopo `system`**; segredos usados pelo código de uma aplicação ficam no escopo do slug dela. O painel mostra valores mascarados depois de salvar.
+Em **Senhas e chaves**, escolha o app numa lista, cole um `.env` inteiro se quiser (aspas, `export` e comentários funcionam) e use **Publicar de novo** para o app passar a usar as variáveis novas: reiniciar não basta, porque elas são gravadas na hora de publicar. No painel, **Início → Tutorial** mostra o que já foi feito e o que ainda dá para fazer (os itens se marcam sozinhos), com guias passo a passo em páginas próprias (`#guide/firstapp`, `address`, `offsite`, `autoupdate`, `email`, `github`). As integrações externas são opcionais. Bootstrap, deploy de pastas locais, repositórios públicos, bancos locais e uso do painel não precisam de token Cloudflare ou GitHub. Guarde credenciais em **Cofre → escopo `system`**; segredos usados pelo código de uma aplicação ficam no escopo do slug dela. O painel mostra valores mascarados depois de salvar.
 
 | Item | Quando é necessário | Como obter/configurar |
 | --- | --- | --- |
