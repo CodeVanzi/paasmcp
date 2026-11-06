@@ -1779,6 +1779,55 @@ volumes:
     assert.deepEqual(parsed["paasmcp-a"], { cpu: 12.5, mem: 64, rxTotal: 1000, txTotal: 2_000_000 });
     assert.equal(parsed.x.cpu, null);
 
+    // Server resources: whole server vs. PaaSMCP's containers vs. the rest (resources.ts)
+    {
+      const resmod = await import("./resources.js");
+      const core = (user: number, idle: number) => ({ model: "x", speed: 1, times: { user, nice: 0, sys: 0, idle, irq: 0 } });
+      const a = resmod.cpuSample([core(100, 900), core(100, 900)], 0);
+      const b = resmod.cpuSample([core(400, 1100), core(200, 1300)], 1000);
+      // 400 busy of 1000 total across both cores = 40%
+      assert.equal(resmod.cpuPercentBetween(a, b), 40);
+      assert.equal(resmod.cpuPercentBetween(a, a), null);
+      assert.equal(resmod.memAvailableBytes("MemTotal: 1000 kB\nMemFree: 10 kB\nMemAvailable:  512 kB\n"), 512 * 1024);
+      assert.equal(resmod.memAvailableBytes("MemTotal: 1000 kB\n"), null);
+      resmod.resetCpuMemory();
+      const GiB = 1024 ** 3;
+      const stats = scale.parseDockerStats(
+        '{"Name":"paasmcp-blog","CPUPerc":"50.00%","MemUsage":"1GiB / 8GiB"}\n' +
+          '{"Name":"paasmcp-dashboard","CPUPerc":"10.00%","MemUsage":"512MiB / 8GiB"}\n' +
+          '{"Name":"other-thing","CPUPerc":"90.00%","MemUsage":"2GiB / 8GiB"}\n'
+      );
+      const cores = os.cpus().length;
+      const r = resmod.hostResources({
+        cpuBefore: { busy: 0, total: 0, at: 0 },
+        now: { busy: 800, total: 1000, at: 1000 },
+        stats,
+        statsRan: true,
+        totalMem: 8 * GiB,
+        availableMem: 4 * GiB,
+        disk: null,
+        load1: 0.5,
+      });
+      assert.equal(r.cpu.usedPercent, 80);
+      const paasCpu = Math.min(80, (0.6 / cores) * 100);
+      assert.equal(r.cpu.split?.paasmcp, Math.round(paasCpu * 10) / 10);
+      assert.equal(r.memory.usedBytes, 4 * GiB);
+      // Only paasmcp-* containers count for PaaSMCP; the other container falls under "others".
+      assert.equal(r.memory.split?.paasmcp, 1.5 * GiB);
+      assert.equal(r.memory.split?.others, 2.5 * GiB);
+      assert.deepEqual(r.top.map((c) => c.name), ["paasmcp-blog", "paasmcp-dashboard"]);
+      // PaaSMCP never shows more than the server uses (readings a moment apart).
+      const tight = resmod.hostResources({ now: { busy: 0, total: 0, at: 5000 }, stats, statsRan: true, totalMem: 8 * GiB, availableMem: 7.5 * GiB, disk: null });
+      assert.equal(tight.memory.split?.paasmcp, 0.5 * GiB);
+      assert.equal(tight.memory.split?.others, 0);
+      // Without docker stats there is no split, only the totals.
+      const noDocker = resmod.hostResources({ statsRan: false, totalMem: 8 * GiB, availableMem: 2 * GiB, disk: null });
+      assert.equal(noDocker.memory.split, null);
+      assert.equal(noDocker.cpu.split, null);
+      const disk = resmod.diskUsage(path.join(os.tmpdir(), "does-not-exist-paasmcp", "x"));
+      assert.ok(disk && disk.totalBytes > 0 && disk.freeBytes <= disk.totalBytes && disk.usedPercent >= 0 && disk.usedPercent <= 100);
+    }
+
     // Rule validation
     assert.throws(() => scale.validateRule({ targetCpu: 200 }), /targetCpu/);
     assert.throws(() => scale.validateRule({ min: 0 }), /min/);

@@ -950,43 +950,46 @@ export function manageAppLifecycle(
   throw new Error(`Unsupported action: ${action}`);
 }
 
-export function getContainerMetrics(): Record<string, AppMetrics> {
-  const metrics: Record<string, AppMetrics> = {};
-  if (process.env.PAASMCP_OFFLINE_TEST === "1") {
-    return metrics;
-  }
+/** Raw `docker stats --no-stream` output for every running container ("" when Docker can't answer). */
+export function readDockerStats(): string {
+  if (process.env.PAASMCP_OFFLINE_TEST === "1") return "";
   try {
-    const out = execFileSync(
-      "docker",
-      ["stats", "--no-stream", "--format", "{{json .}}"],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 4000 }
-    );
-    for (const line of out.trim().split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const row = JSON.parse(line) as {
-          Name?: string;
-          CPUPerc?: string;
-          MemUsage?: string;
-          MemPerc?: string;
-          NetIO?: string;
-          PIDs?: string;
-        };
-        if (row.Name && row.Name.startsWith("paasmcp-")) {
-          metrics[row.Name] = {
-            cpuPercent: row.CPUPerc || "0.00%",
-            memUsage: row.MemUsage || "0B / 0B",
-            memPercent: row.MemPerc || "0.00%",
-            netIO: row.NetIO || "0B / 0B",
-            pids: row.PIDs || "0",
-          };
-        }
-      } catch {
-        // ignore malformed row
-      }
-    }
+    return execFileSync("docker", ["stats", "--no-stream", "--format", "{{json .}}"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 4000,
+    });
   } catch {
     // Docker daemon unavailable or no running containers
+    return "";
+  }
+}
+
+export function getContainerMetrics(out: string = readDockerStats()): Record<string, AppMetrics> {
+  const metrics: Record<string, AppMetrics> = {};
+  for (const line of out.trim().split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line) as {
+        Name?: string;
+        CPUPerc?: string;
+        MemUsage?: string;
+        MemPerc?: string;
+        NetIO?: string;
+        PIDs?: string;
+      };
+      if (row.Name && row.Name.startsWith("paasmcp-")) {
+        metrics[row.Name] = {
+          cpuPercent: row.CPUPerc || "0.00%",
+          memUsage: row.MemUsage || "0B / 0B",
+          memPercent: row.MemPerc || "0.00%",
+          netIO: row.NetIO || "0B / 0B",
+          pids: row.PIDs || "0",
+        };
+      }
+    } catch {
+      // ignore malformed row
+    }
   }
   return metrics;
 }

@@ -171,7 +171,7 @@ Add `paasmcp` to your MCP client configuration:
 | Tool | Description |
 | :--- | :--- |
 | `paas_approvals` | Lists confirmation requests and their status. Agents can read them but never approve. |
-| `paas_system_status` | Returns server hardware stats (CPU/RAM/Disk), live per-container CPU/RAM (`docker stats`), SSH deploy key, masked tokens, DBs, backups, and federation state. |
+| `paas_system_status` | Returns server hardware stats (CPU/RAM/Disk, with how much PaaSMCP uses vs. the rest of the server), live per-container CPU/RAM (`docker stats`), SSH deploy key, masked tokens, DBs, backups, and federation state. |
 | `paas_bootstrap` | Initializes `/opt/homelab/paasmcp`, master encryption key, SSH deploy key, Docker network, and shared Postgres/Redis. |
 | `paas_dashboard` | Starts the Web Workspace UI (`127.0.0.1:4099`) + GitHub Webhook receiver and optionally exposes it (`zero-trust`, `public`, or `tailscale`). |
 | `paas_configure` | Configures Cloudflare `accountId`, `tunnelId`, `baseDomain`, `zeroTrustEmails`, and `tailscaleDomain`. |
