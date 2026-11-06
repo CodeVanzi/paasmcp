@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { HOMELAB_ROOT, loadState, WATCHTOWER_OFF_LABEL } from "./config.js";
+import { HOMELAB_ROOT, loadState, WATCHTOWER_OFF_LABEL, hostName } from "./config.js";
 import { ARBITER_DIR, arbiterClusterId, arbiterPairingStatus, closeArbiterPairing, openArbiterPairing, parseArbiterKeys } from "./arbiter.js";
 import { audit } from "./guard.js";
 
@@ -154,7 +154,7 @@ export async function beJudge(run?: (args: string[]) => void): Promise<{ url: st
   const { url } = await ensureLocalJudge(run);
   const w = openArbiterPairing();
   audit({ event: "judge.pairing-opened", url });
-  return { url, code: w.code, expiresAt: w.expiresAt, host: os.hostname() };
+  return { url, code: w.code, expiresAt: w.expiresAt, host: hostName() };
 }
 
 export function cancelJudgePairing(): void {

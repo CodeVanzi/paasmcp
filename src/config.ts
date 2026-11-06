@@ -403,6 +403,28 @@ export interface WakeTargetRecord {
 }
 
 export const HOMELAB_ROOT = process.env.PAASMCP_ROOT || "/opt/homelab";
+
+/** Where the dashboard container sees the server's /etc/hostname (mounted read-only, dashboard.ts). */
+export const HOST_HOSTNAME_FILE = "/etc/paasmcp-host/hostname";
+const HOST_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
+
+/**
+ * This server's name. Inside the dashboard container os.hostname() is the container id (it changes on
+ * every recreate), so the server's /etc/hostname is read from the read-only mount instead.
+ * PAASMCP_HOST_NAME overrides both (labs). Use it wherever the name means "this server"; keep
+ * os.hostname() where it identifies the process's own machine/container (lock owners, pids).
+ */
+export function hostName(): string {
+  const fromEnv = (process.env.PAASMCP_HOST_NAME || "").trim();
+  if (HOST_NAME_RE.test(fromEnv)) return fromEnv;
+  try {
+    const n = fs.readFileSync(HOST_HOSTNAME_FILE, "utf-8").trim();
+    if (HOST_NAME_RE.test(n)) return n;
+  } catch {
+    /* not in the dashboard container */
+  }
+  return os.hostname();
+}
 export const PAAS_DATA_DIR = path.join(HOMELAB_ROOT, "paasmcp");
 export const PAAS_APPS_DIR = path.join(HOMELAB_ROOT, "apps");
 export const PAAS_VAULT_DIR = path.join(PAAS_DATA_DIR, "vault");

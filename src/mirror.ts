@@ -13,6 +13,7 @@ import {
   sanitizeSlug,
   saveState,
   WATCHTOWER_OFF_COMPOSE,
+  hostName,
 } from "./config.js";
 import { ensureDockerNetwork, ensureSharedPostgresCluster, ensureSharedRedisCluster } from "./database.js";
 import { deployApp, manageAppLifecycle } from "./deployer.js";
@@ -264,7 +265,7 @@ export async function offerMirror(opts: {
     v: 1,
     fromNodeId: state.federation?.nodeId || "primary",
     // The default name is the same on every server; the hostname tells the two apart.
-    fromName: sanitizeSlug(state.federation?.nodeName && state.federation.nodeName !== "primary-node" ? state.federation.nodeName : os.hostname()),
+    fromName: sanitizeSlug(state.federation?.nodeName && state.federation.nodeName !== "primary-node" ? state.federation.nodeName : hostName()),
     host,
     port: sourcePort,
     slot,
@@ -668,7 +669,7 @@ export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> 
   if (!ARBITER_URL_RE.test(url)) return { configured: true, url, ok: false, errorCode: "badUrl", error: "Invalid address. Use http://<Tailscale IP of the arbiter>:4097", ...base };
   const state = loadState();
   const me = state.federation?.nodeId || "primary";
-  const names: Record<string, string> = { [me]: state.federation?.nodeName || os.hostname() };
+  const names: Record<string, string> = { [me]: state.federation?.nodeName || hostName() };
   for (const p of Object.values(state.federation?.peers || {})) names[p.nodeId] = p.name;
   for (const r of Object.values(m.replicas)) names[r.peerNodeId] = r.peerName;
   try {
