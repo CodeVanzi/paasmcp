@@ -16,7 +16,7 @@ import {
 } from "./config.js";
 import { ensureDockerNetwork, ensureSharedPostgresCluster, ensureSharedRedisCluster } from "./database.js";
 import { deployApp, manageAppLifecycle } from "./deployer.js";
-import { ArbiterAbout, askArbiter } from "./arbiter.js";
+import { ArbiterAbout, askArbiter, pairWithArbiter } from "./arbiter.js";
 import { bucketTargets } from "./active.js";
 import { syncBucket } from "./filesync.js";
 import { audit } from "./guard.js";
@@ -561,6 +561,17 @@ export function setArbiterUrl(arbiterUrl: string): MirrorConfig {
   return saveMirror((m) => {
     m.arbiterUrl = url;
   });
+}
+
+/**
+ * Pairs with a PC that shows a pairing code (`arbiter pair` / its dashboard), saves its address and
+ * checks it once. The other server learns the address through the control channel (active.ts).
+ */
+export async function pairArbiterAndSave(host: string, code: string, opts: { port?: number } = {}): Promise<{ url: string; cluster: string; host: string; check: ArbiterCheck }> {
+  const out = await pairWithArbiter(host, code, opts);
+  setArbiterUrl(out.url);
+  audit({ event: "mirror.arbiter-paired", url: out.url, cluster: out.cluster, arbiterHost: out.host });
+  return { ...out, check: await checkArbiter() };
 }
 
 export interface ArbiterCheck {

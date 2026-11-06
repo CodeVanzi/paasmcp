@@ -4569,6 +4569,134 @@ volumes:
     }
   });
 
+  await t.test("56. Arbiter by code: a PC with PaaSMCP pairs with a server, the key only after the code matches, and the other server adopts it", async () => {
+    const arbiter = await import("./arbiter.js");
+    const mirror = await import("./mirror.js");
+    const judge = await import("./judge.js");
+    const active = await import("./active.js");
+    const judgeDir = path.join(tempRoot, "judge-pc");
+    process.env.PAASMCP_ARBITER_DIR = judgeDir;
+    process.env.PAASMCP_ARBITER_ENV_FILE = path.join(judgeDir, "keys.env");
+    const srv = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", keyFile: process.env.PAASMCP_ARBITER_ENV_FILE, stateFile: path.join(judgeDir, "state.json"), pairing: true });
+    await new Promise((r) => srv.once("listening", r));
+    const port = (srv.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${port}`;
+    const st0 = config.loadState();
+    const savedUrl = st0.mirror?.arbiterUrl;
+    try {
+      // Starts with no key: no cluster is accepted, and no code is open.
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter" });
+      await assert.rejects(() => arbiter.askArbiter(url, { op: "heartbeat", node: "x", epoch: 0 }), /HTTP 401/);
+      await assert.rejects(() => arbiter.pairWithArbiter("127.0.0.1", "123456", { port }), (e: Error & { code?: string }) => e.code === "notPairing");
+      // The PC opens a window; /health says so (and nothing else).
+      const w = arbiter.openArbiterPairing();
+      assert.match(w.code, /^\d{6}$/);
+      assert.equal(fs.statSync(path.join(judgeDir, "pairing.json")).mode & 0o777, 0o600);
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter", pairing: true });
+      // A wrong code: the server stops at the proof and never sends the key.
+      const wrong = w.code === "000000" ? "111111" : "000000";
+      await assert.rejects(() => arbiter.pairWithArbiter("127.0.0.1", wrong, { port }), (e: Error & { code?: string }) => e.code === "wrongCode");
+      assert.equal(fs.existsSync(process.env.PAASMCP_ARBITER_ENV_FILE), false, "nothing stored after a wrong code");
+      assert.equal(arbiter.arbiterPairingStatus().triesLeft, arbiter.PAIR_MAX_TRIES - 1);
+      // A key step with a nonce the PC never issued is refused.
+      const forged = await fetch(`${url}/pair`, { method: "POST", body: JSON.stringify({ step: "key", nonceA: "a".repeat(32), nonceC: "b".repeat(32), iv: "00", box: "AA==" }) });
+      assert.equal(forged.status, 403);
+      await assert.rejects(() => arbiter.pairWithArbiter("bad host;", w.code, { port }), (e: Error & { code?: string }) => e.code === "badHost");
+      // The right code: the key arrives, the window closes, and the arbiter serves the cluster at once.
+      const key = arbiter.deriveArbiterKey();
+      const out = await arbiter.pairWithArbiter("127.0.0.1", w.code, { port });
+      assert.equal(out.url, url);
+      assert.equal(out.cluster, arbiter.arbiterClusterId(key));
+      assert.equal(fs.readFileSync(process.env.PAASMCP_ARBITER_ENV_FILE, "utf-8"), `PAASMCP_ARBITER_KEY=${key}\n`);
+      assert.equal(fs.statSync(process.env.PAASMCP_ARBITER_ENV_FILE).mode & 0o777, 0o600);
+      assert.equal(arbiter.arbiterPairingStatus().open, false);
+      assert.equal((await arbiter.askArbiter(url, { op: "heartbeat", node: "x", epoch: 0 })).granted, true);
+      await assert.rejects(() => arbiter.pairWithArbiter("127.0.0.1", w.code, { port }), (e: Error & { code?: string }) => e.code === "notPairing", "a code works once");
+      // Too many tries close the window.
+      arbiter.openArbiterPairing();
+      for (let i = 0; i < arbiter.PAIR_MAX_TRIES; i++) await fetch(`${url}/pair`, { method: "POST", body: JSON.stringify({ step: "hello", nonceA: crypto.randomBytes(16).toString("hex") }) });
+      assert.equal(arbiter.arbiterPairingStatus().open, false);
+      assert.deepEqual(await (await fetch(`${url}/health`)).json(), { ok: true, service: "paasmcp-arbiter" });
+      // Through mirror.ts: pairs, saves the address and checks it.
+      const w2 = arbiter.openArbiterPairing();
+      const paired = await mirror.pairArbiterAndSave("127.0.0.1", w2.code, { port });
+      assert.equal(paired.url, url);
+      assert.equal(config.loadState().mirror?.arbiterUrl, url);
+      assert.equal(paired.check.ok, true);
+      assert.equal(paired.check.about?.clusters, 1, "pairing twice keeps a single key");
+
+      // The other server adopts the arbiter from the control channel, only when it has none.
+      const manifest = active.buildActiveManifest({ ...config.loadState(), mirror: { ...(config.loadState().mirror || { epoch: 0, offers: {}, replicas: {} }), arbiterUrl: url } });
+      assert.equal(manifest.arbiterUrl, url);
+      {
+        const st = config.loadState();
+        const before = st.mirror;
+        st.mirror = { epoch: 0, offers: {}, replicas: { "judge-peer": { peerName: "judge-peer", peerNodeId: "node-judge-peer", peerHost: "100.64.0.77", container: "x", acceptedAt: new Date().toISOString() } as never } };
+        config.saveState(st);
+        const body = active.encodeManifest({ v: 1, nodeId: "node-judge-peer", epoch: 0, apps: {}, arbiterUrl: "http://100.64.0.50:4097" });
+        const r1 = await active.syncActivePeers({ read: () => body, deploy: async () => undefined as never, stop: () => undefined });
+        assert.equal(r1[0].arbiter, "http://100.64.0.50:4097");
+        assert.equal(config.loadState().mirror?.arbiterUrl, "http://100.64.0.50:4097", "a server without an arbiter adopts the other's");
+        const body2 = active.encodeManifest({ v: 1, nodeId: "node-judge-peer", epoch: 0, apps: {}, arbiterUrl: "http://100.64.0.99:4097" });
+        await active.syncActivePeers({ read: () => body2, deploy: async () => undefined as never, stop: () => undefined });
+        assert.equal(config.loadState().mirror?.arbiterUrl, "http://100.64.0.50:4097", "an address already set is never replaced");
+        const st2 = config.loadState();
+        st2.mirror = before;
+        config.saveState(st2);
+      }
+
+      // Candidates: every online device, those with a code first, the pair's own servers marked.
+      const fake = JSON.stringify({ Self: { TailscaleIPs: ["100.64.0.1"] }, Peer: {
+        a: { HostName: "cloud-graco-50", OS: "linux", Online: true, TailscaleIPs: ["100.64.0.50", "fd7a::1"] },
+        b: { HostName: "phone", OS: "android", Online: false, TailscaleIPs: ["100.64.0.60"] },
+      } });
+      const peers = judge.listTailscalePeers(fake);
+      assert.equal(peers.selfIp, "100.64.0.1");
+      assert.deepEqual(peers.peers.map((p) => [p.name, p.ip, p.online]), [["cloud-graco-50", "100.64.0.50", true], ["phone", "100.64.0.60", false]], "devices without PaaSMCP and offline ones stay listed");
+      const found = await judge.findJudgeCandidates(fake);
+      assert.deepEqual(found.devices.map((d) => d.name), ["cloud-graco-50"], "the candidate list keeps online devices only");
+      assert.equal(found.devices[0].arbiter, false);
+
+      // The arbiter container's code: the copied files import nothing else (so it runs with plain node).
+      const codeDir = judge.writeJudgeBundle();
+      const { spawnSync } = await import("node:child_process");
+      const run = spawnSync(process.execPath, ["--input-type=module", "-e", "await import(process.argv[1]); console.log('ok')", path.join(codeDir, "dist", "arbiter.js")], { encoding: "utf-8", env: { ...process.env, PAASMCP_ROOT: path.join(tempRoot, "bundle-root") } });
+      assert.equal(run.stdout.trim(), "ok", run.stderr);
+      // Starting it: one docker run with host network, its keys and state in the arbiter folder.
+      process.env.PAASMCP_ARBITER_HOST = "127.0.0.1";
+      process.env.PAASMCP_ARBITER_PORT = String(port);
+      const calls: string[][] = [];
+      const started = await judge.ensureLocalJudge((a) => calls.push(a));
+      assert.equal(started.started, false, "an arbiter already answers here: nothing is started");
+      assert.equal(calls.length, 0);
+      const opened = await judge.beJudge((a) => calls.push(a));
+      assert.match(opened.code, /^\d{6}$/);
+      const local = await judge.localJudgeStatus();
+      assert.equal(local.running, true);
+      assert.equal(local.pairing.open, true);
+      assert.deepEqual(local.clusters, [arbiter.arbiterClusterId(key)]);
+      judge.cancelJudgePairing();
+      assert.equal((await judge.localJudgeStatus()).pairing.open, false);
+      process.env.PAASMCP_ARBITER_PORT = "1";
+      const runs: string[][] = [];
+      await assert.rejects(() => judge.ensureLocalJudge((a) => runs.push(a)), /does not answer/);
+      const runArgs = runs.find((a) => a[0] === "run")!;
+      assert.ok(runArgs.includes("--network") && runArgs[runArgs.indexOf("--network") + 1] === "host");
+      assert.ok(runArgs.includes(`PAASMCP_ARBITER_ENV_FILE=${path.join(judgeDir, "keys.env")}`));
+      assert.ok(!runArgs.join(" ").includes(key), "the key never goes on the command line");
+      // Guard: stopping the arbiter here needs a confirmation.
+      assert.equal(guard.assessRisk("judge.stop", {})?.level, "confirm");
+    } finally {
+      srv.close();
+      for (const k of ["PAASMCP_ARBITER_DIR", "PAASMCP_ARBITER_ENV_FILE", "PAASMCP_ARBITER_HOST", "PAASMCP_ARBITER_PORT"]) delete process.env[k];
+      const st = config.loadState();
+      if (st.mirror) {
+        st.mirror.arbiterUrl = savedUrl;
+        config.saveState(st);
+      }
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

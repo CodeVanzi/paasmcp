@@ -79,10 +79,11 @@ interface ArbiterFile {
 }
 
 /** Reads the state file; a single-cluster file from before belongs to the first key. */
-export function loadArbiterFile(file: string, firstKey: string): ArbiterFile {
+export function loadArbiterFile(file: string, firstKey: string | undefined): ArbiterFile {
   if (!fs.existsSync(file)) return { v: 2, clusters: {} };
   const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
   if (raw && raw.v === 2 && raw.clusters && typeof raw.clusters === "object") return raw as ArbiterFile;
+  if (!firstKey) return { v: 2, clusters: {} };
   return { v: 2, clusters: { [arbiterClusterId(firstKey)]: { nodes: raw?.nodes || {}, owners: raw?.owners || {} } } };
 }
 
@@ -104,24 +105,60 @@ export interface ArbiterAbout {
   clusters: number;
 }
 
-export function startArbiterServer(opts: { port: number; host: string; keys?: string[]; key?: string; stateFile?: string }): http.Server {
-  const keys = [...(opts.keys || []), ...(opts.key ? [opts.key] : [])];
-  if (!keys.length) throw new Error("The arbiter needs at least one key.");
-  const byId = new Map(keys.map((k) => [arbiterClusterId(k), k]));
+export function startArbiterServer(opts: { port: number; host: string; keys?: string[]; key?: string; stateFile?: string; keyFile?: string; pairing?: boolean }): http.Server {
+  const fixed = [...(opts.keys || []), ...(opts.key ? [opts.key] : [])];
+  // With a key file the arbiter re-reads it when it changes (a new pair joins by code or `add-key`),
+  // so it may start with no key at all and wait for the first pairing.
+  if (!fixed.length && !opts.keyFile) throw new Error("The arbiter needs at least one key.");
+  let cache = { mtime: -1, keys: fixed };
+  const currentKeys = (): string[] => {
+    if (!opts.keyFile) return fixed;
+    let mtime = -2;
+    try {
+      mtime = fs.statSync(opts.keyFile).mtimeMs;
+    } catch {
+      // no file yet
+    }
+    if (mtime !== cache.mtime) {
+      let fromFile: string[] = [];
+      try {
+        fromFile = readKeysFile(opts.keyFile);
+      } catch {
+        // a broken file keeps the keys given on the command line
+      }
+      cache = { mtime, keys: [...new Set([...fixed, ...fromFile])] };
+    }
+    return cache.keys;
+  };
   const file = opts.stateFile || path.join(PAAS_DATA_DIR, "arbiter.json");
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const about: ArbiterAbout = { host: os.hostname(), version: codeVersion(), startedAt: Date.now(), clusters: keys.length };
+  const startedAt = Date.now();
+  const version = codeVersion();
   const server = http.createServer((req, res) => {
-    // Unsigned liveness probe for people checking the arbiter by hand (curl / browser). Reveals nothing.
-    if (req.method === "GET" && req.url === "/health") return res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true,"service":"paasmcp-arbiter"}');
-    if (req.method !== "POST" || req.url !== "/arbiter") return res.writeHead(404).end();
+    const reply = (code: number, o: unknown) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(o));
+    // Unsigned liveness probe for people checking the arbiter by hand (curl / browser), and for
+    // servers looking for a PC to pair with. Reveals nothing but whether a pairing is open.
+    if (req.method === "GET" && req.url === "/health") {
+      const open = opts.pairing && readPairing() !== undefined;
+      return reply(200, open ? { ok: true, service: "paasmcp-arbiter", pairing: true } : { ok: true, service: "paasmcp-arbiter" });
+    }
+    if (req.method !== "POST" || (req.url !== "/arbiter" && !(opts.pairing && req.url === "/pair"))) return res.writeHead(404).end();
     let body = "";
     req.on("data", (c) => {
       body += c;
       if (body.length > 10_000) req.destroy();
     });
     req.on("end", () => {
-      const reply = (code: number, o: unknown) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(o));
+      if (req.url === "/pair") {
+        const out = handlePairRequest(body, (k) => {
+          const target = opts.keyFile || ARBITER_ENV_FILE();
+          writeKeysFile(target, parseArbiterKeys([...readKeysFileSafe(target), k].join(",")));
+          if (!opts.keyFile && !fixed.includes(k)) fixed.push(k);
+        });
+        return reply(out.status, out.body);
+      }
+      const keys = currentKeys();
+      const byId = new Map(keys.map((k) => [arbiterClusterId(k), k]));
       const signature = String(req.headers["x-paasmcp-signature"] || "");
       const claimed = String(req.headers["x-paasmcp-cluster"] || "");
       // The cluster comes from the key that signed the request: a named cluster must match its own key.
@@ -146,6 +183,7 @@ export function startArbiterServer(opts: { port: number; host: string; keys?: st
       const out = arbiterDecide(state, msg, now);
       all.clusters[clusterId] = state;
       writeFileAtomic(file, JSON.stringify(all, null, 2));
+      const about: ArbiterAbout = { host: os.hostname(), version, startedAt, clusters: keys.length };
       reply(200, { granted: out.granted, owner: out.owner, owners: state.owners, nodes: state.nodes, now, cluster: clusterId, about });
     });
   });
@@ -199,19 +237,27 @@ export function installArbiterService(opts: { host: string; port: number; key: s
   return { service, envFile, clusters: keys.map(arbiterClusterId) };
 }
 
-function readArbiterKeys(): string[] {
-  const file = ARBITER_ENV_FILE();
+function readKeysFile(file: string): string[] {
   if (!fs.existsSync(file)) return [];
   const line = fs.readFileSync(file, "utf-8").split("\n").find((l) => l.startsWith("PAASMCP_ARBITER_KEY="));
   return parseArbiterKeys(line?.slice("PAASMCP_ARBITER_KEY=".length));
 }
+function readKeysFileSafe(file: string): string[] {
+  try {
+    return readKeysFile(file);
+  } catch {
+    return [];
+  }
+}
+const readArbiterKeys = () => readKeysFile(ARBITER_ENV_FILE());
 
-function writeArbiterKeys(keys: string[]): void {
-  const file = ARBITER_ENV_FILE();
+function writeKeysFile(file: string, keys: string[]): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   if (fs.existsSync(file)) fs.chmodSync(file, 0o600); // tighten before the keys go in
   fs.writeFileSync(file, `PAASMCP_ARBITER_KEY=${keys.join(",")}\n`, { mode: 0o600 });
   fs.chmodSync(file, 0o600);
 }
+const writeArbiterKeys = (keys: string[]) => writeKeysFile(ARBITER_ENV_FILE(), keys);
 
 const restartArbiter = () => {
   if (process.env.PAASMCP_OFFLINE_TEST === "1") return false;
@@ -287,4 +333,177 @@ export function arbiterInstallCommand(repoUrl: string | undefined, key = deriveA
     `sudo node dist/cli.js arbiter install-service --key ${k}`,
   ].join("\n");
   return { key: k, cluster: arbiterClusterId(k), repoUrl: repo, command };
+}
+
+// ---- Pairing by code: a PC with PaaSMCP becomes the arbiter of another pair from the dashboard ----
+//
+// On the arbiter PC, a person opens a pairing window: a 6-digit code, valid for 10 minutes and a few
+// tries, kept in a root-only file. On one of the servers, the person picks that PC (found on the
+// Tailscale network) and types the code. The server first asks the PC to prove it knows the code
+// (HMAC over fresh nonces from both sides), so a wrong PC never receives anything; then it sends the
+// arbiter key sealed with a key derived from the code (AES-256-GCM). Tailscale already authenticates
+// and encrypts the link; the code is the person confirming both ends.
+
+export const ARBITER_DIR = () => process.env.PAASMCP_ARBITER_DIR || path.join(PAAS_DATA_DIR, "arbiter");
+const PAIRING_FILE = () => path.join(ARBITER_DIR(), "pairing.json");
+export const PAIR_TTL_MS = 10 * 60_000;
+export const PAIR_MAX_TRIES = 5;
+const NONCE_RE = /^[a-f0-9]{32}$/;
+
+interface PairingWindow {
+  code: string;
+  expiresAt: number;
+  tries: number;
+  nonces: string[];
+}
+
+function readPairing(): PairingWindow | undefined {
+  try {
+    const w = JSON.parse(fs.readFileSync(PAIRING_FILE(), "utf-8")) as PairingWindow;
+    if (!w || typeof w.code !== "string" || !/^\d{6}$/.test(w.code) || !(w.expiresAt > Date.now()) || w.tries >= PAIR_MAX_TRIES) return undefined;
+    return { ...w, nonces: Array.isArray(w.nonces) ? w.nonces : [] };
+  } catch {
+    return undefined;
+  }
+}
+
+function writePairing(w: PairingWindow): void {
+  fs.mkdirSync(ARBITER_DIR(), { recursive: true, mode: 0o700 });
+  writeFileAtomic(PAIRING_FILE(), JSON.stringify(w));
+  fs.chmodSync(PAIRING_FILE(), 0o600);
+}
+
+export function closeArbiterPairing(): void {
+  fs.rmSync(PAIRING_FILE(), { force: true });
+}
+
+/** Opens (or renews) the pairing window on this PC and returns its code. */
+export function openArbiterPairing(): { code: string; expiresAt: number } {
+  const w: PairingWindow = { code: String(crypto.randomInt(0, 1_000_000)).padStart(6, "0"), expiresAt: Date.now() + PAIR_TTL_MS, tries: 0, nonces: [] };
+  writePairing(w);
+  return { code: w.code, expiresAt: w.expiresAt };
+}
+
+/** The open window here, if any (with its code: only for this PC's own dashboard or terminal). */
+export function arbiterPairingStatus(): { open: boolean; code?: string; expiresAt?: number; triesLeft?: number } {
+  const w = readPairing();
+  return w ? { open: true, code: w.code, expiresAt: w.expiresAt, triesLeft: PAIR_MAX_TRIES - w.tries } : { open: false };
+}
+
+const pairKey = (code: string) => crypto.scryptSync(code, "paasmcp-arbiter-pair-v1", 32);
+const pairProof = (k: Buffer, nonceA: string, nonceC: string) => crypto.createHmac("sha256", k).update(`arbiter|${nonceA}|${nonceC}`).digest("hex");
+
+/** Arbiter side of POST /pair. `addKey` stores a key that arrived sealed with the right code. */
+export function handlePairRequest(body: string, addKey: (key: string) => void): { status: number; body: Record<string, unknown> } {
+  const w = readPairing();
+  if (!w) {
+    closeArbiterPairing();
+    return { status: 403, body: { error: "not pairing", code: "notPairing" } };
+  }
+  let msg: { step?: string; nonceA?: string; nonceC?: string; iv?: string; box?: string };
+  try {
+    msg = JSON.parse(body);
+  } catch {
+    return { status: 400, body: { error: "bad json" } };
+  }
+  const nonceA = String(msg.nonceA || "");
+  if (!NONCE_RE.test(nonceA)) return { status: 400, body: { error: "bad nonce" } };
+  // scrypt only for requests that count as a try or carry a nonce this PC issued.
+  if (msg.step === "hello") {
+    const k = pairKey(w.code);
+    // Each hello is one try: someone guessing the code gets a handful of answers, not a million.
+    const nonceC = crypto.randomBytes(16).toString("hex");
+    writePairing({ ...w, tries: w.tries + 1, nonces: [...w.nonces, nonceC].slice(-PAIR_MAX_TRIES) });
+    return { status: 200, body: { nonceC, proof: pairProof(k, nonceA, nonceC) } };
+  }
+  if (msg.step === "key") {
+    const nonceC = String(msg.nonceC || "");
+    if (!w.nonces.includes(nonceC)) return { status: 403, body: { error: "unknown nonce", code: "notPairing" } };
+    const k = pairKey(w.code);
+    let key: string;
+    try {
+      const raw = Buffer.from(String(msg.box || ""), "base64");
+      const d = crypto.createDecipheriv("aes-256-gcm", k, Buffer.from(String(msg.iv || ""), "hex"));
+      d.setAAD(Buffer.from(`${nonceA}|${nonceC}`));
+      d.setAuthTag(raw.subarray(raw.length - 16));
+      key = Buffer.concat([d.update(raw.subarray(0, raw.length - 16)), d.final()]).toString("utf-8");
+      [key] = parseArbiterKeys(key);
+      if (!key) throw new Error("empty");
+    } catch {
+      writePairing({ ...w, tries: w.tries + 1 });
+      return { status: 403, body: { error: "wrong code", code: "wrongCode" } };
+    }
+    addKey(key);
+    closeArbiterPairing();
+    return { status: 200, body: { ok: true, cluster: arbiterClusterId(key), host: os.hostname() } };
+  }
+  return { status: 400, body: { error: "unknown step" } };
+}
+
+export type PairErrorCode = "badHost" | "badCode" | "unreachable" | "notArbiter" | "notPairing" | "wrongCode";
+export class PairError extends Error {
+  constructor(public code: PairErrorCode, message: string) {
+    super(message);
+  }
+}
+
+/** A Tailscale IPv4, or a MagicDNS / host name. */
+const PAIR_HOST_RE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?)$/;
+
+/**
+ * Server side: sends this cluster's arbiter key to the PC at `host`, which shows `code`. Returns the
+ * arbiter address to save. Nothing is sent before the PC proves it knows the code.
+ */
+export async function pairWithArbiter(host: string, code: string, opts: { port?: number; key?: string } = {}): Promise<{ url: string; cluster: string; host: string }> {
+  const h = String(host || "").trim();
+  const c = String(code || "").replace(/\D/g, "");
+  if (!PAIR_HOST_RE.test(h)) throw new PairError("badHost", "Invalid address: use the PC's Tailscale IP or name.");
+  if (!/^\d{6}$/.test(c)) throw new PairError("badCode", "The code has 6 digits.");
+  const port = opts.port || 4097;
+  const url = `http://${h}:${port}`;
+  const key = opts.key || deriveArbiterKey();
+  let health: { service?: string; pairing?: boolean };
+  try {
+    const r = await fetch(`${url}/health`, { signal: AbortSignal.timeout(5000) });
+    health = (await r.json()) as never;
+  } catch {
+    throw new PairError("unreachable", `Nothing answered at ${url}. Is that PC on, on Tailscale, and showing a code?`);
+  }
+  if (health?.service !== "paasmcp-arbiter") throw new PairError("notArbiter", "Something answered there, but it is not a PaaSMCP arbiter.");
+  if (!health.pairing) throw new PairError("notPairing", "That PC is not showing a code (or it expired). Click “Be the arbiter of another pair” there again.");
+  const post = async (o: unknown) => {
+    const r = await fetch(`${url}/pair`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(o), signal: AbortSignal.timeout(10_000) });
+    const j = (await r.json().catch(() => ({}))) as Record<string, string>;
+    if (!r.ok) throw new PairError(j.code === "wrongCode" ? "wrongCode" : "notPairing", j.error || `HTTP ${r.status}`);
+    return j;
+  };
+  const nonceA = crypto.randomBytes(16).toString("hex");
+  const k = pairKey(c);
+  const hello = await post({ step: "hello", nonceA });
+  if (!NONCE_RE.test(String(hello.nonceC)) || !timingSafeCompare(pairProof(k, nonceA, hello.nonceC), String(hello.proof || ""))) {
+    throw new PairError("wrongCode", "The code does not match the one on that PC.");
+  }
+  const iv = crypto.randomBytes(12);
+  const e = crypto.createCipheriv("aes-256-gcm", k, iv);
+  e.setAAD(Buffer.from(`${nonceA}|${hello.nonceC}`));
+  const box = Buffer.concat([e.update(key, "utf-8"), e.final(), e.getAuthTag()]).toString("base64");
+  const done = await post({ step: "key", nonceA, nonceC: hello.nonceC, iv: iv.toString("hex"), box });
+  return { url, cluster: String(done.cluster || arbiterClusterId(key)), host: String(done.host || h) };
+}
+
+/**
+ * Runs the arbiter in the foreground: `paasmcp arbiter serve` and the arbiter container a PC with
+ * PaaSMCP starts from its dashboard. Keys come from --key / PAASMCP_ARBITER_KEY plus the key file,
+ * which pairing by code adds to while it runs.
+ */
+export function serveArbiter(opts: { host: string; port: number; keys?: string[]; stateFile?: string }): http.Server {
+  const host = resolveArbiterHost(opts.host);
+  return startArbiterServer({
+    host,
+    port: opts.port,
+    keys: opts.keys || [],
+    keyFile: ARBITER_ENV_FILE(),
+    stateFile: opts.stateFile || process.env.PAASMCP_ARBITER_STATE_FILE || undefined,
+    pairing: true,
+  });
 }
