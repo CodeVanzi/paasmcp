@@ -7177,7 +7177,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (jb && !jb.innerHTML) jb.innerHTML = card(esc(t('checking')));
       const res = await fetch('/api/mirror/arbiter');
       const c = await res.json().catch(() => ({}));
-      if (!res.ok) { box.innerHTML = card(badge('danger', c.error || 'error')); return; }
+      if (!res.ok) {
+        box.innerHTML = card(badge('danger', c.error || 'error'));
+        if (jb) jb.innerHTML = box.innerHTML;
+        return;
+      }
       box.innerHTML = renderArbiterCheck(c);
       renderJudge(c);
       const input = document.getElementById('mArbiter');
