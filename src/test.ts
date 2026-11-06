@@ -3864,6 +3864,12 @@ volumes:
       assert.ok(items.length >= 10);
       for (const id of items) { twice(`tut_${id}`); twice(`tut_${id}Desc`); }
       assert.ok(!page.includes("paasmcp config --account-id"), "no terminal commands left on the first-setup screen");
+      for (const jargon of ["Slug da Aplica", "Provisionar PostgreSQL 16", ">Engine<", "Criar Snapshot Criptografado", "Payload URL do Webhook", "Modo de Seguran"]) {
+        assert.ok(!page.includes(jargon), `plain words instead of: ${jargon}`);
+      }
+      // The deploy card keeps every field inside it (a stray closing tag once pushed the checkboxes out).
+      const deployCard = page.slice(page.indexOf('<div class="card" data-sub="deploy">'), page.indexOf('<div class="card" data-sub="expose">'));
+      assert.equal((deployCard.match(/<div[\s>]/g) || []).length, (deployCard.match(/<\/div>/g) || []).length);
     } finally {
       dsrv.close();
     }
