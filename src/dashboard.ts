@@ -49,7 +49,7 @@ import {
   runPaaSDoctor,
   syncHomepageDashboard,
 } from "./deployer.js";
-import { exposeApplication, ExposeError } from "./exposure.js";
+import { exposeApplication, ExposeError, removeAppAddress } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -633,6 +633,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             mode: body.mode as "public" | "zero-trust" | "tailscale",
             subdomain: body.subdomain ? String(body.subdomain) : undefined,
           });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
+        if (pathname === "/api/unexpose" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const appName = sanitizeSlug(String(body.appName || ""));
+          const hostname = String(body.hostname || "");
+          confirmFromBody("app.unexpose", { appName, hostname }, body);
+          const result = await removeAppAddress(appName, hostname);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
           return true;
@@ -2365,7 +2376,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div class="form-grid">
                 <div>
                   <label class="field-label" id="lblExpApp">Aplicação</label>
-                  <input id="expApp" list="hostedAppsList" placeholder="ex: meu-saas" />
+                  <input id="expApp" list="hostedAppsList" placeholder="ex: meu-saas" oninput="expAppChanged()" />
                   <datalist id="hostedAppsList"></datalist>
                 </div>
                 <div>
@@ -2376,13 +2387,14 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                     <option value="tailscale" id="optTS">Tailscale Serve (Privado na Tailnet)</option>
                   </select>
                 </div>
-                <div>
+                <div id="expSubBox">
                   <label class="field-label" id="lblExpSub">Subdomínio</label>
                   <input id="expSub" placeholder="ex: loja" oninput="renderExposeHint()" />
                 </div>
               </div>
               <p class="ofs-note" id="expPreviewLine" style="margin:-4px 0 10px;"></p>
               <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
+              <div id="expList" style="margin-top:18px;"></div>
             </div>
           
 
@@ -5247,7 +5259,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "mode_zero-trust": "só e-mails autorizados",
       "mode_tailscale": "só a minha rede",
       "mode_local": "rede de casa",
-      "limitsLabel": "Limite: {mem} de memória, {cpu} CPU"
+      "limitsLabel": "Limite: {mem} de memória, {cpu} CPU",
+      "expListTitle": "Endereços publicados",
+      "btnUnexpose": "Tirar do ar",
+      "toastUnexposed": "Endereço tirado do ar: "
     });
     Object.assign(I18N.en, {
       "appNoAddressTip": "This app has no address yet. Click to give it one.",
@@ -5256,7 +5271,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "mode_zero-trust": "authorized emails only",
       "mode_tailscale": "my network only",
       "mode_local": "home network",
-      "limitsLabel": "Limit: {mem} memory, {cpu} CPU"
+      "limitsLabel": "Limit: {mem} memory, {cpu} CPU",
+      "expListTitle": "Published addresses",
+      "btnUnexpose": "Take offline",
+      "toastUnexposed": "Address taken offline: "
     });
 
     Object.assign(I18N.pt, {
@@ -6242,6 +6260,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
       fillScopeSelect(apps);
+      renderAddresses();
 
       const deploys = deployState || s.deploys || {};
       const tbody = document.getElementById('appsTable');
@@ -6950,6 +6969,52 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const line = document.getElementById('expPreviewLine');
       const sub = ((document.getElementById('expSub') || {}).value || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
       if (line) line.textContent = sub && mode !== 'tailscale' && c.baseDomain && c.baseDomain !== 'example.com' ? t('expPreview') + ' https://' + sub + '.' + c.baseDomain : '';
+      const subBox = document.getElementById('expSubBox');
+      if (subBox) subBox.style.display = mode === 'tailscale' ? 'none' : '';
+      renderAddresses();
+    }
+    // Choosing an app suggests the start of the address from its name (until the person types their own).
+    let expAutoSub = '';
+    function expAppChanged() {
+      const app = document.getElementById('expApp').value.trim();
+      const subEl = document.getElementById('expSub');
+      if (!subEl.value || subEl.value === expAutoSub) {
+        expAutoSub = app.toLowerCase().replace(/^paasmcp-/, '').replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+        subEl.value = expAutoSub;
+      }
+      renderExposeHint();
+    }
+    function renderAddresses() {
+      const box = document.getElementById('expList');
+      if (!box) return;
+      const rows = [];
+      Object.values((lastStatus && lastStatus.apps) || {}).forEach(function (a) {
+        (a.domains || []).forEach(function (d) {
+          if (d && d.url && ['public', 'zero-trust', 'tailscale'].indexOf(d.mode) !== -1) rows.push({ app: a.name, d: d });
+        });
+      });
+      box.innerHTML = rows.length
+        ? '<h3 style="font-size:14px;margin:0 0 8px;">' + esc(t('expListTitle')) + '</h3>' + rows.map(function (r) {
+            return '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;margin-bottom:6px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;">'
+              + '<a href="' + esc(r.d.url) + '" target="_blank" rel="noopener" style="font-weight:600;word-break:break-all;">' + esc(r.d.url.replace(/^https?:[/][/]/, '')) + '</a>'
+              + '<span style="color:var(--muted);">' + esc(r.app) + ' · ' + esc(t('mode_' + r.d.mode)) + '</span>'
+              + '<button class="secondary" style="margin-left:auto;padding:4px 10px;font-size:12px;" data-app="' + esc(r.app) + '" data-host="' + esc(r.d.hostname) + '" onclick="removeAddress(this)">' + esc(t('btnUnexpose')) + '</button>'
+              + '</div>';
+          }).join('')
+        : '';
+    }
+    async function removeAddress(btn) {
+      btn.disabled = true;
+      const res = await fetch('/api/unexpose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ appName: btn.getAttribute('data-app'), hostname: btn.getAttribute('data-host') })
+      });
+      const data = await res.json().catch(function () { return {}; });
+      btn.disabled = false;
+      if (!res.ok) { if (!data.confirmationRequired) alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
+      showToast(t('toastUnexposed') + data.removed);
+      loadAll();
     }
     async function loadConnections() {
       const link = document.getElementById('cfTokenLink');

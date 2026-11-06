@@ -253,6 +253,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       }
       return null;
     }
+    case "app.unexpose":
+      return risk(action, subject, "confirm",
+        `Address ${String(params.hostname)} of '${subject}' goes offline: whoever uses it can no longer open the app. You can publish an address again later.`,
+        `O endereço ${String(params.hostname)} do app '${subject}' sai do ar: quem usa esse endereço não consegue mais abrir o app. Dá para publicar um endereço de novo depois.`,
+        params);
     case "db.restore":
       return risk(action, subject, "confirm",
         `The current data (database or volume) will be replaced by backup '${subject}'. A backup of the current state is taken first.`,
