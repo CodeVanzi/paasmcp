@@ -4,6 +4,34 @@ import { syncHomepageDashboard } from "./deployer.js";
 import { assessRisk } from "./guard.js";
 import { getSecrets } from "./vault.js";
 
+/** A problem the person can fix; `pt` is the same text in Portuguese for the dashboard. */
+export class ExposeError extends Error {
+  constructor(message: string, readonly pt: string) {
+    super(message);
+    this.name = "ExposeError";
+  }
+}
+
+/** Pure (tested): turns a failed `tailscale serve` into what the person can do about it. */
+export function tailscaleServeError(err: unknown, tsPort: number, localPort: number): Error {
+  const e = err as { code?: string; stderr?: Buffer | string; message?: string };
+  const out = `${e?.stderr ? String(e.stderr) : ""} ${e?.message || ""}`;
+  const byHand = `sudo tailscale serve --bg --https=${tsPort} http://127.0.0.1:${localPort}`;
+  if (e?.code === "ENOENT" || /tailscaled\.sock|failed to connect to local Tailscale|is Tailscale running/i.test(out)) {
+    return new ExposeError(
+      `Tailscale is not reachable from here. Check that Tailscale is installed and logged in on the server ('tailscale status'), then restart the dashboard ('paasmcp dashboard'), or run on the server: ${byHand}`,
+      `O Tailscale não foi encontrado daqui. Confira no servidor se ele está instalado e conectado ('tailscale status') e reinicie o painel ('paasmcp dashboard'), ou rode no servidor: ${byHand}`
+    );
+  }
+  if (/serve.*(not enabled|disabled)|HTTPS.*(not enabled|disabled)|enable HTTPS/i.test(out)) {
+    return new ExposeError(
+      "Tailscale Serve needs HTTPS turned on for your tailnet: in the Tailscale admin console, open DNS and enable MagicDNS and HTTPS Certificates, then try again.",
+      "O Tailscale Serve precisa do HTTPS ligado na sua tailnet: no painel do Tailscale (login.tailscale.com), abra DNS e ligue MagicDNS e HTTPS Certificates. Depois tente de novo."
+    );
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
 export interface ExposeOptions {
   appName: string;
   subdomain?: string;
@@ -44,16 +72,11 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
   if (opts.mode === "tailscale") {
     const tsPort = opts.tailscalePort || 8460 + (app.localPort - 4000);
     const tsDomain = detectTailscaleDomain(state.tailscaleDomain);
-    execFileSync(
-      "tailscale",
-      [
-        "serve",
-        "--bg",
-        `--https=${tsPort}`,
-        `http://127.0.0.1:${app.localPort}`,
-      ],
-      { stdio: "pipe" }
-    );
+    try {
+      execFileSync("tailscale", ["serve", "--bg", `--https=${tsPort}`, `http://127.0.0.1:${app.localPort}`], { stdio: "pipe", timeout: 60_000 });
+    } catch (err) {
+      throw tailscaleServeError(err, tsPort, app.localPort);
+    }
     const url = `https://${tsDomain}:${tsPort}`;
     const existingIdx = app.domains.findIndex((d) => d.url === url);
     if (existingIdx === -1) {

@@ -24,7 +24,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
@@ -49,7 +49,7 @@ import {
   runPaaSDoctor,
   syncHomepageDashboard,
 } from "./deployer.js";
-import { exposeApplication } from "./exposure.js";
+import { exposeApplication, ExposeError } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -1030,13 +1030,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError;
         const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError).pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError).pt } : {}),
           })
         );
         return;
@@ -4803,7 +4803,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_address_s1": "Decida quem vai usar",
       "guide_address_s1Desc": "Qualquer pessoa na internet: modo Público, com o seu domínio. Só pessoas convidadas: “Só e-mails autorizados”, que pede um código enviado por e-mail. Só você e sua família: Tailscale, que funciona sem domínio.",
       "guide_address_s2": "Com domínio: ligue a Cloudflare",
-      "guide_address_s2Desc": "Em Conexões → Domínio, cole um token e escolha o domínio. O painel cria o túnel sozinho. (Com Tailscale, pule este passo: instale o app Tailscale no servidor e no seu celular ou computador, com a mesma conta.)",
+      "guide_address_s2Desc": "Em Conexões → Domínio, cole um token e escolha o domínio. O painel cria o túnel sozinho. (Com Tailscale, pule este passo: instale o app Tailscale no servidor e no seu celular ou computador, com a mesma conta, e no site do Tailscale, em DNS, ligue “HTTPS Certificates”.)",
       "guide_address_s3": "Publique o endereço",
       "guide_address_s3Desc": "Em “Deixar acessível”, escolha o app, o modo e o começo do endereço (por exemplo <code>loja</code> vira <code>loja.seudominio.com</code>).",
       "guide_address_s4": "Teste no celular",
@@ -4907,7 +4907,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_address_s1": "Decide who will use it",
       "guide_address_s1Desc": "Anyone on the internet: Public mode, on your domain. Only invited people: “Allowed emails only”, which asks for a code sent by email. Only you and your family: Tailscale, which needs no domain.",
       "guide_address_s2": "With a domain: connect Cloudflare",
-      "guide_address_s2Desc": "Under Connections → Domain, paste a token and pick the domain. The dashboard creates the tunnel by itself. (With Tailscale, skip this: install the Tailscale app on the server and on your phone or computer, same account.)",
+      "guide_address_s2Desc": "Under Connections → Domain, paste a token and pick the domain. The dashboard creates the tunnel by itself. (With Tailscale, skip this: install the Tailscale app on the server and on your phone or computer, same account, and on the Tailscale website, under DNS, turn on “HTTPS Certificates”.)",
       "guide_address_s3": "Publish the address",
       "guide_address_s3Desc": "Under “Make reachable”, pick the app, the mode and the start of the address (e.g. <code>shop</code> becomes <code>shop.yourdomain.com</code>).",
       "guide_address_s4": "Test it on your phone",
@@ -8127,8 +8127,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName, mode, subdomain })
       });
-      const data = await res.json();
-      if (!res.ok) return alert('Error: ' + data.error);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { if (!data.confirmationRequired) alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
       showToast(t('toastExposed') + data.url);
       loadAll();
     }
@@ -8184,8 +8184,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 }
 
 // Pinned base image; tools are installed once at build time, never on every start.
+// The tailscale command talks to the server's tailscaled through its socket (mounted when present).
+// It is optional: a mirror without it still builds the dashboard, and Tailscale then says how to do it by hand.
 const DASHBOARD_DOCKERFILE = `FROM node:22.11.0-alpine3.20
 RUN apk add --no-cache docker-cli docker-cli-compose git openssh-client
+RUN apk add --no-cache tailscale || true
 `;
 
 /** Builds the dashboard image once per Dockerfile version (tag = content hash). */
@@ -8218,6 +8221,7 @@ export function ensureDashboardBackgroundService(
   const projectRoot = run.dir;
 
   const image = ensureDashboardImage();
+  const tsDir = tailscaleSocketDir();
   const composePath = path.join(dashDir, "compose.yaml");
   const composeContent = `services:
   dashboard:
@@ -8234,7 +8238,7 @@ ${WATCHTOWER_OFF_COMPOSE}    working_dir: /app
     volumes:
       - ${projectRoot}:/app:ro
       - ${HOMELAB_ROOT}:${HOMELAB_ROOT}
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock${tsDir ? `\n      - ${tsDir}:${tsDir}` : ""}
     networks:
       - ${DOCKER_NETWORK}
 

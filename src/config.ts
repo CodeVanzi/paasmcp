@@ -403,6 +403,15 @@ export const DEFAULT_BASE_DOMAIN = process.env.PAASMCP_BASE_DOMAIN || "example.c
 export const DOCKER_NETWORK = process.env.PAASMCP_DOCKER_NETWORK || "homelab-network";
 
 /**
+ * The folder with tailscaled's socket, when this machine (or the container we run in) has it. The
+ * dashboard container gets it mounted, so "Tailscale Serve" works from the dashboard too.
+ */
+export const TAILSCALE_SOCKET_DIR = "/var/run/tailscale";
+export function tailscaleSocketDir(): string | undefined {
+  return fs.existsSync(path.join(TAILSCALE_SOCKET_DIR, "tailscaled.sock")) ? TAILSCALE_SOCKET_DIR : undefined;
+}
+
+/**
  * Every container PaaSMCP creates carries this label so Watchtower (common in homelabs) leaves it alone:
  * PaaSMCP pins and updates its own images, and a surprise restart of Postgres or an app copy looks
  * like an outage to the active-active watch and the scale decider.
