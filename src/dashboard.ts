@@ -62,6 +62,7 @@ import {
 import { getSystemStatusSummary } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
 import { startPollLoop } from "./pollloop.js";
+import { startAppWatch } from "./appwatch.js";
 import {
   deleteSecretKey,
   getSecrets,
@@ -1022,6 +1023,9 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   // In the dashboard container the dashboard also does the auto-deploy checks, so no timer is needed.
   const stopPolling = startPollLoop();
   server.on("close", stopPolling);
+  // ...and it notices apps that stop on their own (a notice only when Connections → Notices is set up).
+  const stopWatch = startAppWatch();
+  server.on("close", stopWatch);
   return server;
 }
 
@@ -5265,7 +5269,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     Object.assign(I18N.pt, {
       "sub_connect_alerts": "Avisos",
       "ntTitle": "🔔 Avisos no celular ou no chat",
-      "ntDesc": "O painel avisa quando uma publicação automática (git push ou atualização sozinha) falha. Assim você fica sabendo sem abrir o painel.",
+      "ntDesc": "O painel avisa quando uma publicação automática (git push ou atualização sozinha) falha e quando um app para sozinho, e de novo quando ele volta. Assim você fica sabendo sem abrir o painel.",
       "ntHow": "Cole um destes endereços:",
       "ntHowNtfy": "Celular: instale o app ntfy (grátis), assine um tópico com um nome difícil de adivinhar e cole https://ntfy.sh/seu-topico.",
       "ntHowDiscord": "Discord: no canal, Editar canal → Integrações → Webhooks → Novo webhook → Copiar URL.",
@@ -5276,7 +5280,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "ntSending": "Mandando um aviso de teste...",
       "ntSaved": "Aviso de teste enviado e endereço salvo.",
       "ntOn": "Avisos ligados",
-      "ntOnDesc": "Para {host}. Publicações que falharem vão gerar um aviso{success}.",
+      "ntOnDesc": "Para {host}. Publicações que falharem e apps que pararem vão gerar um aviso{success}.",
       "ntOnSuccessShort": ", e as automáticas que derem certo também",
       "ntChange": "Trocar endereço",
       "ntOff": "Desligar avisos",
@@ -5287,7 +5291,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     Object.assign(I18N.en, {
       "sub_connect_alerts": "Notices",
       "ntTitle": "🔔 Notices on your phone or chat",
-      "ntDesc": "The dashboard tells you when an automatic publish (git push or self-update) fails, so you know without opening the dashboard.",
+      "ntDesc": "The dashboard tells you when an automatic publish (git push or self-update) fails and when an app stops on its own, and again when it is back, so you know without opening the dashboard.",
       "ntHow": "Paste one of these addresses:",
       "ntHowNtfy": "Phone: install the ntfy app (free), subscribe to a topic with a hard-to-guess name and paste https://ntfy.sh/your-topic.",
       "ntHowDiscord": "Discord: in the channel, Edit channel → Integrations → Webhooks → New webhook → Copy URL.",
@@ -5298,7 +5302,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "ntSending": "Sending a test notice...",
       "ntSaved": "Test notice sent and address saved.",
       "ntOn": "Notices on",
-      "ntOnDesc": "To {host}. Failed publishes send a notice{success}.",
+      "ntOnDesc": "To {host}. Failed publishes and apps that stop send a notice{success}.",
       "ntOnSuccessShort": ", and so do automatic ones that work",
       "ntChange": "Change address",
       "ntOff": "Turn notices off",

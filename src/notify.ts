@@ -2,7 +2,7 @@ import { audit } from "./guard.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
 
 // Notices to the person when nobody is looking at the screen: a deploy that failed (or, if they ask,
-// one that went live on its own after a git push). One address, kept in the system vault, that is
+// one that went live on its own after a git push), and an app that stopped on its own (appwatch.ts). One address, kept in the system vault, that is
 // either a Discord or Slack webhook or an ntfy topic (free phone app), or any URL that takes a POST.
 
 export type NotifyKind = "discord" | "slack" | "ntfy";
@@ -126,15 +126,27 @@ export function deployNoticeText(n: DeployNotice, settings: { onSuccess: boolean
     : { title: `${n.app}: falha ao publicar`, text: `❌ A publicação de ${n.app}${c} falhou: ${n.error || "erro desconhecido"}\nA versão anterior continua no ar. Detalhes no painel.` };
 }
 
-/** Sends the notice for a finished deploy, if one is due. Never throws: a notice must not break a deploy. */
-export async function notifyDeploy(n: DeployNotice): Promise<void> {
+/** Sends one notice when notices are set up. Never throws: a notice must not break what triggered it. */
+export async function sendNotice(build: (lang: NotifyLang) => { title: string; text: string } | undefined, event: string, app: string): Promise<void> {
   try {
     const s = getSecrets("system");
     if (!s.NOTIFY_URL) return;
-    const msg = deployNoticeText(n, { onSuccess: s.NOTIFY_ON_SUCCESS === "1", lang: s.NOTIFY_LANG === "en" ? "en" : "pt" });
+    const msg = build(s.NOTIFY_LANG === "en" ? "en" : "pt");
     if (!msg) return;
     await post(s.NOTIFY_URL, msg.title, msg.text);
   } catch (err) {
-    audit({ event: "notify.failed", app: n.app, error: err instanceof Error ? err.message : String(err) });
+    audit({ event: "notify.failed", about: event, app, error: err instanceof Error ? err.message : String(err) });
   }
+}
+
+/** The notice for a finished deploy, if one is due. */
+export async function notifyDeploy(n: DeployNotice): Promise<void> {
+  const onSuccess = (() => {
+    try {
+      return getSecrets("system").NOTIFY_ON_SUCCESS === "1";
+    } catch {
+      return false;
+    }
+  })();
+  await sendNotice((lang) => deployNoticeText(n, { onSuccess, lang }), n.ok ? "deploy.live" : "deploy.failed", n.app);
 }
