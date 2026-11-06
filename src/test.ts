@@ -3814,6 +3814,7 @@ volumes:
       { id: "66666666-2222-3333-4444-555555555555", name: "old", status: "down", remote_config: false },
     ];
     let created = 0;
+    let noAccountRead = false;
     const seenAuth: string[] = [];
     const srv = http.createServer((req, res) => {
       let raw = "";
@@ -3829,7 +3830,7 @@ volumes:
           return res.writeHead(200).end(JSON.stringify({ login: "octo-cat", name: "Octo" }));
         }
         if (auth !== `Bearer ${CF_TOKEN}`) return res.writeHead(403).end(JSON.stringify({ success: false }));
-        if (p === "/accounts") return ok([{ id: ACC, name: "Home" }, { id: "not-an-id", name: "x" }]);
+        if (p === "/accounts") return ok(noAccountRead ? [] : [{ id: ACC, name: "Home" }, { id: "not-an-id", name: "x" }]);
         if (p === "/zones") return ok([{ id: "z1", name: "loja.dev", status: "active", account: { id: ACC } }, { id: "z2", name: "pending.dev", status: "pending", account: { id: ACC } }]);
         if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "GET") return ok(tunnels);
         if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "POST") {
@@ -3869,6 +3870,13 @@ volumes:
       assert.equal(found.accounts[0].tunnels[1].remote, false);
       assert.deepEqual(found.missing, ["access"], "a token without Access is reported, not refused");
       assert.equal(vault.getSecrets("system").CF_API_TOKEN, undefined, "checking saves nothing");
+      // A token without "Account Settings: Read": the account comes from its zones, and is still probed.
+      noAccountRead = true;
+      const viaZone = await conn.discoverCloudflare(CF_TOKEN);
+      noAccountRead = false;
+      assert.deepEqual(viaZone.accounts.map((a) => a.id), [ACC]);
+      assert.equal(viaZone.accounts[0].tunnels.length, 2);
+      assert.deepEqual(viaZone.missing, ["access"]);
 
       const noConfirm = () => assert.fail("first connection needs no confirmation");
       await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "other.dev", tunnelId: "new" }, noConfirm), /DNS/);
