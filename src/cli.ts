@@ -4,6 +4,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import {
   ensureDirectories,
+  HOMELAB_ROOT,
   loadState,
   PAAS_DATA_DIR,
   sanitizeSlug,
@@ -754,6 +755,25 @@ async function runCli() {
       break;
     }
 
+    case "wake": {
+      // Turn on a PC of this server's network by Wake-on-LAN (wakepc.ts).
+      const { addWakeTarget, listWakeTargets, removeWakeTarget, wakeTarget } = await import("./wakepc.js");
+      const [sub, name] = rest;
+      if (!sub || sub === "list") {
+        console.log(JSON.stringify({ pcs: listWakeTargets() }, null, 2));
+      } else if (sub === "add" && name) {
+        console.log(JSON.stringify(addWakeTarget(name, { mac: getFlagValue(rest, "--mac"), broadcast: getFlagValue(rest, "--broadcast"), port: getFlagValue(rest, "--port") }), null, 2));
+        console.error(`Saved. Turn it on with 'paasmcp wake ${name}' or the “Turn on” button in Connections > PCs. The PC needs 'sudo paasmcp pool wake-setup' once (and Wake on LAN in its BIOS to wake from power off).`);
+      } else if (sub === "remove" && name) {
+        console.log(JSON.stringify(removeWakeTarget(name), null, 2));
+      } else if (sub && !sub.startsWith("-") && !name && !["add", "remove"].includes(sub)) {
+        console.log(JSON.stringify(await wakeTarget(sub), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp wake [list] | add <name> --mac <aa:bb:cc:dd:ee:ff> [--broadcast 192.168.1.255] [--port 9] | remove <name> | <name>");
+      }
+      break;
+    }
+
     case "pcs": {
       // The devices of the Tailscale network, with and without PaaSMCP (installing is done from the dashboard).
       const { listTailnetPcs } = await import("./pcinstall.js");
@@ -1152,6 +1172,7 @@ Commands:
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp pcs [--no-probe]                           Devices of your Tailscale, with and without PaaSMCP (install them in the dashboard: Connections > PCs)
+  paasmcp wake [list|add <name> --mac <mac>|remove <name>|<name>]  Turn on a PC of this network by Wake-on-LAN
   paasmcp arbiter <key|serve|install-service|pair|be-judge|pair-with|add-key|remove-key|clusters|check>
                                                     Third vote for automatic failover (one device can serve several clusters)
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)
@@ -1258,5 +1279,10 @@ const lockFree =
   (command === "scale" && SCALE_LOCK_FREE.has(process.argv[3]));
 (lockFree ? runCli() : withStateLock(runCli)).catch((err) => {
   console.error("Error:", err instanceof Error ? err.message : String(err));
+  // An install made by the dashboard or the install script belongs to root (/opt/homelab is 0700).
+  const e = err as NodeJS.ErrnoException;
+  if ((e?.code === "EACCES" || e?.code === "EPERM") && typeof e.path === "string" && e.path.startsWith(HOMELAB_ROOT) && process.getuid?.() !== 0) {
+    console.error(`This PaaSMCP install belongs to another user (usually root): run it with sudo, for example 'sudo paasmcp ${process.argv.slice(2, 4).join(" ")}'.`);
+  }
   process.exit(1);
 });

@@ -11,6 +11,7 @@ import { DiaryLang, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStat
 import { autoRiskParams, setAutoScale } from "./autoscale.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy, validateCourtesy } from "./pool.js";
 import { setWake } from "./wake.js";
+import { wakeTarget } from "./wakepc.js";
 import { validateHelperName } from "./poolproto.js";
 import { activeReadiness, activeStatus, switchActiveActive } from "./active.js";
 import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./activetunnel.js";
@@ -1094,6 +1095,11 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         // Pair with a PC that shows a code (its dashboard's “Be the arbiter of another pair”).
         if (pathname === "/api/mirror/arbiter/candidates" && req.method === "GET") return reply(await findJudgeCandidates());
         if (pathname === "/api/pcs" && req.method === "GET") return reply(await listTailnetPcs());
+        if (pathname === "/api/pcs/wake" && req.method === "POST") {
+          // Turns on a PC of this server's network (set up with 'paasmcp wake add'). Free, audited.
+          const body = await readJsonBody(req);
+          return reply(await wakeTarget(body.name, { by: actor, dashboardImage: dashboardImageTag() }));
+        }
         if (pathname === "/api/pcs/job" && req.method === "GET") return reply({ job: currentPcJob() });
         if (pathname === "/api/pcs/check" && req.method === "POST") {
           // Logs in to the PC (Tailscale SSH or its password, kept in memory only) and runs the read-only check.
@@ -5989,6 +5995,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "sub_connect_pcs": "PCs",
       "pcsDesc": "Todos os aparelhos da sua rede Tailscale, e quais já têm o PaaSMCP. Num PC Linux sem PaaSMCP, o botão Instalar entra nele uma vez, confere o que ele tem e só instala depois da sua confirmação.",
       "pcsBtnInstall": "Instalar o PaaSMCP",
+      "pcsBtnWake": "Ligar",
+      "pcsWakeSent": "Pedido para ligar {name} enviado. Um PC que liga costuma aparecer em 1 ou 2 minutos (atualize a lista).",
       "pcsFormTitle": "Instalar o PaaSMCP em {name}",
       "pcsFormDesc": "O painel entra no PC pela Tailscale, confere o sistema e o que falta, e só instala depois que você escolher o papel e confirmar. A senha fica só na memória durante a instalação: não é salva em lugar nenhum.",
       "pcsUser": "Usuário no PC",
@@ -6086,6 +6094,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "sub_connect_pcs": "PCs",
       "pcsDesc": "Every device of your Tailscale network, and which ones already run PaaSMCP. On a Linux PC without PaaSMCP, the Install button logs in once, checks what it has, and only installs after you confirm.",
       "pcsBtnInstall": "Install PaaSMCP",
+      "pcsBtnWake": "Turn on",
+      "pcsWakeSent": "Turn-on request sent to {name}. A PC that starts usually shows up within 1 or 2 minutes (refresh the list).",
       "pcsFormTitle": "Install PaaSMCP on {name}",
       "pcsFormDesc": "The dashboard logs in to the PC through Tailscale, checks the system and what is missing, and only installs after you pick the role and confirm. The password stays in memory during the install only: it is saved nowhere.",
       "pcsUser": "User on the PC",
@@ -8274,7 +8284,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const ssh = x.state === 'installable' && x.ssh && !busy ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('pcsSsh_' + x.ssh)) + '</div>' : '';
       return '<div class="pc-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border);">' +
         '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip || '') + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + ssh + '</div>' +
-        '<div class="pc-actions">' + (canInstall ? '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" data-ip="' + esc(x.ip) + '" data-name="' + esc(x.name) + '" data-ssh="' + esc(x.ssh || '') + '" onclick="pcOpenForm(this.dataset)">' + esc(t('pcsBtnInstall')) + '</button>' : '') + '</div></div>';
+        '<div class="pc-actions">' + (x.canWake && !x.online ? '<button style="padding:4px 12px;font-size:12.5px;margin-right:6px;" data-name="' + esc(x.name) + '" onclick="pcWake(this)">' + esc(t('pcsBtnWake')) + '</button>' : '') + (canInstall ? '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" data-ip="' + esc(x.ip) + '" data-name="' + esc(x.name) + '" data-ssh="' + esc(x.ssh || '') + '" onclick="pcOpenForm(this.dataset)">' + esc(t('pcsBtnInstall')) + '</button>' : '') + '</div></div>';
+    }
+    async function pcWake(btn) {
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/pcs/wake', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: btn.dataset.name }) });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) { showToast(d.error || 'error'); btn.disabled = false; return; }
+        showToast(t('pcsWakeSent').replace('{name}', btn.dataset.name));
+        setTimeout(() => { btn.disabled = false; }, 30000);
+      } catch (e) { btn.disabled = false; }
     }
     // Installing PaaSMCP on one of those PCs: log in, check, pick the role, confirm, watch the steps.
     let pcJobTimer = null;
