@@ -4237,10 +4237,87 @@ volumes:
     assert.ok(e2 instanceof ExposeError, "daemon not reachable: same advice");
     const https = Object.assign(new Error("Command failed"), { stderr: "Serve is not enabled on your tailnet." });
     assert.match((tailscaleServeError(https, 8465, 4005) as InstanceType<typeof ExposeError>).pt, /HTTPS Certificates/);
+    assert.match(tailscaleServeError(missing, 8465, 4005, true).message, /sudo tailscale serve --https=8465 off/, "taking it off: the command that turns it off");
     const other = new Error("something else");
     assert.equal(tailscaleServeError(other, 1, 2), other, "anything else goes through unchanged");
     const { tailscaleSocketDir } = await import("./config.js");
     assert.ok(tailscaleSocketDir() === undefined || tailscaleSocketDir() === "/var/run/tailscale");
+  });
+
+  await t.test("53. Taking an address off the air: tunnel route, tunnel DNS record and PaaSMCP's email gate go, nothing else", async () => {
+    const { removeAppAddress, ExposeError } = await import("./exposure.js");
+    const http = (await import("node:http")).default;
+    const guard = await import("./guard.js");
+    assert.equal(guard.assessRisk("app.unexpose", { appName: "shop", hostname: "shop.loja.dev" })?.level, "confirm");
+    const calls: string[] = [];
+    let putIngress: Array<{ hostname?: string; service: string }> = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const u = new URL(req.url || "/", "http://x");
+        const p = u.pathname;
+        calls.push(`${req.method} ${p}`);
+        const ok = (r: unknown) => res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ success: true, result: r }));
+        if (p === "/accounts/acc9/cfd_tunnel/tun9/configurations" && req.method === "GET") {
+          return ok({ config: { ingress: [{ hostname: "shop.loja.dev", service: "http://paasmcp-shop:3000" }, { hostname: "blog.loja.dev", service: "http://paasmcp-blog:80" }, { service: "http_status:404" }], "warp-routing": { enabled: false } } });
+        }
+        if (p === "/accounts/acc9/cfd_tunnel/tun9/configurations" && req.method === "PUT") {
+          const body = JSON.parse(raw);
+          assert.deepEqual(body.config["warp-routing"], { enabled: false }, "the rest of the tunnel settings stay");
+          putIngress = body.config.ingress;
+          return ok({});
+        }
+        if (p === "/zones") return ok([{ id: "z9" }]);
+        if (p === "/zones/z9/dns_records" && req.method === "GET") {
+          return ok([{ id: "r1", type: "CNAME", content: "tun9.cfargotunnel.com" }, { id: "r2", type: "TXT", content: "mine" }]);
+        }
+        if (p.startsWith("/zones/z9/dns_records/") && req.method === "DELETE") return ok({});
+        if (p === "/accounts/acc9/access/apps" && req.method === "GET") {
+          return ok([{ id: "a1", domain: "shop.loja.dev", name: "PaaSMCP - shop" }, { id: "a2", domain: "shop.loja.dev", name: "Made by hand" }]);
+        }
+        if (p.startsWith("/accounts/acc9/access/apps/") && req.method === "DELETE") return ok({});
+        res.writeHead(404).end(JSON.stringify({ success: false }));
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const before = config.loadState();
+    const apiBefore = process.env.PAASMCP_CF_API_URL;
+    const tokenBefore = vault.getSecrets("system").CF_API_TOKEN;
+    process.env.PAASMCP_CF_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      const st = config.loadState();
+      const any = Object.values(st.apps)[0] as any;
+      st.apps.shop = { ...(any || {}), name: "shop", containerName: "paasmcp-shop", localPort: 4077, domains: [
+        { hostname: "shop.loja.dev", mode: "public", url: "https://shop.loja.dev" },
+        { hostname: "casa.tail1.ts.net:8460", mode: "tailscale", url: "https://casa.tail1.ts.net:8460" },
+      ] } as any;
+      st.cloudflare = { ...st.cloudflare, accountId: "acc9", tunnelId: "tun9", baseDomain: "loja.dev" };
+      delete (st as any).activeTunnel;
+      config.saveState(st);
+      vault.setSecretEntries("system", { CF_API_TOKEN: "t".repeat(40) });
+
+      await assert.rejects(removeAppAddress("shop", "evil.other.dev"), (e: Error) => e instanceof ExposeError && /não é um endereço/.test((e as InstanceType<typeof ExposeError>).pt));
+      assert.equal(calls.length, 0, "an address the app does not have is refused before anything is sent");
+
+      const r = await removeAppAddress("shop", "shop.loja.dev");
+      assert.equal(r.removed, "https://shop.loja.dev");
+      assert.deepEqual(putIngress.map((x) => x.hostname || x.service), ["blog.loja.dev", "http_status:404"], "only this route goes; the catch-all stays");
+      assert.ok(calls.includes("DELETE /zones/z9/dns_records/r1"), "the tunnel CNAME goes");
+      assert.ok(!calls.includes("DELETE /zones/z9/dns_records/r2"), "a record PaaSMCP did not make stays");
+      assert.ok(r.notes.some((n) => /TXT/.test(n)));
+      assert.ok(calls.includes("DELETE /accounts/acc9/access/apps/a1") && !calls.includes("DELETE /accounts/acc9/access/apps/a2"), "only PaaSMCP's own email gate goes");
+      assert.deepEqual(config.loadState().apps.shop.domains.map((d) => d.hostname), ["casa.tail1.ts.net:8460"], "the other address stays");
+    } finally {
+      srv.close();
+      if (apiBefore === undefined) delete process.env.PAASMCP_CF_API_URL; else process.env.PAASMCP_CF_API_URL = apiBefore;
+      if (tokenBefore) vault.setSecretEntries("system", { CF_API_TOKEN: tokenBefore }); else vault.deleteSecretKey("system", "CF_API_TOKEN");
+      const st = config.loadState();
+      delete st.apps.shop;
+      st.cloudflare = before.cloudflare;
+      if (before.activeTunnel) st.activeTunnel = before.activeTunnel;
+      config.saveState(st);
+    }
   });
 
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {

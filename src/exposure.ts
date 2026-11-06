@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { appServiceUrl, loadState, sanitizeSlug, saveState } from "./config.js";
 import { syncHomepageDashboard } from "./deployer.js";
-import { assessRisk } from "./guard.js";
+import { assessRisk, audit } from "./guard.js";
 import { getSecrets } from "./vault.js";
 
 /** A problem the person can fix; `pt` is the same text in Portuguese for the dashboard. */
@@ -13,10 +13,10 @@ export class ExposeError extends Error {
 }
 
 /** Pure (tested): turns a failed `tailscale serve` into what the person can do about it. */
-export function tailscaleServeError(err: unknown, tsPort: number, localPort: number): Error {
+export function tailscaleServeError(err: unknown, tsPort: number, localPort: number, turnOff = false): Error {
   const e = err as { code?: string; stderr?: Buffer | string; message?: string };
   const out = `${e?.stderr ? String(e.stderr) : ""} ${e?.message || ""}`;
-  const byHand = `sudo tailscale serve --bg --https=${tsPort} http://127.0.0.1:${localPort}`;
+  const byHand = turnOff ? `sudo tailscale serve --https=${tsPort} off` : `sudo tailscale serve --bg --https=${tsPort} http://127.0.0.1:${localPort}`;
   if (e?.code === "ENOENT" || /tailscaled\.sock|failed to connect to local Tailscale|is Tailscale running/i.test(out)) {
     return new ExposeError(
       `Tailscale is not reachable from here. Check that Tailscale is installed and logged in on the server ('tailscale status'), then restart the dashboard ('paasmcp dashboard'), or run on the server: ${byHand}`,
@@ -310,4 +310,124 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
     mode: opts.mode,
     details: `Cloudflare Tunnel route ${publicUrl} -> ${internalServiceUrl} configured with proxied CNAME DNS. ${zeroTrustStatus}${tunnelNote}`,
   };
+}
+
+// ---- Taking an address off the air (dashboard: Make reachable → Published addresses) ----
+
+const cfApi = () => (process.env.PAASMCP_CF_API_URL || "https://api.cloudflare.com/client/v4").replace(/\/+$/, "");
+
+/**
+ * Removes one of an app's addresses: its tunnel route, its DNS record (only a CNAME that points to a
+ * Cloudflare tunnel, so nothing else of the person's is touched) and the email gate PaaSMCP created
+ * for it; with Tailscale, the `tailscale serve` entry. Only addresses saved on the app can be removed.
+ */
+export async function removeAppAddress(appName: string, hostname: string): Promise<{ removed: string; notes: string[] }> {
+  const slug = sanitizeSlug(appName);
+  const state = loadState();
+  const app = state.apps[slug];
+  if (!app) throw new Error(`Application '${slug}' not found.`);
+  const entry = app.domains.find((d) => d.hostname === hostname);
+  if (!entry) {
+    throw new ExposeError(`'${hostname}' is not an address of ${slug}.`, `'${hostname}' não é um endereço de ${slug}.`);
+  }
+  const notes: string[] = [];
+
+  if (entry.mode === "tailscale") {
+    const port = Number(hostname.split(":").pop());
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`No port in '${hostname}'.`);
+    try {
+      execFileSync("tailscale", ["serve", `--https=${port}`, "off"], { stdio: "pipe", timeout: 60_000 });
+    } catch (err) {
+      const e = err as { stderr?: Buffer | string };
+      // Already gone (removed by hand): the saved address goes too.
+      if (!/not found|no serve config|nothing to remove|handler does not exist/i.test(String(e?.stderr || ""))) {
+        throw tailscaleServeError(err, port, app.localPort, true);
+      }
+      notes.push("Tailscale had no entry for it any more.");
+    }
+  } else if (entry.mode === "public" || entry.mode === "zero-trust") {
+    const { accountId, tunnelId, baseDomain } = state.cloudflare;
+    const token = getSecrets("system").CF_API_TOKEN || process.env.CF_API_TOKEN;
+    if (!accountId || !tunnelId || !baseDomain || !token) {
+      throw new ExposeError(
+        "Cloudflare is not connected, so the address cannot be removed from here (Connections → Domain).",
+        "O Cloudflare não está conectado, então o endereço não pode ser tirado daqui (Conexões → Domínio)."
+      );
+    }
+    const cf = async <T>(method: string, route: string, body?: unknown): Promise<T> => {
+      let res: Response;
+      try {
+        res = await fetch(`${cfApi()}${route}`, {
+          method,
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: AbortSignal.timeout(20_000),
+        });
+      } catch (err) {
+        throw new ExposeError(
+          `Could not reach Cloudflare (${err instanceof Error ? err.message : String(err)}). The address stays listed; try again in a moment.`,
+          "Não deu para falar com o Cloudflare agora (a internet do servidor caiu?). O endereço continua na lista; tente de novo daqui a pouco."
+        );
+      }
+      const data = (await res.json().catch(() => ({}))) as { result?: T };
+      if (!res.ok) throw new Error(`Cloudflare ${method} ${route.split("?")[0]}: HTTP ${res.status}`);
+      return data.result as T;
+    };
+
+    // An app on both servers: forget the address first, so their tunnel hands it back to the main one.
+    if (state.activeTunnel?.routes[hostname]) {
+      app.domains = app.domains.filter((d) => d.hostname !== hostname);
+      saveState(state);
+      try {
+        const { routeActiveTunnel } = await import("./activetunnel.js");
+        await routeActiveTunnel();
+      } catch (err) {
+        const back = loadState();
+        if (back.apps[slug] && !back.apps[slug].domains.some((d) => d.hostname === hostname)) {
+          back.apps[slug].domains.push(entry);
+          saveState(back);
+        }
+        throw err;
+      }
+    }
+
+    type Ingress = { hostname?: string; service: string; [k: string]: unknown };
+    const cfg = await cf<{ config?: { ingress?: Ingress[]; [k: string]: unknown } }>("GET", `/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`);
+    const config = cfg?.config || {};
+    const ingress = config.ingress || [];
+    if (ingress.some((r) => r.hostname === hostname)) {
+      const kept = ingress.filter((r) => r.hostname !== hostname);
+      if (!kept.some((r) => !r.hostname)) kept.push({ service: "http_status:404" });
+      await cf("PUT", `/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`, { config: { ...config, ingress: kept } });
+    }
+
+    const zones = await cf<Array<{ id: string }>>("GET", `/zones?name=${encodeURIComponent(baseDomain)}`);
+    const zoneId = zones?.[0]?.id;
+    if (zoneId) {
+      const records = await cf<Array<{ id: string; type: string; content: string }>>("GET", `/zones/${zoneId}/dns_records?name=${encodeURIComponent(hostname)}`);
+      for (const r of records || []) {
+        if (r.type === "CNAME" && /\.cfargotunnel\.com$/i.test(r.content)) await cf("DELETE", `/zones/${zoneId}/dns_records/${encodeURIComponent(r.id)}`);
+        else notes.push(`DNS record ${r.type} ${hostname} was not created by PaaSMCP and was left alone.`);
+      }
+    }
+
+    try {
+      const accessApps = await cf<Array<{ id: string; domain: string; name: string }>>("GET", `/accounts/${accountId}/access/apps`);
+      for (const a of accessApps || []) {
+        if (a.domain === hostname && /^PaaSMCP\b/.test(a.name)) await cf("DELETE", `/accounts/${accountId}/access/apps/${encodeURIComponent(a.id)}`);
+      }
+    } catch {
+      if (entry.mode === "zero-trust") notes.push("The email gate could not be checked (token without Access permission); remove it in Cloudflare Zero Trust → Access if it is still listed.");
+    }
+  }
+
+  const latest = loadState();
+  const a = latest.apps[slug];
+  if (a && a.domains.some((d) => d.hostname === hostname)) {
+    a.domains = a.domains.filter((d) => d.hostname !== hostname);
+    saveState(latest);
+  }
+  syncHomepageDashboard();
+  audit({ event: "app.unexpose", app: slug, hostname, mode: entry.mode });
+  return { removed: entry.url, notes };
 }
