@@ -495,7 +495,7 @@ function toolCatalog() {
       {
         name: "paas_db_backup",
         description:
-          "Encrypted (AES-256-GCM) backups of databases (pg_dump / Redis RDB) and app Docker volumes. 'create' a snapshot, 'list' them, 'restore' one (needs human confirmation; a safety backup is taken first), 'test' that a backup really restores (into a temporary database, live data untouched), 'sync' new backups off-site (S3/R2/B2, BACKUP_S3_* in the system vault) or 'fetch' one back from off-site.",
+          "Encrypted (AES-256-GCM) backups of databases (pg_dump / Redis RDB) and app Docker volumes. 'create' a snapshot, 'list' them, 'restore' one (needs human confirmation; a safety backup is taken first), 'test' that a backup really restores (into a temporary database, live data untouched), 'sync' new backups off-site (R2, S3, Google, B2, Wasabi, MinIO or another PaaSMCP; a person sets the destination in the dashboard or with 'paasmcp backup target') or 'fetch' one back from off-site.",
         inputSchema: {
           type: "object",
           properties: {

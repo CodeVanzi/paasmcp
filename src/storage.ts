@@ -23,7 +23,7 @@ function garageSecrets(): { rpcSecret: string; adminToken: string } {
   return { rpcSecret, adminToken };
 }
 
-async function admin<T = any>(method: string, route: string, body?: unknown): Promise<T> {
+export async function garageAdmin<T = any>(method: string, route: string, body?: unknown): Promise<T> {
   const res = await fetch(`${adminUrl()}${route}`, {
     method,
     headers: { Authorization: `Bearer ${garageSecrets().adminToken}`, "Content-Type": "application/json" },
@@ -65,7 +65,9 @@ admin_token = "${adminToken}"
       { mode: 0o600 }
     );
     // S3 (not admin) is also published on the Tailscale IP once a mirror peer or helper PCs need it.
-    const mirrorBind = tailnetBindIp(loadState());
+    // Backup grants (offsite.ts) publish only this S3 port there too, never Postgres or Redis.
+    const st = loadState();
+    const mirrorBind = tailnetBindIp(st) || st.backupShare?.bindIp;
     const composeFile = path.join(PAAS_GARAGE_DIR, "compose.yaml");
     fs.writeFileSync(
       composeFile,
@@ -96,7 +98,7 @@ networks:
   let status: { node: string } | undefined;
   for (let i = 0; i < 30 && !status; i++) {
     try {
-      status = await admin("GET", "/v1/status");
+      status = await garageAdmin("GET", "/v1/status");
     } catch {
       await new Promise((r) => setTimeout(r, 1000));
     }
@@ -104,10 +106,10 @@ networks:
   if (!status) throw new Error("Garage did not answer on its admin API within 30s (see 'docker logs paasmcp-garage').");
 
   // A fresh node has no layout; give this server one zone. The mirror (plan item 5) adds the second.
-  const layout = await admin<{ version: number; roles: { id: string }[] }>("GET", "/v1/layout");
+  const layout = await garageAdmin<{ version: number; roles: { id: string }[] }>("GET", "/v1/layout");
   if (!layout.roles.some((r) => r.id === status!.node)) {
-    await admin("POST", "/v1/layout", [{ id: status.node, zone: "z1", capacity: capacityGb * 1e9, tags: ["paasmcp"] }]);
-    await admin("POST", "/v1/layout/apply", { version: layout.version + 1 });
+    await garageAdmin("POST", "/v1/layout", [{ id: status.node, zone: "z1", capacity: capacityGb * 1e9, tags: ["paasmcp"] }]);
+    await garageAdmin("POST", "/v1/layout/apply", { version: layout.version + 1 });
   }
 }
 
@@ -118,12 +120,12 @@ export async function createBucketWithKey(
   await ensureGarage();
   let bucketInfo: { id: string };
   try {
-    bucketInfo = await admin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
+    bucketInfo = await garageAdmin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
   } catch {
-    bucketInfo = await admin("POST", "/v1/bucket", { globalAlias: bucket });
+    bucketInfo = await garageAdmin("POST", "/v1/bucket", { globalAlias: bucket });
   }
-  const key = await admin<{ accessKeyId: string; secretAccessKey: string }>("POST", "/v1/key", { name: keyName });
-  await admin("POST", "/v1/bucket/allow", {
+  const key = await garageAdmin<{ accessKeyId: string; secretAccessKey: string }>("POST", "/v1/key", { name: keyName });
+  await garageAdmin("POST", "/v1/bucket/allow", {
     bucketId: bucketInfo.id,
     accessKeyId: key.accessKeyId,
     permissions: { read: true, write: true, owner: false },
@@ -142,22 +144,22 @@ export async function ensureBucketWithImportedKey(bucket: string, accessKeyId: s
   if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error(`Invalid bucket name '${bucket}'.`);
   if (!/^[A-Za-z0-9]{8,128}$/.test(accessKeyId) || !/^[A-Za-z0-9/+=]{8,256}$/.test(secretAccessKey)) throw new Error("Unexpected S3 key format.");
   try {
-    await admin("GET", "/v1/status");
+    await garageAdmin("GET", "/v1/status");
   } catch {
     await ensureGarage();
   }
   let bucketInfo: { id: string };
   try {
-    bucketInfo = await admin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
+    bucketInfo = await garageAdmin("GET", `/v1/bucket?globalAlias=${encodeURIComponent(bucket)}`);
   } catch {
-    bucketInfo = await admin("POST", "/v1/bucket", { globalAlias: bucket });
+    bucketInfo = await garageAdmin("POST", "/v1/bucket", { globalAlias: bucket });
   }
   try {
-    await admin("GET", `/v1/key?id=${encodeURIComponent(accessKeyId)}`);
+    await garageAdmin("GET", `/v1/key?id=${encodeURIComponent(accessKeyId)}`);
   } catch {
-    await admin("POST", "/v1/key/import", { name: keyName, accessKeyId, secretAccessKey });
+    await garageAdmin("POST", "/v1/key/import", { name: keyName, accessKeyId, secretAccessKey });
   }
-  await admin("POST", "/v1/bucket/allow", {
+  await garageAdmin("POST", "/v1/bucket/allow", {
     bucketId: bucketInfo.id,
     accessKeyId,
     permissions: { read: true, write: true, owner: false },

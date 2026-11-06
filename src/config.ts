@@ -234,6 +234,23 @@ export interface StorageRecord {
   createdAt: string;
 }
 
+/** A revocable key another computer uses to send its backups into a bucket on this server (offsite.ts). */
+export interface BackupGrantRecord {
+  name: string;
+  bucket: string;
+  bucketId: string;
+  accessKeyId: string;
+  maxGb?: number;
+  createdAt: string;
+  revokedAt?: string;
+}
+
+export interface BackupShareConfig {
+  /** Tailscale IP where Garage's S3 API (only S3, not the admin API) is published for the grants. */
+  bindIp?: string;
+  grants: Record<string, BackupGrantRecord>;
+}
+
 export interface MirrorReplicaRecord {
   peerName: string;
   peerNodeId: string;
@@ -340,6 +357,8 @@ export interface PaaSState {
   databases: Record<string, DatabaseRecord>;
   backups?: Record<string, BackupRecord>;
   storage?: Record<string, StorageRecord>;
+  /** Other computers that send their backups here (offsite.ts). */
+  backupShare?: BackupShareConfig;
   mirror?: MirrorConfig;
   edge?: EdgeConfig;
   /** Origin side: the Cloudflare tunnel used only by apps that run on both servers (activetunnel.ts). */

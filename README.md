@@ -178,7 +178,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_update` | `check` newer Postgres/Redis/Garage releases within the same major; `apply` (confirmation) backs up, switches (mirror copies first), health-checks and rolls back on failure. |
 | `paas_email_provision` | Lets an app send email through the server's relay (Brevo, SES...): injects `SMTP_*`, `EMAIL_FROM`, `EMAIL_URL` (and `BREVO_API_KEY`), sender `<app>@<domain>`. |
 | `paas_storage_provision` | Gives an app its own S3 bucket and key on this server (Garage, started on first use) and injects `S3_*` / `AWS_*` into its vault. |
-| `paas_db_backup` | Creates, lists, restores and **tests** AES-256-GCM encrypted `pg_dump` / Redis / Docker volume snapshots (SHA-256 checked); `sync` sends them off-site (S3/R2/B2/Garage), `fetch` brings one back. |
+| `paas_db_backup` | Creates, lists, restores and **tests** AES-256-GCM encrypted `pg_dump` / Redis / Docker volume snapshots (SHA-256 checked); `sync` sends them off-site (S3/R2/B2/Google/Wasabi/MinIO or another PaaSMCP, set up in the dashboard or with `paasmcp backup target`), `fetch` brings one back. |
 | `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds Dockerfile or sanitized `docker-compose.yml`, sets CPU/RAM limits, healthchecks the new version in a candidate container (blue/green; `healthcheckPath`, `healthcheckTimeoutSeconds`, `skipHealthcheck`), tags `:previous` image, and swaps containers. A failed healthcheck keeps the running version and returns the candidate's logs. |
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
 | `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), `destroy` (to the 30-day trash), `restore` (from the trash) or `purge`. |
@@ -237,9 +237,16 @@ paasmcp email provision my-saas --from-name "My SaaS"
 # S3 bucket + key for an app on this server (Garage); redeploy to load S3_* / AWS_*
 paasmcp storage provision my-saas
 
-# Off-site copies (R2, B2, S3, Garage): set BACKUP_S3_ENDPOINT, BACKUP_S3_BUCKET,
-# BACKUP_S3_ACCESS_KEY_ID, BACKUP_S3_SECRET_ACCESS_KEY (+ optional BACKUP_S3_REGION, BACKUP_S3_PREFIX)
-# in the "system" vault scope, then:
+# Off-site copies: pick the provider and paste only its fields (dashboard: Databases > Off-server
+# backups). The destination is tested (write, read, delete a small file) before it is saved.
+# Providers: r2, s3, gcs, b2, wasabi, paasmcp (an access code from another PaaSMCP), custom (MinIO...).
+# The secret key is asked without echo (or read from stdin).
+paasmcp backup target set r2 --account-id <id> --bucket my-backups --access-key-id <key-id>
+paasmcp backup target set paasmcp            # paste the access code the other server printed
+paasmcp backup target                        # show it (no secret), 'test' or 'clear'
+# The other way round: let another computer keep ITS backups on this server's Garage, over Tailscale
+paasmcp backup grant laptop --max-gb 50      # one bucket + one key for it, shown once (code + fields)
+paasmcp backup grants                        # list with space used; 'paasmcp backup revoke laptop'
 sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
 paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
 paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it

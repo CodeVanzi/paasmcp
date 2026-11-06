@@ -3452,6 +3452,240 @@ volumes:
     deploys.forgetDeploys("paasmcp-dashboard");
   });
 
+  await t.test("41. Off-site destination per provider (tested before saving) and revocable keys for other computers", async () => {
+    const offsite = await import("./offsite.js");
+    const guard = await import("./guard.js");
+    const dashboard = await import("./dashboard.js");
+    const http = await import("node:http");
+    const vm = await import("node:vm");
+    const build = offsite.buildOffsiteTarget;
+    const base = { bucket: "my-backups", accessKeyId: "AKIAEXAMPLE1", secretAccessKey: "s3cr3t/Key+Example" };
+
+    // Each provider needs only its own fields; the address is built here.
+    const id = "0123456789abcdef0123456789abcdef";
+    assert.equal(build({ provider: "r2", accountId: id, ...base }).endpoint, `https://${id}.r2.cloudflarestorage.com`);
+    const pasted = build({ provider: "r2", accountId: `https://${id}.eu.r2.cloudflarestorage.com/my-backups`, ...base, bucket: "" });
+    assert.equal(pasted.endpoint, `https://${id}.eu.r2.cloudflarestorage.com`);
+    assert.equal(pasted.bucket, "my-backups");
+    assert.equal(pasted.region, "auto");
+    assert.equal(build({ provider: "s3", region: "sa-east-1", ...base }).endpoint, "https://s3.sa-east-1.amazonaws.com");
+    const b2 = build({ provider: "b2", region: "https://s3.us-west-004.backblazeb2.com", ...base });
+    assert.equal(b2.endpoint, "https://s3.us-west-004.backblazeb2.com");
+    assert.equal(b2.region, "us-west-004");
+    assert.equal(build({ provider: "gcs", ...base }).endpoint, "https://storage.googleapis.com");
+    assert.equal(build({ provider: "wasabi", region: "eu-central-1", ...base }).endpoint, "https://s3.eu-central-1.wasabisys.com");
+    assert.throws(() => build({ provider: "s3", ...base }), /region/);
+    assert.throws(() => build({ provider: "r2", accountId: "nope", ...base }), /account id/);
+    assert.throws(() => build({ provider: "dropbox", ...base }), /Unknown provider/);
+    assert.throws(() => build({ provider: "gcs", ...base, bucket: "Bad Bucket" }), /bucket/);
+    assert.throws(() => build({ provider: "gcs", ...base, secretAccessKey: "short" }), /secret/);
+    assert.throws(() => build({ provider: "gcs", ...base, prefix: "../etc" }), /folder/);
+    // Plain http only inside the network or Tailscale; no credentials in the address.
+    assert.throws(() => build({ provider: "custom", endpoint: "http://minio.example.com", ...base }), /https/);
+    assert.equal(build({ provider: "custom", endpoint: "http://100.101.2.3:9000/", ...base }).endpoint, "http://100.101.2.3:9000");
+    assert.equal(build({ provider: "custom", endpoint: "http://192.168.0.5:9000", ...base }).region, "us-east-1");
+    assert.throws(() => build({ provider: "custom", endpoint: "https://u:p@minio.example.com", ...base }), /user, password/);
+    // Another PaaSMCP: one code carries everything.
+    const code = offsite.encodeAccessCode({ endpoint: "http://100.64.0.9:3900", bucket: "backup-casa", accessKeyId: "GK1234567890", secretAccessKey: "abcdefabcdef12345678", region: "garage" });
+    const fromCode = build({ provider: "paasmcp", code: "  " + code.slice(0, 30) + "\n" + code.slice(30) + " " });
+    assert.equal(fromCode.endpoint, "http://100.64.0.9:3900");
+    assert.equal(fromCode.secretAccessKey, "abcdefabcdef12345678");
+    assert.throws(() => build({ provider: "paasmcp", code: "hello" }), /not a PaaSMCP access code/);
+    const evil = offsite.encodeAccessCode({ endpoint: "http://evil.example.com", bucket: "x-y-z", accessKeyId: "GK1234567890", secretAccessKey: "abcdefabcdef12345678", region: "garage" });
+    assert.throws(() => build({ provider: "paasmcp", code: evil }), /https/);
+
+    // A fake S3 that accepts only key AK2 (DELETE included).
+    const store = new Map<string, Buffer>();
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        if (!/Credential=AK2\//.test(String(req.headers.authorization))) return res.writeHead(403).end("<Error>AccessDenied</Error>");
+        if (req.method === "PUT") store.set(req.url!, Buffer.concat(chunks));
+        if (req.method === "DELETE") { store.delete(req.url!); return res.writeHead(204).end(); }
+        const found = store.get(req.url!);
+        if (req.method === "GET" && !found) return res.writeHead(404).end();
+        res.writeHead(200).end(req.method === "GET" ? found : undefined);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const endpoint = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const saved = vault.getSecrets("system");
+    const keys = ["BACKUP_S3_PROVIDER", "BACKUP_S3_ENDPOINT", "BACKUP_S3_BUCKET", "BACKUP_S3_ACCESS_KEY_ID", "BACKUP_S3_SECRET_ACCESS_KEY", "BACKUP_S3_REGION", "BACKUP_S3_PREFIX", "BACKUP_S3_TESTED_AT"];
+    for (const k of keys) vault.deleteSecretKey("system", k);
+    const human = (action: string, confirmed: boolean) => (params: Record<string, unknown>) =>
+      guard.authorizeHuman(action, params, { confirmed, by: "test" });
+    try {
+      // Wrong key: nothing is saved, and the reason is in plain words.
+      await assert.rejects(
+        offsite.saveOffsiteTarget({ provider: "custom", endpoint, bucket: "bkt", accessKeyId: "AK1", secretAccessKey: "wrongwrong" }, human("backup.target", false)),
+        /key was refused/
+      );
+      assert.equal(vault.getSecrets("system").BACKUP_S3_ENDPOINT, undefined);
+      assert.deepEqual(offsite.offsiteSummary(), { configured: false });
+
+      // The first destination needs no confirmation; the test file is written, read and removed.
+      const ok = await offsite.saveOffsiteTarget({ provider: "custom", endpoint, bucket: "bkt", accessKeyId: "AK2", secretAccessKey: "rightright", prefix: "srv9" }, human("backup.target", false));
+      assert.equal(ok.test!.deleted, true);
+      assert.equal(store.size, 0, "test file removed");
+      const sum = offsite.offsiteSummary() as Record<string, unknown>;
+      assert.equal(sum.configured, true);
+      assert.equal(sum.prefix, "srv9");
+      assert.equal(sum.accessKeyHint, "AK2…");
+      assert.ok(!JSON.stringify(sum).includes("rightright"), "the summary never carries the secret");
+      assert.equal(vault.getSecrets("system").BACKUP_S3_PROVIDER, "custom");
+      assert.ok((await offsite.retestOffsiteTarget()).test.ok);
+
+      // Replacing a working destination asks first; the same destination with a new key does not.
+      await assert.rejects(
+        offsite.saveOffsiteTarget({ provider: "custom", endpoint, bucket: "other", accessKeyId: "AK2", secretAccessKey: "rightright" }, human("backup.target", false)),
+        guard.ConfirmationRequiredError
+      );
+      assert.equal(vault.getSecrets("system").BACKUP_S3_BUCKET, "bkt");
+      await offsite.saveOffsiteTarget({ provider: "custom", endpoint, bucket: "bkt", accessKeyId: "AK2", secretAccessKey: "rightright" }, human("backup.target", false));
+      assert.equal(vault.getSecrets("system").BACKUP_S3_PREFIX, undefined, "an empty folder goes back to the default");
+
+      await assert.rejects(offsite.clearOffsiteTarget(human("backup.target.clear", false)), guard.ConfirmationRequiredError);
+      await offsite.clearOffsiteTarget(human("backup.target.clear", true));
+      assert.deepEqual(offsite.offsiteSummary(), { configured: false });
+      for (const k of keys) assert.equal(vault.getSecrets("system")[k], undefined, k);
+    } finally {
+      srv.close();
+      for (const k of keys) if (saved[k]) vault.setSecretEntries("system", { [k]: saved[k] });
+    }
+
+    // Providing side: a fake Garage admin API.
+    const calls: string[] = [];
+    const buckets = new Map<string, string>();
+    const liveKeys = new Set<string>();
+    let n = 0;
+    const adm = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const url = new URL(req.url!, "http://x");
+        const body = raw ? JSON.parse(raw) : undefined;
+        calls.push(`${req.method} ${url.pathname}${url.search}`);
+        const json = (o: unknown, code = 200) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(o));
+        if (url.pathname === "/v1/status") return json({ node: "node1" });
+        if (url.pathname === "/v1/layout" && req.method === "GET") return json({ version: 1, roles: [{ id: "node1" }] });
+        if (url.pathname === "/v1/bucket" && req.method === "GET") {
+          const byAlias = url.searchParams.get("globalAlias");
+          if (byAlias) return buckets.has(byAlias) ? json({ id: buckets.get(byAlias) }) : json({ code: "NoSuchBucket" }, 404);
+          return json({ id: url.searchParams.get("id"), bytes: 1234 });
+        }
+        if (url.pathname === "/v1/bucket" && req.method === "POST") {
+          buckets.set(body.globalAlias, "b-" + body.globalAlias);
+          return json({ id: "b-" + body.globalAlias });
+        }
+        if (url.pathname === "/v1/bucket" && req.method === "PUT") return json({});
+        if (url.pathname === "/v1/key" && req.method === "POST") {
+          const k = `GK${++n}00000000`;
+          liveKeys.add(k);
+          return json({ accessKeyId: k, secretAccessKey: `secret-${n}-abcdefgh` });
+        }
+        if (url.pathname === "/v1/key" && req.method === "DELETE") {
+          liveKeys.delete(url.searchParams.get("id")!);
+          return json({});
+        }
+        if (url.pathname === "/v1/bucket/allow") return json({});
+        json({}, 404);
+      });
+    });
+    await new Promise<void>((r) => adm.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GARAGE_ADMIN_URL = `http://127.0.0.1:${(adm.address() as { port: number }).port}`;
+    process.env.PAASMCP_SHARE_BIND_IP = "100.100.1.2";
+    try {
+      // Without Tailscale (and nothing published yet), the person is told what to install.
+      const st0 = config.loadState();
+      const keep = { mirror: st0.mirror, pool: st0.pool };
+      delete st0.mirror;
+      delete st0.pool;
+      config.saveState(st0);
+      delete process.env.PAASMCP_SHARE_BIND_IP;
+      const PATH = process.env.PATH;
+      process.env.PATH = "/nonexistent";
+      try {
+        await assert.rejects(offsite.createBackupGrant("pc", {}, human("backup.grant", true)), /Tailscale is not running here/);
+      } finally {
+        process.env.PATH = PATH;
+        process.env.PAASMCP_SHARE_BIND_IP = "100.100.1.2";
+        const st1 = config.loadState();
+        Object.assign(st1, keep);
+        config.saveState(st1);
+      }
+      await assert.rejects(offsite.createBackupGrant("Note Book", { maxGb: 50 }, human("backup.grant", false)), guard.ConfirmationRequiredError);
+      assert.equal(calls.filter((c) => c.startsWith("POST /v1/key")).length, 0, "no key before the person confirms");
+      await assert.rejects(offsite.createBackupGrant("x", { maxGb: 1.5 }, human("backup.grant", true)), /whole number/);
+      const g = await offsite.createBackupGrant("Note Book", { maxGb: 50 }, human("backup.grant", true));
+      assert.equal(g.grant.name, "note-book");
+      assert.equal(g.grant.bucket, "backup-note-book");
+      // The address the mirror or the helpers already publish on, else this server's Tailscale IP.
+      const already = config.tailnetBindIp(config.loadState());
+      assert.equal(g.access.endpoint, `http://${already || "100.100.1.2"}:3900`);
+      assert.ok(calls.includes("PUT /v1/bucket?id=b-backup-note-book"), "quota set");
+      if (!already) assert.equal(config.loadState().backupShare?.bindIp, "100.100.1.2");
+      assert.ok(!JSON.stringify(config.loadState()).includes(g.access.secretAccessKey), "the secret is never stored in state.json");
+      // The code works on the other side as-is.
+      const other = build({ provider: "paasmcp", code: g.code });
+      assert.equal(other.accessKeyId, g.access.accessKeyId);
+      assert.equal(other.bucket, "backup-note-book");
+
+      await assert.rejects(offsite.createBackupGrant("note-book", {}, human("backup.grant", true)), /already has a key/);
+      const listed = await offsite.listBackupGrants();
+      assert.equal(listed[0].bytes, 1234);
+      assert.ok(!("secretAccessKey" in listed[0]));
+
+      const revoked = await offsite.revokeBackupGrant("note-book");
+      assert.ok(revoked.grant.revokedAt);
+      assert.ok(!liveKeys.has(g.access.accessKeyId), "key deleted in Garage");
+      // A new key for the same name keeps the same bucket (and its backups).
+      const again = await offsite.createBackupGrant("note-book", {}, human("backup.grant", true));
+      assert.equal(again.grant.bucket, "backup-note-book");
+      assert.notEqual(again.access.accessKeyId, g.access.accessKeyId);
+      assert.equal(again.grant.revokedAt, undefined);
+      await assert.rejects(offsite.revokeBackupGrant("ghost"), /No key named/);
+
+      // Dashboard: the routes sit behind the login, the new key's answer is never cached, and the page's script compiles.
+      const dashToken = dashboard.getOrCreateDashboardToken();
+      const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+      await new Promise((r) => dsrv.once("listening", r));
+      const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+      try {
+        assert.equal((await fetch(`${baseUrl}/api/offsite`)).status, 401);
+        const secret = totp.getDashboardTotpSecret();
+        const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: dashToken, ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+        const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+        const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+        const info = await (await fetch(`${baseUrl}/api/offsite`, { headers: { cookie } })).json();
+        assert.equal(info.grants.length, 1);
+        assert.ok(!JSON.stringify(info).includes("secret-"), "no secret in the listing");
+        assert.equal((await post("/api/offsite/grants", { name: "vm-oracle" })).status, 409, "a new key is confirmed first");
+        const made = await post("/api/offsite/grants", { name: "vm-oracle", confirmed: true });
+        assert.equal(made.status, 200);
+        assert.equal(made.headers.get("cache-control"), "no-store");
+        assert.ok((await made.json()).code.startsWith("paasmcp-backup:1:"));
+        const bad = await post("/api/offsite/target", { provider: "s3", bucket: "b-b-b", accessKeyId: "AKIA1", secretAccessKey: "xxxxxxxxxx" });
+        assert.equal(bad.status, 400);
+        const badBody = await bad.json();
+        assert.match(badBody.error, /region/);
+        assert.match(badBody.errorPt, /região/, "the screen gets the Portuguese text");
+        const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+        for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+        assert.ok(page.includes("saveOffsiteUi(") && page.includes("ofsHint_r2") && page.includes('autocomplete="new-password"'));
+      } finally {
+        dsrv.close();
+      }
+    } finally {
+      adm.close();
+      delete process.env.PAASMCP_GARAGE_ADMIN_URL;
+      delete process.env.PAASMCP_SHARE_BIND_IP;
+      const st = config.loadState();
+      delete st.backupShare;
+      config.saveState(st);
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

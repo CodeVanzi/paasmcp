@@ -188,6 +188,28 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "The app copies running on this PC stop, their images are removed, and the user 'paasmcp-worker' with the server's key is deleted. Remove the PC on the server too ('paasmcp pool remove <name>').",
         "As cópias de apps que rodam neste PC param, as imagens delas são apagadas e o usuário 'paasmcp-worker' com a chave do servidor é removido. Remova o PC no servidor também ('paasmcp pool remove <nome>').",
         params);
+    case "backup.target": {
+      // Free the first time; replacing a working destination is confirmed, since new backups go elsewhere.
+      if (!params.replacing) return null;
+      return risk(action, "backup-target", "confirm",
+        `Backups will now go to ${String(params.target)} instead of ${String(params.previous)}. Copies already sent stay where they are; this server stops sending new ones there.`,
+        `As cópias vão passar a ir para ${String(params.target)} em vez de ${String(params.previous)}. O que já foi enviado continua lá; este servidor só para de mandar cópias novas para lá.`,
+        params);
+    }
+    case "backup.target.clear":
+      return risk(action, "backup-target", "confirm",
+        "This server stops sending backups off the server. Copies already sent stay there, and local copies are no longer pruned (they only are after reaching the destination).",
+        "Este servidor para de mandar cópias para fora. O que já foi enviado continua lá, e as cópias locais deixam de ser apagadas (elas só são apagadas depois de chegarem ao destino).",
+        params);
+    case "backup.grant": {
+      const name = String(params.name);
+      const limit = Number(params.maxGb) > 0 ? ` up to ${Number(params.maxGb)} GB` : " with no size limit";
+      const limitPt = Number(params.maxGb) > 0 ? ` até ${Number(params.maxGb)} GB` : " sem limite de tamanho";
+      return risk(action, name, "confirm",
+        `Creates a key for '${name}': whoever has it can write and read files in its own bucket on this server${limit}, over Tailscale only. It sees nothing else here. The key is shown once; revoke it any time.`,
+        `Cria uma chave para '${name}': quem tiver a chave pode gravar e ler arquivos num bucket só dele neste servidor,${limitPt}, só pela Tailscale. Ela não enxerga mais nada aqui. A chave aparece uma vez só; dá para revogar quando quiser.`,
+        params);
+    }
     case "update.apply":
       return risk(action, String(params.component), "confirm",
         `${String(params.component)} restarts on ${String(params.image)} (a few seconds of downtime for every app that uses it). Databases are backed up first; if it does not come back healthy in 60 s, the previous version is restored.`,

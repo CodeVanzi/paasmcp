@@ -43,6 +43,7 @@ import {
   watchTick,
 } from "./mirror.js";
 import { listStorage, provisionStorage } from "./storage.js";
+import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteInput, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import {
   backupAppVolumes,
   fetchOffsite,
@@ -153,6 +154,56 @@ async function confirmOnHelper(action: string, params: Record<string, unknown>, 
   console.error(`⚠️  ${r.warning.en}`);
   const confirmed = args.includes("--yes") || (await ask("Continue? [y/N] "))?.toLowerCase() === "y";
   if (!confirmed) throw new Error("Not confirmed. Nothing was changed. (Add --yes to skip the question.)");
+}
+
+/** Reads a secret without echoing it (terminal) or from stdin (pipe). */
+async function readSecret(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    const chunks: Buffer[] = [];
+    for await (const c of process.stdin) chunks.push(c as Buffer);
+    return Buffer.concat(chunks).toString("utf-8").trim();
+  }
+  const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+  const out = rl as unknown as { _writeToOutput: (s: string) => void; output: NodeJS.WriteStream };
+  process.stderr.write(prompt);
+  out._writeToOutput = () => {};
+  try {
+    return (await rl.question("")).trim();
+  } finally {
+    rl.close();
+    process.stderr.write("\n");
+  }
+}
+
+const TARGET_USAGE =
+  "Usage: paasmcp backup target [show]|set <r2|s3|gcs|b2|wasabi|paasmcp|custom> [--account-id ID] [--region R] [--endpoint URL] [--bucket B] [--access-key-id K] [--prefix P] [--yes]|test|clear [--yes]\n" +
+  "       The secret key (or, for 'paasmcp', the access code) is asked without echo, or read from stdin.";
+
+async function backupTargetCli(args: string[]): Promise<void> {
+  const [sub = "show", provider] = args;
+  if (sub === "show") {
+    console.log(JSON.stringify(offsiteSummary(), null, 2));
+  } else if (sub === "test") {
+    console.log(JSON.stringify(await retestOffsiteTarget(), null, 2));
+  } else if (sub === "clear") {
+    console.log(JSON.stringify(await clearOffsiteTarget((p) => confirmInCli("backup.target.clear", p, args)), null, 2));
+  } else if (sub === "set") {
+    if (!provider) throw new Error(TARGET_USAGE);
+    const input: OffsiteInput = {
+      provider,
+      accountId: getFlagValue(args, "--account-id"),
+      region: getFlagValue(args, "--region"),
+      endpoint: getFlagValue(args, "--endpoint"),
+      bucket: getFlagValue(args, "--bucket"),
+      accessKeyId: getFlagValue(args, "--access-key-id"),
+      prefix: getFlagValue(args, "--prefix"),
+    };
+    if (provider === "paasmcp") input.code = await readSecret("Access code from the other PaaSMCP: ");
+    else input.secretAccessKey = await readSecret("Secret access key: ");
+    console.log(JSON.stringify(await saveOffsiteTarget(input, (p) => confirmInCli("backup.target", p, args)), null, 2));
+  } else {
+    throw new Error(TARGET_USAGE);
+  }
 }
 
 async function runCli() {
@@ -826,6 +877,21 @@ async function runCli() {
         console.log(JSON.stringify(await runNightlyBackup(days), null, 2));
       } else if (sub === "install-timer") {
         console.log(JSON.stringify(installBackupTimer(Number(getFlagValue(rest, "--hour") || 3)), null, 2));
+      } else if (sub === "target") {
+        await backupTargetCli(rest.slice(1));
+      } else if (sub === "grant") {
+        if (!arg1) throw new Error("Usage: paasmcp backup grant <name> [--max-gb N] [--yes]");
+        const gb = getFlagValue(rest, "--max-gb");
+        const r = await createBackupGrant(arg1, { maxGb: gb === undefined ? undefined : Number(gb) }, (p) => confirmInCli("backup.grant", p, rest));
+        console.error("Shown only now. Copy it before closing the terminal; if lost, revoke and make another.\n");
+        console.log(`Access code (paste it in the other PaaSMCP, provider "paasmcp"):\n${r.code}\n`);
+        console.log(`For other programs (rclone, restic, apps):\n  endpoint          ${r.access.endpoint}\n  bucket            ${r.access.bucket}\n  access key id     ${r.access.accessKeyId}\n  secret access key ${r.access.secretAccessKey}\n  region            ${r.access.region}`);
+        console.log(`An app on this server uses ${r.internalEndpoint} instead.`);
+      } else if (sub === "grants") {
+        console.log(JSON.stringify(await listBackupGrants(), null, 2));
+      } else if (sub === "revoke") {
+        if (!arg1) throw new Error("Usage: paasmcp backup revoke <name>");
+        console.log(JSON.stringify(await revokeBackupGrant(arg1), null, 2));
       } else if (sub === "export-key") {
         console.error(
           "This is the master key that decrypts the vault and every backup. Off-site backups are useless without it.\n" +
@@ -833,7 +899,7 @@ async function runCli() {
         );
         console.log(getOrCreateMasterKey().toString("hex"));
       } else {
-        throw new Error("Usage: paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key> [--days N] [--hour H]");
+        throw new Error("Usage: paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key|target|grant|grants|revoke> [--days N] [--hour H]");
       }
       break;
     }
@@ -1059,6 +1125,9 @@ Commands:
   paasmcp storage <provision <app>|list>            S3 bucket + key per app on this server (Garage)
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
                                                     Restore test, off-site sync (S3/R2/B2), daily timer, master key export
+  paasmcp backup target [show|set <provider>|test|clear]  Where backups go (r2, s3, gcs, b2, wasabi, paasmcp, custom), tested before saving
+  paasmcp backup grant <name> [--max-gb N]          Revocable key for another computer to keep its backups here (Tailscale)
+  paasmcp backup grants | revoke <name>             List / revoke those keys
   paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo (or multi-service compose.yaml)
   paasmcp expose <app> <public|zero-trust|tailscale> [subdomain]
   paasmcp <logs|restart|stop|start|rollback> <app>

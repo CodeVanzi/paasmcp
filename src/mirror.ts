@@ -328,6 +328,7 @@ export function acceptMirror(
       backupsTarget = "kept your existing off-site target (BACKUP_S3_*); the peer's bucket was not used";
     } else {
       setSecretEntries("system", {
+        BACKUP_S3_PROVIDER: "paasmcp", // shown as "Another PaaSMCP" in the dashboard
         BACKUP_S3_ENDPOINT: offer.s3.endpoint,
         BACKUP_S3_BUCKET: offer.s3.bucket,
         BACKUP_S3_ACCESS_KEY_ID: offer.s3.accessKeyId,
