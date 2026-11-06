@@ -44,7 +44,7 @@ import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, sto
 import { listTailnetPcs } from "./pcinstall.js";
 import { checkGitHub, connectionsSummary, ensureRepoHook, githubRepoOf, listGitHubRepos, listRepoHooks } from "./connections.js";
 import { clearNotify, notifySummary, saveNotify } from "./notify.js";
-import { listBackupGrants, offsiteSummary, retestOffsiteTarget, revokeBackupGrant } from "./offsite.js";
+import { listBackupGrants, offsiteSummary, publicStorageUrl, retestOffsiteTarget, revokeBackupGrant } from "./offsite.js";
 import { prepareTemplate, TEMPLATES } from "./templates.js";
 import { provisionStorage } from "./storage.js";
 import { backupAppVolumes, fetchOffsite, syncOffsite, testRestore } from "./backup.js";
@@ -535,7 +535,7 @@ function toolCatalog() {
       {
         name: "paas_storage_provision",
         description:
-          "Gives an app its own S3-compatible bucket on this server (Garage, started on first use) with a dedicated access key. Injects S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION and the AWS_* equivalents into the app's vault (redeploy the app to load them). Idempotent: calling again returns the existing bucket.",
+          "Gives an app its own S3-compatible bucket on this server (Garage, started on first use) with a dedicated access key. Injects S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION and the AWS_* equivalents into the app's vault (redeploy the app to load them). Idempotent: calling again returns the existing bucket. An app whose files are at the person's own account (set in the dashboard) is left as it is.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1377,7 +1377,7 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
           const result = action === "test" ? testRestore(String(args.backupId)) : await fetchOffsite(String(args.backupId));
           return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         }
-        if (action === "offsite_status") return json({ target: offsiteSummary(), grants: await listBackupGrants() });
+        if (action === "offsite_status") return json({ target: offsiteSummary(), grants: await listBackupGrants(), publicUrl: publicStorageUrl() });
         if (action === "offsite_test") return json(await retestOffsiteTarget());
         if (action === "grant_revoke") return json(await revokeBackupGrant(String(args.name || "")));
         throw new Error(`Unsupported paas_db_backup action: ${action}`);

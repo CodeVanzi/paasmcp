@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
-import { BackupGrantRecord, loadState, sanitizeSlug, saveState, tailnetBindIp } from "./config.js";
+import { BackupGrantRecord, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp } from "./config.js";
 import { getOffsiteConfig, OffsiteConfig, s3Request } from "./backup.js";
-import { createBucketWithKey, ensureGarage, GARAGE_INTERNAL_ENDPOINT, GARAGE_REGION, garageAdmin } from "./storage.js";
+import { APP_S3_KEYS, appS3Variables, createBucketWithKey, ensureGarage, GARAGE_INTERNAL_ENDPOINT, GARAGE_REGION, garageAdmin } from "./storage.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
 
 /**
@@ -334,15 +334,61 @@ export function validateGrantName(raw: string): string {
   return name;
 }
 
-export async function createBackupGrant(rawName: string, opts: { maxGb?: number }, authorize: (params: Record<string, unknown>) => void | Promise<void>) {
+// ---------------------------------------------------------------------------
+// Optional: Garage's S3 API over HTTPS through the main Cloudflare tunnel
+// ---------------------------------------------------------------------------
+
+export function publicStorageUrl(): string | null {
+  const h = loadState().backupShare?.publicHostname;
+  return h ? `https://${h}` : null;
+}
+
+/**
+ * Publishes only Garage's S3 API (not its admin API, not Postgres or Redis) at https://<sub>.<domain>
+ * through the tunnel that already serves the apps: no open port, no home IP shown, TLS by Cloudflare.
+ * Every request still needs a valid key, and each key only reaches its own bucket.
+ */
+export async function enablePublicStorage(subdomain: string, authorize: (params: Record<string, unknown>) => void | Promise<void>) {
+  const { hostnameOnDomain, routeHostnameOnTunnel } = await import("./exposure.js");
+  const current = publicStorageUrl();
+  const hostname = hostnameOnDomain(subdomain || "s3");
+  if (current === `https://${hostname}`) return { url: current, created: false };
+  if (current) throw fail(`S3 is already published at ${current}. Turn it off first to move it.`, `O S3 já está publicado em ${current}. Desligue antes de mudar o endereço.`);
+  const taken = Object.values(loadState().apps || {}).some((a) => (a.domains || []).some((d) => d.hostname === hostname));
+  if (taken) throw fail(`${hostname} is already used by an app.`, `${hostname} já é usado por um app.`);
+  await authorize({ hostname });
+  await ensureGarage();
+  const url = await routeHostnameOnTunnel(hostname, GARAGE_INTERNAL_ENDPOINT);
+  const s = loadState();
+  s.backupShare = { grants: {}, ...(s.backupShare || {}), publicHostname: hostname };
+  saveState(s);
+  return { url, created: true };
+}
+
+export async function disablePublicStorage(authorize: (params: Record<string, unknown>) => void | Promise<void>) {
+  const hostname = loadState().backupShare?.publicHostname;
+  if (!hostname) return { url: null };
+  const users = Object.values(loadState().backupShare?.grants || {}).filter((g) => g.internet && !g.revokedAt).map((g) => g.name);
+  await authorize({ hostname, users: users.join(", ") });
+  const { unrouteHostnameOnTunnel } = await import("./exposure.js");
+  await unrouteHostnameOnTunnel(hostname);
+  const s = loadState();
+  if (s.backupShare) delete s.backupShare.publicHostname;
+  saveState(s);
+  return { url: null };
+}
+
+export async function createBackupGrant(rawName: string, opts: { maxGb?: number; internet?: boolean }, authorize: (params: Record<string, unknown>) => void | Promise<void>) {
   const name = validateGrantName(rawName);
   const maxGb = opts.maxGb === undefined || opts.maxGb === null || Number(opts.maxGb) === 0 ? undefined : Number(opts.maxGb);
   if (maxGb !== undefined && !(Number.isInteger(maxGb) && maxGb >= 1 && maxGb <= 100000)) throw fail("The limit is a whole number of GB (1 or more), or empty for no limit.", "O limite é um número inteiro de GB (1 ou mais), ou vazio para sem limite.");
   const current = loadState().backupShare?.grants?.[name];
   if (current && !current.revokedAt) throw fail(`'${name}' already has a key. Revoke it first to make a new one.`, `'${name}' já tem uma chave. Revogue antes de gerar outra.`);
-  await authorize({ name, maxGb: maxGb || 0 });
+  const internet = opts.internet === true;
+  await authorize({ name, maxGb: maxGb || 0, internet, publishing: internet && !publicStorageUrl() });
 
-  const endpoint = await shareEndpoint();
+  // Over the internet: the HTTPS address (published now if needed, already confirmed above).
+  const endpoint = internet ? (await enablePublicStorage("s3", () => {})).url : await shareEndpoint();
   const bucket = current?.bucket || `backup-${name}`.slice(0, 63);
   const key = await createBucketWithKey(bucket, `backup-grant-${name}`);
   if (maxGb) {
@@ -354,6 +400,7 @@ export async function createBackupGrant(rawName: string, opts: { maxGb?: number 
     bucketId: key.bucketId,
     accessKeyId: key.accessKeyId,
     ...(maxGb ? { maxGb } : {}),
+    ...(internet ? { internet: true } : {}),
     createdAt: new Date().toISOString(),
   };
   const s = loadState();
@@ -403,4 +450,44 @@ export async function listBackupGrants() {
       return { ...g, bytes };
     })
   );
+}
+
+// ---------------------------------------------------------------------------
+// An app's files at the person's own account (R2, S3...), instead of this server's Garage
+// ---------------------------------------------------------------------------
+
+/**
+ * Tests the account (write, read, delete a small file) and puts the same S3_* / AWS_* variables a
+ * Garage bucket would into the app's vault, so the app's code does not change. The secret goes only
+ * to the vault. Replacing the app's current storage is confirmed (guard `storage.app.replace`).
+ */
+export async function useExternalStorage(appName: string, input: OffsiteInput, authorize: (params: Record<string, unknown>) => void | Promise<void>) {
+  const slug = sanitizeSlug(appName);
+  if (!slug) throw fail("Fill in the app name first.", "Preencha o nome do app primeiro.");
+  const target = buildOffsiteTarget({ ...input, prefix: "paasmcp-check" });
+  const before = loadState().storage?.[slug];
+  const host = new URL(target.endpoint).host;
+  const replacing = Boolean(before && (before.bucket !== target.bucket || (before.host || "garage") !== host));
+  const test = await testOffsiteTarget(target);
+  await authorize({
+    appName: slug,
+    replacing,
+    target: describe(target),
+    previous: before ? (before.provider && before.provider !== "garage" ? `${before.bucket} @ ${before.host}` : `this server (${before.bucket})`) : "",
+    previousPt: before ? (before.provider && before.provider !== "garage" ? `${before.bucket} @ ${before.host}` : `este servidor (${before.bucket})`) : "",
+  });
+  setSecretEntries(slug, appS3Variables(target));
+  const record: StorageRecord = {
+    appName: slug,
+    bucket: target.bucket,
+    bucketId: "",
+    accessKeyId: target.accessKeyId,
+    createdAt: new Date().toISOString(),
+    provider: target.provider,
+    host,
+  };
+  const s = loadState();
+  s.storage = { ...(s.storage || {}), [slug]: record };
+  saveState(s);
+  return { record, injectedKeys: APP_S3_KEYS, test };
 }

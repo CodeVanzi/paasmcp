@@ -233,9 +233,14 @@ export interface BackupRecord {
 export interface StorageRecord {
   appName: string;
   bucket: string;
+  /** Garage bucket id; empty for a bucket at another provider. */
   bucketId: string;
   accessKeyId: string;
   createdAt: string;
+  /** Absent (or "garage") = this server's Garage; otherwise the person's own account (offsite.ts providers). */
+  provider?: string;
+  /** Host of the provider's S3 address (no secret), for the screens. */
+  host?: string;
 }
 
 /** A revocable key another computer uses to send its backups into a bucket on this server (offsite.ts). */
@@ -245,6 +250,8 @@ export interface BackupGrantRecord {
   bucketId: string;
   accessKeyId: string;
   maxGb?: number;
+  /** The key was handed out with the HTTPS address (reachable from the internet), not the Tailscale one. */
+  internet?: boolean;
   createdAt: string;
   revokedAt?: string;
 }
@@ -252,6 +259,8 @@ export interface BackupGrantRecord {
 export interface BackupShareConfig {
   /** Tailscale IP where Garage's S3 API (only S3, not the admin API) is published for the grants. */
   bindIp?: string;
+  /** Hostname on the main Cloudflare tunnel that serves Garage's S3 API over HTTPS (opt-in). */
+  publicHostname?: string;
   grants: Record<string, BackupGrantRecord>;
 }
 
