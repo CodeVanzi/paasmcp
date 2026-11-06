@@ -50,6 +50,7 @@ import {
   syncHomepageDashboard,
 } from "./deployer.js";
 import { exposeApplication, ExposeError, releaseAddresses, removeAppAddress } from "./exposure.js";
+import { trashDeleteDate } from "./trashclean.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -371,6 +372,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         if (pathname === "/api/status" && req.method === "GET") {
           const status = { ...getSystemStatusSummary(true), controlPlane: followStatus() };
+          // Trashed apps: the day the trash deletes them for good (trashclean.ts).
+          const statusApps = (status as { apps?: Record<string, { trashedAt?: string }> }).apps;
+          if (statusApps && process.env.PAASMCP_TRASH_AUTO !== "0") {
+            for (const [k, a] of Object.entries(statusApps)) {
+              if (a?.trashedAt) statusApps[k] = { ...a, trashDeleteOn: trashDeleteDate(a as { name: string; trashedAt?: string }) } as typeof a;
+            }
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
           return true;
@@ -3194,6 +3202,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         actionRestore: "Restaurar",
         actionPurge: "Apagar de vez",
         trashedStatus: "Na lixeira desde ",
+        trashDeleteOn: " · apagado de vez em ",
         toastSecretSaved: "✅ Segredo criptografado no Vault!",
         toastDbCreated: "✅ Banco criado.",
         toastBackupSaved: "📸 Backup criptografado salvo: ",
@@ -3338,6 +3347,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         actionRestore: "Restore",
         actionPurge: "Delete for good",
         trashedStatus: "In the trash since ",
+        trashDeleteOn: " · deleted for good on ",
         toastSecretSaved: "✅ Secret encrypted in Vault!",
         toastDbCreated: "✅ Database created.",
         toastBackupSaved: "📸 Encrypted backup saved: ",
@@ -6365,7 +6375,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   \${rollbackBtn}
                   \${followBtn}
                   \${a.trashedAt
-                    ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10))}</span>
+                    ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10) + (a.trashDeleteOn ? t('trashDeleteOn') + new Date(a.trashDeleteOn).toLocaleDateString() : ''))}</span>
                        <button class="secondary" onclick="appAction('\${esc(a.name)}','restore')">\${esc(t('actionRestore'))}</button>
                        <button class="danger" onclick="appAction('\${esc(a.name)}','purge')">\${esc(t('actionPurge'))}</button>\`
                     : \`<button class="danger" onclick="appAction('\${esc(a.name)}','destroy')">\${esc(t('actionDelete'))}</button>\`}

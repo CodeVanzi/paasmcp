@@ -4333,6 +4333,49 @@ volumes:
     }
   });
 
+  await t.test("54. The trash empties itself: a notice 3 days before, never deleted without one, restore resets it", async () => {
+    const { trashPlan, trashDeleteDate, WARN_DAYS } = await import("./trashclean.js");
+    const day = 24 * 3600 * 1000;
+    const now = Date.parse("2026-12-31T04:00:00Z");
+    const ago = (d: number) => new Date(now - d * day).toISOString();
+    const plan = trashPlan([
+      { name: "fresh", trashedAt: ago(5) },
+      { name: "soon", trashedAt: ago(27) },
+      { name: "old-never-warned", trashedAt: ago(90) },
+      { name: "warned-yesterday", trashedAt: ago(40), trashWarnedAt: ago(1) },
+      { name: "due", trashedAt: ago(30), trashWarnedAt: ago(WARN_DAYS) },
+      { name: "running" },
+    ], now);
+    assert.deepEqual(plan.warn.sort(), ["old-never-warned", "soon"], "27 days in: the notice; an old app with no notice gets one first");
+    assert.deepEqual(plan.purge, ["due"], "deleted only after 30 days and 3 days after the notice");
+    assert.equal(trashDeleteDate({ name: "x", trashedAt: ago(90), trashWarnedAt: ago(0) }), new Date(now + WARN_DAYS * day).toISOString(), "never sooner than 3 days after the notice");
+    assert.equal(trashDeleteDate({ name: "x", trashedAt: ago(0) }), new Date(now + 30 * day).toISOString());
+
+    const { runTrashCleanup } = await import("./trashclean.js");
+    const before = process.env.PAASMCP_TRASH_AUTO;
+    process.env.PAASMCP_TRASH_AUTO = "0";
+    try {
+      assert.deepEqual(await runTrashCleanup(now), { warned: [], purged: [], errors: [] }, "PAASMCP_TRASH_AUTO=0 turns it off");
+    } finally {
+      if (before === undefined) delete process.env.PAASMCP_TRASH_AUTO; else process.env.PAASMCP_TRASH_AUTO = before;
+    }
+    const st = config.loadState();
+    const any = Object.values(st.apps)[0] as any;
+    st.apps.oldtrash = { ...(any || {}), name: "oldtrash", trashedAt: ago(28), trashDir: "/nonexistent-trash", domains: [] } as any;
+    delete (st.apps.oldtrash as any).trashWarnedAt;
+    config.saveState(st);
+    try {
+      const r = await runTrashCleanup(now);
+      assert.deepEqual(r.warned, ["oldtrash"]);
+      assert.ok(config.loadState().apps.oldtrash.trashWarnedAt, "the notice is remembered");
+      assert.deepEqual((await runTrashCleanup(now + day)).warned, [], "one notice only");
+    } finally {
+      const s2 = config.loadState();
+      delete s2.apps.oldtrash;
+      config.saveState(s2);
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

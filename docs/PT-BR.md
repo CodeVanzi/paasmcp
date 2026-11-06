@@ -103,7 +103,7 @@ Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pes
 
 Como a confirmação funciona com IA: a ferramenta MCP não executa e devolve um pedido (`approvalId`, ex. `c-7F3K2A`), que vale 10 minutos e só para aqueles parâmetros. Uma pessoa aprova no painel (cartão "Confirmações pendentes") ou no servidor com `paasmcp approve c-7F3K2A`; depois a IA repete a chamada com `approvalId`. Tudo fica registrado em `/opt/homelab/paasmcp/audit.log`.
 
-Na linha de comando, a pergunta aparece na tela; `--yes` serve para scripts nas confirmações comuns e `--confirm-name <nome>` nas fortes. Para a lixeira expirar sozinha, agende `paasmcp trash purge-expired` uma vez por dia (cron ou timer do systemd).
+Na linha de comando, a pergunta aparece na tela; `--yes` serve para scripts nas confirmações comuns e `--confirm-name <nome>` nas fortes. A lixeira se esvazia sozinha junto com o backup da noite (do painel ou do timer do systemd): 3 dias antes de apagar um app, chega um aviso (Conexões → Avisos), e nada é apagado sem esse aviso. Restaurar o app cancela. Para desligar, `PAASMCP_TRASH_AUTO=0`; `paasmcp trash purge-expired` apaga na hora os vencidos.
 
 ### IA em outra máquina (MCP pela rede) e dois fatores no painel
 

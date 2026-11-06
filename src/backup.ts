@@ -360,6 +360,10 @@ export async function runNightlyBackup(retentionDays = 7, opts: { ifDue?: boolea
   const offsiteState =
     typeof offsite === "string" ? "not-configured" : offsite.failed.length ? "failed" : "ok";
   const failures = [...errors, ...(typeof offsite === "string" ? [] : offsite.failed.map((f) => `${f.id}: ${f.error}`))];
+  // The trash empties itself after its 30 days, with a notice 3 days before (trashclean.ts).
+  const { runTrashCleanup } = await import("./trashclean.js");
+  const trash = await runTrashCleanup().catch((err: unknown) => ({ warned: [], purged: [], errors: [String(err instanceof Error ? err.message : err)] }));
+  failures.push(...trash.errors.map((e) => `trash ${e}`));
   writeNightlyMark({ date: today, startedAt, finishedAt: new Date().toISOString(), created: created.length, errors: failures.slice(0, 20), offsite: offsiteState });
   if (failures.length) {
     await sendNotice(
@@ -371,7 +375,7 @@ export async function runNightlyBackup(retentionDays = 7, opts: { ifDue?: boolea
       "backup"
     );
   }
-  return { created, errors, offsite, prune };
+  return { created, errors, offsite, prune, trash };
 }
 
 export function installBackupTimer(hour = 3): { service: string; timer: string } {

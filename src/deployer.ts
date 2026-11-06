@@ -828,6 +828,7 @@ export function manageAppLifecycle(
       fs.renameSync(app.trashDir, app.appDir);
       delete app.trashedAt;
       delete app.trashDir;
+      delete app.trashWarnedAt;
       app.status = "running";
       saveState(state);
       execFileSync("docker", ["compose", "-f", path.join(app.appDir, "compose.yaml"), "up", "-d"], {
@@ -939,6 +940,7 @@ export function manageAppLifecycle(
     else fs.mkdirSync(trashDir, { recursive: true, mode: 0o700 });
     app.trashedAt = now.toISOString();
     app.trashDir = trashDir;
+    delete app.trashWarnedAt;
     app.status = "trashed";
     saveState(state);
     syncHomepageDashboard();

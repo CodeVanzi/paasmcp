@@ -45,6 +45,8 @@ export interface AppRecord {
   autoDeploy?: "poll";
   trashedAt?: string;
   trashDir?: string;
+  /** When the "will be deleted" notice went out (trashclean.ts); cleared on restore. */
+  trashWarnedAt?: string;
   /** Blue/green deploy: path probed on the candidate container (default "/"). */
   healthcheckPath?: string;
   /** Blue/green deploy: seconds to wait for a healthy answer (default 20). */

@@ -301,7 +301,7 @@ paasmcp dashboard 2fa enable
 # Trash: destroy is reversible for 30 days
 paasmcp destroy my-saas
 paasmcp restore my-saas
-paasmcp trash purge-expired   # run daily from cron
+paasmcp trash purge-expired   # the nightly backup already empties the trash (notice 3 days before; PAASMCP_TRASH_AUTO=0 turns it off)
 
 # Pair a secondary server (config & vault sync; data mirror in progress)
 paasmcp node invite https://paas.example.com --mode active-active-tunnel
