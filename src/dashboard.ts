@@ -621,17 +621,20 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           );
           // Copies on helper PCs follow this server's copy, in the background.
           let poolNote = "";
+          let pool: "updating" | "failed" | undefined;
           const lifeSlug = sanitizeSlug(String(body.appName));
           if (loadState().apps[lifeSlug]?.pool && ["restart", "stop", "start", "rollback", "destroy"].includes(action)) {
             try {
               startPoolJob(action, lifeSlug, (log) => poolAfterLifecycle(lifeSlug, action, log));
               poolNote = "\nCopies on helper PCs are being updated (Helpers screen).";
+              pool = "updating";
             } catch (err) {
               poolNote = `\nCopies on helper PCs were not updated: ${err instanceof Error ? err.message : String(err)}`;
+              pool = "failed";
             }
           }
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ output: output + poolNote }));
+          res.end(JSON.stringify({ output: output + poolNote, ...(pool ? { pool } : {}) }));
           return true;
         }
 
@@ -2949,10 +2952,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         <div class="card" id="logsCard" style="display:none;">
           <div class="card-header">
             <h2>
-              <span id="logsTitle">📜 Logs do Container</span>
+              <span id="logsTitle">📜 O que o app escreveu (logs)</span>
               <button class="secondary" id="btnCloseLogs" onclick="document.getElementById('logsCard').style.display='none'">Fechar</button>
             </h2>
           </div>
+          <p class="ofs-note" id="logsHint" style="margin:0 0 8px;"></p>
           <pre id="logsBox"></pre>
         </div>
       </div>
@@ -3033,7 +3037,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         doctorDesc: "Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.",
         agentsTitle: "🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)",
         agentsDesc: "O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:",
-        logsTitle: "📜 Logs do Container",
+        logsTitle: "📜 O que o app escreveu (logs)",
         btnCloseLogs: "Fechar",
         statHost: "Servidor Host",
         statDisk: "Disco:",
@@ -3177,7 +3181,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         doctorDesc: "Checks for <code>OOMKilled</code> (low RAM), restart loops, exit codes, and health of all services.",
         agentsTitle: "🤖 How to Connect your AI Agent (MCP Compatible Clients)",
         agentsDesc: "PaaSMCP exposes <strong>15 native MCP tools</strong> via stdio JSON-RPC. Copy the config below so your AI agent can manage the entire server for you:",
-        logsTitle: "📜 Container Logs",
+        logsTitle: "📜 What the app wrote (logs)",
         btnCloseLogs: "Close",
         statHost: "Host Server",
         statDisk: "Disk:",
@@ -5107,6 +5111,39 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "dfOkList": "See Your apps"
     });
 
+    Object.assign(I18N.pt, {
+      "life_restart": "{app} foi reiniciado.",
+      "life_stop": "{app} foi parado.",
+      "life_start": "{app} foi ligado.",
+      "life_rollback": "{app} voltou para a versão anterior.",
+      "life_destroy": "{app} foi para a lixeira. Dá para restaurar na lista Seus apps.",
+      "life_restore": "{app} saiu da lixeira e está ligado.",
+      "life_purge": "{app} foi apagado de vez.",
+      "lifePoolUpdating": "As cópias nos PCs ajudantes estão sendo atualizadas.",
+      "lifePoolFailed": "As cópias nos PCs ajudantes não foram atualizadas (veja a tela Ajudantes).",
+      "lifeErrNoPrevious": "Ainda não existe uma versão anterior guardada desse app. Ela aparece depois da próxima publicação.",
+      "lifeErr": "Não deu para fazer isso agora.",
+      "logsEmpty": "O app ainda não escreveu nada.",
+      "logsHint": "As linhas mais recentes ficam no fim. Erros costumam aparecer com Error, Exception ou Traceback.",
+      "actionRollbackTip": "Volta para a versão publicada antes desta, em segundos"
+    });
+    Object.assign(I18N.en, {
+      "life_restart": "{app} was restarted.",
+      "life_stop": "{app} was stopped.",
+      "life_start": "{app} was started.",
+      "life_rollback": "{app} is back on the previous version.",
+      "life_destroy": "{app} went to the trash. You can restore it in Your apps.",
+      "life_restore": "{app} left the trash and is running.",
+      "life_purge": "{app} was deleted for good.",
+      "lifePoolUpdating": "Copies on helper PCs are being updated.",
+      "lifePoolFailed": "Copies on helper PCs were not updated (see the Helpers screen).",
+      "lifeErrNoPrevious": "There is no earlier version of this app saved yet. One appears after the next publish.",
+      "lifeErr": "Could not do that right now.",
+      "logsEmpty": "The app has not written anything yet.",
+      "logsHint": "The newest lines are at the end. Errors usually show up with Error, Exception or Traceback.",
+      "actionRollbackTip": "Goes back to the version published before this one, in seconds"
+    });
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -5881,7 +5918,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:2px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
             : '';
           const rollbackBtn = a.previousImageTag
-            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="Reverter para imagem anterior em 1s">\${btnIcon('back')}\${esc(t('actionRollback'))}</button>\`
+            ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="\${esc(t('actionRollbackTip'))}">\${btnIcon('back')}\${esc(t('actionRollback'))}</button>\`
             : '';
 
           const domainPills = (a.domains || []).map(dom => \`
@@ -7665,15 +7702,23 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName, action })
       });
-      const data = await res.json();
-      if (!res.ok) return alert(data.error);
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        if (data.confirmationRequired) return;
+        const err = String(data.error || ('HTTP ' + res.status));
+        return alert(/No previous image snapshot/.test(err) ? t('lifeErrNoPrevious') : t('lifeErr') + '\\n\\n' + err);
+      }
       if (action === 'logs') {
         const card = document.getElementById('logsCard');
         card.style.display = 'block';
-        document.getElementById('logsBox').textContent = data.output || '(empty logs)';
+        document.getElementById('logsTitle').textContent = t('logsTitle') + ' · ' + appName;
+        const out = String(data.output || '').trim();
+        document.getElementById('logsHint').textContent = out ? t('logsHint') : '';
+        document.getElementById('logsBox').textContent = out || t('logsEmpty');
         card.scrollIntoView({ behavior: 'smooth' });
       } else {
-        showToast('✅ ' + data.output);
+        const msg = I18N.en['life_' + action] ? t('life_' + action).split('{app}').join(appName) : String(data.output || '');
+        showToast('✅ ' + msg + (data.pool === 'updating' ? ' ' + t('lifePoolUpdating') : data.pool === 'failed' ? ' ' + t('lifePoolFailed') : ''));
         loadAll();
       }
     }

@@ -4015,6 +4015,10 @@ volumes:
       for (const a of ["github", "options", "guide", "trash", "doctor"]) twice(`dfAct_${a}`);
       for (const k of ["dfDetails", "dfOkTitle", "dfOkNext", "dfOkLive", "dfOkExpose", "dfOkList"]) twice(k);
       assert.ok(!page.includes("HealthcheckFailedError"), "no guessing from the error's class name (it is not in the message)");
+      // App buttons (restart, stop, trash...) answer in the screen's language, not with the server's English text.
+      for (const a of ["restart", "stop", "start", "rollback", "destroy", "restore", "purge"]) twice(`life_${a}`);
+      for (const k of ["lifePoolUpdating", "lifePoolFailed", "lifeErrNoPrevious", "lifeErr", "logsEmpty", "logsHint", "actionRollbackTip"]) twice(k);
+      assert.ok(!page.includes("showToast('✅ ' + data.output)"));
       // The route answers 422 with the kind, and the error itself, never a bare 500.
       const res = await fetch(`${baseUrl}/api/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ appName: "nope-46", repoSource: "/no/such/folder-46" }) });
       const data = (await res.json()) as { error: string; failure: { kind: string } };
