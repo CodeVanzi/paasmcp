@@ -731,6 +731,22 @@ volumes:
       assert.equal(good.ok, true);
       assert.equal(good.url, url, "a pasted /arbiter suffix is dropped");
       assert.ok(good.nodes?.some((n) => n.isMe && n.secondsAgo === 0));
+      // Arbiter tab: where it runs, the takeover it recorded, and the watchdog's last contact.
+      assert.equal(good.about?.host, os.hostname());
+      assert.equal(good.about?.clusters, 1);
+      assert.ok(typeof good.latencyMs === "number");
+      assert.ok(good.owners?.some((o) => o.owner === "other-server" && o.epoch === 5), "the claim above is listed");
+      assert.ok(good.watch?.okAt, "watchTick records its last talk with the arbiter");
+      assert.equal(JSON.stringify(await (await fetch(`${url}/health`)).json()).includes(os.hostname()), false, "the unsigned probe reveals nothing");
+      // Install command: this cluster's key, a repository URL without credentials, nothing else.
+      const inst = arbiter.arbiterInstallCommand("https://user:ghp_secret@github.com/me/paasmcp.git");
+      assert.equal(inst.key, key);
+      assert.equal(inst.repoUrl, "https://github.com/me/paasmcp.git");
+      assert.ok(!inst.command.includes("ghp_secret") && inst.command.includes(`install-service --key ${key}`));
+      assert.equal(arbiter.publicRepoUrl("git@github.com:me/paasmcp.git"), "https://github.com/me/paasmcp.git");
+      assert.equal(arbiter.publicRepoUrl("https://x.com/a;rm -rf /"), arbiter.DEFAULT_REPO_URL);
+      assert.equal(arbiter.publicRepoUrl("file:///etc"), arbiter.DEFAULT_REPO_URL);
+      assert.equal(arbiter.publicRepoUrl(undefined), arbiter.DEFAULT_REPO_URL);
       const other = arbiter.startArbiterServer({ port: 0, host: "127.0.0.1", key: "0".repeat(64), stateFile: path.join(tempRoot, "arb2.json") });
       await new Promise((r) => other.once("listening", r));
       const otherPort = (other.address() as { port: number }).port;

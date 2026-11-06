@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { PAAS_DATA_DIR, writeFileAtomic } from "./config.js";
 import { getSecrets, timingSafeCompare } from "./vault.js";
@@ -85,12 +86,31 @@ export function loadArbiterFile(file: string, firstKey: string): ArbiterFile {
   return { v: 2, clusters: { [arbiterClusterId(firstKey)]: { nodes: raw?.nodes || {}, owners: raw?.owners || {} } } };
 }
 
+/** Version of the PaaSMCP code running here (package.json next to dist/), or "" when unknown. */
+function codeVersion(): string {
+  try {
+    const dir = path.dirname(new URL(import.meta.url).pathname);
+    return String(JSON.parse(fs.readFileSync(path.join(dir, "..", "package.json"), "utf-8")).version || "");
+  } catch {
+    return "";
+  }
+}
+
+/** What the arbiter tells the servers of a cluster about itself (signed replies only, never /health). */
+export interface ArbiterAbout {
+  host: string;
+  version: string;
+  startedAt: number;
+  clusters: number;
+}
+
 export function startArbiterServer(opts: { port: number; host: string; keys?: string[]; key?: string; stateFile?: string }): http.Server {
   const keys = [...(opts.keys || []), ...(opts.key ? [opts.key] : [])];
   if (!keys.length) throw new Error("The arbiter needs at least one key.");
   const byId = new Map(keys.map((k) => [arbiterClusterId(k), k]));
   const file = opts.stateFile || path.join(PAAS_DATA_DIR, "arbiter.json");
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  const about: ArbiterAbout = { host: os.hostname(), version: codeVersion(), startedAt: Date.now(), clusters: keys.length };
   const server = http.createServer((req, res) => {
     // Unsigned liveness probe for people checking the arbiter by hand (curl / browser). Reveals nothing.
     if (req.method === "GET" && req.url === "/health") return res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true,"service":"paasmcp-arbiter"}');
@@ -126,7 +146,7 @@ export function startArbiterServer(opts: { port: number; host: string; keys?: st
       const out = arbiterDecide(state, msg, now);
       all.clusters[clusterId] = state;
       writeFileAtomic(file, JSON.stringify(all, null, 2));
-      reply(200, { granted: out.granted, owner: out.owner, owners: state.owners, nodes: state.nodes, now, cluster: clusterId });
+      reply(200, { granted: out.granted, owner: out.owner, owners: state.owners, nodes: state.nodes, now, cluster: clusterId, about });
     });
   });
   server.listen(opts.port, opts.host);
@@ -136,7 +156,7 @@ export function startArbiterServer(opts: { port: number; host: string; keys?: st
 export async function askArbiter(
   url: string,
   msg: { op: Op; node: string; epoch: number; dataOf?: string; to?: string }
-): Promise<{ granted: boolean; owner?: { owner: string; epoch: number }; owners: ArbiterState["owners"]; nodes: ArbiterState["nodes"]; now: number }> {
+): Promise<{ granted: boolean; owner?: { owner: string; epoch: number }; owners: ArbiterState["owners"]; nodes: ArbiterState["nodes"]; now: number; about?: ArbiterAbout }> {
   const body = JSON.stringify({ ...msg, ts: Date.now() });
   const key = deriveArbiterKey();
   const res = await fetch(`${url.replace(/\/+$/, "")}/arbiter`, {
@@ -228,3 +248,43 @@ export function removeArbiterKey(idOrKey: string): { removed: string; clusters: 
 
 /** Ids of the clusters this arbiter serves (never the keys). */
 export const listArbiterClusters = () => readArbiterKeys().map(arbiterClusterId);
+
+export const DEFAULT_REPO_URL = "https://github.com/CodeVanzi/paasmcp.git";
+
+/**
+ * A git URL the arbiter device can clone without this server's credentials: https only, no user or
+ * token in it (a github.com SSH address becomes https). Anything else falls back to the public repo.
+ */
+export function publicRepoUrl(raw: string | undefined): string {
+  let u = String(raw || "").trim();
+  const ssh = /^git@github\.com:([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+?)(\.git)?$/.exec(u);
+  if (ssh) u = `https://github.com/${ssh[1]}.git`;
+  try {
+    const p = new URL(u);
+    if (p.protocol !== "https:") return DEFAULT_REPO_URL;
+    p.username = "";
+    p.password = "";
+    p.search = "";
+    p.hash = "";
+    const out = p.toString();
+    return /^https:\/\/[A-Za-z0-9.-]+(:\d+)?\/[A-Za-z0-9._~/-]+$/.test(out) ? out : DEFAULT_REPO_URL;
+  } catch {
+    return DEFAULT_REPO_URL;
+  }
+}
+
+/**
+ * Ready-to-paste commands for the arbiter device: get (or update) the code and install the service with
+ * this cluster's key. Re-running it on a device that already judges another pair keeps that pair too
+ * (install-service merges keys), so it is the same command in both cases.
+ */
+export function arbiterInstallCommand(repoUrl: string | undefined, key = deriveArbiterKey()): { key: string; cluster: string; repoUrl: string; command: string } {
+  const [k] = parseArbiterKeys(key);
+  const repo = publicRepoUrl(repoUrl);
+  const command = [
+    `test -d paasmcp || git clone ${repo} paasmcp`,
+    "cd paasmcp && git pull --ff-only && npm install && npm run build",
+    `sudo node dist/cli.js arbiter install-service --key ${k}`,
+  ].join("\n");
+  return { key: k, cluster: arbiterClusterId(k), repoUrl: repo, command };
+}
