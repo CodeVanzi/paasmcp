@@ -178,7 +178,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_configure` | Configures Cloudflare `accountId`, `tunnelId`, `baseDomain`, `zeroTrustEmails`, and `tailscaleDomain`. |
 | `paas_github_key` | Retrieves the SSH Ed25519 public deploy key + SHA256 fingerprint or auto-registers it on a GitHub repository via API. |
 | `paas_secret_set` | Encrypts and stores secrets in AES-256-GCM Vault (from key-values, `.env`, or secret file path). |
-| `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`). |
+| `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`), each key's description and when it was created and last changed. `paas_secret_set` takes optional `descriptions`. |
 | `paas_secret_delete` | Deletes a secret key from the encrypted vault. |
 | `paas_db_provision` | Creates an isolated PostgreSQL or Redis database and binds `DATABASE_URL` / `REDIS_URL` into the app's vault. |
 | `paas_update` | `check` newer Postgres/Redis/Garage releases within the same major; `apply` (confirmation) backs up, switches (mirror copies first), health-checks and rolls back on failure. |

@@ -18,7 +18,8 @@ By default, PaaSMCP stores all runtime state under `PAASMCP_ROOT` (`/opt/homelab
 │   │   └── paasmcp_deploy_ed25519.pub  # Public SSH deploy key (+ SHA256 fingerprint)
 │   ├── vault/
 │   │   ├── system.enc.json       # Encrypted platform tokens (CF_API_TOKEN, GITHUB_TOKEN, WEBHOOK_SECRET, FEDERATION_CLUSTER_KEY)
-│   │   └── <app-slug>.enc.json   # Encrypted environment variables per application
+│   │   ├── <app-slug>.enc.json   # Encrypted environment variables per application
+│   │   └── <scope>.meta.enc.json # Encrypted per-key description, created and last-changed dates (never the values)
 │   ├── backups/
 │   │   └── <id>.enc.bak          # Binary AES-256-GCM encrypted pg_dump / Redis / volume snapshots (mode 0600)
 │   ├── mirror/<peer>/            # Streaming copy of a peer's Postgres (its own compose.yaml + data/)

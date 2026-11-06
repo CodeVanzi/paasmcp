@@ -77,8 +77,10 @@ import {
   listMaskedSecrets,
    maskSecretValue,
   setSecretEntries,
+  setSecretDescription,
   setSecretFromFile,
 } from "./vault.js";
+import { listSecretDetails } from "./vaultdocs.js";
 
 /** One `docker stats` call feeds both the per-app numbers and the server split; CPU is read around it. */
 function diskSplit() {
@@ -359,6 +361,12 @@ function toolCatalog() {
               type: "string",
               description: "Optional path to a .env file to import into the encrypted vault.",
             },
+            descriptions: {
+              type: "object",
+              additionalProperties: { type: "string" },
+              description:
+                "Optional KEY -> short text saying what the key is and what it is for (shown in the dashboard; empty text clears it). Never put the value here.",
+            },
           },
           required: ["scope"],
         },
@@ -366,7 +374,7 @@ function toolCatalog() {
       {
         name: "paas_secret_list",
         description:
-          "Lists all environment variable keys stored in the encrypted Vault for an app or 'system' with masked values.",
+          "Lists all environment variable keys stored in the encrypted Vault for an app or 'system' with masked values, plus each key's description and when it was created and last changed (missing dates mean the key predates date tracking).",
         inputSchema: {
           type: "object",
           properties: {
@@ -955,6 +963,11 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
         if (typeof args.dotEnvFilePath === "string") {
           updatedKeys.push(...importDotEnvFile(scope, args.dotEnvFilePath));
         }
+        if (args.descriptions && typeof args.descriptions === "object") {
+          for (const [k, text] of Object.entries(args.descriptions as Record<string, unknown>)) {
+            setSecretDescription(scope, k, String(text ?? ""));
+          }
+        }
         return {
           content: [
             {
@@ -982,7 +995,7 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
               text: JSON.stringify(
                 {
                   scope,
-                  secrets: listMaskedSecrets(scope),
+                  secrets: listSecretDetails(scope),
                 },
                 null,
                 2
