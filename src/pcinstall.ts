@@ -135,7 +135,7 @@ export async function listTailnetPcs(opts: { statusJson?: string; probe?: boolea
       let ssh: PcSsh | undefined;
       // Only online Linux devices of the owner are probed: phones and other people's devices never are.
       if (probe && p.online && p.ip && isLinux(p.os) && !p.shared && !p.otherOwner) {
-        const [arb, banner] = await Promise.all([probeArbiter(p.ip), sshBanner(p.ip)]);
+        const [arb, banner] = await Promise.all([probeArbiter(p.ip), sshBanner(p.ip, 22, 3000)]);
         if (arb.arbiter) roles.add("arbiter");
         ssh = sshKind(banner);
       }

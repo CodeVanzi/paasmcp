@@ -8123,18 +8123,19 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         if (d.error) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNoTs')) + '</p>'; return; }
         const list = d.pcs || [];
         if (!list.length) { box.innerHTML = '<p class="card-desc">' + esc(t('pcsNone')) + '</p>'; return; }
+        if (!document.getElementById('pcsJobBox').innerHTML) await pcResume();
         box.innerHTML = list.map(pcRow).join('');
-        if (!document.getElementById('pcsJobBox').innerHTML) pcResume();
       } finally { btn.disabled = false; }
     }
     function pcRow(x) {
-      const canInstall = x.state === 'installable' || (x.state === 'paasmcp' && (x.roles || []).join() === 'installed');
+      const busy = lastPcJob && lastPcJob.ip === x.ip && ['connecting', 'ready', 'installing'].indexOf(lastPcJob.phase) !== -1;
+      const canInstall = !busy && (x.state === 'installable' || (x.state === 'paasmcp' && (x.roles || []).join() === 'installed'));
       let tag;
       if (x.state === 'paasmcp') tag = badge('success', t('pcsHas')) + (x.roles || []).map(r => ' ' + badge('', t('pcsRole_' + r))).join('');
       else if (x.state === 'installable') tag = badge('warning', t('pcsCan'));
       else if (x.state === 'offline') tag = badge('', t('pcsOffline'));
       else tag = badge('', t('pcsWhy_' + (x.why || 'notLinux')));
-      const ssh = x.state === 'installable' && x.ssh ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('pcsSsh_' + x.ssh)) + '</div>' : '';
+      const ssh = x.state === 'installable' && x.ssh && !busy ? '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('pcsSsh_' + x.ssh)) + '</div>' : '';
       return '<div class="pc-row" style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-bottom:1px solid var(--border);">' +
         '<div><strong>' + esc(x.name) + '</strong> <span style="color:var(--muted);">' + esc(x.ip || '') + (x.os ? ' · ' + esc(x.os) : '') + '</span> ' + tag + ssh + '</div>' +
         '<div class="pc-actions">' + (canInstall ? '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" data-ip="' + esc(x.ip) + '" data-name="' + esc(x.name) + '" data-ssh="' + esc(x.ssh || '') + '" onclick="pcOpenForm(this.dataset)">' + esc(t('pcsBtnInstall')) + '</button>' : '') + '</div></div>';
@@ -8171,6 +8172,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         if (!res.ok) { ofsMsg('pcFormMsg', (currentLang === 'pt' && d.errorPt) || d.error || ('HTTP ' + res.status), 'err'); return; }
         renderPcJob(d.job);
         pcPoll();
+        loadPcs();
       } finally { if (document.getElementById('btnPcCheck')) btn.disabled = false; }
     }
     function pcPoll() {
@@ -8201,9 +8203,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       ];
       return '<table style="font-size:12.5px;margin:6px 0;">' + rows.map(r => '<tr><td style="color:var(--muted);padding:2px 12px 2px 0;">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>').join('') + '</table>';
     }
+    let lastPcJob = null;
     function renderPcJob(j) {
       const box = document.getElementById('pcsJobBox');
       if (!box || !j) return;
+      lastPcJob = j;
       const keep = box.querySelector('details[open]');
       let html = '<h3 class="ofs-h" style="margin-top:0;">' + esc(t('pcsFormTitle').replace('{name}', j.name)) + ' <span style="color:var(--muted);font-weight:400;">' + esc(j.ip) + '</span></h3>';
       if (j.phase === 'connecting') {

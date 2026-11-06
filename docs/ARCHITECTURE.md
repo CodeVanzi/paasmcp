@@ -611,7 +611,38 @@ federation peer or a PC installed from this dashboard, or an arbiter answering o
 (online Linux device of the owner), *off*, or *not possible here* (not Linux, shared from another
 account, another user's device, no IPv4). Only online Linux devices of the owner are probed, with two
 read-only probes: the arbiter's `/health` and the first line of port 22 (`SSH-2.0-Tailscale` vs OpenSSH),
-which says how the dashboard could log in there. Nothing logs in anywhere.
+which says how the dashboard could log in there. The list itself logs in nowhere.
+
+**Installing from there** (`src/pcremote.ts`, one job at a time, `/api/pcs/check|install|job|cancel`):
+
+1. *Log in.* Only to an IP the list shows as the owner's online Linux PC without PaaSMCP (or one this
+   dashboard installed). One OpenSSH connection to the Tailscale IP, kept open as a ControlMaster in a
+   private folder under `/dev/shm`: by Tailscale SSH (no password; a `check` rule's login link, sent as
+   the SSH banner, is shown on the screen) or by the PC's password, passed once through a one-shot askpass
+   file that is deleted right after the login. No public-key login is offered, so no key of this server
+   is used or left there. Host key: pinned to the `sshHostKeys` Tailscale reports when it has them
+   (Tailscale SSH on), otherwise accepted on first use (the Tailscale IP already identifies the device)
+   and its fingerprint shown. Three wrong logins on one PC block it for 10 minutes.
+2. *Check (read-only, as the login user).* `CHECK_SCRIPT` prints `key=value` lines (OS, CPU type, memory,
+   free disk, systemd, git/node/docker/compose/tailscale versions, sshd, PaaSMCP already in
+   `/opt/paasmcp`, how root is reached); `parseFacts` keeps known keys only, printable and capped;
+   `planFor` says what is missing and what blocks (not Debian/Ubuntu, CPU type, no systemd, under 1.5 GB
+   free, no sudo, no Tailscale). When sudo wants the password, `sudo -S -v` checks it before anything is
+   offered. The job waits 15 minutes for the person's choice.
+3. *Install (root, after guard `pc.install`, confirm).* The script (`installScript`, every value validated
+   and single-quoted) is written to `/tmp/paasmcp-install-<id>.sh` (0600) and run with `bash`, `sudo -n`
+   or `sudo -S` (the password on stdin, never in argv), then deleted. Steps, marked `@@step`: apt packages
+   (git, ca-certificates, curl, xz-utils, `docker.io` when Docker is missing, a compose package until
+   `docker compose` works, `openssh-server` for a helper); Node.js 20+ (kept when there; else apt when it
+   has 20+; else the official v22 tarball checked against `NODE_SHA256`); the code (`git clone` of this
+   server's repository at this server's exact commit into `/opt/paasmcp`, `npm ci`, build, links in
+   `/usr/local/bin`); the role. Server: `init` + `dashboard`. Helper: invite made here, `pool join --yes`
+   there, Tailscale SSH switched off (its own SSH server would bypass the forced command the helper key
+   relies on), then `pool add` here. Arbiter (only when this server has a pair): `arbiter be-judge` there
+   and `pairArbiterAndSave` here with the code it prints. Optionally (always for a helper) Tailscale SSH
+   is switched off at the end, detached so it outlives the session it closes.
+4. *Records.* `audit.log` (`pc.install.connect|start|done|failed|cancelled`, no password),
+   `<data>/pcinstall/installs.json` (name, IP, role, commit, who), so the list knows the PC.
 
 ## 10f. Dashboard layout (`src/dashboard.ts`)
 
@@ -673,6 +704,7 @@ turns the loop off.
 | `PAASMCP_WAKE_WAIT_SECONDS`, `PAASMCP_WAKE_RECHECK_SECONDS` | `180`, `60` | Labs only: how long a woken PC gets to answer before another magic packet, and how soon the decider retries a step it held for a PC waking up. |
 | `PAASMCP_WORKER_HOME`, `PAASMCP_WORKER_RUN_DIR` | `/var/lib/paasmcp-worker`, `/run/paasmcp-worker` | Tests only: where the helper's worker keeps its settings and the in-memory variables folder. |
 | `PAASMCP_WORKER_ALLOW_DISK` | — | Tests only: `1` lets the worker write variables outside tmpfs. |
+| `PAASMCP_PC_SSH_PORT` | `22` | Labs only: the SSH port used to install PaaSMCP on another PC. |
 | `PAASMCP_OFFLINE_TEST` | — | `1` in unit tests: skips Docker and network calls. |
 
 ## 12. Test labs
@@ -690,6 +722,14 @@ turns the loop off.
   the network: from 10 s after the cut every visit succeeds in under a second; pause and resume; a new
   deploy rolls every copy to v2; `scale off`, `pool remove` (the key stops working) and `pool leave`.
   Builds its helper image if missing (`POOL_LAB_BUILD_FLAGS` passes extra build flags).
+- `scripts/pcinstall-lab.sh`: installing PaaSMCP on other PCs from the dashboard, through its API. Two
+  plain Ubuntu containers (sshd, sudo, certificates; no git, Docker or Node) play the PCs; stand-ins for
+  `systemctl` and `tailscale`, and a fake `tailscale status` here. A wrong password ends in `auth`; pc-a
+  (sudo user + password) is checked (nothing changes there), asks for confirmation, and becomes a helper
+  that answers this server's key, with the same commit and Node 20+; pc-b (root + password) becomes a
+  server whose dashboard answers there. The passwords are in no answer, log, data file or PC disk; no key
+  is left in any `authorized_keys`; the script and the connection folders are gone. Needs the checkout's
+  commit on GitHub.
 - `scripts/autoscale-lab.sh`: scale phase 4 with real Docker, on the same kind of helper PCs. An app with
   Postgres gets automatic scaling (1 to 3 copies, 20 visits/s per copy) and rounds run by hand. The
   balancer must count exactly the visits sent through it; under 50 visits/s copies go 1 → 2 → 3 on the

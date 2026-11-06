@@ -118,7 +118,7 @@ docker build --network host --build-arg PROXY_URL="${PROXY_URL:+http://127.0.0.1
   || { tail -20 "$SRC/build.log"; echo "FAIL building the PC image"; exit 1; }
 # Inside the running PCs the proxy is the lab gateway, not this machine's loopback.
 for pc in "$PA:$IPA" "$PB:$IPB"; do
-  docker run -d --privileged --name "${pc%%:*}" --hostname "${pc%%:*}" --network "$NET" --ip "${pc##*:}" --tmpfs /run:rw,mode=755 "$IMG" >/dev/null || exit 1
+  docker run -d --privileged --name "${pc%%:*}" --hostname "${pc%%:*}" --network "$NET" --ip "${pc##*:}" --tmpfs /run:rw,mode=755 -v /var/lib/docker "$IMG" >/dev/null || exit 1
   if [ -n "$PROXY_URL" ]; then
     docker exec "${pc%%:*}" sh -c "sed -i 's|http://127.0.0.1:[0-9]*|$PROXY_URL|g' /etc/environment; printf 'Acquire::https::Proxy \"%s\";\n' '$PROXY_URL' > /etc/apt/apt.conf.d/99proxy"
   fi
