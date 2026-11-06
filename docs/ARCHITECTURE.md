@@ -179,7 +179,7 @@ Automatic failover with only two servers would split the brain when the link bet
 ### Active-active: an app on both servers (`src/active.ts`, `src/edge.ts`)
 
 `paasmcp active on <app>` (guard `app.active`, confirm; MCP `paas_active`; dashboard **Second server → App on
-both servers**) makes an app run on the origin server **and** on the mirror peer, both taking requests.
+both**) makes an app run on the origin server **and** on the mirror peer, both taking requests.
 There is still **one writer**: the origin's Postgres.
 
 - **Readiness** (`activeReadiness`): the app comes from git and has a recorded full commit
@@ -563,6 +563,18 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
   Going back to sleep is the PC's own power settings: nothing puts it to sleep, and a PC whose automatic
   suspend is shorter than the load sleeps with copies on it (the balancer stops sending it visits within
   about 6 s, and it is woken again while its copy is still wanted).
+
+## 10f. Dashboard layout (`src/dashboard.ts`)
+
+One page, three columns: a side menu, the page, and telemetry (host, resources, and a "quick health" box whose lines
+open the page that fixes them). The menu groups pages under Apps, Servers, Integrations and System, collapses to
+icons (`paasmcp_nav_collapsed` in localStorage) and becomes a drawer below 720 px; between 720 and 1240 px it shows icons
+only and the telemetry moves under the page. A page with several parts lists them in `PAGE_SUBS`; each card carries
+`data-sub="<part>"`, and `goTo(tab, part)` shows only that part's cards, marks the folder tab and the nested menu item,
+and writes `#<tab>/<part>` to the URL (back button and bookmarks work). Code that needs a field on another part calls
+`revealEl(id)`, which opens the right page and part first. Menu counters are hidden at zero and their tooltip says
+what is counted (the AI count comes from `mcpToolCount` in `paas_status`). The light theme uses blue-grey tones, not
+white.
 
 ## 11. Environment variables
 

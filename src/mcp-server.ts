@@ -107,6 +107,7 @@ export function getSystemStatusSummary(includeMetrics = true) {
     sshPublicKey: keyInfo.publicKey,
     sshKeyFingerprint: keyInfo.fingerprint,
     systemSecretsConfigured: sysSecrets,
+    mcpToolCount: toolCatalog().tools.length,
     webhookEndpointPath: "/api/webhooks/github",
     webhookSecretMasked: maskSecretValue(getOrCreateWebhookSecret()),
     tailscaleDomain: state.tailscaleDomain,
@@ -188,6 +189,11 @@ async function listToolsFor(level: TokenLevel) {
 }
 
 async function listTools() {
+  return toolCatalog();
+}
+
+/** Every MCP tool this server offers (the panel shows how many). */
+function toolCatalog() {
   return {
     tools: [
       {
