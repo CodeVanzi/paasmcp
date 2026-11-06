@@ -4196,7 +4196,7 @@ volumes:
     fs.rmSync(nightly.NIGHTLY_MARK, { force: true });
   });
 
-  await t.test("51. Health probes from inside the dashboard container go to the app's address on the Docker network", () => {
+  await t.test("51. Health probes from inside the dashboard container go to the app's address on the Docker network", async () => {
     const before = process.env.PAASMCP_IN_DASHBOARD;
     try {
       delete process.env.PAASMCP_IN_DASHBOARD;
@@ -4206,6 +4206,20 @@ volumes:
       assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "fd00::5"), "http://[fd00::5]:3000/");
       assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => ""), "http://127.0.0.1:4005/", "no address on the network (network_mode): falls back");
       assert.equal(deployer.probeUrl("paasmcp-shop", 3000, 4005, "/", () => "evil.example/x?"), "http://127.0.0.1:4005/", "only an IP is used");
+      const storage = await import("./storage.js");
+      const envBefore = { a: process.env.PAASMCP_GARAGE_ADMIN_URL, s: process.env.PAASMCP_GARAGE_S3_URL };
+      delete process.env.PAASMCP_GARAGE_ADMIN_URL;
+      delete process.env.PAASMCP_GARAGE_S3_URL;
+      try {
+        assert.equal(storage.garageAdminUrl(), "http://paasmcp-garage:3903", "Garage admin by name on the Docker network");
+        assert.equal(storage.localS3Url(), "http://paasmcp-garage:3900");
+        delete process.env.PAASMCP_IN_DASHBOARD;
+        assert.equal(storage.garageAdminUrl(), "http://127.0.0.1:3903", "on the host: loopback");
+        assert.equal(storage.localS3Url(), "http://127.0.0.1:3900");
+      } finally {
+        if (envBefore.a !== undefined) process.env.PAASMCP_GARAGE_ADMIN_URL = envBefore.a;
+        if (envBefore.s !== undefined) process.env.PAASMCP_GARAGE_S3_URL = envBefore.s;
+      }
     } finally {
       if (before === undefined) delete process.env.PAASMCP_IN_DASHBOARD; else process.env.PAASMCP_IN_DASHBOARD = before;
     }
