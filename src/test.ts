@@ -4834,7 +4834,7 @@ volumes:
     fs.rmSync(path.join(config.PAAS_DATA_DIR, "owner-test"), { recursive: true, force: true });
   });
 
-  await t.test("58. Vault keys: description and dates, kept encrypted, with built-in text for PaaSMCP's own keys", async () => {
+  await t.test("59. Vault keys: description and dates, kept encrypted, with built-in text for PaaSMCP's own keys", async () => {
     const vm = await import("node:vm");
     const vaultdocs = await import("./vaultdocs.js");
     const scope = "meta-test-app";
