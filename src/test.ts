@@ -4104,6 +4104,33 @@ volumes:
     }
   });
 
+  await t.test("48. App watch: a notice when an app stops on its own (two rounds, not mid-deploy) and when it is back", async () => {
+    const w = await import("./appwatch.js");
+    const none = new Set<string>();
+    let r = w.watchRound(undefined, ["a", "b"], new Set(["a", "b"]), none);
+    assert.deepEqual(r.events, []);
+    // One missed round is a restart, not news; the second one is.
+    r = w.watchRound(r.next, ["a", "b"], new Set(["b"]), none);
+    assert.deepEqual(r.events, []);
+    r = w.watchRound(r.next, ["a", "b"], new Set(["b"]), none);
+    assert.deepEqual(r.events, [{ app: "a", kind: "down" }]);
+    r = w.watchRound(r.next, ["a", "b"], new Set(["b"]), none);
+    assert.deepEqual(r.events, [], "said once");
+    r = w.watchRound(r.next, ["a", "b"], new Set(["a", "b"]), none);
+    assert.deepEqual(r.events, [{ app: "a", kind: "back" }]);
+    // Mid-deploy the old container may be gone for a moment: no count, no notice.
+    r = w.watchRound(r.next, ["a", "b"], new Set(["a"]), new Set(["b"]));
+    r = w.watchRound(r.next, ["a", "b"], new Set(["a"]), new Set(["b"]));
+    assert.deepEqual(r.events, []);
+    // An app stopped from the dashboard is no longer expected, so it never gets a notice.
+    r = w.watchRound(r.next, ["a"], new Set(["a"]), none);
+    r = w.watchRound(r.next, ["a"], new Set(["a"]), none);
+    assert.deepEqual(r.events, []);
+    assert.match(w.watchNoticeText({ app: "loja", kind: "down" }, "pt").text, /loja parou/);
+    assert.match(w.watchNoticeText({ app: "loja", kind: "back" }, "en").text, /loja is running again/);
+    assert.equal(w.DOWN_ROUNDS, 2);
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);
