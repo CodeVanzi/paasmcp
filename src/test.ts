@@ -672,6 +672,19 @@ volumes:
     assert.equal(config.loadState().mirror?.offers["server-b"].peerCidr, "100.64.0.2/32");
     await assert.rejects(mirror.offerMirror({ peerName: "x", peerCidr: "1.2.3.4; rm -rf /", advertiseHost: "h" }), /Invalid --peer-ip/);
 
+    // The slot reserves WAL from the start (two copies accepted at once used to lose a segment),
+    // and an older unreserved, unused slot is made again.
+    const slotSql = mirror.replicationSlotSql("mirror_server_b");
+    assert.match(slotSql[0], /pg_drop_replication_slot.*restart_lsn IS NULL AND NOT active/);
+    assert.match(slotSql[1], /pg_create_physical_replication_slot\('mirror_server_b', true\)/);
+    assert.throws(() => mirror.replicationSlotSql("x'; DROP"), /Invalid replication slot/);
+    // The replication password never goes into docker's argv (a failed command prints its argv).
+    const secret = "f00dfeedcafe0123456789abcdef";
+    const bb = mirror.basebackupCommand({ host: "100.64.0.1", port: 5432, slot: "mirror_server_b", password: secret }, "/tmp/x", "postgres:16");
+    assert.ok(!bb.args.join(" ").includes(secret), "password must not be in argv");
+    assert.equal(bb.args[bb.args.indexOf("-e") + 1], "PGPASSWORD");
+    assert.equal(bb.env.PGPASSWORD, secret);
+
     const accepted = mirror.acceptMirror(offer.token);
     assert.equal(accepted.replica.container, `paasmcp-mirror-${accepted.replica.peerName}`);
     assert.throws(() => mirror.acceptMirror(offer.token.slice(0, -4) + "AAAA"), /could not be decrypted/);
