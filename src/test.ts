@@ -4916,5 +4916,78 @@ volumes:
     }
   });
 
+  await t.test("60. MCP covers the dashboard's newer screens, with the same levels and confirmations", async () => {
+    const mcp = await import("./mcp-server.js");
+    const call = async (tool: string, args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => (await mcp.handleToolCall(tool, args, level)).content[0].text;
+    const callJson = async (tool: string, args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => JSON.parse(await call(tool, args, level));
+
+    const all = (await mcp.listToolsFor("destroy")).tools.map((x) => x.name);
+    for (const n of ["paas_app_templates", "paas_connections", "paas_usage", "paas_pcs"]) assert.ok(all.includes(n), n);
+    const readNames = (await mcp.listToolsFor("read")).tools.map((x) => x.name);
+    for (const n of ["paas_usage", "paas_connections", "paas_pcs"]) assert.ok(readNames.includes(n), `read lists ${n}`);
+    assert.equal(readNames.includes("paas_app_templates"), false);
+
+    // Ready-made apps: the list is free, publishing needs a deploy token.
+    const tl = await callJson("paas_app_templates", { action: "list" }, "deploy");
+    assert.ok(tl.templates.some((x: { id: string }) => x.id === "uptime-kuma"));
+    assert.match(await call("paas_app_templates", { action: "deploy", id: "uptime-kuma" }, "read"), /read-only tools/);
+
+    // An app from a repository: redeploy, auto-publish and taking an address off the air.
+    const st = config.loadState();
+    const base = Object.values(st.apps)[0];
+    st.apps["mcp-new"] = { ...base, name: "mcp-new", repoUrl: "acme/mcp-new", branch: "main", trashedAt: undefined, autoDeploy: undefined, domains: [{ hostname: "new.example.com", mode: "public", url: "https://new.example.com" }] };
+    st.databases["mcp-new-postgres"] = { name: "mcp-new-postgres", engine: "postgres", appName: "mcp-new" } as (typeof st.databases)[string];
+    config.saveState(st);
+    assert.match(await call("paas_app_lifecycle", { appName: "nobody-here", action: "redeploy" }, "deploy"), /not found/);
+    assert.equal((await callJson("paas_app_lifecycle", { appName: "mcp-new", action: "autodeploy_on" }, "deploy")).autoDeploy, "poll");
+    assert.equal(config.loadState().apps["mcp-new"].autoDeploy, "poll");
+    assert.equal((await callJson("paas_app_lifecycle", { appName: "mcp-new", action: "autodeploy_off" }, "deploy")).autoDeploy, undefined);
+    assert.match(await call("paas_app_lifecycle", { appName: "mcp-new", action: "unexpose" }, "destroy"), /'hostname' is required/);
+    assert.match(await call("paas_app_lifecycle", { appName: "mcp-new", action: "unexpose", hostname: "new.example.com" }, "deploy"), /level 'destroy'/);
+    const unexpose = await callJson("paas_app_lifecycle", { appName: "mcp-new", action: "unexpose", hostname: "new.example.com" }, "destroy");
+    assert.equal(unexpose.confirmationRequired, true);
+    assert.equal(config.loadState().apps["mcp-new"].domains.length, 1, "nothing changes before a person approves");
+
+    // Usage: reading is free, the warning size needs deploy; 0 clears it.
+    assert.match(await call("paas_usage", { action: "db_limit", name: "mcp-new-postgres", sizeMb: 500 }, "read"), /level 'deploy'/);
+    assert.equal((await callJson("paas_usage", { action: "db_limit", name: "mcp-new-postgres", sizeMb: 500 }, "deploy")).warnSizeMb, 500);
+    const us = await callJson("paas_usage", { days: 0 }, "read");
+    assert.equal(us.warnSizeMb["mcp-new-postgres"], 500);
+    assert.deepEqual(us.dailyHistory, []);
+    assert.equal((await callJson("paas_usage", { action: "db_limit", name: "mcp-new-postgres", sizeMb: 0 }, "deploy")).warnSizeMb, null);
+
+    // Connections: a summary without tokens; changes need deploy; webhooks only for app repositories.
+    vault.setSecretEntries("system", { GITHUB_TOKEN: "github_pat_" + "z".repeat(40) });
+    const conn = await call("paas_connections", { action: "status" }, "read");
+    assert.equal(JSON.parse(conn).github.tokenSaved, true);
+    assert.equal(conn.includes("zzzzzzzz"), false, "the token never comes back");
+    assert.match(await call("paas_connections", { action: "notify_set", url: "https://ntfy.sh/x" }, "read"), /level 'deploy'/);
+    assert.match(await call("paas_connections", { action: "webhook_on", repo: "someone/else", address: "https://painel.example.com" }, "deploy"), /No app here/);
+    vault.deleteSecretKey("system", "GITHUB_TOKEN");
+
+    // Judge and arbiter: stopping the judge needs a person; a bad arbiter address is refused.
+    assert.match(await call("paas_mirror", { action: "judge_stop" }, "deploy"), /level 'destroy'/);
+    assert.equal((await callJson("paas_mirror", { action: "judge_stop" }, "destroy")).confirmationRequired, true);
+    assert.match(await call("paas_mirror", { action: "arbiter_set", url: "http://100.64.0.9:4097" }, "deploy"), /level 'destroy'/);
+    assert.equal((await callJson("paas_mirror", { action: "arbiter_pair", host: "100.64.0.9", code: "123456" }, "destroy")).confirmationRequired, true);
+    assert.match(await call("paas_connections", { action: "github_repos" }, "read"), /level 'deploy'/);
+    assert.match(await call("paas_mirror", { action: "handback" }, "destroy"), /'peer' is required/);
+
+    // E-mail relay: status never shows the password; scale diary language needs deploy.
+    assert.ok("relay" in (await callJson("paas_email_provision", { action: "status" }, "deploy")));
+    assert.match(await call("paas_email_provision", { action: "test", to: "not an email" }, "deploy"), /Invalid recipient/);
+    assert.match(await call("paas_scale", { action: "language", language: "en" }, "read"), /level 'deploy'/);
+    assert.equal((await callJson("paas_scale", { action: "language", language: "pt" }, "deploy")).language, "pt");
+    const off = await callJson("paas_db_backup", { action: "offsite_status" }, "deploy");
+    assert.equal(typeof off.target.configured, "boolean");
+    assert.ok(Array.isArray(off.grants));
+    assert.equal(/secretAccessKey/i.test(JSON.stringify(off)), false);
+
+    const s2 = config.loadState();
+    delete s2.apps["mcp-new"];
+    delete s2.databases["mcp-new-postgres"];
+    config.saveState(s2);
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
