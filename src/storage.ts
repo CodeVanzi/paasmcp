@@ -166,11 +166,41 @@ export async function ensureBucketWithImportedKey(bucket: string, accessKeyId: s
   });
 }
 
-export async function provisionStorage(appName: string): Promise<{ record: StorageRecord; injectedKeys: string[]; reused: boolean }> {
+export const APP_S3_KEYS = ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION", "AWS_ENDPOINT_URL_S3", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"];
+
+/** True when the app's files live in this server's Garage (the mirror copies those; another provider needs nothing). */
+export function usesLocalGarage(env: Record<string, string>): boolean {
+  return Boolean(env.S3_BUCKET) && (!env.S3_ENDPOINT || env.S3_ENDPOINT === GARAGE_INTERNAL_ENDPOINT);
+}
+
+/** S3_* for code that reads it explicitly; AWS_* so boto3 / AWS SDKs pick it up with no code. */
+export function appS3Variables(v: { endpoint: string; bucket: string; accessKeyId: string; secretAccessKey: string; region: string }): Record<string, string> {
+  return {
+    S3_ENDPOINT: v.endpoint,
+    S3_BUCKET: v.bucket,
+    S3_ACCESS_KEY_ID: v.accessKeyId,
+    S3_SECRET_ACCESS_KEY: v.secretAccessKey,
+    S3_REGION: v.region,
+    AWS_ENDPOINT_URL_S3: v.endpoint,
+    AWS_ACCESS_KEY_ID: v.accessKeyId,
+    AWS_SECRET_ACCESS_KEY: v.secretAccessKey,
+    AWS_REGION: v.region,
+  };
+}
+
+/**
+ * A bucket on this server's Garage for the app. An app whose files are at another provider keeps them
+ * there unless `replaceExternal` (the dashboard asks the person first, guard `storage.app.replace`).
+ */
+export async function provisionStorage(appName: string, opts: { replaceExternal?: boolean } = {}): Promise<{ record: StorageRecord; injectedKeys: string[]; reused: boolean }> {
   const slug = sanitizeSlug(appName);
   const existing = loadState().storage?.[slug];
-  const keys = ["S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION", "AWS_ENDPOINT_URL_S3", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"];
-  if (existing && getSecrets(slug).S3_SECRET_ACCESS_KEY) {
+  const keys = APP_S3_KEYS;
+  const external = Boolean(existing?.provider && existing.provider !== "garage");
+  if (existing && external && !opts.replaceExternal) {
+    throw new Error(`App '${slug}' keeps its files at ${existing.host || existing.provider} (bucket ${existing.bucket}). Change it in the dashboard (App files) if you want this server's storage instead.`);
+  }
+  if (existing && !external && getSecrets(slug).S3_SECRET_ACCESS_KEY) {
     return { record: existing, injectedKeys: keys, reused: true };
   }
 
@@ -178,18 +208,7 @@ export async function provisionStorage(appName: string): Promise<{ record: Stora
   const { bucketId, ...key } = await createBucketWithKey(bucket, `paasmcp-${slug}`);
   const bucketInfo = { id: bucketId };
 
-  // S3_* for code that reads it explicitly; AWS_* so boto3 / AWS SDKs pick it up with no code.
-  setSecretEntries(slug, {
-    S3_ENDPOINT: GARAGE_INTERNAL_ENDPOINT,
-    S3_BUCKET: bucket,
-    S3_ACCESS_KEY_ID: key.accessKeyId,
-    S3_SECRET_ACCESS_KEY: key.secretAccessKey,
-    S3_REGION: GARAGE_REGION,
-    AWS_ENDPOINT_URL_S3: GARAGE_INTERNAL_ENDPOINT,
-    AWS_ACCESS_KEY_ID: key.accessKeyId,
-    AWS_SECRET_ACCESS_KEY: key.secretAccessKey,
-    AWS_REGION: GARAGE_REGION,
-  });
+  setSecretEntries(slug, appS3Variables({ endpoint: GARAGE_INTERNAL_ENDPOINT, bucket, accessKeyId: key.accessKeyId, secretAccessKey: key.secretAccessKey, region: GARAGE_REGION }));
 
   const record: StorageRecord = {
     appName: slug,

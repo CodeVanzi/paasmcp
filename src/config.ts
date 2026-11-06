@@ -229,9 +229,14 @@ export interface BackupRecord {
 export interface StorageRecord {
   appName: string;
   bucket: string;
+  /** Garage bucket id; empty for a bucket at another provider. */
   bucketId: string;
   accessKeyId: string;
   createdAt: string;
+  /** Absent (or "garage") = this server's Garage; otherwise the person's own account (offsite.ts providers). */
+  provider?: string;
+  /** Host of the provider's S3 address (no secret), for the screens. */
+  host?: string;
 }
 
 /** A revocable key another computer uses to send its backups into a bucket on this server (offsite.ts). */

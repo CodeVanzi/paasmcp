@@ -483,7 +483,7 @@ function toolCatalog() {
       {
         name: "paas_storage_provision",
         description:
-          "Gives an app its own S3-compatible bucket on this server (Garage, started on first use) with a dedicated access key. Injects S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION and the AWS_* equivalents into the app's vault (redeploy the app to load them). Idempotent: calling again returns the existing bucket.",
+          "Gives an app its own S3-compatible bucket on this server (Garage, started on first use) with a dedicated access key. Injects S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_REGION and the AWS_* equivalents into the app's vault (redeploy the app to load them). Idempotent: calling again returns the existing bucket. An app whose files are at the person's own account (set in the dashboard) is left as it is.",
         inputSchema: {
           type: "object",
           properties: {

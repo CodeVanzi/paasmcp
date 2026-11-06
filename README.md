@@ -236,6 +236,8 @@ paasmcp email provision my-saas --from-name "My SaaS"
 
 # S3 bucket + key for an app on this server (Garage); redeploy to load S3_* / AWS_*
 paasmcp storage provision my-saas
+# Or the app's files at your own account (R2, S3, Google, B2, Wasabi, MinIO): in the dashboard, tick
+# "Create file space" when publishing (or App files) and pick the provider; the same S3_* / AWS_* go in.
 
 # Off-site copies: pick the provider and paste only its fields (dashboard: Databases > Off-server
 # backups). The destination is tested (write, read, delete a small file) before it is saved.

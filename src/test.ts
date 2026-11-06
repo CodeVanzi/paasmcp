@@ -3846,6 +3846,56 @@ volumes:
     }
   });
 
+  await t.test("43. App files at the person's own account: tested, same variables, guarded switch, never copied by the mirror", async () => {
+    const offsite = await import("./offsite.js");
+    const storage = await import("./storage.js");
+    const guard = await import("./guard.js");
+    const http = await import("node:http");
+    const store = new Map<string, Buffer>();
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        if (!/Credential=AKAPP\//.test(String(req.headers.authorization))) return res.writeHead(403).end();
+        if (req.method === "PUT") store.set(req.url!, Buffer.concat(chunks));
+        if (req.method === "DELETE") { store.delete(req.url!); return res.writeHead(204).end(); }
+        const f = store.get(req.url!);
+        if (req.method === "GET" && !f) return res.writeHead(404).end();
+        res.writeHead(200).end(req.method === "GET" ? f : undefined);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const endpoint = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const human = (confirmed: boolean) => (params: Record<string, unknown>) => guard.authorizeHuman("storage.app.replace", params, { confirmed, by: "test" });
+    try {
+      await assert.rejects(offsite.useExternalStorage("fotos-ext", { provider: "custom", endpoint, bucket: "fotos", accessKeyId: "NOPE", secretAccessKey: "abcdefghij" }, human(false)), /key was refused/);
+      assert.equal(vault.getSecrets("fotos-ext").S3_BUCKET, undefined, "nothing written when the test fails");
+      const r = await offsite.useExternalStorage("Fotos Ext", { provider: "custom", endpoint, bucket: "fotos", accessKeyId: "AKAPP", secretAccessKey: "abcdefghij" }, human(false));
+      const env = vault.getSecrets("fotos-ext");
+      assert.equal(env.S3_ENDPOINT, endpoint);
+      assert.equal(env.AWS_ENDPOINT_URL_S3, endpoint);
+      assert.equal(env.S3_SECRET_ACCESS_KEY, "abcdefghij");
+      assert.equal(env.AWS_REGION, "us-east-1");
+      assert.equal(r.record.provider, "custom");
+      assert.equal(r.record.bucketId, "");
+      assert.ok(!JSON.stringify(config.loadState().storage).includes("abcdefghij"), "secret only in the vault");
+      assert.equal(store.size, 0, "test file removed");
+      // The mirror only copies buckets that live in this server's Garage.
+      assert.equal(storage.usesLocalGarage(env), false);
+      assert.equal(storage.usesLocalGarage({ S3_BUCKET: "app-x", S3_ENDPOINT: storage.GARAGE_INTERNAL_ENDPOINT }), true);
+      // An agent or the CLI cannot silently move it back to this server.
+      await assert.rejects(storage.provisionStorage("fotos-ext"), /keeps its files at/);
+      // Another bucket for the same app is confirmed; the same one again is not.
+      await assert.rejects(offsite.useExternalStorage("fotos-ext", { provider: "custom", endpoint, bucket: "fotos-2", accessKeyId: "AKAPP", secretAccessKey: "abcdefghij" }, human(false)), guard.ConfirmationRequiredError);
+      await offsite.useExternalStorage("fotos-ext", { provider: "custom", endpoint, bucket: "fotos", accessKeyId: "AKAPP", secretAccessKey: "abcdefghij" }, human(false));
+    } finally {
+      srv.close();
+      const st = config.loadState();
+      delete st.storage?.["fotos-ext"];
+      config.saveState(st);
+    }
+  });
+
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {
     const dir = path.join(config.PAAS_DATA_DIR, "owner-test", "a", "b");
     config.ensureDataDir(dir);

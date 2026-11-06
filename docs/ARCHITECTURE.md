@@ -271,6 +271,11 @@ There is still **one writer**: the origin's Postgres.
 
 - **Storage:** one Garage node per server; `paas_storage_provision` creates a bucket and a key per app and
   injects both `S3_*` and `AWS_*` variables (boto3 and the AWS SDKs work without code changes).
+  `useExternalStorage` (offsite.ts) does the same with the person's own account (any provider of the
+  off-site picker), tested first; the record keeps `provider` + `host`, the secret stays in the vault.
+  Switching an app's storage is guard `storage.app.replace`; `provisionStorage` refuses to replace an
+  external bucket unless the dashboard passes `replaceExternal` after that confirmation. The mirror and
+  active-active only copy buckets in this server's Garage (`usesLocalGarage`).
 - **Email:** one relay (Brevo, SES, Mailgun...) configured once in the `system` vault; `paas_email_provision`
   injects `SMTP_*`, `EMAIL_URL` and `DEFAULT_FROM_EMAIL`. The built-in test client refuses to send the
   password without TLS.

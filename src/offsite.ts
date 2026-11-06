@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
-import { BackupGrantRecord, loadState, sanitizeSlug, saveState, tailnetBindIp } from "./config.js";
+import { BackupGrantRecord, loadState, sanitizeSlug, saveState, StorageRecord, tailnetBindIp } from "./config.js";
 import { getOffsiteConfig, OffsiteConfig, s3Request } from "./backup.js";
-import { createBucketWithKey, ensureGarage, GARAGE_INTERNAL_ENDPOINT, GARAGE_REGION, garageAdmin } from "./storage.js";
+import { APP_S3_KEYS, appS3Variables, createBucketWithKey, ensureGarage, GARAGE_INTERNAL_ENDPOINT, GARAGE_REGION, garageAdmin } from "./storage.js";
 import { deleteSecretKey, getSecrets, setSecretEntries } from "./vault.js";
 
 /**
@@ -450,4 +450,44 @@ export async function listBackupGrants() {
       return { ...g, bytes };
     })
   );
+}
+
+// ---------------------------------------------------------------------------
+// An app's files at the person's own account (R2, S3...), instead of this server's Garage
+// ---------------------------------------------------------------------------
+
+/**
+ * Tests the account (write, read, delete a small file) and puts the same S3_* / AWS_* variables a
+ * Garage bucket would into the app's vault, so the app's code does not change. The secret goes only
+ * to the vault. Replacing the app's current storage is confirmed (guard `storage.app.replace`).
+ */
+export async function useExternalStorage(appName: string, input: OffsiteInput, authorize: (params: Record<string, unknown>) => void | Promise<void>) {
+  const slug = sanitizeSlug(appName);
+  if (!slug) throw fail("Fill in the app name first.", "Preencha o nome do app primeiro.");
+  const target = buildOffsiteTarget({ ...input, prefix: "paasmcp-check" });
+  const before = loadState().storage?.[slug];
+  const host = new URL(target.endpoint).host;
+  const replacing = Boolean(before && (before.bucket !== target.bucket || (before.host || "garage") !== host));
+  const test = await testOffsiteTarget(target);
+  await authorize({
+    appName: slug,
+    replacing,
+    target: describe(target),
+    previous: before ? (before.provider && before.provider !== "garage" ? `${before.bucket} @ ${before.host}` : `this server (${before.bucket})`) : "",
+    previousPt: before ? (before.provider && before.provider !== "garage" ? `${before.bucket} @ ${before.host}` : `este servidor (${before.bucket})`) : "",
+  });
+  setSecretEntries(slug, appS3Variables(target));
+  const record: StorageRecord = {
+    appName: slug,
+    bucket: target.bucket,
+    bucketId: "",
+    accessKeyId: target.accessKeyId,
+    createdAt: new Date().toISOString(),
+    provider: target.provider,
+    host,
+  };
+  const s = loadState();
+  s.storage = { ...(s.storage || {}), [slug]: record };
+  saveState(s);
+  return { record, injectedKeys: APP_S3_KEYS, test };
 }

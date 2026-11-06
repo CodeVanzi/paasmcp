@@ -196,6 +196,14 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `As cópias vão passar a ir para ${String(params.target)} em vez de ${String(params.previous)}. O que já foi enviado continua lá; este servidor só para de mandar cópias novas para lá.`,
         params);
     }
+    case "storage.app.replace": {
+      // Free the first time; changing where an app keeps its files is confirmed (files are not copied).
+      if (!params.replacing) return null;
+      return risk(action, subject, "confirm",
+        `App '${subject}' will keep its files at ${String(params.target)} instead of ${String(params.previous)}. Files already stored are not copied. Redeploy the app to load the new variables.`,
+        `O app '${subject}' vai guardar os arquivos em ${String(params.targetPt || params.target)} em vez de ${String(params.previousPt || params.previous)}. Os arquivos que já estão lá não são copiados. Reimplante o app para ele ler as variáveis novas.`,
+        params);
+    }
     case "storage.public":
       return risk(action, String(params.hostname), "confirm",
         `This server's S3 API (Garage; not its admin API, not the databases) will answer at https://${String(params.hostname)} through the Cloudflare tunnel. No port is opened and your IP stays hidden. Every request needs a valid key, and each key only reaches its own bucket.`,

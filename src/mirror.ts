@@ -21,7 +21,7 @@ import { bucketTargets } from "./active.js";
 import { syncBucket } from "./filesync.js";
 import { audit } from "./guard.js";
 import { exposeApplication } from "./exposure.js";
-import { createBucketWithKey } from "./storage.js";
+import { createBucketWithKey, usesLocalGarage } from "./storage.js";
 import { imageFor } from "./updater.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, setSecretEntries } from "./vault.js";
 
@@ -527,7 +527,7 @@ export async function handbackMirror(
   if (!OFFLINE()) {
     for (const app of stoppedApps) {
       const env = getSecrets(app);
-      if (!loadState().apps[app]?.activeActive || !env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
+      if (!loadState().apps[app]?.activeActive || !usesLocalGarage(env) || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
       try {
         const t = bucketTargets(rec, env);
         const r = await syncBucket(t.local, t.origin, "additive");
