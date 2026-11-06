@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { AppRecord, ensureDataDir, PAAS_DATA_DIR, sanitizeSlug, writeFileAtomic } from "./config.js";
 import { DASHBOARD_APP_NAME } from "./guard.js";
+import { notifyDeploy } from "./notify.js";
 import { readFollow } from "./selfupdate.js";
 
 // Deploy progress, readable while a deploy runs. Deploys start in several processes (dashboard,
@@ -183,6 +184,7 @@ function trackerFor(run: DeployRun): DeployTracker {
       run.finishedAt = new Date().toISOString();
       if (warning) run.warning = cleanText(redactCredentials(warning), 500);
       touch();
+      void notifyDeploy({ app: run.app, trigger: run.trigger, ok: true, commit: run.commit?.sha });
     },
     fail(err) {
       clearInterval(heartbeat);
@@ -192,6 +194,7 @@ function trackerFor(run: DeployRun): DeployTracker {
       run.error = cleanText(redactCredentials(message.split("\n")[0]), 300);
       run.log = logTail(message.split("\n").slice(1).join("\n"));
       touch();
+      void notifyDeploy({ app: run.app, trigger: run.trigger, ok: false, commit: run.commit?.sha, error: run.error });
     },
   };
 }
