@@ -13,6 +13,7 @@ export type DeployFailureKind =
   | "build"
   | "network"
   | "trash"
+  | "name"
   | "other";
 
 /** Where the dashboard can send the person to fix it. */
@@ -27,6 +28,7 @@ export function explainDeployError(err: unknown): DeployFailure {
   if (err instanceof HealthcheckFailedError) return { kind: "healthcheck", action: "options" };
   const msg = err instanceof Error ? err.message : String(err);
   if (/is in the trash/i.test(msg)) return { kind: "trash", action: "trash" };
+  if (/already exists with other code/i.test(msg)) return { kind: "name" };
   if (/Could not resolve host|Temporary failure in name resolution|Network is unreachable|Connection timed out/i.test(msg)) {
     return { kind: "network" };
   }

@@ -3996,6 +3996,7 @@ volumes:
       [new Error("Command failed: docker build -t x . (exit 1)\nnpm ERR! missing script: build"), "build", undefined],
       [new Error("fatal: unable to access 'https://github.com/a/b.git/': Could not resolve host: github.com"), "network", undefined],
       [new Error("App 'shop' is in the trash. Restore it (action 'restore') or purge it before deploying again."), "trash", "trash"],
+      [new Error("An app named 'x' already exists with other code. Pick another name."), "name", undefined],
       [new Error("something else"), "other", undefined],
     ];
     for (const [err, kind, action] of cases) {
@@ -4036,6 +4037,24 @@ volumes:
       const data = (await res.json()) as { error: string; failure: { kind: string } };
       assert.equal(res.status, 422);
       assert.ok(data.error && data.failure && typeof data.failure.kind === "string");
+      // Ready-made apps (test 49 covers the files): the list, and a name that is taken is refused untouched.
+      const tpl = await import("./templates.js");
+      const st0 = config.loadState();
+      st0.apps["tpl-taken"] = { ...(Object.values(st0.apps)[0] || {}), name: "tpl-taken", repoUrl: "someone/else" } as never;
+      config.saveState(st0);
+      try {
+        const list = (await (await fetch(`${baseUrl}/api/templates`, { headers: { cookie } })).json()) as { templates: Array<{ id: string }> };
+        assert.equal(list.templates.length, tpl.TEMPLATES.length);
+        const tres = await fetch(`${baseUrl}/api/templates/deploy`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify({ id: "it-tools", appName: "tpl-taken" }) });
+        assert.equal(tres.status, 422);
+        assert.equal(((await tres.json()) as { failure: { kind: string } }).failure.kind, "name");
+        assert.equal(config.loadState().apps["tpl-taken"].repoUrl, "someone/else", "the existing app is untouched");
+        for (const t0 of tpl.TEMPLATES) for (const k of [`tpl_${t0.id}`, `tpl_${t0.id}Desc`]) twice(k);
+      } finally {
+        const st1 = config.loadState();
+        delete st1.apps["tpl-taken"];
+        config.saveState(st1);
+      }
     } finally {
       dsrv.close();
     }
@@ -4129,6 +4148,23 @@ volumes:
     assert.match(w.watchNoticeText({ app: "loja", kind: "down" }, "pt").text, /loja parou/);
     assert.match(w.watchNoticeText({ app: "loja", kind: "back" }, "en").text, /loja is running again/);
     assert.equal(w.DOWN_ROUNDS, 2);
+  });
+
+  await t.test("49. Ready-made apps: pinned images, data in a named volume, and a name that is taken is refused", async () => {
+    const tpl = await import("./templates.js");
+    const YAMLmod = (await import("yaml")).default;
+    for (const t0 of tpl.TEMPLATES) {
+      assert.match(t0.image, /^[a-z0-9./-]+:[A-Za-z0-9._-]+$/, `${t0.id} has an exact tag`);
+      assert.ok(!/:latest$|:\d+$/.test(t0.image), `${t0.id} is not on a moving tag`);
+      const doc = YAMLmod.parse(tpl.templateCompose(t0));
+      assert.deepEqual(Object.keys(doc.services), ["app"]);
+      assert.deepEqual(doc.services.app.ports, [String(t0.port)], "only the container port: PaaSMCP binds it to 127.0.0.1");
+      if (t0.dataPath) assert.deepEqual(doc.services.app.volumes, [`data:${t0.dataPath}`]);
+    }
+    assert.throws(() => tpl.findTemplate("../etc"), /Unknown ready-made app/);
+    const { dir } = tpl.prepareTemplate("it-tools");
+    assert.ok(fs.existsSync(path.join(dir, "docker-compose.yml")));
+    assert.ok(dir.startsWith(tpl.TEMPLATES_DIR));
   });
 
   await t.test("ensureDataDir creates nested data folders, private, and is a no-op when they exist", () => {

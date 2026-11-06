@@ -15,6 +15,7 @@ import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, listGitHubRepos, saveCloudflare } from "./connections.js";
 import { explainDeployError } from "./deployhelp.js";
+import { prepareTemplate, TEMPLATES } from "./templates.js";
 import { clearNotify, NotifyError, notifySummary, saveNotify } from "./notify.js";
 import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
@@ -571,6 +572,32 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             memoryLimit: body.memoryLimit ? String(body.memoryLimit) : undefined,
             cpuLimit: body.cpuLimit ? String(body.cpuLimit) : undefined,
             });
+          } catch (err) {
+            return deployFailed(err);
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
+        // Ready-made apps: a pinned compose file written by PaaSMCP, published like a local folder.
+        if (pathname === "/api/templates" && req.method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ templates: TEMPLATES }));
+          return true;
+        }
+        if (pathname === "/api/templates/deploy" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const { dir, template } = prepareTemplate(String(body.id || ""));
+          const appName = sanitizeSlug(String(body.appName || template.id));
+          // Never replace an app that came from somewhere else (a repository, the dashboard itself).
+          const existing = loadState().apps[appName];
+          if (existing && existing.repoUrl !== dir) {
+            return deployFailed(new Error(`An app named '${appName}' already exists with other code. Pick another name.`));
+          }
+          let result;
+          try {
+            result = await deployApp({ appName, repoSource: dir, branch: "main", trigger: "dashboard" });
           } catch (err) {
             return deployFailed(err);
           }
@@ -1225,6 +1252,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
     .dep-pick { margin: -4px 0 14px; max-width: 520px; }
     .nt-list { margin: 0 0 12px; padding-left: 18px; }
+    .tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+    .tpl-item { border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+    .tpl-item strong { font-size: 13.5px; }
+    .tpl-item p { margin: 0; color: var(--muted); flex: 1; }
+    .tpl-item .tpl-row { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
     .nt-list li { margin-bottom: 4px; }
     .dep-result { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 720px; }
     .dep-result.ok { background: var(--success-soft); }
@@ -2306,6 +2338,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </details>
               <button onclick="deployNewApp()" id="btnDeploy">🚀 Publicar</button>
               <div id="depResult"></div>
+            </div>
+
+            <div class="card" data-sub="deploy">
+              <div class="card-header">
+                <h2 data-i18n="tplTitle"></h2>
+                <p class="card-desc" data-i18n="tplDesc"></p>
+              </div>
+              <div id="tplList" class="tpl-grid"></div>
+              <div id="tplResult"></div>
             </div>
 
             <div class="card" data-sub="expose">
@@ -5105,6 +5146,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "dfh_network": "Confira a conexão do servidor e tente de novo em alguns minutos.",
       "df_trash": "Esse app está na lixeira.",
       "dfh_trash": "Restaure ou apague de vez na lista Seus apps antes de publicar com esse nome.",
+      "df_name": "Já existe um app com esse nome.",
+      "dfh_name": "Escolha outro nome. O app que já existe continua como está.",
       "df_other": "Não deu para publicar.",
       "dfh_other": "O erro está nos detalhes. Se não ficar claro, o Diagnóstico confere o servidor.",
       "dfDetails": "Detalhes técnicos",
@@ -5136,6 +5179,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "dfh_network": "Check the server's connection and try again in a few minutes.",
       "df_trash": "This app is in the trash.",
       "dfh_trash": "Restore it or delete it for good in Your apps before publishing with this name.",
+      "df_name": "An app with this name already exists.",
+      "dfh_name": "Pick another name. The existing app stays as it is.",
       "df_other": "Could not publish.",
       "dfh_other": "The error is in the details. If it is not clear, Diagnostics checks the server.",
       "dfDetails": "Technical details",
@@ -5310,6 +5355,76 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "tut_alerts": "Get a notice when something fails",
       "tut_alertsDesc": "On your phone (ntfy), Discord or Slack."
     });
+
+    Object.assign(I18N.pt, {
+      "tplTitle": "📦 Apps prontos",
+      "tplDesc": "Sem repositório: escolha um app conhecido e o painel instala a versão testada, com os dados guardados entre atualizações.",
+      "tpl_uptime-kuma": "Uptime Kuma",
+      "tpl_uptime-kumaDesc": "Vigia seus sites e serviços e avisa quando algum cai.",
+      "tpl_memos": "Memos",
+      "tpl_memosDesc": "Anotações rápidas e privadas, como um Twitter só seu.",
+      "tpl_it-tools": "IT Tools",
+      "tpl_it-toolsDesc": "Dezenas de ferramentas úteis no navegador: gerar senhas, converter formatos, QR code.",
+      "tplInstall": "Instalar",
+      "tplInstalling": "Instalando...",
+      "tplSite": "Site do projeto",
+      "tplNamePrompt": "Nome do app (letras minúsculas, números e hífen):",
+      "tplFirstAdmin": "Atenção: na primeira visita, quem abrir cria a conta de administrador. Crie a sua logo, ou dê o endereço “Só e-mails autorizados”."
+    });
+    Object.assign(I18N.en, {
+      "tplTitle": "📦 Ready-made apps",
+      "tplDesc": "No repository needed: pick a well-known app and the dashboard installs the tested version, with its data kept across updates.",
+      "tpl_uptime-kuma": "Uptime Kuma",
+      "tpl_uptime-kumaDesc": "Watches your sites and services and tells you when one goes down.",
+      "tpl_memos": "Memos",
+      "tpl_memosDesc": "Quick private notes, like a Twitter of your own.",
+      "tpl_it-tools": "IT Tools",
+      "tpl_it-toolsDesc": "Dozens of handy browser tools: password generator, format converters, QR codes.",
+      "tplInstall": "Install",
+      "tplInstalling": "Installing...",
+      "tplSite": "Project site",
+      "tplNamePrompt": "App name (lowercase letters, numbers and hyphens):",
+      "tplFirstAdmin": "Heads up: on the first visit, whoever opens it creates the admin account. Create yours right away, or give it the “Authorized emails only” address."
+    });
+
+    let tplData = null;
+    async function renderTemplates() {
+      const box = document.getElementById('tplList');
+      if (!box) return;
+      if (!tplData) {
+        const res = await fetch('/api/templates');
+        if (!res.ok) return;
+        tplData = (await res.json()).templates || [];
+      }
+      box.innerHTML = tplData.map(function (tp) {
+        return '<div class="tpl-item"><strong>' + esc(t('tpl_' + tp.id) || tp.id) + '</strong><p>' + esc(t('tpl_' + tp.id + 'Desc')) + '</p>' +
+          '<div class="tpl-row"><a href="' + esc(tp.homepage) + '" target="_blank" rel="noopener noreferrer">' + esc(t('tplSite')) + ' ↗</a>' +
+          '<button class="secondary" data-tpl="' + esc(tp.id) + '" onclick="installTemplate(this.dataset.tpl, this)">' + esc(t('tplInstall')) + '</button></div></div>';
+      }).join('');
+    }
+    async function installTemplate(id, btn) {
+      const tp = (tplData || []).find(function (x) { return x.id === id; });
+      if (!tp) return;
+      const name = (prompt(t('tplNamePrompt'), id) || '').trim().toLowerCase();
+      if (!name) return;
+      const box = document.getElementById('tplResult');
+      box.innerHTML = '';
+      const label = btn.textContent;
+      btn.textContent = t('tplInstalling');
+      btn.disabled = true;
+      try {
+        setTimeout(pollDeploys, 800);
+        const res = await fetch('/api/templates/deploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, appName: name }) });
+        const data = await res.json().catch(function () { return {}; });
+        if (!res.ok && !data.failure && !data.error) data.error = 'HTTP ' + res.status;
+        box.innerHTML = deployResultHtml(res.ok, name, data) + (res.ok && tp.firstVisitAdmin ? '<p class="ofs-note" style="margin-top:8px;">⚠️ ' + esc(t('tplFirstAdmin')) + '</p>' : '');
+        if (res.ok) { showToast(t('toastDeployDone') + name); loadAll(); }
+        box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } finally {
+        btn.textContent = label;
+        btn.disabled = false;
+      }
+    }
 
     function esc(str) {
       return String(str ?? '')
@@ -5648,6 +5763,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       renderHome();
       renderExposeHint();
       renderRepoPick();
+      renderTemplates();
       const search = document.getElementById('appSearchInput');
       if (search) search.placeholder = t('appSearch');
       renderAi();
