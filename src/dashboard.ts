@@ -67,6 +67,7 @@ import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js
 import { startPollLoop } from "./pollloop.js";
 import { startAppWatch } from "./appwatch.js";
 import { startNightlyLoop } from "./nightly.js";
+import { readDbHistory, readLatestUsage, setDatabaseLimit, startUsageLoop, usageRoundOnce } from "./usage.js";
 import {
   deleteSecretKey,
   getSecrets,
@@ -389,6 +390,27 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/resources" && req.method === "GET") {
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           res.end(JSON.stringify(resourceSnapshot(true)));
+          return true;
+        }
+
+        // Database sizes and their growth (Databases page), plus the disk split; refresh measures now.
+        // GET (outside the state lock): ?refresh=1 measures now instead of showing the last round.
+        if (pathname === "/api/usage" && req.method === "GET") {
+          // Measuring walks folders: at most once every 30 s, whoever asks.
+          const prev = readLatestUsage();
+          const age = prev ? Date.now() - Date.parse(prev.measuredAt) : Infinity;
+          if (url.searchParams.get("refresh") === "1" && !(age < 30_000)) await usageRoundOnce();
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ latest: readLatestUsage(), history: readDbHistory() }));
+          return true;
+        }
+        if (pathname === "/api/databases/limit" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const raw = body.sizeMb;
+          const sizeMb = raw === null || raw === "" || raw === undefined ? null : Number(raw);
+          const rec = setDatabaseLimit(String(body.name || ""), sizeMb);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ name: rec.name, warnSizeMb: rec.warnSizeMb ?? null }));
           return true;
         }
 
@@ -1109,6 +1131,9 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   // ...and it makes the nightly backup, so no systemd timer has to be installed by hand.
   const stopNightly = startNightlyLoop();
   server.on("close", stopNightly);
+  // ...and it measures the disk split and the size of each database every 10 minutes (usage.ts).
+  const stopUsage = startUsageLoop();
+  server.on("close", stopUsage);
   return server;
 }
 
@@ -1860,6 +1885,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .progress-fill.danger {
       background: var(--danger);
     }
+    :root, [data-theme="dark"] { --seg-db: #a78bfa; --seg-bk: #f472b6; --seg-files: #a3e635; }
+    [data-theme="light"] { --seg-db: #7c3aed; --seg-bk: #db2777; --seg-files: #4d7c0f; }
     .progress-track.stacked { display: flex; }
     .progress-track .seg { height: 100%; transition: width 0.3s ease; }
     .progress-track .seg.paas { background: var(--accent); }
@@ -4698,6 +4725,33 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "resSnapshots": "Instantâneos",
           "resSnapshotsOne": "1 cópia",
           "resSnapshotsN": "{n} cópias",
+          "resDiskApps": "Apps",
+          "resDiskDbs": "Bancos",
+          "resDiskBackups": "Cópias e lixeira",
+          "resDiskFiles": "Arquivos",
+          "resDiskMeasuring": "divisão sendo medida...",
+          "resTopDiskTip": "Quem mais ocupa disco (código, volumes, imagem e banco):",
+          "dbMeasuring": "Medindo os bancos...",
+          "dbMeasuredAt": "Medido {when}",
+          "dbNotMeasured": "Ainda não medido",
+          "dbMeasureNow": "Medir agora",
+          "dbViewFull": "Ver gráficos",
+          "dbViewCompact": "Modo compacto",
+          "dbShareTitle": "Divisão entre os bancos",
+          "dbShareOf": "{p} dos bancos",
+          "dbSizeUnknown": "tamanho ainda não medido",
+          "dbRedisKeys": "{n} chaves",
+          "dbRedisNote": "O Redis guarda tudo na memória e não separa o tamanho por banco: {v} no total.",
+          "dbChartAgo": "{n} dias atrás",
+          "dbChartLimit": "--- tamanho de aviso",
+          "dbLimitLabel": "Tamanho de aviso",
+          "dbLimitNone": "sem limite",
+          "dbLimitSave": "Salvar",
+          "dbLimitClear": "Tirar",
+          "dbLimitSaved": "Tamanho de aviso salvo.",
+          "dbLimitCleared": "Tamanho de aviso removido.",
+          "dbLimitBad": "Use um número inteiro de MB, a partir de 1.",
+          "dbLimitHint": "Os bancos dividem um Postgres só, então nenhum tem espaço reservado. O tamanho de aviso é o seu limite: o painel mostra quanto dele já foi usado e manda um aviso (Conexões → Avisos) em 80% e 100%, sem travar o app.",
           "healthTitle": "Saúde rápida",
           "healthBackup": "Última cópia",
           "healthOffsite": "Cópia fora do servidor",
@@ -4774,6 +4828,33 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "resSnapshots": "Snapshots",
           "resSnapshotsOne": "1 backup",
           "resSnapshotsN": "{n} backups",
+          "resDiskApps": "Apps",
+          "resDiskDbs": "Databases",
+          "resDiskBackups": "Backups and trash",
+          "resDiskFiles": "Files",
+          "resDiskMeasuring": "split being measured...",
+          "resTopDiskTip": "Using the most disk (code, volumes, image and database):",
+          "dbMeasuring": "Measuring the databases...",
+          "dbMeasuredAt": "Measured {when}",
+          "dbNotMeasured": "Not measured yet",
+          "dbMeasureNow": "Measure now",
+          "dbViewFull": "Show charts",
+          "dbViewCompact": "Compact view",
+          "dbShareTitle": "Split between databases",
+          "dbShareOf": "{p} of the databases",
+          "dbSizeUnknown": "size not measured yet",
+          "dbRedisKeys": "{n} keys",
+          "dbRedisNote": "Redis keeps everything in memory and has no size per database: {v} in total.",
+          "dbChartAgo": "{n} days ago",
+          "dbChartLimit": "--- warning size",
+          "dbLimitLabel": "Warning size",
+          "dbLimitNone": "no limit",
+          "dbLimitSave": "Save",
+          "dbLimitClear": "Remove",
+          "dbLimitSaved": "Warning size saved.",
+          "dbLimitCleared": "Warning size removed.",
+          "dbLimitBad": "Use a whole number of MB, 1 or more.",
+          "dbLimitHint": "The databases share one Postgres, so none has space set aside. The warning size is your limit: the dashboard shows how much of it is used and sends a notice (Connections → Notices) at 80% and 100%, without stopping the app.",
           "healthTitle": "Quick health",
           "healthBackup": "Last backup",
           "healthOffsite": "Off-server backup",
@@ -6482,15 +6563,34 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         html += stackedBar(0, memPct) + '<div class="res-legend"><span>' + esc(freeTxt) + '</span></div>';
       }
 
-      // Disk (the one holding the apps' data)
+      // Disk (the one holding the apps' data), split by what PaaSMCP keeps there when measured.
       const d = r.disk;
+      const split = (liveResources && liveResources.diskSplit) || s.diskSplit;
       if (d) {
         html += '<div class="telemetry-item" style="border-bottom:none;padding-bottom:2px;"><span>' + esc(t('resDisk')) + ' (' + esc(fmtResBytes(d.usedBytes)) + ' / ' + esc(fmtResBytes(d.totalBytes)) + ')</span>' +
-          '<span class="telemetry-val" style="color:' + toneOf(d.usedPercent) + ';">' + esc(d.usedPercent + '%') + '</span></div>' +
-          '<div class="progress-track"><div class="progress-fill ' + (d.usedPercent > 85 ? 'danger' : d.usedPercent > 70 ? 'warning' : '') + '" style="width:' + d.usedPercent + '%;"></div></div>' +
-          '<div class="res-legend"><span>' + esc(t('resFree').replace('{v}', fmtResBytes(d.freeBytes))) + '</span></div>';
+          '<span class="telemetry-val" style="color:' + toneOf(d.usedPercent) + ';">' + esc(d.usedPercent + '%') + '</span></div>';
+        const freeDisk = t('resFree').replace('{v}', fmtResBytes(d.freeBytes));
+        if (split && split.parts && d.totalBytes) {
+          const kinds = [['apps', 'resDiskApps', 'var(--accent)'], ['databases', 'resDiskDbs', 'var(--seg-db)'], ['backups', 'resDiskBackups', 'var(--seg-bk)'], ['files', 'resDiskFiles', 'var(--seg-files)']];
+          const sum = kinds.reduce(function (n, k) { return n + (split.parts[k[0]] || 0); }, 0);
+          // Folders measured with du can sit on another disk than Docker's: never show more than is used.
+          const scale = sum > d.usedBytes && sum > 0 ? d.usedBytes / sum : 1;
+          const others = Math.max(0, d.usedBytes - sum * scale);
+          const topApps = Object.entries(split.perApp || {}).filter(function (e) { return e[1] > 0; })
+            .sort(function (a, b) { return b[1] - a[1]; }).slice(0, 5)
+            .map(function (e) { return e[0] + ': ' + fmtResBytes(e[1]); }).join(' · ');
+          html += '<div class="progress-track stacked">' + kinds.map(function (k) {
+              return '<div class="seg" style="width:' + ((split.parts[k[0]] || 0) * scale / d.totalBytes * 100).toFixed(2) + '%;background:' + k[2] + ';"></div>';
+            }).join('') + '<div class="seg other" style="width:' + (others / d.totalBytes * 100).toFixed(2) + '%;"></div></div>' +
+            '<div class="res-legend">' + kinds.filter(function (k) { return split.parts[k[0]] * scale >= 1e6; }).map(function (k) {
+              return '<span' + (k[0] === 'apps' && topApps ? ' title="' + esc(t('resTopDiskTip') + ' ' + topApps) + '"' : '') + '><span class="res-dot" style="background:' + k[2] + ';"></span>' + esc(t(k[1])) + ' ' + esc(fmtResBytes(split.parts[k[0]] * scale)) + '</span>';
+            }).join('') + '<span><span class="res-dot other"></span>' + esc(t('resOthers')) + ' ' + esc(fmtResBytes(others)) + '</span><span>' + esc(freeDisk) + '</span></div>';
+        } else {
+          html += '<div class="progress-track"><div class="progress-fill ' + (d.usedPercent > 85 ? 'danger' : d.usedPercent > 70 ? 'warning' : '') + '" style="width:' + d.usedPercent + '%;"></div></div>' +
+            '<div class="res-legend"><span>' + esc(freeDisk) + '</span>' + (split ? '' : '<span>' + esc(t('resDiskMeasuring')) + '</span>') + '</div>';
+        }
       }
-      if (cpu.split || mem.split) html += '<div class="res-hint">' + esc(t('resHint')) + '</div>';
+      if (cpu.split || mem.split || split) html += '<div class="res-hint">' + esc(t('resHint')) + '</div>';
       return html + snapshots + '</div>';
     }
     let resourcesTimer = null;
@@ -6509,6 +6609,125 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         // offline for a moment: try again later
       }
       resourcesTimer = setTimeout(pollResources, 15000);
+    }
+
+    // Databases page: size of each database, its share, a warning size and growth charts (usage.ts).
+    let usageData = null;
+    let usageLoading = false;
+    function dbViewMode() { try { return localStorage.getItem('paasmcp_db_view') === 'full' ? 'full' : 'compact'; } catch { return 'compact'; } }
+    function setDbView(mode) { try { localStorage.setItem('paasmcp_db_view', mode); } catch {} renderDbUsage(); }
+    async function loadUsage(refresh) {
+      if (usageLoading) return;
+      usageLoading = true;
+      if (refresh) renderDbUsage();
+      try {
+        const res = await rawFetch('/api/usage' + (refresh ? '?refresh=1' : ''));
+        if (res.ok) usageData = await res.json();
+      } catch {}
+      usageLoading = false;
+      renderDbUsage();
+      if (refresh && lastStatus) pollResources();
+    }
+    // Growth line for one database over the kept history (up to 90 days); limitBytes draws the warning size.
+    function dbChart(points, limitBytes, compact, label) {
+      const W = compact ? 120 : 300, H = compact ? 28 : 90;
+      const now = Date.now();
+      const from = points.length ? Math.min(points[0].t, now - 24 * 3600 * 1000) : now - 24 * 3600 * 1000;
+      const top = Math.max(1, limitBytes || 0, ...points.map(function (p) { return p.v; })) * 1.08;
+      const x = function (tt) { return ((tt - from) / Math.max(1, now - from)) * W; };
+      const y = function (v) { return H - (v / top) * (H - 3); };
+      const pts = points.map(function (p) { return x(p.t).toFixed(1) + ',' + y(p.v).toFixed(1); });
+      const line = pts.length > 1
+        ? '<polyline points="' + pts.join(' ') + '" style="fill:none;stroke:var(--accent);stroke-width:' + (compact ? 1.4 : 1.6) + '"/>'
+        : pts.length ? '<circle cx="' + pts[0].split(',')[0] + '" cy="' + pts[0].split(',')[1] + '" r="2" style="fill:var(--accent)"/>' : '';
+      const lim = limitBytes ? '<line x1="0" x2="' + W + '" y1="' + y(limitBytes).toFixed(1) + '" y2="' + y(limitBytes).toFixed(1) + '" style="stroke:var(--warning);stroke-width:1;stroke-dasharray:4 3"/>' : '';
+      const svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" style="width:' + (compact ? '120px' : '100%') + ';height:' + H + 'px;display:block;' + (compact ? '' : 'border-bottom:1px solid var(--border);') + '" role="img" aria-label="' + esc(label) + '">' + lim + line + '</svg>';
+      if (compact) return svg;
+      const days = Math.max(1, Math.round((now - from) / 86400000));
+      return svg + '<div style="display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted);margin-top:3px;"><span>' +
+        esc(t('dbChartAgo').replace('{n}', String(days))) + '</span>' + (limitBytes ? '<span>' + esc(t('dbChartLimit')) + '</span>' : '') + '<span>' + esc(t('scaleNowLbl')) + '</span></div>';
+    }
+    function renderDbUsage() {
+      const box = document.getElementById('dbList');
+      if (!box || !lastStatus) return;
+      const dbs = Object.values(lastStatus.databases || {});
+      if (!dbs.length) { box.innerHTML = '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>'; return; }
+      if (!usageData && !usageLoading) { loadUsage(false); }
+      const latest = (usageData && usageData.latest) || null;
+      const sizes = {};
+      ((latest && latest.databases) || []).forEach(function (d) { sizes[d.name] = d; });
+      const hist = (usageData && usageData.history) || [];
+      const compact = dbViewMode() === 'compact';
+      const pgTotal = dbs.reduce(function (n, d) { const z = sizes[d.name]; return n + (d.engine === 'postgres' && z && z.bytes ? z.bytes : 0); }, 0);
+
+      let head = '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0 8px;">' +
+        '<span style="font-size:11.5px;color:var(--muted);">' + esc(usageLoading ? t('dbMeasuring') : latest ? t('dbMeasuredAt').replace('{when}', relTime(latest.measuredAt) || fmtWhen(latest.measuredAt)) : t('dbNotMeasured')) + '</span>' +
+        '<span style="display:flex;gap:6px;">' +
+        '<button class="secondary" style="padding:4px 9px;font-size:11px;" data-mode="' + (compact ? 'full' : 'compact') + '" onclick="setDbView(this.dataset.mode)">' + esc(t(compact ? 'dbViewFull' : 'dbViewCompact')) + '</button>' +
+        '<button class="secondary" style="padding:4px 9px;font-size:11px;" onclick="loadUsage(true)"' + (usageLoading ? ' disabled' : '') + '>' + esc(t('dbMeasureNow')) + '</button>' +
+        '</span></div>';
+      // Share of each Postgres database in the whole, one bar.
+      const pgDbs = dbs.filter(function (d) { const z = sizes[d.name]; return d.engine === 'postgres' && z && z.bytes; });
+      if (pgDbs.length > 1 && pgTotal > 0) {
+        const palette = ['var(--accent)', '#8b5cf6', '#db2777', '#65a30d', '#0d9488', '#ea580c'];
+        head += '<div style="font-size:11.5px;color:var(--muted);margin-bottom:2px;">' + esc(t('dbShareTitle')) + ' · ' + esc(fmtResBytes(pgTotal)) + '</div>' +
+          '<div class="progress-track stacked">' + pgDbs.map(function (d, i) {
+            return '<div class="seg" title="' + esc(d.appName + ': ' + fmtResBytes(sizes[d.name].bytes)) + '" style="width:' + (sizes[d.name].bytes / pgTotal * 100).toFixed(1) + '%;background:' + palette[i % palette.length] + ';"></div>';
+          }).join('') + '</div>' +
+          '<div class="res-legend">' + pgDbs.map(function (d, i) {
+            return '<span><span class="res-dot" style="background:' + palette[i % palette.length] + ';"></span>' + esc(d.appName) + ' ' + esc(pctNum(sizes[d.name].bytes / pgTotal * 100)) + '</span>';
+          }).join('') + '</div>';
+      }
+
+      const rows = dbs.map(function (d) {
+        const z = sizes[d.name];
+        const isPg = d.engine === 'postgres';
+        const bytes = z && typeof z.bytes === 'number' ? z.bytes : null;
+        const limit = d.warnSizeMb ? d.warnSizeMb * 1e6 : 0;
+        const pct = limit && bytes !== null ? bytes / limit * 100 : null;
+        const points = isPg ? hist.filter(function (p) { return p.s && typeof p.s[d.name] === 'number'; }).map(function (p) { return { t: p.t, v: p.s[d.name] }; }) : [];
+        if (isPg && bytes !== null && latest) points.push({ t: Date.parse(latest.measuredAt), v: bytes });
+        const sizeTxt = isPg
+          ? (bytes === null ? t('dbSizeUnknown') : fmtResBytes(bytes) + (limit ? ' / ' + fmtResBytes(limit) : '') + (pgTotal > 0 && !limit && pgDbs.length > 1 ? ' · ' + t('dbShareOf').replace('{p}', pctNum(bytes / pgTotal * 100)) : ''))
+          : t('dbRedisKeys').replace('{n}', String((z && z.keys) || 0));
+        const top = '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">' +
+          '<div><strong>' + esc(d.appName) + '</strong> · ' + esc(t('bkKind_' + d.engine) || d.engine) + '<br/><span style="color:var(--muted);">' + esc(t(isPg ? 'dbGetsPg' : 'dbGetsRedis')) + '</span></div>' +
+          '<div style="display:flex;align-items:center;gap:10px;">' + (compact && points.length ? dbChart(points, limit, true, d.appName) : '') +
+          '<span class="telemetry-val" style="color:' + (pct === null ? 'var(--text)' : toneOf(pct)) + ';">' + esc(sizeTxt) + (pct !== null ? ' (' + esc(pctNum(pct)) + ')' : '') + '</span></div></div>';
+        const bar = pct !== null
+          ? '<div class="progress-track" style="margin:8px 0 4px;"><div class="progress-fill ' + (pct >= 100 ? 'danger' : pct >= 80 ? 'warning' : '') + '" style="width:' + Math.min(100, pct).toFixed(1) + '%;"></div></div>'
+          : '';
+        const chart = !compact && points.length ? '<div style="margin-top:8px;">' + dbChart(points, limit, false, d.appName) + '</div>' : '';
+        const limitForm = isPg
+          ? '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:11.5px;color:var(--muted);">' +
+            '<label for="dbLim_' + esc(d.name) + '">' + esc(t('dbLimitLabel')) + '</label>' +
+            '<input id="dbLim_' + esc(d.name) + '" type="number" min="1" step="1" inputmode="numeric" value="' + esc(d.warnSizeMb || '') + '" placeholder="' + esc(t('dbLimitNone')) + '" style="width:110px;padding:4px 8px;font-size:12px;" />' +
+            '<span>MB</span>' +
+            '<button class="secondary" style="padding:4px 9px;font-size:11px;" data-db="' + esc(d.name) + '" onclick="saveDbLimit(this.dataset.db, false)">' + esc(t('dbLimitSave')) + '</button>' +
+            (d.warnSizeMb ? '<button class="secondary" style="padding:4px 9px;font-size:11px;" data-db="' + esc(d.name) + '" onclick="saveDbLimit(this.dataset.db, true)">' + esc(t('dbLimitClear')) + '</button>' : '') +
+            '</div>'
+          : '';
+        return '<div style="margin-bottom:8px;padding:10px 12px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;" title="' + esc(d.dbName + ' / ' + d.dbUser) + '">' +
+          top + bar + chart + limitForm + '</div>';
+      }).join('');
+      const redisNote = latest && latest.redis && dbs.some(function (d) { return d.engine === 'redis'; })
+        ? '<p class="res-hint">' + esc(t('dbRedisNote').replace('{v}', fmtResBytes(latest.redis.usedMemoryBytes))) + '</p>' : '';
+      const hint = dbs.some(function (d) { return d.engine === 'postgres'; }) ? '<p class="res-hint">' + esc(t('dbLimitHint')) + '</p>' : '';
+      box.innerHTML = head + rows + redisNote + hint;
+    }
+    async function saveDbLimit(name, clear) {
+      const input = document.getElementById('dbLim_' + name);
+      const raw = clear ? '' : String((input && input.value) || '').trim();
+      if (raw !== '' && !(Number.isInteger(Number(raw)) && Number(raw) >= 1)) { showToast(t('dbLimitBad')); return; }
+      const res = await rawFetch('/api/databases/limit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name, sizeMb: raw === '' ? null : Number(raw) }) });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { showToast(data.error || t('dbLimitBad')); return; }
+      if (lastStatus && lastStatus.databases && lastStatus.databases[name]) {
+        if (data.warnSizeMb) lastStatus.databases[name].warnSizeMb = data.warnSizeMb;
+        else delete lastStatus.databases[name].warnSizeMb;
+      }
+      showToast(t(data.warnSizeMb ? 'dbLimitSaved' : 'dbLimitCleared'));
+      renderDbUsage();
     }
 
     // "Quick health" box in the telemetry column: one line per thing that needs care, each opens its page.
@@ -6742,10 +6961,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const searchVal = document.getElementById('appSearchInput')?.value;
       if (searchVal) filterApps(searchVal);
 
-      const dbs = Object.values(s.databases || {});
-      document.getElementById('dbList').innerHTML = dbs.length
-        ? dbs.map(d => \`<div style="margin-bottom:6px;padding:8px 10px;border-radius:8px;background:var(--bg-subtle);border:1px solid var(--border);font-size:12.5px;" title="\${esc(d.dbName)} / \${esc(d.dbUser)}">🗄️ <strong>\${esc(d.appName)}</strong> · \${esc(t('bkKind_' + d.engine) || d.engine)}<br/><span style="color:var(--muted);">\${esc(t(d.engine === 'redis' ? 'dbGetsRedis' : 'dbGetsPg'))}</span></div>\`).join('')
-        : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyDbs')) + '</span>';
+      renderDbUsage();
 
       renderNightly(s.nightlyBackup);
       const backups = s.backups || [];
