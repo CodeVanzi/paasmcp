@@ -1191,6 +1191,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .sec-apply.changed { color: var(--text); border-left: 3px solid var(--warning, #d97706); padding-left: 8px; }
     .sec-paste summary { cursor: pointer; font-size: 13px; font-weight: 600; }
     .sec-paste textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .dep-more { margin: 4px 0 14px; }
+    .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -2176,7 +2178,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
           <div class="console-search-bar">
             <input class="console-search-input" id="appSearchInput" placeholder="Buscar aplicações por nome, stack ou porta..." oninput="filterApps(this.value)" />
-            <button class="secondary" onclick="fillDeployPreset('saas', document.getElementById('presetSaas')); const depEl = revealEl('depApp'); if (depEl) depEl.focus();" style="padding:6px 12px;font-size:12.5px;">+ Novo Deploy</button>
+            <button class="secondary" id="btnNewApp" onclick="goTo('overview', 'deploy'); const depEl = document.getElementById('depApp'); if (depEl) depEl.focus();" style="padding:6px 12px;font-size:12.5px;">+ Publicar um app</button>
           </div>
           <div class="apps-card-list" id="appsTable">
             <div style="padding: 24px; text-align: center; color: var(--muted);">...</div>
@@ -2204,40 +2206,26 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <p class="preset-hint" id="deployPresetHint"></p>
               <div class="form-grid">
                 <div>
-                  <label class="field-label" id="lblDepApp">Slug da Aplicação</label>
+                  <label class="field-label" id="lblDepApp">Nome do app</label>
                   <input id="depApp" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblDepRepo">Repositório GitHub ou Caminho</label>
+                  <label class="field-label" id="lblDepRepo">Repositório (dono/nome) ou pasta do servidor</label>
                   <input id="depRepo" placeholder="ex: seu-usuario/meu-repo" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblDepBranch">Branch Git</label>
+                  <label class="field-label" id="lblDepBranch">Branch</label>
                   <input id="depBranch" placeholder="main" value="main" />
-                </div>
-              </div>
-              <div class="form-grid">
-                <div>
-                  <label class="field-label" id="lblDepMem">Limite de RAM (Opcional)</label>
-                  <input id="depMem" placeholder="ex: 512m ou 1g" />
-                </div>
-                <div>
-                  <label class="field-label" id="lblDepCpu">Limite de vCPUs (Opcional)</label>
-                  <input id="depCpu" placeholder="ex: 0.5 ou 1.0" />
-                </div>
-                <div>
-                  <label class="field-label" data-i18n="lblDepHealth"></label>
-                  <input id="depHealth" placeholder="/" />
                 </div>
               </div>
               <div style="display:flex; gap:18px; align-items:center; margin-bottom:14px; font-size:12.5px; flex-wrap:wrap;">
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depPg" style="width:auto;" />
-                  <span id="lblDepPg">Provisionar PostgreSQL 16 (injeta <code>DATABASE_URL</code>)</span>
+                  <span id="lblDepPg">Banco PostgreSQL (o app recebe <code>DATABASE_URL</code>)</span>
                 </label>
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depRedis" style="width:auto;" />
-                  <span id="lblDepRedis">Provisionar Redis 7 (injeta <code>REDIS_URL</code>)</span>
+                  <span id="lblDepRedis">Cache Redis (o app recebe <code>REDIS_URL</code>)</span>
                 </label>
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depPoll" style="width:auto;" />
@@ -2251,12 +2239,30 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input type="checkbox" id="depEmail" style="width:auto;" />
                   <span data-i18n="lblDepEmail"></span>
                 </label>
-                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              </div>
+              <details class="dep-more">
+                <summary data-i18n="depMore"></summary>
+                <p class="ofs-note" data-i18n="depMoreDesc" style="margin-top:8px;"></p>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" id="lblDepMem">Memória máxima</label>
+                  <input id="depMem" placeholder="ex: 512m ou 1g" />
+                </div>
+                <div>
+                  <label class="field-label" id="lblDepCpu">Processadores (CPUs) no máximo</label>
+                  <input id="depCpu" placeholder="ex: 0.5 ou 1.0" />
+                </div>
+                <div>
+                  <label class="field-label" data-i18n="lblDepHealth"></label>
+                  <input id="depHealth" placeholder="/" />
+                </div>
+              </div>
+                <label style="margin-bottom:12px;font-size:12.5px;display:flex;align-items:center;gap:6px;cursor:pointer;">
                   <input type="checkbox" id="depNoHealth" style="width:auto;" />
                   <span data-i18n="lblDepNoHealth"></span>
                 </label>
-              </div>
-              <button onclick="deployNewApp()" id="btnDeploy">🚀 Fazer Build & Deploy</button>
+              </details>
+              <button onclick="deployNewApp()" id="btnDeploy">🚀 Publicar</button>
             </div>
 
             <div class="card" data-sub="expose">
@@ -2265,12 +2271,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <p class="card-desc" id="exposeDesc">Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.</p>
               </div>
               <div id="exposeCfHint"></div>
-              <div class="examples-bar">
-                <span id="lblQuickFillExpose">⚡ Modos:</span>
-                <button class="chip" onclick="fillExposeMode('public')" id="chipModePublic">🌍 Público (HTTPS Aberto)</button>
-                <button class="chip" onclick="fillExposeMode('zero-trust')" id="chipModeZT">🛡️ Zero Trust (OTP por E-mail)</button>
-                <button class="chip" onclick="fillExposeMode('tailscale')" id="chipModeTS">🔒 Tailscale (VPN Privada)</button>
-              </div>
+              <p class="preset-hint show" id="expModeHint" style="margin:0 0 10px;"></p>
               <div class="form-grid">
                 <div>
                   <label class="field-label" id="lblExpApp">Aplicação</label>
@@ -2278,8 +2279,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <datalist id="hostedAppsList"></datalist>
                 </div>
                 <div>
-                  <label class="field-label" id="lblExpMode">Modo de Segurança</label>
-                  <select id="expMode">
+                  <label class="field-label" id="lblExpMode">Quem pode abrir</label>
+                  <select id="expMode" onchange="renderExposeHint()">
                     <option value="public" id="optPublic">Cloudflare Público (HTTPS aberto)</option>
                     <option value="zero-trust" id="optZT">Cloudflare Zero Trust (Login PIN por E-mail)</option>
                     <option value="tailscale" id="optTS">Tailscale Serve (Privado na Tailnet)</option>
@@ -2287,9 +2288,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 </div>
                 <div>
                   <label class="field-label" id="lblExpSub">Subdomínio</label>
-                  <input id="expSub" placeholder="ex: app" />
+                  <input id="expSub" placeholder="ex: loja" oninput="renderExposeHint()" />
                 </div>
               </div>
+              <p class="ofs-note" id="expPreviewLine" style="margin:-4px 0 10px;"></p>
               <button onclick="exposeApp()" id="btnExpose">🔗 Publicar Endereço</button>
             </div>
           
@@ -2361,12 +2363,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <p class="card-desc" id="whDesc">Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.</p>
             </div>
             <div style="margin-bottom:14px;">
-              <span class="field-label" id="lblWhUrl">Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):</span>
+              <span class="field-label" data-i18n="whLblUrl"></span>
               <code id="webhookUrlBox" style="display:block;padding:8px 10px;user-select:all;">/api/webhooks/github</code>
             </div>
             <div style="margin-bottom:16px;">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
-                <span class="field-label" id="lblWhSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
+                <span class="field-label" data-i18n="whLblSecret" style="margin:0;">Webhook Secret (HMAC-SHA256):</span>
                 <button class="chip" onclick="revealWebhookSecret()" id="btnRevealWhSecret">👁️ Revelar / Copiar Secret</button>
               </div>
               <code id="webhookSecretBox" style="display:block;padding:8px 10px;">••••••••••••</code>
@@ -2478,7 +2480,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input id="dbApp" list="hostedAppsList" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblDbEngine">Engine</label>
+                  <label class="field-label" id="lblDbEngine">Tipo</label>
                   <select id="dbEngine">
                     <option value="postgres" id="optDbPg">PostgreSQL 16 (Isolado por DB + Role)</option>
                     <option value="redis" id="optDbRedis">Redis 7 (DB Lógico Isolado)</option>
@@ -2500,15 +2502,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <input id="bakApp" list="hostedAppsList" placeholder="ex: meu-saas" />
                 </div>
                 <div>
-                  <label class="field-label" id="lblBakEngine">Engine</label>
+                  <label class="field-label" id="lblBakEngine">O que copiar</label>
                   <select id="bakEngine">
                     <option value="postgres" id="optBakPg">PostgreSQL 16 (pg_dump)</option>
                     <option value="redis" id="optBakRedis">Redis 7 (RDB)</option>
-                    <option value="volume">Docker volumes</option>
+                    <option value="volume" id="optBakVol">Docker volumes</option>
                   </select>
                 </div>
               </div>
-              <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Criar Snapshot Criptografado</button>
+              <button onclick="createBackup()" id="btnCreateBackup" style="margin-bottom:16px;">📸 Fazer uma cópia agora</button>
               <div id="backupsList"></div>
             </div>
           
@@ -2989,48 +2991,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         thActions: "Ações Rápidas",
         deployTitle: "➕ Novo Deploy (GitHub, Multi-Service Compose ou Local)",
         deployDesc: "Detecta automaticamente Node, Next.js, Python, Go, SPA, Dockerfile ou <code>docker-compose.yml</code> (injetando segredos do Vault com segurança).",
-        lblQuickFillDeploy: "⚡ Presets:",
-        lblDepApp: "Slug da Aplicação",
-        lblDepRepo: "Repositório GitHub ou Caminho",
-        lblDepBranch: "Branch Git",
-        lblDepMem: "Limite de RAM (Opcional)",
-        lblDepCpu: "Limite de vCPUs (Opcional)",
-        lblDepPg: "Provisionar PostgreSQL 16 (injeta <code>DATABASE_URL</code>)",
-        lblDepRedis: "Provisionar Redis 7 (injeta <code>REDIS_URL</code>)",
-        btnDeploy: "🚀 Fazer Build & Deploy",
         exposeTitle: "🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)",
         exposeDesc: "Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.",
-        lblQuickFillExpose: "⚡ Modos:",
-        chipModePublic: "🌍 Público (HTTPS Aberto)",
-        chipModeZT: "🛡️ Zero Trust (OTP por E-mail)",
-        chipModeTS: "🔒 Tailscale (VPN Privada)",
-        lblExpApp: "Aplicação",
-        lblExpMode: "Modo de Segurança",
-        optPublic: "Cloudflare Público (HTTPS aberto)",
-        optZT: "Cloudflare Zero Trust (Login PIN por E-mail)",
-        optTS: "Tailscale Serve (Privado na Tailnet)",
-        lblExpSub: "Subdomínio",
-        btnExpose: "🔗 Publicar Endereço",
         vaultTitle: "Variáveis de cada app",
         vaultDesc: "O que o código do app lê como variável de ambiente: chaves de serviços (Stripe, OpenAI...), senhas e endereços. Fica cifrado no disco e não aparece inteiro de novo depois de salvo.",
         lblSecScope: "De qual app?",
         lblSecKey: "Nome (letras, números e _)",
         lblSecVal: "Valor",
         btnSaveSecret: "Salvar",
-        dbTitle: "🗄️ Provisionar Banco Multi-Tenant Isolado",
         dbDesc: "Cria banco, role exclusiva e injeta <code>DATABASE_URL</code> / <code>REDIS_URL</code> diretamente no Cofre do app.",
-        lblDbApp: "Aplicação",
-        lblDbEngine: "Engine",
-        optDbPg: "PostgreSQL 16 (Isolado por DB + Role)",
-        optDbRedis: "Redis 7 (DB Lógico Isolado)",
-        btnCreateDb: "+ Provisionar Banco",
-        backupsTitle: "🛡️ Snapshots & Restore Criptografados (AES-256-GCM)",
         backupsDesc: "Gera <code>pg_dump</code> ou snapshot Redis, criptografa com a chave mestra do Vault e verifica integridade SHA-256 antes do restore.",
-        lblBakApp: "App para Backup",
-        lblBakEngine: "Engine",
-        optBakPg: "PostgreSQL 16 (pg_dump)",
-        optBakRedis: "Redis 7 (RDB)",
-        btnCreateBackup: "📸 Criar Snapshot Criptografado",
         fedTitle: "🌐 Handshake Multi-Servidor & Redundância (HA Federation)",
         fedDesc: "Pareie um segundo servidor (VPS ou outro Homelab) usando token assinado <code>HMAC-SHA256</code> para rodar os mesmos serviços em <strong>Alta Disponibilidade via Cloudflare Tunnel</strong> ou <strong>Warm Standby</strong>.",
         lblFedUrl: "URL deste Servidor (Primary)",
@@ -3043,14 +3013,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnJoinPeer: "🤝 Fazer Handshake",
         whTitle: "⚡ Auto-Deploy via GitHub Webhook & Deploy Key SSH",
         whDesc: "Receba <code>git push</code> do GitHub com validação de assinatura <code>X-Hub-Signature-256</code> em tempo constante para reconstruir seus apps automaticamente.",
-        lblWhUrl: "Payload URL do Webhook (adicione no GitHub → Settings → Webhooks):",
-        lblWhSecret: "Webhook Secret (HMAC-SHA256):",
-        btnRevealWhSecret: "👁️ Revelar / Copiar Secret",
-        lblSshKey: "Chave SSH Pública de Deploy (Ed25519):",
-        btnCopySsh: "📋 Copiar Chave SSH",
         doctorTitle: "🩺 PaaSMCP Doctor — Diagnóstico Automático de Containers",
         doctorDesc: "Verifica <code>OOMKilled</code> (falta de RAM), loops de reinicialização, códigos de saída e saúde de todos os serviços.",
-        btnRunDoctor: "🔍 Executar Diagnóstico Agora",
         agentsTitle: "🤖 Como Conectar seu Agente de IA (Clientes MCP Compatíveis)",
         agentsDesc: "O PaaSMCP expõe <strong>15 ferramentas MCP nativas</strong> via stdio JSON-RPC. Copie a configuração abaixo para que sua IA opere todo o servidor por você:",
         logsTitle: "📜 Logs do Container",
@@ -3062,16 +3026,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         statAppsDbs: "Apps & Bancos Isolados",
         statSnapshots: "Snapshots Criptografados",
         statSecurityFed: "Segurança & Federação",
-        presetSaas: "SaaS Next.js + PG (512MB)",
-        presetCompose: "Multi-Service Compose + PG + Redis",
-        presetSpa: "SPA / Site Estático",
-        presetDjango: "Django + PG",
-        presetFastapi: "FastAPI + PG",
-        presetNode: "API Node / Express",
-        presetGo: "API Go",
-        presetDotnet: "C# / ASP.NET + PG",
         presetHint_dotnet: "C#: precisa de um <code>.csproj</code> na raiz (ou um projeto web em <code>src/&lt;nome&gt;</code>). O painel roda <code>dotnet publish</code> com a versão do <code>TargetFramework</code> e o app ouve a porta 8080. O banco chega em <code>DATABASE_URL</code>.",
-        presetDockerfile: "Dockerfile próprio (Rails, Laravel…)",
         presetHint_saas: "Next.js: precisa de <code>package.json</code> com os scripts <code>build</code> e <code>start</code>. Roda na porta 3000 e o banco chega em <code>DATABASE_URL</code>.",
         presetHint_django: "Django: precisa de <code>manage.py</code>, <code>requirements.txt</code> e da pasta do projeto com <code>wsgi.py</code>. Roda com gunicorn na porta 8000. Coloque o domínio em <code>ALLOWED_HOSTS</code> e leia o banco de <code>DATABASE_URL</code> (ex.: dj-database-url).",
         presetHint_fastapi: "FastAPI: precisa de <code>requirements.txt</code> com <code>fastapi</code> e <code>uvicorn</code>, e do objeto <code>app</code> em <code>main.py</code> (ou <code>app.py</code>). Roda na porta 8000.",
@@ -3092,12 +3047,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         promptEx3Title: "💬 Diagnóstico & Multi-Node",
         promptEx3Desc: "'Rode o <code>paas_doctor</code> para ver se algum container sofreu OOMKill e gere um token de pareamento HA'",
         emptyApps: "Nenhuma aplicação hospedada ainda. Use um dos presets abaixo para testar!",
-        emptyDbs: "Nenhum banco provisionado ainda.",
-        emptyBackups: "Nenhum snapshot criptografado criado ainda.",
         emptyPeers: "Nenhum servidor secundário pareado ainda.",
         emptySecrets: "Nada salvo aqui ainda.",
         emptyDoctor: "Nenhum container registrado para diagnóstico.",
-        actionExpose: "Expor",
         actionEnv: "Variáveis",
         actionLogs: "Logs",
         actionRestart: "Reiniciar",
@@ -3139,7 +3091,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         depPhase_building: "🔨 Montando a imagem",
         depPhase_checking: "🩺 Testando a nova versão",
         depPhase_switching: "🔁 Trocando de versão",
-        depPhase_live: "🟢 No ar",
         depPhase_failed: "❌ Último deploy falhou",
         depOldStillLive: "a versão anterior segue no ar",
         depShowError: "Ver o erro",
@@ -3184,48 +3135,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         thActions: "Quick Actions",
         deployTitle: "➕ New Deploy (GitHub, Multi-Service Compose, or Local)",
         deployDesc: "Auto-detects Node, Next.js, Python, Go, SPA, Dockerfile, or <code>docker-compose.yml</code> (safely injecting Vault secrets).",
-        lblQuickFillDeploy: "⚡ Presets:",
-        lblDepApp: "Application Slug",
-        lblDepRepo: "GitHub Repo or Path",
-        lblDepBranch: "Git Branch",
-        lblDepMem: "Memory Limit (Optional)",
-        lblDepCpu: "vCPU Limit (Optional)",
-        lblDepPg: "Provision PostgreSQL 16 (injects <code>DATABASE_URL</code>)",
-        lblDepRedis: "Provision Redis 7 (injects <code>REDIS_URL</code>)",
-        btnDeploy: "🚀 Build & Deploy",
         exposeTitle: "🌐 Expose Application (Cloudflare Tunnel / Zero Trust / Tailscale)",
         exposeDesc: "Configures Cloudflare Tunnel routing + proxied DNS CNAME + Zero Trust policy without opening router ports.",
-        lblQuickFillExpose: "⚡ Modes:",
-        chipModePublic: "🌍 Public (Open HTTPS)",
-        chipModeZT: "🛡️ Zero Trust (Email OTP)",
-        chipModeTS: "🔒 Tailscale (Private VPN)",
-        lblExpApp: "Application",
-        lblExpMode: "Security Mode",
-        optPublic: "Cloudflare Public (Open HTTPS)",
-        optZT: "Cloudflare Zero Trust (Email PIN Login)",
-        optTS: "Tailscale Serve (Private on Tailnet)",
-        lblExpSub: "Subdomain",
-        btnExpose: "🔗 Expose Address",
         vaultTitle: "Each app's variables",
         vaultDesc: "What the app's code reads as environment variables: service keys (Stripe, OpenAI...), passwords and addresses. Encrypted on disk and never shown in full again after saving.",
         lblSecScope: "Which app?",
         lblSecKey: "Name (letters, digits and _)",
         lblSecVal: "Value",
         btnSaveSecret: "Save",
-        dbTitle: "🗄️ Provision Isolated Multi-Tenant Database",
         dbDesc: "Creates database, exclusive role, and injects <code>DATABASE_URL</code> / <code>REDIS_URL</code> directly into app Vault.",
-        lblDbApp: "Application",
-        lblDbEngine: "Engine",
-        optDbPg: "PostgreSQL 16 (Isolated by DB + Role)",
-        optDbRedis: "Redis 7 (Isolated Logical DB)",
-        btnCreateDb: "+ Provision Database",
-        backupsTitle: "🛡️ Encrypted Snapshots & Restore (AES-256-GCM)",
         backupsDesc: "Generates <code>pg_dump</code> or Redis snapshot, encrypts with Vault master key, and verifies SHA-256 integrity prior to restore.",
-        lblBakApp: "App for Backup",
-        lblBakEngine: "Engine",
-        optBakPg: "PostgreSQL 16 (pg_dump)",
-        optBakRedis: "Redis 7 (RDB)",
-        btnCreateBackup: "📸 Create Encrypted Snapshot",
         fedTitle: "🌐 Multi-Server Handshake & Redundancy (HA Federation)",
         fedDesc: "Pair a secondary server (VPS or homelab) via <code>HMAC-SHA256</code> signed token to run identical services in <strong>High Availability via Cloudflare Tunnel</strong> or <strong>Warm Standby</strong>.",
         lblFedUrl: "This Server URL (Primary)",
@@ -3238,14 +3157,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btnJoinPeer: "🤝 Perform Handshake",
         whTitle: "⚡ Auto-Deploy via GitHub Webhook & SSH Deploy Key",
         whDesc: "Receive GitHub <code>git push</code> with constant-time <code>X-Hub-Signature-256</code> signature validation to auto-rebuild apps.",
-        lblWhUrl: "Webhook Payload URL (add in GitHub → Settings → Webhooks):",
-        lblWhSecret: "Webhook Secret (HMAC-SHA256):",
-        btnRevealWhSecret: "👁️ Reveal / Copy Secret",
-        lblSshKey: "Public SSH Deploy Key (Ed25519):",
-        btnCopySsh: "📋 Copy SSH Key",
         doctorTitle: "🩺 PaaSMCP Doctor — Automated Container Diagnostics",
         doctorDesc: "Checks for <code>OOMKilled</code> (low RAM), restart loops, exit codes, and health of all services.",
-        btnRunDoctor: "🔍 Run Diagnostics Now",
         agentsTitle: "🤖 How to Connect your AI Agent (MCP Compatible Clients)",
         agentsDesc: "PaaSMCP exposes <strong>15 native MCP tools</strong> via stdio JSON-RPC. Copy the config below so your AI agent can manage the entire server for you:",
         logsTitle: "📜 Container Logs",
@@ -3257,16 +3170,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         statAppsDbs: "Isolated Apps & DBs",
         statSnapshots: "Encrypted Snapshots",
         statSecurityFed: "Security & Federation",
-        presetSaas: "SaaS Next.js + PG (512MB)",
-        presetCompose: "Multi-Service Compose + PG + Redis",
-        presetSpa: "SPA / Static Site",
-        presetDjango: "Django + PG",
-        presetFastapi: "FastAPI + PG",
-        presetNode: "Node / Express API",
-        presetGo: "Go API",
-        presetDotnet: "C# / ASP.NET + PG",
         presetHint_dotnet: "C#: needs a <code>.csproj</code> at the root (or one web project in <code>src/&lt;name&gt;</code>). The dashboard runs <code>dotnet publish</code> with the <code>TargetFramework</code> version and the app listens on port 8080. The database arrives in <code>DATABASE_URL</code>.",
-        presetDockerfile: "Own Dockerfile (Rails, Laravel…)",
         presetHint_saas: "Next.js: needs a <code>package.json</code> with <code>build</code> and <code>start</code> scripts. Runs on port 3000 and the database arrives in <code>DATABASE_URL</code>.",
         presetHint_django: "Django: needs <code>manage.py</code>, <code>requirements.txt</code> and the project folder with <code>wsgi.py</code>. Runs with gunicorn on port 8000. Put the domain in <code>ALLOWED_HOSTS</code> and read the database from <code>DATABASE_URL</code> (e.g. dj-database-url).",
         presetHint_fastapi: "FastAPI: needs a <code>requirements.txt</code> with <code>fastapi</code> and <code>uvicorn</code>, and the <code>app</code> object in <code>main.py</code> (or <code>app.py</code>). Runs on port 8000.",
@@ -3287,12 +3191,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         promptEx3Title: "💬 Diagnostics & Multi-Node",
         promptEx3Desc: "'Run <code>paas_doctor</code> to check if any container suffered an OOMKill and generate an HA pairing token'",
         emptyApps: "No hosted applications yet. Use one of the presets below to get started!",
-        emptyDbs: "No databases provisioned yet.",
-        emptyBackups: "No encrypted snapshots created yet.",
         emptyPeers: "No secondary servers paired yet.",
         emptySecrets: "Nothing saved here yet.",
         emptyDoctor: "No containers registered for diagnostics.",
-        actionExpose: "Expose",
         actionEnv: "Variables",
         actionLogs: "Logs",
         actionRestart: "Restart",
@@ -3334,7 +3235,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         depPhase_building: "🔨 Building the image",
         depPhase_checking: "🩺 Testing the new version",
         depPhase_switching: "🔁 Switching versions",
-        depPhase_live: "🟢 Live",
         depPhase_failed: "❌ Last deploy failed",
         depOldStillLive: "the previous version is still live",
         depShowError: "Show the error",
@@ -3376,9 +3276,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "deployDesc": "Informe o repositório do GitHub (ou uma pasta do servidor). O painel descobre a linguagem e monta tudo sozinho. As senhas do app ficam em Senhas e chaves.",
           "exposeTitle": "🌐 Deixar um app acessível",
           "exposeDesc": "Escolha quem pode abrir: qualquer pessoa na internet, só e-mails autorizados ou só a sua rede privada (Tailscale). Nenhuma porta do roteador é aberta.",
-          "dbTitle": "🗄️ Criar um banco de dados",
           "dbDesc": "Cada app ganha o seu próprio banco, separado dos outros. O endereço de conexão (<code>DATABASE_URL</code> ou <code>REDIS_URL</code>) entra sozinho nas senhas do app.",
-          "backupsTitle": "🛡️ Cópias de segurança",
           "backupsDesc": "Cópias cifradas dos bancos e dos arquivos dos apps. Use “Testar” para conferir que a cópia abre antes de precisar dela.",
           "fedTitle": "🔗 Conectar outro servidor",
           "fedDesc": "Primeiro passo para ter um segundo servidor: os dois trocam uma chave de confiança. Depois use a aba “Cópia ao vivo” para copiar os dados.",
@@ -3489,8 +3387,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepPoll": "Atualizar sozinho quando eu mudar o código (confere a cada 2 min)",
           "lblDepStorage": "Criar espaço para arquivos",
           "lblDepEmail": "Deixar o app enviar e-mails",
-          "lblDepHealth": "Endereço de teste antes de trocar (Opcional)",
-          "lblDepNoHealth": "Não é um site (pular o teste antes de trocar)",
           "deployHealthFailed": "A nova versão não passou no teste e NÃO foi colocada no ar. A versão anterior continua funcionando. Veja o erro do app abaixo:",
           "emailTitle": "✉️ Envio de e-mails",
           "emailDesc": "E-mail enviado direto de casa cai no spam ou nem sai. Por isso o painel usa um serviço de envio, configurado uma vez para todos os apps.",
@@ -3700,9 +3596,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "deployDesc": "Enter the GitHub repository (or a folder on the server). The dashboard detects the language and builds everything. App passwords live in Passwords & keys.",
           "exposeTitle": "🌐 Make an app reachable",
           "exposeDesc": "Choose who can open it: anyone on the internet, only allowed emails, or only your private network (Tailscale). No router port is opened.",
-          "dbTitle": "🗄️ Create a database",
           "dbDesc": "Each app gets its own database, separate from the others. The connection address (<code>DATABASE_URL</code> or <code>REDIS_URL</code>) goes into the app's passwords automatically.",
-          "backupsTitle": "🛡️ Backups",
           "backupsDesc": "Encrypted copies of app databases and files. Use “Test” to check a backup opens before you need it.",
           "fedTitle": "🔗 Connect another server",
           "fedDesc": "First step to a second server: both exchange a trust key. Then use the “Live copy” tab to copy the data.",
@@ -3813,8 +3707,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblDepPoll": "Update by itself when I change the code (checks every 2 min)",
           "lblDepStorage": "Create file space",
           "lblDepEmail": "Let the app send email",
-          "lblDepHealth": "Test address before switching (Optional)",
-          "lblDepNoHealth": "Not a website (skip the test before switching)",
           "deployHealthFailed": "The new version failed its test and was NOT put live. The previous version is still running. The app's error is below:",
           "emailTitle": "✉️ Email sending",
           "emailDesc": "Email sent straight from home lands in spam or never leaves. So the dashboard uses a sending service, set up once for all apps.",
@@ -4579,6 +4471,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     const I18N_KEYS = [
+      'btnNewApp', 'dbTitle', 'optDbPg', 'optDbRedis', 'backupsTitle', 'lblBakApp', 'lblBakEngine', 'optBakPg', 'optBakRedis', 'optBakVol', 'btnCreateBackup', 'lblDbApp', 'lblDbEngine', 'btnCreateDb',
       'setupGithubDocsLink',
       'setupLocalDesc',
       'setupWebhookNote',
@@ -4586,12 +4479,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
-      'exposeTitle', 'exposeDesc', 'lblQuickFillExpose', 'chipModePublic', 'chipModeZT', 'chipModeTS', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
+      'exposeTitle', 'exposeDesc', 'lblExpApp', 'lblExpMode', 'optPublic', 'optZT', 'optTS', 'lblExpSub', 'btnExpose',
       'vaultTitle', 'vaultDesc', 'lblSecScope', 'lblSecKey', 'lblSecVal', 'btnSaveSecret',
       'dbTitle', 'dbDesc', 'lblDbApp', 'lblDbEngine', 'optDbPg', 'optDbRedis', 'btnCreateDb',
       'backupsTitle', 'backupsDesc', 'lblBakApp', 'lblBakEngine', 'optBakPg', 'optBakRedis', 'btnCreateBackup',
       'fedTitle', 'fedDesc', 'lblFedUrl', 'lblFedMode', 'optFedActive', 'optFedWarm', 'btnGenInvite', 'btnExportSync', 'lblJoinPeer', 'btnJoinPeer',
-      'whTitle', 'whDesc', 'lblWhUrl', 'lblWhSecret', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
+      'whTitle', 'whDesc', 'btnRevealWhSecret', 'lblSshKey', 'btnCopySsh',
       'doctorTitle', 'doctorDesc', 'btnRunDoctor',
       'presetSaas', 'presetDjango', 'presetFastapi', 'presetNode', 'presetGo', 'presetDotnet', 'presetCompose', 'presetSpa', 'presetDockerfile',
       'promptEx1Title', 'promptEx1Desc', 'promptEx2Title', 'promptEx2Desc', 'promptEx3Title', 'promptEx3Desc',
@@ -4989,6 +4882,139 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "redeployConfirm": "Publish {app} again with the current variables? The live version keeps working until the new one passes the test."
     });
 
+    Object.assign(I18N.pt, {
+      "lblQuickFillDeploy": "Parecido com:",
+      "lblDepApp": "Nome do app",
+      "lblDepRepo": "Repositório (dono/nome) ou pasta do servidor",
+      "lblDepBranch": "Branch",
+      "lblDepMem": "Memória máxima",
+      "lblDepCpu": "Processadores (CPUs) no máximo",
+      "lblDepPg": "Banco PostgreSQL (o app recebe <code>DATABASE_URL</code>)",
+      "lblDepRedis": "Cache Redis (o app recebe <code>REDIS_URL</code>)",
+      "btnDeploy": "🚀 Publicar",
+      "lblDepHealth": "Página que o teste abre",
+      "lblDepNoHealth": "Não é um site (pular o teste antes de trocar)",
+      "depMore": "Mais opções",
+      "depMoreDesc": "Pode deixar em branco. Antes de trocar a versão no ar, o painel abre uma página do app para ver se ele responde (por padrão, a página inicial).",
+      "presetSaas": "Next.js + banco",
+      "presetCompose": "Vários serviços (docker-compose)",
+      "presetSpa": "Site estático (React, Vue...)",
+      "presetDjango": "Django + banco",
+      "presetFastapi": "FastAPI + banco",
+      "presetNode": "Node / Express",
+      "presetGo": "Go",
+      "presetDotnet": "C# / ASP.NET + banco",
+      "presetDockerfile": "Dockerfile próprio (Rails, Laravel…)",
+      "btnNewApp": "+ Publicar um app",
+      "appSearch": "Buscar por nome, linguagem ou porta...",
+      "appsCount": "{n} apps",
+      "appsCountOne": "1 app",
+      "lblPort": "Porta",
+      "depPhase_live": "No ar",
+      "actionExpose": "Endereço",
+      "lblExpApp": "App",
+      "lblExpMode": "Quem pode abrir",
+      "optPublic": "Qualquer pessoa (público)",
+      "optZT": "Só e-mails autorizados",
+      "optTS": "Só a minha rede (Tailscale)",
+      "lblExpSub": "Começo do endereço",
+      "btnExpose": "🔗 Publicar endereço",
+      "expHint_public": "Bom para sites e apps com login próprio. Qualquer pessoa com o endereço abre.",
+      "expHint_zero-trust": "A pessoa digita o e-mail e recebe um código. Só entra quem está na lista de Conexões → Domínio. Bom para painéis e ferramentas internas.",
+      "expHint_tailscale": "Só abre em aparelhos com o Tailscale ligado na sua conta. Não precisa de domínio.",
+      "expPreview": "Vai ficar:",
+      "whLblUrl": "Endereço para colar no GitHub (Settings → Webhooks → Add webhook, campo Payload URL; Content type: application/json; evento: Just the push event)",
+      "whLblSecret": "Segredo (campo Secret do mesmo formulário)",
+      "btnRevealWhSecret": "👁️ Mostrar e copiar",
+      "lblSshKey": "Chave de leitura para repositório privado (também em Conexões → GitHub)",
+      "btnCopySsh": "📋 Copiar chave",
+      "dbTitle": "🗄️ Criar um banco de dados",
+      "lblDbApp": "App",
+      "lblDbEngine": "Tipo",
+      "optDbPg": "PostgreSQL (banco de dados)",
+      "optDbRedis": "Redis (cache e filas)",
+      "btnCreateDb": "+ Criar banco",
+      "emptyDbs": "Nenhum banco ainda.",
+      "backupsTitle": "🛡️ Cópias de segurança",
+      "lblBakApp": "App",
+      "lblBakEngine": "O que copiar",
+      "optBakPg": "Banco PostgreSQL",
+      "optBakRedis": "Cache Redis",
+      "optBakVol": "Arquivos do app (volumes do Docker)",
+      "btnCreateBackup": "📸 Fazer uma cópia agora",
+      "emptyBackups": "Nenhuma cópia ainda.",
+      "btnRunDoctor": "🔍 Rodar diagnóstico",
+      "sev_healthy": "Tudo certo",
+      "sev_warning": "Atenção",
+      "sev_critical": "Problema"
+    });
+    Object.assign(I18N.en, {
+      "lblQuickFillDeploy": "Looks like:",
+      "lblDepApp": "App name",
+      "lblDepRepo": "Repository (owner/name) or server folder",
+      "lblDepBranch": "Branch",
+      "lblDepMem": "Maximum memory",
+      "lblDepCpu": "Maximum processors (CPUs)",
+      "lblDepPg": "PostgreSQL database (the app gets <code>DATABASE_URL</code>)",
+      "lblDepRedis": "Redis cache (the app gets <code>REDIS_URL</code>)",
+      "btnDeploy": "🚀 Publish",
+      "lblDepHealth": "Page the test opens",
+      "lblDepNoHealth": "Not a website (skip the test before switching)",
+      "depMore": "More options",
+      "depMoreDesc": "You can leave these empty. Before replacing the live version, the dashboard opens a page of the app to see that it answers (the home page by default).",
+      "presetSaas": "Next.js + database",
+      "presetCompose": "Several services (docker-compose)",
+      "presetSpa": "Static site (React, Vue...)",
+      "presetDjango": "Django + database",
+      "presetFastapi": "FastAPI + database",
+      "presetNode": "Node / Express",
+      "presetGo": "Go",
+      "presetDotnet": "C# / ASP.NET + database",
+      "presetDockerfile": "Own Dockerfile (Rails, Laravel…)",
+      "btnNewApp": "+ Publish an app",
+      "appSearch": "Search by name, language or port...",
+      "appsCount": "{n} apps",
+      "appsCountOne": "1 app",
+      "lblPort": "Port",
+      "depPhase_live": "Live",
+      "actionExpose": "Address",
+      "lblExpApp": "App",
+      "lblExpMode": "Who can open it",
+      "optPublic": "Anyone (public)",
+      "optZT": "Allowed emails only",
+      "optTS": "Only my network (Tailscale)",
+      "lblExpSub": "Start of the address",
+      "btnExpose": "🔗 Publish address",
+      "expHint_public": "Good for sites and apps with their own login. Anyone with the address can open it.",
+      "expHint_zero-trust": "The person types their email and gets a code. Only people on the list in Connections → Domain get in. Good for admin panels and internal tools.",
+      "expHint_tailscale": "Only opens on devices with Tailscale on, in your account. No domain needed.",
+      "expPreview": "It will be:",
+      "whLblUrl": "Address to paste on GitHub (Settings → Webhooks → Add webhook, Payload URL field; Content type: application/json; event: Just the push event)",
+      "whLblSecret": "Secret (the Secret field on the same form)",
+      "btnRevealWhSecret": "👁️ Show and copy",
+      "lblSshKey": "Read-only key for a private repository (also under Connections → GitHub)",
+      "btnCopySsh": "📋 Copy key",
+      "dbTitle": "🗄️ Create a database",
+      "lblDbApp": "App",
+      "lblDbEngine": "Type",
+      "optDbPg": "PostgreSQL (database)",
+      "optDbRedis": "Redis (cache and queues)",
+      "btnCreateDb": "+ Create database",
+      "emptyDbs": "No databases yet.",
+      "backupsTitle": "🛡️ Backups",
+      "lblBakApp": "App",
+      "lblBakEngine": "What to back up",
+      "optBakPg": "PostgreSQL database",
+      "optBakRedis": "Redis cache",
+      "optBakVol": "App files (Docker volumes)",
+      "btnCreateBackup": "📸 Back up now",
+      "emptyBackups": "No backups yet.",
+      "btnRunDoctor": "🔍 Run diagnostics",
+      "sev_healthy": "All good",
+      "sev_warning": "Warning",
+      "sev_critical": "Problem"
+    });
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -5325,6 +5351,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.querySelectorAll('[data-i18n]').forEach(el => { el.innerHTML = t(el.getAttribute('data-i18n')); });
       renderHome();
       renderExposeHint();
+      const search = document.getElementById('appSearchInput');
+      if (search) search.placeholder = t('appSearch');
       renderAi();
       renderArbiterInstall();
       for (const k of I18N_KEYS) {
@@ -5441,6 +5469,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     function fillExposeMode(mode) {
       document.getElementById('expMode').value = mode;
+      renderExposeHint();
     }
 
     function setVaultScope(scope) {
@@ -5453,6 +5482,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function selectAppForExpose(appName) {
       document.getElementById('expApp').value = appName;
       document.getElementById('expSub').value = appName.replace(/^paasmcp-/, '');
+      renderExposeHint();
       revealEl('expApp');
     }
 
@@ -5688,7 +5718,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       const apps = Object.values(s.apps || {});
       const metricsMap = s.containerMetrics || {};
-      document.getElementById('appsBadgeCount').textContent = apps.length + ' apps';
+      document.getElementById('appsBadgeCount').textContent = t(apps.length === 1 ? 'appsCountOne' : 'appsCount').split('{n}').join(String(apps.length));
 
       document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
       fillScopeSelect(apps);
@@ -5812,7 +5842,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   <span class="lang-dot" style="background:\${langColor};"></span>
                   <code>\${esc(a.runtimeType)}</code>
                 </span>
-                <span>Porta: <code>\${esc(a.localPort)}</code></span>
+                <span>\${esc(t('lblPort'))}: <code>\${esc(a.localPort)}</code></span>
                 <span>\${metricHtml} \${limitsHtml}</span>
                 \${deployStatusHtml(d, true)}
                 \${a.lastWebhookAt ? \`<span style="color:var(--muted)">⚡ Webhook: \${esc(a.lastWebhookAt.slice(0,19))}</span>\` : ''}
@@ -6388,8 +6418,14 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const c = (lastStatus && lastStatus.cloudflare) || {};
       const cfs = (lastStatus && lastStatus.systemSecretsConfigured) || {};
       const ready = Boolean(c.accountId && c.tunnelId && c.baseDomain && c.baseDomain !== 'example.com' && cfs.CF_API_TOKEN);
-      el.innerHTML = ready ? '' : '<div class="preset-hint show" style="margin:0 0 12px;">' + esc(t('exposeNeedCf')) +
+      const mode = (document.getElementById('expMode') || {}).value || 'public';
+      el.innerHTML = ready || mode === 'tailscale' ? '' : '<div class="preset-hint show" style="margin:0 0 12px;">' + esc(t('exposeNeedCf')) +
         ' <a href="#connect/cloudflare">' + esc(t('exposeOpenConnect')) + '</a></div>';
+      const hint = document.getElementById('expModeHint');
+      if (hint) hint.textContent = t('expHint_' + mode);
+      const line = document.getElementById('expPreviewLine');
+      const sub = ((document.getElementById('expSub') || {}).value || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+      if (line) line.textContent = sub && mode !== 'tailscale' && c.baseDomain && c.baseDomain !== 'example.com' ? t('expPreview') + ' https://' + sub + '.' + c.baseDomain : '';
     }
     async function loadConnections() {
       const link = document.getElementById('cfTokenLink');
@@ -7369,13 +7405,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const items = data.diagnostics || [];
         const checkedTime = data.checkedAt ? new Date(data.checkedAt).toLocaleTimeString() : '';
         document.getElementById('doctorReportBox').innerHTML = items.length
-          ? \`<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px;">\${esc(t('lastCheck'))} <strong>\${esc(checkedTime)}</strong> · \${esc(t('overallStatus'))} <span class="badge \${data.overallHealth === 'healthy' ? 'success' : data.overallHealth === 'warning' ? 'warning' : 'danger'}">\${esc((data.overallHealth || 'healthy').toUpperCase())}</span></div>\` +
+          ? \`<div style="font-size:11.5px;color:var(--muted);margin-bottom:10px;">\${esc(t('lastCheck'))} <strong>\${esc(checkedTime)}</strong> · \${esc(t('overallStatus'))} <span class="badge \${data.overallHealth === 'healthy' ? 'success' : data.overallHealth === 'warning' ? 'warning' : 'danger'}">\${esc(t('sev_' + (data.overallHealth || 'healthy')))}</span></div>\` +
             items.map(d => \`
             <div style="padding:12px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
                 <strong>\${esc(d.target === 'server' ? t('doctorServer') : d.target)}</strong>
                 <div style="display:flex;gap:6px;align-items:center;">
-                  <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(d.severity.toUpperCase())}</span>
+                  <span class="badge \${d.severity === 'healthy' ? 'success' : d.severity === 'warning' ? 'warning' : 'danger'}">\${esc(t('sev_' + d.severity))}</span>
                   \${d.severity !== 'healthy' && d.target !== 'server' ? \`<button class="secondary" style="padding:3px 9px;font-size:11px;" onclick="appAction('\${esc(d.target)}','restart')">\${esc(t('btnRestartContainer'))}</button>\` : ''}
                 </div>
               </div>
