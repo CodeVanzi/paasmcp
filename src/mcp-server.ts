@@ -61,7 +61,7 @@ import {
   registerFederationPeer,
 } from "./federation.js";
 import { getOrCreateSshDeployKey, registerGitHubDeployKey } from "./github.js";
-import { levelAllows, TokenLevel } from "./tokens.js";
+import { levelAllows, McpVia, noteMcpUse, TokenLevel } from "./tokens.js";
 import { cpuSample, hostResources } from "./resources.js";
 import { readLatestUsage } from "./usage.js";
 import { DiaryLang, parseDockerStats, ruleFor, ruleRiskParams, scaleDiary, scaleHistory, scaleStatus, setScaleRule } from "./scale.js";
@@ -183,15 +183,18 @@ const READ_ONLY_TOOLS = new Set(["paas_system_status", "paas_secret_list", "paas
  * One MCP server per connection. `level` comes from the caller: stdio runs on the server itself
  * ("destroy"), HTTP callers get the level of their personal token (tokens.ts).
  */
-export function createMcpServer(level: TokenLevel = "destroy"): Server {
+export function createMcpServer(level: TokenLevel = "destroy", via: McpVia = "stdio"): Server {
   const server = new Server(
     { name: "paasmcp-mcp", version: "1.2.0" },
     { capabilities: { tools: {} } }
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => listToolsFor(level));
-  server.setRequestHandler(CallToolRequestSchema, async (request) =>
-    handleToolCall(request.params.name, request.params.arguments ?? {}, level)
-  );
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    // Only real MCP calls land here (the dashboard calls handleToolCall directly), so this marks
+    // "Connect your AI" as done in the dashboard tutorial.
+    noteMcpUse(via);
+    return handleToolCall(request.params.name, request.params.arguments ?? {}, level);
+  });
   return server;
 }
 
