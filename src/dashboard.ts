@@ -1141,6 +1141,21 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .ofs-kv { display: grid; grid-template-columns: max-content 1fr auto; gap: 4px 10px; align-items: center; font-size: 12.5px; }
     .ofs-kv code { word-break: break-all; }
     @media (max-width: 560px) { .ofs-kv { grid-template-columns: 1fr auto; } .ofs-kv .k { grid-column: 1 / -1; color: var(--muted); } }
+    .tut-row { display: flex; gap: 12px; align-items: center; padding: 11px 14px; margin-bottom: 8px; border-radius: 10px; background: var(--bg-subtle); border: 1px solid var(--border); font-size: 13px; }
+    .tut-check { flex: 0 0 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border); display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #fff; }
+    .tut-done .tut-check { background: var(--success, #22c55e); border-color: var(--success, #22c55e); }
+    .tut-done .tut-text strong { color: var(--muted); }
+    .tut-text { flex: 1; min-width: 0; }
+    .tut-desc { color: var(--muted); margin-top: 3px; line-height: 1.5; }
+    .tut-guide { margin-left: 4px; white-space: nowrap; }
+    .tut-act { flex: 0 0 auto; }
+    .tut-bar { height: 8px; border-radius: 99px; background: var(--bg-subtle); border: 1px solid var(--border); overflow: hidden; }
+    .tut-bar span { display: block; height: 100%; background: var(--success, #22c55e); transition: width .4s ease; }
+    .tut-count { font-size: 12.5px; color: var(--muted); margin: 6px 0 4px; }
+    .guide-steps { margin: 0; padding-left: 22px; display: grid; gap: 16px; }
+    .guide-step { font-size: 13.5px; line-height: 1.5; padding-left: 4px; }
+    .guide-step::marker { font-weight: 700; color: var(--accent, var(--text)); }
+    @media (max-width: 560px) { .tut-row { flex-wrap: wrap; } .tut-act { margin-left: 34px; } }
     .preset-hint { display: none; margin: -4px 0 12px; font-size: 12px; color: var(--muted); line-height: 1.5; }
     .preset-hint.show { display: block; }
     .badge {
@@ -2103,34 +2118,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           </div>
           <div id="homeSteps"></div>
         </div>
-        <div class="card" data-sub="setup">
+        <div class="card" data-sub="tutorial">
           <div class="card-header">
-            <h2 id="setupTitle">🧭 Primeira configuração: o que você precisa?</h2>
-            <p class="card-desc" id="setupDesc">Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.</p>
+            <h2 data-i18n="tutTitle"></h2>
+            <p class="card-desc" data-i18n="tutDesc"></p>
           </div>
-          <div class="grid-2">
-            <div class="arch-box">
-              <h3 id="setupGithubTitle">🐙 GitHub — opcional</h3>
-              <p id="setupGithubDesc">Só para código privado. Em Conexões → GitHub você copia a chave de leitura ou salva um token, e o painel diz se deu certo.</p>
-              <p><a href="#connect/github" id="setupGithubLink">Abrir Conexões → GitHub</a></p>
-            </div>
-            <div class="arch-box">
-              <h3 id="setupCloudTitle">☁️ Cloudflare — opcional para publicar</h3>
-              <p id="setupCloudDesc">Para abrir os apps no seu domínio, com HTTPS. Em Conexões → Domínio você cola um token, e o painel acha a conta, o domínio e o túnel sozinho (e cria o túnel se faltar).</p>
-              <p><a href="#connect/cloudflare" id="setupCloudLink">Abrir Conexões → Domínio</a></p>
-            </div>
-            <div class="arch-box">
-              <h3 id="setupLocalTitle">🔐 Acesso e deploy local</h3>
-              <p id="setupLocalDesc">O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.</p>
-            </div>
-            <div class="arch-box">
-              <h3 id="setupAppTitle">🧩 Segredos e sugestões por aplicação</h3>
-              <p id="setupAppDesc">Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.</p>
-            </div>
-          </div>
-          <p class="card-desc" id="setupWebhookNote">Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.</p>
+          <div id="tutProgress"></div>
+          <div id="tutList"></div>
         </div>
       </div>
+      <div class="tab-pane" id="tab-guide"></div>
 
       <!-- TAB 2: OVERVIEW, APPS, DEPLOY & EXPOSE -->
       <div class="tab-pane active" id="tab-overview">
@@ -2927,21 +2924,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     const I18N = {
       pt: {
-        setupTitle: "🧭 Primeira configuração: o que você precisa?",
-        setupDesc: "Configure só as integrações que pretende usar. O PaaSMCP funciona localmente sem tokens de terceiros; os valores secretos são guardados no Cofre.",
-        setupGithubTitle: "🐙 GitHub — opcional",
-        setupGithubDesc: "Só para código privado. Em Conexões → GitHub você copia a chave de leitura ou salva um token, e o painel diz se deu certo.",
-        setupGithubLink: "Abrir Conexões → GitHub",
-        setupGithubDocsLink: "Permissões da API ↗",
-        setupCloudTitle: "☁️ Cloudflare — opcional para publicar",
-        setupCloudDesc: "Para abrir os apps no seu domínio, com HTTPS. Em Conexões → Domínio você cola um token, e o painel acha a conta, o domínio e o túnel sozinho (e cria o túnel se faltar).",
-        setupCloudLink: "Abrir Conexões → Domínio",
-        setupCloudDocsLink: "Guia de tokens ↗",
-        setupLocalTitle: "🔐 Acesso e deploy local",
-        setupLocalDesc: "O token do painel é criado automaticamente: consulte com <code>paasmcp dashboard token</code>. Para repositório público, privado por SSH ou pasta local, não é necessário token GitHub se adicionar a chave SSH pública ao repositório. Tailscale é alternativa privada e não requer Cloudflare.",
-        setupAppTitle: "🧩 Segredos e sugestões por aplicação",
-        setupAppDesc: "Salve chaves da aplicação no escopo com o slug dela (por exemplo <code>STRIPE_SECRET_KEY</code> ou <code>API_KEY</code>), nunca em <code>system</code>. Se precisar, marque PostgreSQL/Redis no deploy. Depois confira Logs e rode Doctor; exponha como Público só serviços sem login próprio. Use Zero Trust ou Tailscale para ferramentas administrativas.",
-        setupWebhookNote: "Auto-deploy por webhook é opcional: cadastre no GitHub a URL mostrada no fim da tela Apps, evento Push e o secret mostrado pelo painel. Não cole tokens no chat; insira-os no Cofre.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navHome: "Início",
         navOverview: "Aplicações",
@@ -3140,21 +3122,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         relDay: "há {n} dias",
       },
       en: {
-        setupTitle: "🧭 First-time setup: what do you need?",
-        setupDesc: "Configure only the integrations you plan to use. PaaSMCP works locally without third-party tokens; secret values are stored in the Vault.",
-        setupGithubTitle: "🐙 GitHub — optional",
-        setupGithubDesc: "Only for private code. Under Connections → GitHub you copy the read-only key or save a token, and the dashboard tells you whether it worked.",
-        setupGithubLink: "Open Connections → GitHub",
-        setupGithubDocsLink: "API permissions ↗",
-        setupCloudTitle: "☁️ Cloudflare — optional for publishing",
-        setupCloudDesc: "To open apps on your own domain, with HTTPS. Under Connections → Domain you paste a token, and the dashboard finds the account, domain and tunnel by itself (and creates the tunnel if needed).",
-        setupCloudLink: "Open Connections → Domain",
-        setupCloudDocsLink: "Token guide ↗",
-        setupLocalTitle: "🔐 Dashboard access and local deploy",
-        setupLocalDesc: "The dashboard token is generated automatically: retrieve it with <code>paasmcp dashboard token</code>. Public repositories, SSH access to private repositories, and local folders do not require a GitHub token if you add the public SSH key to the repository. Tailscale is a private alternative that does not require Cloudflare.",
-        setupAppTitle: "🧩 App secrets and recommendations",
-        setupAppDesc: "Save application keys in the scope named after its slug (for example <code>STRIPE_SECRET_KEY</code> or <code>API_KEY</code>), never in <code>system</code>. Select PostgreSQL/Redis during deployment if needed. Then check Logs and run Doctor; expose as Public only services with their own login. Use Zero Trust or Tailscale for admin tools.",
-        setupWebhookNote: "Webhook auto-deploy is optional: add the URL shown at the end of the Apps screen to GitHub, select Push events, and use the secret shown by the dashboard. Do not paste tokens into chat; enter them in the Vault.",
         sidebarSubtitle: "Agent-First Micro-PaaS",
         navHome: "Home",
         navOverview: "Applications",
@@ -3368,7 +3335,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navAgents": "Conectar IA",
           "navPool": "Ajudantes",
           "homeTitle": "Resumo do servidor",
-          "setupTitle": "🧭 Integrações opcionais",
           "appsTitle": "📦 Seus apps",
           "appsDesc": "Cada app roda isolado no servidor. Daqui você vê o uso de memória, abre os logs, volta para a versão anterior ou para o app. Quando chega um commit novo, a linha do app mostra a nova versão sendo montada e testada; a versão atual continua no ar até a nova passar no teste.",
           "deployTitle": "➕ Publicar um app",
@@ -3397,18 +3363,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "agentsTitle": "🤖 Conectar sua IA",
           "agentsDesc": "Qualquer IA compatível com MCP (Claude Code, Codex, Gemini CLI, Cursor, VS Code, modelos locais) pode cuidar do servidor por você: publicar apps, fazer cópias, ver o que deu errado. Ações arriscadas sempre esperam a sua aprovação no Início.",
           "homeDesc": "Resumo do servidor, pedidos esperando você e os próximos passos.",
-          "stepsTitle": "🧭 Primeiros passos",
-          "stepsDesc": "Faça na ordem. Cada passo diz o que é e por que vale a pena.",
-          "step1Title": "Publicar o primeiro app",
-          "step1Desc": "Cole o endereço do código e o painel monta o resto.",
-          "step2Title": "Guardar cópias fora do servidor",
-          "step2Desc": "Se o servidor quebrar ou for roubado, seus dados continuam salvos em outro lugar.",
-          "step3Title": "Configurar o envio de e-mails",
-          "step3Desc": "Para os apps mandarem “esqueci a senha” e avisos. Leva 5 minutos com uma conta gratuita.",
-          "step4Title": "Ligar um segundo servidor",
-          "step4Desc": "Ele guarda uma cópia ao vivo de tudo e pode assumir se este cair.",
-          "step5Title": "Conectar sua IA",
-          "step5Desc": "Peça em português: “publica meu app”, “faz uma cópia agora”.",
           "optional": "opcional",
           "done": "Feito",
           "openStep": "Fazer agora",
@@ -3707,7 +3661,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navAgents": "Connect AI",
           "navPool": "Helpers",
           "homeTitle": "Server summary",
-          "setupTitle": "🧭 Optional integrations",
           "appsTitle": "📦 Your apps",
           "appsDesc": "Each app runs isolated on the server. From here you see memory use, open logs, go back to the previous version or stop the app. When a new commit arrives, the app's row shows the new version being built and tested; the current version stays live until the new one passes the test.",
           "deployTitle": "➕ Publish an app",
@@ -3736,18 +3689,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "agentsTitle": "🤖 Connect your AI",
           "agentsDesc": "Any MCP-compatible AI (Claude Code, Codex, Gemini CLI, Cursor, VS Code, local models) can run the server for you: publish apps, make backups, find what went wrong. Risky actions always wait for your approval on Home.",
           "homeDesc": "Server summary, requests waiting for you and next steps.",
-          "stepsTitle": "🧭 First steps",
-          "stepsDesc": "Do them in order. Each step says what it is and why it is worth it.",
-          "step1Title": "Publish your first app",
-          "step1Desc": "Paste the code address and the dashboard does the rest.",
-          "step2Title": "Keep backups off the server",
-          "step2Desc": "If the server breaks or is stolen, your data is still safe elsewhere.",
-          "step3Title": "Set up email sending",
-          "step3Desc": "So apps can send “forgot password” and notices. Takes 5 minutes with a free account.",
-          "step4Title": "Add a second server",
-          "step4Desc": "It keeps a live copy of everything and can take over if this one goes down.",
-          "step5Title": "Connect your AI",
-          "step5Desc": "Ask in plain words: “publish my app”, “back up now”.",
           "optional": "optional",
           "done": "Done",
           "openStep": "Do it now",
@@ -4489,8 +4430,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navSecSystem": "Sistema",
           "navCollapse": "Recolher menu",
           "navExpand": "Expandir menu",
-          "sub_home_start": "Primeiros passos",
-          "sub_home_setup": "Primeira configuração",
           "sub_overview_list": "Seus apps",
           "sub_overview_deploy": "Publicar um app",
           "sub_overview_expose": "Deixar acessível",
@@ -4550,8 +4489,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "navSecSystem": "System",
           "navCollapse": "Collapse menu",
           "navExpand": "Expand menu",
-          "sub_home_start": "First steps",
-          "sub_home_setup": "First setup",
           "sub_overview_list": "Your apps",
           "sub_overview_deploy": "Publish an app",
           "sub_overview_expose": "Make reachable",
@@ -4611,9 +4548,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     const I18N_KEYS = [
-      'setupTitle', 'setupDesc', 'setupGithubTitle', 'setupGithubDesc', 'setupGithubLink', 'setupGithubDocsLink',
-      'setupCloudTitle', 'setupCloudDesc', 'setupCloudLink', 'setupCloudDocsLink', 'setupLocalTitle', 'setupLocalDesc',
-      'setupAppTitle', 'setupAppDesc', 'setupWebhookNote',
+      'setupGithubDocsLink',
+      'setupLocalDesc',
+      'setupWebhookNote',
       'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect',
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
@@ -4777,6 +4714,215 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "exposeOpenConnect": "Open Connections"
     });
 
+    Object.assign(I18N.pt, {
+      "sub_home_start": "Resumo",
+      "sub_home_tutorial": "Tutorial",
+      "stepsTitle": "Próximo passo",
+      "stepsDesc": "O que mais vale a pena fazer agora.",
+      "tutTitle": "O que você já fez e o que ainda pode fazer",
+      "tutDesc": "Os itens se marcam sozinhos quando o painel vê que estão prontos. Os guias explicam passo a passo, numa página própria.",
+      "tutCount": "{n} de {t} feitos",
+      "tutGuide": "Ver o guia",
+      "tutOpen": "Abrir",
+      "tutSeeAll": "Ver o tutorial completo",
+      "tutAllEssential": "O essencial está pronto. Veja no tutorial o que mais dá para fazer.",
+      "tutGroup_essential": "Essencial",
+      "tutGroup_essentialDesc": "Para ter um app no ar, com endereço e com os dados guardados fora do servidor.",
+      "tutGroup_recommended": "Recomendado",
+      "tutGroup_recommendedDesc": "Deixa o dia a dia mais fácil e evita sustos.",
+      "tutGroup_grow": "Quando precisar de mais",
+      "tutGroup_growDesc": "Mais segurança contra queda, mais força ou ajuda de uma IA.",
+      "tut_app": "Publicar o primeiro app",
+      "tut_appDesc": "Informe o repositório do GitHub e o painel monta e liga o app.",
+      "tut_address": "Dar um endereço ao app",
+      "tut_addressDesc": "Pelo seu domínio (Cloudflare) ou só para você e sua família (Tailscale).",
+      "tut_offsite": "Guardar cópias fora do servidor",
+      "tut_offsiteDesc": "Se o servidor quebrar ou for roubado, os dados continuam salvos em outro lugar.",
+      "tut_autoupdate": "Atualizar o app sozinho quando o código muda",
+      "tut_autoupdateDesc": "Você manda o código para o GitHub e o app se atualiza, sem abrir o painel.",
+      "tut_email": "Configurar o envio de e-mails",
+      "tut_emailDesc": "Para os apps mandarem “esqueci a senha” e avisos. Leva 5 minutos com uma conta grátis.",
+      "tut_backup": "Fazer uma cópia e testar",
+      "tut_backupDesc": "Faça uma cópia do banco e use “Testar” para ver se ela abre antes de precisar dela.",
+      "tut_doctor": "Rodar o diagnóstico",
+      "tut_doctorDesc": "Procura problemas no servidor e nos apps e diz o que fazer. Vale rodar de vez em quando.",
+      "tut_github": "Ligar o GitHub para código privado",
+      "tut_githubDesc": "Só se o seu repositório for privado.",
+      "tut_mirror": "Ligar um segundo servidor",
+      "tut_mirrorDesc": "Guarda uma cópia ao vivo de tudo e pode assumir se este cair.",
+      "tut_pool": "Emprestar força de outros PCs",
+      "tut_poolDesc": "PCs da casa rodam cópias extras dos apps quando o servidor aperta.",
+      "tut_ai": "Conectar sua IA",
+      "tut_aiDesc": "Peça em português: “publica meu app”, “faz uma cópia agora”.",
+      "guideCrumb": "Guia",
+      "guideOpenScreen": "Abrir esta tela",
+      "guideOthers": "Outros guias:",
+      "guideBack": "← Voltar ao tutorial",
+      "guide_firstapp": "Publicar o primeiro app",
+      "guide_firstapp_lead": "Uns 5 minutos. Você precisa só do endereço do repositório no GitHub.",
+      "guide_firstapp_s1": "Abra “Publicar um app”",
+      "guide_firstapp_s1Desc": "Se o seu projeto parece com um dos modelos (Next.js, Django, Node...), clique nele para preencher os campos. Senão, deixe sem modelo: o painel descobre a linguagem sozinho.",
+      "guide_firstapp_s2": "Código privado? Ligue o GitHub antes",
+      "guide_firstapp_s2Desc": "Repositório público não precisa de nada. Se for privado, siga a tela Conexões → GitHub (leva 2 minutos).",
+      "guide_firstapp_s3": "Preencha nome e repositório",
+      "guide_firstapp_s3Desc": "O nome vira o endereço do app (use letras minúsculas e hífen, por exemplo <code>minha-loja</code>). O repositório é <code>dono/nome</code>, como aparece no GitHub. Marque PostgreSQL ou Redis se o app usa banco: o endereço do banco entra no app sozinho.",
+      "guide_firstapp_s4": "Clique em Publicar e acompanhe",
+      "guide_firstapp_s4Desc": "A linha do app mostra cada fase: baixando, montando, testando, no ar. Se algo falhar, o painel mostra o motivo, e uma versão que já estava no ar continua funcionando.",
+      "guide_firstapp_s5": "Senhas do app ficam em Senhas e chaves",
+      "guide_firstapp_s5Desc": "Chaves como a da Stripe vão em Senhas e chaves, com o nome do app. Depois publique de novo para o app usar.",
+      "guide_address": "Dar um endereço ao app",
+      "guide_address_lead": "Escolha quem pode abrir o app. Não precisa abrir porta no roteador.",
+      "guide_address_s1": "Decida quem vai usar",
+      "guide_address_s1Desc": "Qualquer pessoa na internet: modo Público, com o seu domínio. Só pessoas convidadas: “Só e-mails autorizados”, que pede um código enviado por e-mail. Só você e sua família: Tailscale, que funciona sem domínio.",
+      "guide_address_s2": "Com domínio: ligue a Cloudflare",
+      "guide_address_s2Desc": "Em Conexões → Domínio, cole um token e escolha o domínio. O painel cria o túnel sozinho. (Com Tailscale, pule este passo: instale o app Tailscale no servidor e no seu celular ou computador, com a mesma conta.)",
+      "guide_address_s3": "Publique o endereço",
+      "guide_address_s3Desc": "Em “Deixar acessível”, escolha o app, o modo e o começo do endereço (por exemplo <code>loja</code> vira <code>loja.seudominio.com</code>).",
+      "guide_address_s4": "Teste no celular",
+      "guide_address_s4Desc": "Abra o endereço fora do Wi-Fi de casa. O endereço aparece também na linha do app. O HTTPS já vem pronto.",
+      "guide_offsite": "Guardar cópias fora do servidor",
+      "guide_offsite_lead": "Uns 10 minutos. Depois disso o servidor manda as cópias toda noite, sozinho.",
+      "guide_offsite_s1": "Escolha onde guardar",
+      "guide_offsite_s1Desc": "Cloudflare R2 e Backblaze B2 têm 10 GB grátis e servem para a maioria. Se você já usa Amazon, Google ou Wasabi, use o que já tem. Outro PaaSMCP (de um amigo, ou seu em outra casa) também serve.",
+      "guide_offsite_s2": "Crie o lugar e a chave no serviço",
+      "guide_offsite_s2Desc": "No serviço escolhido, crie um “bucket” (uma pasta para as cópias) e uma chave de acesso só para ele. A tela de cópias mostra onde fica cada coisa no serviço que você escolher.",
+      "guide_offsite_s3": "Cole os campos e clique em Testar e salvar",
+      "guide_offsite_s3Desc": "O painel grava, lê e apaga um arquivo de teste antes de salvar. Se der errado, ele diz qual campo conferir.",
+      "guide_offsite_s4": "Confira a primeira cópia",
+      "guide_offsite_s4Desc": "No dia seguinte, o quadro “Última cópia” no Início diz “Guardada também fora do servidor”. Para não esperar, faça uma cópia agora na aba Cópias de segurança e clique em “Enviar agora”.",
+      "guide_autoupdate": "Atualizar o app sozinho",
+      "guide_autoupdate_lead": "Você manda o código para o GitHub e o app se atualiza. Duas formas: escolha uma.",
+      "guide_autoupdate_s1": "Mais simples: marque “Atualizar sozinho”",
+      "guide_autoupdate_s1Desc": "Ao publicar o app, marque “Atualizar sozinho quando eu mudar o código”. O servidor olha o GitHub a cada 2 minutos. Funciona em qualquer rede, sem configurar mais nada.",
+      "guide_autoupdate_s2": "Mais rápido: aviso do GitHub (webhook)",
+      "guide_autoupdate_s2Desc": "O GitHub avisa o servidor na hora. Só funciona se o painel tiver um endereço na internet. A tela “Publicar a cada push” mostra o endereço e o segredo para colar no GitHub (Settings → Webhooks).",
+      "guide_autoupdate_s3": "Nada quebra no meio",
+      "guide_autoupdate_s3Desc": "A versão nova só entra depois de responder ao teste. Se falhar, a atual continua no ar e a linha do app mostra o motivo.",
+      "guide_email": "Configurar o envio de e-mails",
+      "guide_email_lead": "Uns 5 minutos com uma conta grátis. Vale para todos os apps.",
+      "guide_email_s1": "Crie uma conta num serviço de envio",
+      "guide_email_s1Desc": "O Brevo tem plano grátis com 300 e-mails por dia. Outros (Resend, Mailgun, Amazon SES) também servem. E-mail mandado direto de casa cai no spam, por isso o serviço.",
+      "guide_email_s2": "Confirme o seu domínio no serviço",
+      "guide_email_s2Desc": "O serviço pede para criar alguns registros no DNS do domínio. Se o domínio está na Cloudflare, cole os registros lá, em DNS → Records.",
+      "guide_email_s3": "Copie os dados SMTP para o painel",
+      "guide_email_s3Desc": "Servidor, porta, usuário e senha (ou chave SMTP) ficam na área SMTP do serviço. Cole na tela E-mail e salve. Mande um e-mail de teste para você.",
+      "guide_email_s4": "Libere o envio para cada app",
+      "guide_email_s4Desc": "Na mesma tela, em “Permitir que um app envie e-mail”, escreva o nome do app. Depois publique o app de novo.",
+      "guide_github": "Ligar o GitHub para código privado",
+      "guide_github_lead": "Só para repositórios privados. Uns 2 minutos.",
+      "guide_github_s1": "Escolha entre chave e token",
+      "guide_github_s1Desc": "A chave de leitura é a mais segura: o servidor só consegue ler aquele repositório. O token poupa o trabalho de colar a chave em cada repositório.",
+      "guide_github_s2": "Com chave: cole no repositório",
+      "guide_github_s2Desc": "Copie a chave em Conexões → GitHub. No GitHub, abra o repositório, Settings → Deploy keys → Add deploy key, cole e deixe “Allow write access” desmarcado.",
+      "guide_github_s3": "Com token: crie, teste e indique o repositório",
+      "guide_github_s3Desc": "Crie um token fine-grained só com os repositórios que vai publicar e a permissão Administration: Read and write. Cole em Conexões → GitHub, clique Testar e salvar, e escreva o repositório para o painel cadastrar a chave.",
+      "lead_guide": ""
+    });
+    Object.assign(I18N.en, {
+      "sub_home_start": "Summary",
+      "sub_home_tutorial": "Tutorial",
+      "stepsTitle": "Next step",
+      "stepsDesc": "What is most worth doing now.",
+      "tutTitle": "What you have done and what you can still do",
+      "tutDesc": "Items tick themselves when the dashboard sees they are ready. The guides explain step by step, on a page of their own.",
+      "tutCount": "{n} of {t} done",
+      "tutGuide": "See the guide",
+      "tutOpen": "Open",
+      "tutSeeAll": "See the full tutorial",
+      "tutAllEssential": "The essentials are ready. See the tutorial for what else you can do.",
+      "tutGroup_essential": "Essential",
+      "tutGroup_essentialDesc": "To have an app online, with an address and its data kept off the server.",
+      "tutGroup_recommended": "Recommended",
+      "tutGroup_recommendedDesc": "Makes day to day easier and avoids scares.",
+      "tutGroup_grow": "When you need more",
+      "tutGroup_growDesc": "More safety against outages, more power, or help from an AI.",
+      "tut_app": "Publish your first app",
+      "tut_appDesc": "Enter the GitHub repository and the dashboard builds and starts the app.",
+      "tut_address": "Give the app an address",
+      "tut_addressDesc": "On your domain (Cloudflare) or only for you and your family (Tailscale).",
+      "tut_offsite": "Keep backups off the server",
+      "tut_offsiteDesc": "If the server breaks or is stolen, the data is still safe elsewhere.",
+      "tut_autoupdate": "Update the app by itself when the code changes",
+      "tut_autoupdateDesc": "You push code to GitHub and the app updates, without opening the dashboard.",
+      "tut_email": "Set up email sending",
+      "tut_emailDesc": "So apps can send “forgot password” and notices. Takes 5 minutes with a free account.",
+      "tut_backup": "Make a backup and test it",
+      "tut_backupDesc": "Back up the database and use “Test” to check it opens before you need it.",
+      "tut_doctor": "Run diagnostics",
+      "tut_doctorDesc": "Looks for problems in the server and apps and says what to do. Worth running now and then.",
+      "tut_github": "Connect GitHub for private code",
+      "tut_githubDesc": "Only if your repository is private.",
+      "tut_mirror": "Add a second server",
+      "tut_mirrorDesc": "Keeps a live copy of everything and can take over if this one goes down.",
+      "tut_pool": "Borrow power from other PCs",
+      "tut_poolDesc": "Home PCs run extra copies of the apps when the server is busy.",
+      "tut_ai": "Connect your AI",
+      "tut_aiDesc": "Ask in plain words: “publish my app”, “back up now”.",
+      "guideCrumb": "Guide",
+      "guideOpenScreen": "Open this screen",
+      "guideOthers": "Other guides:",
+      "guideBack": "← Back to the tutorial",
+      "guide_firstapp": "Publish your first app",
+      "guide_firstapp_lead": "About 5 minutes. You only need the repository's address on GitHub.",
+      "guide_firstapp_s1": "Open “Publish an app”",
+      "guide_firstapp_s1Desc": "If your project looks like one of the presets (Next.js, Django, Node...), click it to fill in the fields. Otherwise leave it: the dashboard detects the language by itself.",
+      "guide_firstapp_s2": "Private code? Connect GitHub first",
+      "guide_firstapp_s2Desc": "A public repository needs nothing. If it is private, follow Connections → GitHub (takes 2 minutes).",
+      "guide_firstapp_s3": "Fill in the name and repository",
+      "guide_firstapp_s3Desc": "The name becomes the app's address (use lowercase letters and hyphens, e.g. <code>my-shop</code>). The repository is <code>owner/name</code>, as shown on GitHub. Tick PostgreSQL or Redis if the app uses a database: its address goes into the app by itself.",
+      "guide_firstapp_s4": "Click Publish and follow along",
+      "guide_firstapp_s4Desc": "The app's row shows each phase: fetching, building, testing, live. If something fails, the dashboard shows why, and a version already live keeps working.",
+      "guide_firstapp_s5": "App passwords live in Secrets & keys",
+      "guide_firstapp_s5Desc": "Keys such as Stripe's go in Secrets & keys, under the app's name. Then publish again so the app uses them.",
+      "guide_address": "Give the app an address",
+      "guide_address_lead": "Choose who can open the app. No router port needs opening.",
+      "guide_address_s1": "Decide who will use it",
+      "guide_address_s1Desc": "Anyone on the internet: Public mode, on your domain. Only invited people: “Allowed emails only”, which asks for a code sent by email. Only you and your family: Tailscale, which needs no domain.",
+      "guide_address_s2": "With a domain: connect Cloudflare",
+      "guide_address_s2Desc": "Under Connections → Domain, paste a token and pick the domain. The dashboard creates the tunnel by itself. (With Tailscale, skip this: install the Tailscale app on the server and on your phone or computer, same account.)",
+      "guide_address_s3": "Publish the address",
+      "guide_address_s3Desc": "Under “Make reachable”, pick the app, the mode and the start of the address (e.g. <code>shop</code> becomes <code>shop.yourdomain.com</code>).",
+      "guide_address_s4": "Test it on your phone",
+      "guide_address_s4Desc": "Open the address off your home Wi-Fi. The address also shows on the app's row. HTTPS comes ready.",
+      "guide_offsite": "Keep backups off the server",
+      "guide_offsite_lead": "About 10 minutes. After that the server sends backups every night by itself.",
+      "guide_offsite_s1": "Pick where to keep them",
+      "guide_offsite_s1Desc": "Cloudflare R2 and Backblaze B2 have 10 GB free and suit most people. If you already use Amazon, Google or Wasabi, use what you have. Another PaaSMCP (a friend's, or yours in another house) works too.",
+      "guide_offsite_s2": "Create the bucket and key on the service",
+      "guide_offsite_s2Desc": "On the chosen service, create a “bucket” (a folder for the backups) and an access key just for it. The backups screen shows where each thing is on the service you pick.",
+      "guide_offsite_s3": "Paste the fields and click Test and save",
+      "guide_offsite_s3Desc": "The dashboard writes, reads and deletes a test file before saving. If it fails, it says which field to check.",
+      "guide_offsite_s4": "Check the first backup",
+      "guide_offsite_s4Desc": "The next day, the “Last backup” tile on Home says “Also stored off the server”. To skip the wait, make a backup now on the Backups tab and click “Send now”.",
+      "guide_autoupdate": "Update the app by itself",
+      "guide_autoupdate_lead": "You push code to GitHub and the app updates. Two ways: pick one.",
+      "guide_autoupdate_s1": "Simplest: tick “Update by itself”",
+      "guide_autoupdate_s1Desc": "When publishing, tick “Update by itself when I change the code”. The server checks GitHub every 2 minutes. Works on any network, nothing else to set up.",
+      "guide_autoupdate_s2": "Faster: GitHub notice (webhook)",
+      "guide_autoupdate_s2Desc": "GitHub tells the server right away. Only works if the dashboard has an internet address. The “Publish on every push” screen shows the address and the secret to paste into GitHub (Settings → Webhooks).",
+      "guide_autoupdate_s3": "Nothing breaks halfway",
+      "guide_autoupdate_s3Desc": "The new version only goes live after it answers the test. If it fails, the current one stays live and the app's row shows why.",
+      "guide_email": "Set up email sending",
+      "guide_email_lead": "About 5 minutes with a free account. Works for every app.",
+      "guide_email_s1": "Create an account on a sending service",
+      "guide_email_s1Desc": "Brevo has a free plan with 300 emails a day. Others (Resend, Mailgun, Amazon SES) work too. Email sent straight from home lands in spam, hence the service.",
+      "guide_email_s2": "Verify your domain on the service",
+      "guide_email_s2Desc": "The service asks you to create a few DNS records. If the domain is on Cloudflare, paste them there under DNS → Records.",
+      "guide_email_s3": "Copy the SMTP details into the dashboard",
+      "guide_email_s3Desc": "Server, port, user and password (or SMTP key) are in the service's SMTP area. Paste them on the Email screen and save. Send yourself a test email.",
+      "guide_email_s4": "Allow each app to send",
+      "guide_email_s4Desc": "On the same screen, under “Allow an app to send email”, type the app's name. Then publish the app again.",
+      "guide_github": "Connect GitHub for private code",
+      "guide_github_lead": "Only for private repositories. About 2 minutes.",
+      "guide_github_s1": "Choose between key and token",
+      "guide_github_s1Desc": "The read-only key is safest: the server can only read that repository. The token saves pasting the key into each repository.",
+      "guide_github_s2": "With a key: paste it into the repository",
+      "guide_github_s2Desc": "Copy the key under Connections → GitHub. On GitHub, open the repository, Settings → Deploy keys → Add deploy key, paste it and leave “Allow write access” unticked.",
+      "guide_github_s3": "With a token: create, test and name the repository",
+      "guide_github_s3Desc": "Create a fine-grained token with only the repositories you will publish and Administration: Read and write. Paste it under Connections → GitHub, click Test and save, and type the repository so the dashboard adds the key.",
+      "lead_guide": ""
+    });
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -4816,7 +4962,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     // Pages with more than one part get folder tabs on top and nested items in the side menu.
     const PAGE_SUBS = {
-      home: ['start', 'setup'],
+      home: ['start', 'tutorial'],
       overview: ['list', 'deploy', 'expose', 'scale', 'diary', 'webhook'],
       databases: ['dbs', 'backups', 'offsite', 'files'],
       mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
@@ -4933,12 +5079,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         activeSubs[tab] = sub;
         try { localStorage.setItem('paasmcp_active_subs', JSON.stringify(activeSubs)); } catch {}
       }
-      const moved = tab !== currentTab || currentSub(tab) !== prevSub;
+      const moved = tab !== currentTab || currentSub(tab) !== prevSub || (tab === 'guide' && sub !== currentGuide);
       if (tab !== currentTab) switchTab(tab, navBtnFor(tab));
       if (mode !== 'init') openSectionOf(tab);
       currentTab = tab;
       renderSubNav();
-      const hash = '#' + tab + (subs ? '/' + currentSub(tab) : '');
+      if (tab === 'guide') { if (sub) currentGuide = sub; renderGuide(); }
+      const hash = '#' + tab + (subs ? '/' + currentSub(tab) : tab === 'guide' && currentGuide ? '/' + currentGuide : '');
       if (mode !== 'hash' && location.hash !== hash) {
         try {
           if (mode === 'init') history.replaceState(null, '', hash);
@@ -5056,6 +5203,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'email') loadEmail();
       if (tabName === 'agents') { renderAi(); loadAiTokens(); }
       if (tabName === 'connect') loadConnections();
+      if (tabName === 'home') loadTutorialExtra();
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') { loadStorage(); loadOffsite(); }
@@ -5724,19 +5872,106 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         tile(t('tileBackup'), last ? new Date(last.createdAt).toLocaleString() : t('never'), last ? (last.offsiteAt ? t('tileBackupOff') : t('tileBackupLocal')) : t('tileBackupNone')) +
         tile(t('tileMirror'), m.fenced ? t('mirrorFenced') : hasMirror ? t('tileMirrorOn') : t('tileMirrorOff'), t('tileMirrorNote')) +
         tile(t('tileEmail'), emailRelay ? emailRelay.host : t('notConfigured'), emailRelay ? emailRelay.fromDomain : t('tileEmailNote'));
-      const steps = [
-        ['step1', apps.length > 0, 'overview', false, 'deploy'],
-        ['step2', offsiteOn, 'databases', false, 'offsite'],
-        ['step3', Boolean(emailRelay), 'email', false],
-        ['step4', hasMirror, 'mirror', true, 'connect'],
-        ['step5', false, 'agents', true, 'connect'],
+      renderNextStep();
+      renderTutorial();
+      if (!tutExtra.loaded && (currentTab === 'home')) loadTutorialExtra();
+    }
+
+    // ---- Tutorial: what is done and what can still be done, with step-by-step guides on their own pages ----
+    let tutExtra = { pool: 0, ai: 0, loaded: false };
+    let currentGuide = '';
+    async function loadTutorialExtra() {
+      try {
+        const [p, k] = await Promise.all([fetch('/api/pool'), fetch('/api/tokens')]);
+        const pool = p.ok ? await p.json() : {};
+        const tok = k.ok ? await k.json() : {};
+        tutExtra = { pool: (pool.helpers || []).length, ai: (tok.tokens || []).length, loaded: true };
+      } catch { tutExtra.loaded = true; }
+      renderHome();
+    }
+    function tutorialItems() {
+      const s = lastStatus || {};
+      const apps = Object.values(s.apps || {});
+      const sys = s.systemSecretsConfigured || {};
+      const m = s.mirror || {};
+      return [
+        { id: 'app', group: 'essential', done: apps.length > 0, go: ['overview', 'deploy'], guide: 'firstapp' },
+        { id: 'address', group: 'essential', done: apps.some(function (a) { return (a.domains || []).length > 0; }), go: ['overview', 'expose'], guide: 'address' },
+        { id: 'offsite', group: 'essential', done: Boolean(sys.BACKUP_S3_ENDPOINT), go: ['databases', 'offsite'], guide: 'offsite' },
+        { id: 'autoupdate', group: 'recommended', done: apps.some(function (a) { return Boolean(a.autoDeploy); }), go: ['overview', 'deploy'], guide: 'autoupdate' },
+        { id: 'email', group: 'recommended', done: Boolean(emailRelay), go: ['email', ''], guide: 'email' },
+        { id: 'backup', group: 'recommended', done: (s.backups || []).length > 0, go: ['databases', 'backups'] },
+        { id: 'doctor', group: 'recommended', done: false, go: ['doctor', ''], always: true },
+        { id: 'github', group: 'recommended', done: Boolean(sys.GITHUB_TOKEN), go: ['connect', 'github'], guide: 'github', optional: true },
+        { id: 'mirror', group: 'grow', done: Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0, go: ['mirror', 'connect'] },
+        { id: 'pool', group: 'grow', done: tutExtra.pool > 0, go: ['pool', 'add'] },
+        { id: 'ai', group: 'grow', done: tutExtra.ai > 0, go: ['agents', 'connect'] },
       ];
-      document.getElementById('homeSteps').innerHTML = steps.map((st, i) => card(
-        '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
-        '<div><strong>' + (i + 1) + '. ' + esc(t(st[0] + 'Title')) + '</strong>' + (st[3] ? ' <span style="color:var(--muted)">(' + esc(t('optional')) + ')</span>' : '') +
-        '<div style="color:var(--muted);margin-top:4px;">' + esc(t(st[0] + 'Desc')) + '</div></div>' +
-        (st[1] ? badge('success', t('done')) : '<button class="secondary" onclick="goTab(&#39;' + st[2] + '&#39;, &#39;' + (st[4] || '') + '&#39;)">' + esc(t('openStep')) + '</button>') +
-        '</div>')).join('');
+    }
+    function tutRow(it) {
+      const guide = it.guide ? ' <a href="#guide/' + it.guide + '" class="tut-guide">' + esc(t('tutGuide')) + '</a>' : '';
+      const action = it.done
+        ? badge('success', t('done'))
+        : '<button class="secondary" data-go-tab="' + it.go[0] + '" data-go-sub="' + it.go[1] + '">' + esc(t(it.always ? 'tutOpen' : 'openStep')) + '</button>';
+      return '<div class="tut-row' + (it.done ? ' tut-done' : '') + '">' +
+        '<span class="tut-check" aria-hidden="true">' + (it.done ? '✓' : '') + '</span>' +
+        '<div class="tut-text"><strong>' + esc(t('tut_' + it.id)) + '</strong>' + (it.optional ? ' <span style="color:var(--muted)">(' + esc(t('optional')) + ')</span>' : '') +
+        '<div class="tut-desc">' + esc(t('tut_' + it.id + 'Desc')) + guide + '</div></div>' +
+        '<div class="tut-act">' + action + '</div></div>';
+    }
+    function tutCountText() {
+      const items = tutorialItems().filter(function (it) { return !it.always; });
+      return t('tutCount').split('{n}').join(String(items.filter(function (it) { return it.done; }).length)).split('{t}').join(String(items.length));
+    }
+    function renderTutorial() {
+      const box = document.getElementById('tutList');
+      if (!box) return;
+      const items = tutorialItems().filter(function (it) { return !it.always; });
+      const done = items.filter(function (it) { return it.done; }).length;
+      const bar = document.getElementById('tutProgress');
+      if (bar) bar.innerHTML = '<div class="tut-bar" role="progressbar" aria-valuemin="0" aria-valuemax="' + items.length + '" aria-valuenow="' + done + '"><span style="width:' + Math.round(done * 100 / items.length) + '%"></span></div>' +
+        '<div class="tut-count">' + esc(tutCountText()) + '</div>';
+      box.innerHTML = ['essential', 'recommended', 'grow'].map(function (g) {
+        return '<h3 class="ofs-h">' + esc(t('tutGroup_' + g)) + '</h3><p class="ofs-note">' + esc(t('tutGroup_' + g + 'Desc')) + '</p>' +
+          tutorialItems().filter(function (it) { return it.group === g; }).map(tutRow).join('');
+      }).join('');
+    }
+    function renderNextStep() {
+      const box = document.getElementById('homeSteps');
+      if (!box) return;
+      const next = tutorialItems().filter(function (it) { return !it.done && !it.always && !it.optional; }).slice(0, 2);
+      box.innerHTML = (next.length ? next.map(tutRow).join('') : card(badge('success', t('done')) + ' ' + esc(t('tutAllEssential')))) +
+        '<div style="margin-top:8px;"><a href="#home/tutorial">' + esc(t('tutSeeAll')) + '</a> <span style="color:var(--muted);font-size:12.5px;">· ' + esc(tutCountText()) + '</span></div>';
+    }
+
+    const GUIDES = {
+      firstapp: { steps: 5, go: [['overview', 'deploy'], ['connect', 'github'], ['overview', 'deploy'], ['overview', 'list'], ['vault', '']] },
+      address: { steps: 4, go: [null, ['connect', 'cloudflare'], ['overview', 'expose'], ['overview', 'expose']] },
+      offsite: { steps: 4, go: [null, null, ['databases', 'offsite'], ['databases', 'backups']] },
+      autoupdate: { steps: 3, go: [['overview', 'deploy'], ['overview', 'webhook'], null] },
+      email: { steps: 4, go: [null, null, ['email', ''], ['email', '']] },
+      github: { steps: 3, go: [null, ['connect', 'github'], ['connect', 'github']] },
+    };
+    function renderGuide() {
+      const pane = document.getElementById('tab-guide');
+      if (!pane) return;
+      const id = GUIDES[currentGuide] ? currentGuide : 'firstapp';
+      const g = GUIDES[id];
+      const k = 'guide_' + id;
+      let steps = '';
+      for (let i = 1; i <= g.steps; i++) {
+        const go = g.go[i - 1];
+        steps += '<li class="guide-step"><strong>' + esc(t(k + '_s' + i)) + '</strong><div class="tut-desc">' + t(k + '_s' + i + 'Desc') + '</div>' +
+          (go ? '<button class="secondary" style="margin-top:6px;" data-go-tab="' + go[0] + '" data-go-sub="' + go[1] + '">' + esc(t('guideOpenScreen')) + '</button>' : '') + '</li>';
+      }
+      const others = Object.keys(GUIDES).filter(function (x) { return x !== id; })
+        .map(function (x) { return '<a href="#guide/' + x + '">' + esc(t('guide_' + x)) + '</a>'; }).join(' · ');
+      pane.innerHTML =
+        '<div class="page-head"><div class="page-crumb"><a href="#home/tutorial">' + esc(t('sub_home_tutorial')) + '</a> <span aria-hidden="true">/</span> ' + esc(t('guideCrumb')) + '</div>' +
+        '<h1><span>' + esc(t(k)) + '</span></h1><p class="page-lead">' + esc(t(k + '_lead')) + '</p></div>' +
+        '<div class="card"><ol class="guide-steps">' + steps + '</ol>' +
+        '<p class="ofs-note" style="margin-top:14px;">' + esc(t('guideOthers')) + ' ' + others + '</p>' +
+        '<a href="#home/tutorial">' + esc(t('guideBack')) + '</a></div>';
     }
 
     async function loadEmail() {
