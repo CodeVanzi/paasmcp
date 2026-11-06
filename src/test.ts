@@ -4794,7 +4794,9 @@ volumes:
     const script = r.installScript({ role: "helper", repoUrl: nasty, ref: "a".repeat(40), ip: "100.64.0.20", invite: "paasmcp-pool://AbC_d-e" + "x".repeat(40) });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pcs-"));
     fs.writeFileSync(path.join(dir, "s.sh"), script);
-    assert.equal(spawnSync("bash", ["-n", path.join(dir, "s.sh")]).status, 0, "bash -n accepts the script");
+    // The dashboard's self-update runs these tests in its Alpine image, which has no bash: check with sh there.
+    const shell = spawnSync("bash", ["-c", "true"]).status === 0 ? "bash" : "sh";
+    assert.equal(spawnSync(shell, ["-n", path.join(dir, "s.sh")]).status, 0, `${shell} -n accepts the script`);
     assert.match(script, /REF='a{40}'/);
     assert.match(script, new RegExp(r.NODE_SHA256.x64));
     assert.match(script, /sha256sum -c/);
