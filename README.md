@@ -248,6 +248,8 @@ paasmcp email provision my-saas --from-name "My SaaS"
 
 # S3 bucket + key for an app on this server (Garage); redeploy to load S3_* / AWS_*
 paasmcp storage provision my-saas
+# Or the app's files at your own account (R2, S3, Google, B2, Wasabi, MinIO): in the dashboard, tick
+# "Create file space" when publishing (or App files) and pick the provider; the same S3_* / AWS_* go in.
 
 # Off-site copies: pick the provider and paste only its fields (dashboard: Databases > Off-server
 # backups). The destination is tested (write, read, delete a small file) before it is saved.
@@ -259,8 +261,17 @@ paasmcp backup target                        # show it (no secret), 'test' or 'c
 # The other way round: let another computer keep ITS backups on this server's Garage, over Tailscale
 paasmcp backup grant laptop --max-gb 50      # one bucket + one key for it, shown once (code + fields)
 paasmcp backup grants                        # list with space used; 'paasmcp backup revoke laptop'
+<<<<<<< HEAD
+# For something outside Tailscale (an app on Render, a VPS): --internet hands out https://s3.<your domain>,
+# this server's S3 API (only it) published through the Cloudflare tunnel. No open port; every request needs a key.
+paasmcp backup grant render-app --max-gb 20 --internet
+paasmcp storage public status                # or 'off' (the keys made with --internet stop working outside Tailscale)
+# Uploads above 50 MB go in parts (S3 multipart), so they fit Cloudflare's 100 MB per request.
+sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
+=======
 sudo paasmcp backup install-timer --hour 3   # optional: the dashboard container already runs this every night from 3:30 (server time)
                                              # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
+>>>>>>> origin/main
 paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
 paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it
 

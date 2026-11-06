@@ -21,7 +21,7 @@ import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, e
 import { explainDeployError } from "./deployhelp.js";
 import { prepareTemplate, TEMPLATES } from "./templates.js";
 import { clearNotify, NotifyError, notifySummary, saveNotify } from "./notify.js";
-import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
+import { clearOffsiteTarget, createBackupGrant, disablePublicStorage, listBackupGrants, OffsiteError, publicStorageUrl, useExternalStorage, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -880,7 +880,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         // Off-site destination (receiving side) and keys for other computers (providing side).
         if (pathname === "/api/offsite" && req.method === "GET") {
-          return reply({ target: offsiteSummary(), grants: await listBackupGrants() });
+          return reply({ target: offsiteSummary(), grants: await listBackupGrants(), publicUrl: publicStorageUrl() });
         }
         if (pathname === "/api/offsite/target" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -909,13 +909,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const body = await readJsonBody(req);
           const r = await createBackupGrant(
             String(body.name || ""),
-            { maxGb: body.maxGb === undefined || body.maxGb === "" || body.maxGb === null ? undefined : Number(body.maxGb) },
+            { maxGb: body.maxGb === undefined || body.maxGb === "" || body.maxGb === null ? undefined : Number(body.maxGb), internet: body.internet === true },
             (params) => confirmFromBody("backup.grant", params, body)
           );
           // The secret is in this answer only: never cached, never logged.
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           res.end(JSON.stringify(r));
           return true;
+        }
+        if (pathname === "/api/offsite/public/off" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await disablePublicStorage((params) => confirmFromBody("storage.public.off", params, body)));
         }
         if (pathname === "/api/offsite/grants/revoke" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -976,8 +980,29 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         if (pathname === "/api/storage" && req.method === "GET") return reply({ storage: listStorage() });
         if (pathname === "/api/storage" && req.method === "POST") {
           const body = await readJsonBody(req);
-          const { record, reused } = await provisionStorage(String(body.appName || ""));
+          const appName = sanitizeSlug(String(body.appName || ""));
+          // Back to this server from another provider: the person confirms (files are not copied).
+          const before = loadState().storage?.[appName];
+          const external = Boolean(before?.provider && before.provider !== "garage");
+          if (external) {
+            confirmFromBody("storage.app.replace", {
+              appName, replacing: true,
+              target: "this server's storage", targetPt: "este servidor",
+              previous: `${before!.bucket} @ ${before!.host}`,
+            }, body);
+          }
+          const { record, reused } = await provisionStorage(appName, { replaceExternal: external });
           return reply({ record, reused });
+        }
+        if (pathname === "/api/storage/external" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const str = (k: string) => (body[k] ? String(body[k]) : undefined);
+          const r = await useExternalStorage(
+            String(body.appName || ""),
+            { provider: String(body.provider || ""), accountId: str("accountId"), region: str("region"), endpoint: str("endpoint"), bucket: str("bucket"), accessKeyId: str("accessKeyId"), secretAccessKey: str("secretAccessKey"), code: str("code") },
+            (params) => confirmFromBody("storage.app.replace", params, body)
+          );
+          return reply({ record: r.record, injectedKeys: r.injectedKeys });
         }
 
         if (pathname === "/api/email" && req.method === "GET") {
@@ -2509,7 +2534,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <span data-i18n="lblDepPoll"></span>
                 </label>
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
-                  <input type="checkbox" id="depStorage" style="width:auto;" />
+                  <input type="checkbox" id="depStorage" style="width:auto;" onchange="toggleDepStorage()" />
                   <span data-i18n="lblDepStorage"></span>
                 </label>
                 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
@@ -2539,6 +2564,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                   <span data-i18n="lblDepNoHealth"></span>
                 </label>
               </details>
+              <div id="depStoBox" style="display:none;margin:-4px 0 14px;padding:12px 14px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
+                <p class="ofs-note" data-i18n="stoWhere"></p>
+                <div id="depProviders" class="ofs-chips"></div>
+                <div id="depFields"></div>
+                <div class="ofs-msg" id="depStoMsg" role="status" aria-live="polite"></div>
+              </div>
               <button onclick="deployNewApp()" id="btnDeploy">🚀 Publicar</button>
               <div id="depResult"></div>
             </div>
@@ -2758,6 +2789,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <input id="ofsGrantGb" type="number" min="1" step="1" placeholder="50" />
               </div>
             </div>
+            <label style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px;cursor:pointer;">
+              <input type="checkbox" id="ofsGrantNet" style="width:auto;flex:none;margin-top:3px;" />
+              <span><span data-i18n="ofsGrantNet"></span><br><span class="ofs-note" data-i18n="ofsGrantNetHint"></span></span>
+            </label>
+            <div id="ofsPublic"></div>
             <div class="ofs-msg" id="ofsGrantMsg" role="status" aria-live="polite"></div>
             <div style="margin-top:10px;"><button class="secondary" onclick="createGrantUi()" id="btnOfsGrant" data-i18n="ofsBtnGrant"></button></div>
             <div id="ofsGrantResult"></div>
@@ -2770,8 +2806,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             </div>
             <div id="storageList" style="margin-bottom:10px;"></div>
             <label class="field-label" for="stoApp" data-i18n="lblAppName"></label>
-            <input id="stoApp" placeholder="ex: meu-saas" />
-            <div style="margin-top:10px;"><button onclick="provisionStorageUi()" data-i18n="btnStorage"></button></div>
+            <input id="stoApp" list="hostedAppsList" placeholder="ex: meu-saas" style="max-width:420px;" />
+            <p class="ofs-note" style="margin-top:12px;" data-i18n="stoWhere"></p>
+            <div id="stoProviders" class="ofs-chips"></div>
+            <div id="stoFields"></div>
+            <div class="ofs-msg" id="stoMsg" role="status" aria-live="polite"></div>
+            <div style="margin-top:10px;"><button onclick="provisionStorageUi()" id="btnStorageGo" data-i18n="btnStorage"></button></div>
           </div>
           
             <div class="card" data-sub="dbs">
@@ -3760,7 +3800,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsBtnStop": "Parar de enviar",
           "ofsSending": "Enviando…",
           "ofsGiveTitle": "Guardar cópias de outro computador aqui",
-          "ofsGiveDesc": "Gera uma chave que outro PaaSMCP, um computador ou um app usa para guardar cópias num bucket só dele neste servidor, pela Tailscale. Ele não enxerga mais nada daqui, e você pode revogar a chave quando quiser.",
+          "ofsGiveDesc": "Gera uma chave que outro PaaSMCP, um computador ou um app usa para guardar cópias num bucket só dele neste servidor, pela Tailscale (ou pela internet, se você marcar a opção abaixo). Ele não enxerga mais nada daqui, e você pode revogar a chave quando quiser.",
           "ofsGrantName": "Nome de quem vai usar",
           "ofsGrantGb": "Limite em GB (vazio = sem limite)",
           "ofsBtnGrant": "Gerar chave",
@@ -3776,10 +3816,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsStored": "guardando",
           "ofsLimit": "limite",
           "ofsRevoked": "Revogada",
+          "stoWhere": "Onde guardar os arquivos do app:",
+          "stoProvLocal": "Neste servidor",
+          "stoHint_garage": "Fica no armazenamento deste servidor (Garage), num bucket com chave só do app. Não precisa de conta em lugar nenhum.",
+          "stoSameVars": "O app recebe as mesmas variáveis S3_* e AWS_* de sempre, então o código dele não muda.",
+          "ofsNeedApp": "Preencha o nome do app.",
+          "ofsGrantNet": "Acesso pela internet (HTTPS)",
+          "ofsGrantNetHint": "Para um app ou servidor fora da sua Tailscale (Render, Vercel, outro provedor). O S3 deste servidor ganha um endereço HTTPS no seu domínio pelo túnel da Cloudflare, sem abrir porta.",
+          "ofsPublishing": "Criando o endereço HTTPS no seu domínio…",
+          "ofsPublicOn": "Endereço público do S3 deste servidor:",
+          "ofsPublicOff": "Desligar",
+          "ofsInternet": "internet",
           "ofsBtnRevoke": "Revogar",
           "ofsRevokedMsg": "A chave de {name} não funciona mais. O que já foi guardado continua aqui.",
           "storageTitle": "🗂️ Arquivos dos apps",
-          "storageDesc": "Espaço para fotos, PDFs e uploads. Cada app ganha o seu, com chave própria; as bibliotecas comuns (boto3, AWS SDK) funcionam sem mudar código.",
+          "storageDesc": "Espaço para fotos, PDFs e uploads, neste servidor ou numa conta sua (R2, S3...). Cada app ganha o seu, com chave própria; as bibliotecas comuns (boto3, AWS SDK) funcionam sem mudar código.",
           "storageNone": "Nenhum app com espaço de arquivos ainda.",
           "btnStorage": "+ Criar espaço de arquivos",
           "storageDone": "Espaço criado. Publique o app de novo para ele usar.",
@@ -4156,7 +4207,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsBtnStop": "Stop sending",
           "ofsSending": "Sending…",
           "ofsGiveTitle": "Keep another computer's backups here",
-          "ofsGiveDesc": "Makes a key that another PaaSMCP, a computer or an app uses to keep backups in a bucket of its own on this server, over Tailscale. It sees nothing else here, and you can revoke the key any time.",
+          "ofsGiveDesc": "Makes a key that another PaaSMCP, a computer or an app uses to keep backups in a bucket of its own on this server, over Tailscale (or the internet, if you tick the option below). It sees nothing else here, and you can revoke the key any time.",
           "ofsGrantName": "Name of who will use it",
           "ofsGrantGb": "Limit in GB (empty = no limit)",
           "ofsBtnGrant": "Make key",
@@ -4172,10 +4223,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsStored": "storing",
           "ofsLimit": "limit",
           "ofsRevoked": "Revoked",
+          "stoWhere": "Where to keep the app's files:",
+          "stoProvLocal": "On this server",
+          "stoHint_garage": "Kept on this server's storage (Garage), in a bucket with a key only for this app. No account needed anywhere.",
+          "stoSameVars": "The app gets the same S3_* and AWS_* variables as always, so its code does not change.",
+          "ofsNeedApp": "Fill in the app name.",
+          "ofsGrantNet": "Access over the internet (HTTPS)",
+          "ofsGrantNetHint": "For an app or server outside your Tailscale (Render, Vercel, another host). This server's S3 gets an HTTPS address on your domain through the Cloudflare tunnel, no open port.",
+          "ofsPublishing": "Creating the HTTPS address on your domain…",
+          "ofsPublicOn": "Public address of this server's S3:",
+          "ofsPublicOff": "Turn off",
+          "ofsInternet": "internet",
           "ofsBtnRevoke": "Revoke",
           "ofsRevokedMsg": "{name}'s key no longer works. What it already stored stays here.",
           "storageTitle": "🗂️ App files",
-          "storageDesc": "Space for photos, PDFs and uploads. Each app gets its own, with its own key; common libraries (boto3, AWS SDK) work without code changes.",
+          "storageDesc": "Space for photos, PDFs and uploads, on this server or in an account of yours (R2, S3...). Each app gets its own, with its own key; common libraries (boto3, AWS SDK) work without code changes.",
           "storageNone": "No app has file space yet.",
           "btnStorage": "+ Create file space",
           "storageDone": "Space created. Publish the app again so it uses it.",
@@ -8069,14 +8131,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!res.ok) return;
       const items = (await res.json()).storage || [];
       document.getElementById('storageList').innerHTML = items.length
-        ? items.map(i => card('<strong>' + esc(i.appName) + '</strong> · <code>' + esc(i.bucket) + '</code>')).join('')
+        ? items.map(i => card('<strong>' + esc(i.appName) + '</strong> · <code>' + esc(i.bucket) + '</code> <span style="color:var(--muted)">(' +
+            esc(i.provider && i.provider !== 'garage' ? i.host : t('stoProvLocal')) + ')</span>')).join('')
         : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('storageNone')) + '</span>';
+      if (!document.getElementById('stoProviders').innerHTML) renderPicker('sto');
     }
     async function provisionStorageUi() {
       const appName = document.getElementById('stoApp').value.trim();
-      if (!appName) return;
-      const r = await postJson('/api/storage', { appName });
-      if (r) { showToast(t('storageDone')); loadStorage(); }
+      if (!appName) { ofsMsg('stoMsg', t('ofsNeedApp'), 'err'); return; }
+      const btn = document.getElementById('btnStorageGo');
+      btn.disabled = true;
+      try {
+        const r = await provisionAppStorage('sto', appName);
+        if (r) { showToast(t('storageDone')); loadStorage(); }
+      } finally { btn.disabled = false; }
     }
     // ---- Off-site backups: one form per provider, secrets typed here and never shown back ----
     // Fields each provider needs, in order. Labels and hints are in I18N (ofsF_<field>, ofsHint_<provider>).
@@ -8090,7 +8158,6 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       ['custom', null, ['endpoint', 'region', 'bucket', 'accessKeyId', 'secretAccessKey']],
     ];
     const OFS_PLACEHOLDER = { r2: { accountId: '0123456789abcdef0123456789abcdef' }, s3: { region: 'us-east-1' }, b2: { region: 'us-west-004' }, wasabi: { region: 'us-east-1' }, custom: { endpoint: 'https://minio.example.com', region: 'us-east-1' } };
-    let ofsProvider = 'r2';
     let ofsData = null;
 
     function ofsLabel(p, f) {
@@ -8619,45 +8686,81 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       document.getElementById('ofsForm').style.display = 'block';
       document.getElementById('btnOfsCancel').style.display = changing ? '' : 'none';
       const tg = ofsData && ofsData.target;
-      if (changing && tg && tg.provider) ofsProvider = tg.provider;
+      if (changing && tg && tg.provider) PICKERS.ofs.provider = tg.provider;
       renderOffsiteProviders();
       ofsMsg('ofsMsg', '');
     }
     function closeOffsiteForm() { document.getElementById('ofsForm').style.display = 'none'; ofsMsg('ofsMsg', ''); }
 
-    function renderOffsiteProviders() {
-      document.getElementById('ofsProviders').innerHTML = OFS_PROVIDERS.map(([id, name]) =>
-        '<button type="button" class="chip' + (id === ofsProvider ? ' selected' : '') + '" aria-pressed="' + (id === ofsProvider) + '" onclick="pickOffsiteProvider(&#39;' + id + '&#39;)">' +
-        esc(name || (id === 'paasmcp' ? t('ofsProvPaasmcp') : t('ofsProvCustom'))) + '</button>').join('');
-      renderOffsiteFields();
+    // One provider picker, used for off-site backups ('ofs') and for app files ('dep' in the publish
+    // form, 'sto' in the App files card). 'garage' = this server's own storage (apps only).
+    const PICKERS = {
+      ofs: { provider: 'r2', prefix: true, local: false, msg: 'ofsMsg' },
+      dep: { provider: 'garage', prefix: false, local: true, msg: 'depStoMsg' },
+      sto: { provider: 'garage', prefix: false, local: true, msg: 'stoMsg' },
+    };
+    function renderPicker(key) {
+      const pk = PICKERS[key];
+      const list = (pk.local ? [['garage', null, []]] : []).concat(OFS_PROVIDERS);
+      document.getElementById(key + 'Providers').innerHTML = list.map(([id, name]) =>
+        '<button type="button" class="chip' + (id === pk.provider ? ' selected' : '') + '" aria-pressed="' + (id === pk.provider) + '" onclick="pickProvider(&#39;' + key + '&#39;, &#39;' + id + '&#39;)">' +
+        esc(name || (id === 'garage' ? t('stoProvLocal') : id === 'paasmcp' ? t('ofsProvPaasmcp') : t('ofsProvCustom'))) + '</button>').join('');
+      renderPickerFields(key);
     }
-    function pickOffsiteProvider(id) { ofsProvider = id; renderOffsiteProviders(); ofsMsg('ofsMsg', ''); }
-
-    function renderOffsiteFields() {
-      const def = OFS_PROVIDERS.find((x) => x[0] === ofsProvider);
-      const ph = OFS_PLACEHOLDER[ofsProvider] || {};
+    function pickProvider(key, id) { PICKERS[key].provider = id; renderPicker(key); ofsMsg(PICKERS[key].msg, ''); }
+    function renderPickerFields(key) {
+      const pk = PICKERS[key];
+      const box = document.getElementById(key + 'Fields');
+      if (pk.provider === 'garage') { box.innerHTML = '<p class="ofs-note">' + esc(t('stoHint_garage')) + '</p>'; return; }
+      const def = OFS_PROVIDERS.find((x) => x[0] === pk.provider);
+      const ph = OFS_PLACEHOLDER[pk.provider] || {};
       const field = (f) => {
-        const id = 'ofs_' + f;
-        const label = '<label class="field-label" for="' + id + '">' + esc(ofsLabel(ofsProvider, f)) + '</label>';
+        const id = key + '_' + f;
+        const label = '<label class="field-label" for="' + id + '">' + esc(ofsLabel(pk.provider, f)) + '</label>';
         if (f === 'code') return '<div style="grid-column:1/-1;">' + label + '<textarea id="' + id + '" rows="3" autocomplete="off" spellcheck="false" placeholder="paasmcp-backup:1:…"></textarea></div>';
         const secret = f === 'secretAccessKey';
         return '<div>' + label + '<input id="' + id + '" ' + (secret ? 'type="password" autocomplete="new-password"' : 'autocomplete="off"') +
           ' spellcheck="false" placeholder="' + esc(ph[f] || '') + '" /></div>';
       };
-      document.getElementById('ofsFields').innerHTML =
-        '<p class="ofs-note">' + esc(t('ofsHint_' + ofsProvider)) + '</p>' +
+      box.innerHTML =
+        '<p class="ofs-note">' + esc(t('ofsHint_' + pk.provider)) + (pk.local ? ' ' + esc(t('stoSameVars')) : '') + '</p>' +
         '<div class="form-grid">' + def[2].map(field).join('') + '</div>' +
-        (ofsProvider === 'paasmcp' ? '' : '<details style="margin-top:6px;font-size:12.5px;"><summary style="color:var(--muted)">' + esc(t('ofsMore')) + '</summary>' +
-          '<div style="margin-top:8px;max-width:420px;"><label class="field-label" for="ofs_prefix">' + esc(t('ofsF_prefix')) + '</label><input id="ofs_prefix" autocomplete="off" spellcheck="false" placeholder="paasmcp/' + esc((lastStatus && lastStatus.hostname) || 'servidor') + '" /></div></details>');
+        (!pk.prefix || pk.provider === 'paasmcp' ? '' : '<details style="margin-top:6px;font-size:12.5px;"><summary style="color:var(--muted)">' + esc(t('ofsMore')) + '</summary>' +
+          '<div style="margin-top:8px;max-width:420px;"><label class="field-label" for="' + key + '_prefix">' + esc(t('ofsF_prefix')) + '</label><input id="' + key + '_prefix" autocomplete="off" spellcheck="false" placeholder="paasmcp/' + esc((lastStatus && lastStatus.hostname) || 'servidor') + '" /></div></details>');
+    }
+    function pickerBody(key) {
+      const pk = PICKERS[key];
+      const body = { provider: pk.provider };
+      const def = OFS_PROVIDERS.find((x) => x[0] === pk.provider);
+      for (const f of (def ? def[2] : []).concat(pk.prefix ? ['prefix'] : [])) {
+        const el = document.getElementById(key + '_' + f);
+        if (el && el.value.trim()) body[f] = el.value.trim();
+      }
+      return body;
+    }
+    // Typed secrets leave the page as soon as they are saved.
+    function clearPicker(key) { document.querySelectorAll('#' + key + 'Fields input, #' + key + 'Fields textarea').forEach((el) => { el.value = ''; }); }
+    function renderOffsiteProviders() { renderPicker('ofs'); }
+
+    /** App files: this server's storage or the person's own account, before or after the app exists. */
+    async function provisionAppStorage(key, appName) {
+      const pk = PICKERS[key];
+      ofsMsg(pk.msg, pk.provider === 'garage' ? '' : t('ofsTesting'));
+      const r = pk.provider === 'garage'
+        ? await ofsPost('/api/storage', { appName }, pk.msg)
+        : await ofsPost('/api/storage/external', Object.assign({ appName }, pickerBody(key)), pk.msg);
+      if (r) { clearPicker(key); ofsMsg(pk.msg, ''); }
+      else if (document.getElementById(pk.msg).textContent === t('ofsTesting')) ofsMsg(pk.msg, '');
+      return r;
+    }
+    function toggleDepStorage() {
+      const on = document.getElementById('depStorage').checked;
+      document.getElementById('depStoBox').style.display = on ? 'block' : 'none';
+      if (on) renderPicker('dep');
     }
 
     async function saveOffsiteUi() {
-      const def = OFS_PROVIDERS.find((x) => x[0] === ofsProvider);
-      const body = { provider: ofsProvider };
-      for (const f of def[2].concat(['prefix'])) {
-        const el = document.getElementById('ofs_' + f);
-        if (el && el.value.trim()) body[f] = el.value.trim();
-      }
+      const body = pickerBody('ofs');
       const btn = document.getElementById('btnOfsSave');
       btn.disabled = true;
       ofsMsg('ofsMsg', t('ofsTesting'));
@@ -8665,7 +8768,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const r = await ofsPost('/api/offsite/target', body, 'ofsMsg');
         if (!r) { if (document.getElementById('ofsMsg').textContent === t('ofsTesting')) ofsMsg('ofsMsg', ''); return; }
         // Typed secrets leave the page as soon as they are saved.
-        document.querySelectorAll('#ofsFields input, #ofsFields textarea').forEach((el) => { el.value = ''; });
+        clearPicker('ofs');
         showToast(t('ofsSaved') + (r.test && !r.test.deleted ? ' ' + t('ofsNoDelete') : ''));
         await loadOffsite();
         loadAll();
@@ -8706,12 +8809,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     function renderGrants() {
       const grants = (ofsData && ofsData.grants) || [];
+      const pub = ofsData && ofsData.publicUrl;
+      document.getElementById('ofsPublic').innerHTML = pub
+        ? '<div class="ofs-note" style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' + esc(t('ofsPublicOn')) + ' <code>' + esc(pub) + '</code>' +
+          '<button class="secondary chip" onclick="publicOffUi()">' + esc(t('ofsPublicOff')) + '</button></div>'
+        : '';
       document.getElementById('ofsGrants').innerHTML = grants.map((g) => card(
         '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
         '<div><strong>' + esc(g.name) + '</strong> · <code>' + esc(g.bucket) + '</code>' +
         '<div style="color:var(--muted);margin-top:4px;">' + esc(t('ofsKey')) + ' <code>' + esc(String(g.accessKeyId).slice(0, 6)) + '…</code>' +
         (typeof g.bytes === 'number' ? ' · ' + esc(t('ofsStored')) + ' ' + esc(fmtBytes(g.bytes)) + (g.maxGb ? ' / ' + esc(g.maxGb) + ' GB' : '') : (g.maxGb ? ' · ' + esc(t('ofsLimit')) + ' ' + esc(g.maxGb) + ' GB' : '')) +
         ' · ' + esc(new Date(g.createdAt).toLocaleDateString()) + '</div></div>' +
+        (g.internet && !g.revokedAt ? badge('', t('ofsInternet')) + ' ' : '') +
         (g.revokedAt ? badge('warning', t('ofsRevoked')) : '<button class="danger" onclick="revokeGrantUi(&#39;' + esc(g.name) + '&#39;)">' + esc(t('ofsBtnRevoke')) + '</button>') +
         '</div>')).join('');
     }
@@ -8724,7 +8833,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       btn.disabled = true;
       ofsMsg('ofsGrantMsg', '');
       try {
-        const r = await ofsPost('/api/offsite/grants', { name, maxGb: gb || undefined }, 'ofsGrantMsg');
+        const internet = document.getElementById('ofsGrantNet').checked;
+        ofsMsg('ofsGrantMsg', internet && !(ofsData && ofsData.publicUrl) ? t('ofsPublishing') : '');
+        const r = await ofsPost('/api/offsite/grants', { name, maxGb: gb || undefined, internet }, 'ofsGrantMsg');
+        if (r) ofsMsg('ofsGrantMsg', '');
         if (!r) return;
         document.getElementById('ofsGrantName').value = '';
         const a = r.access;
@@ -8741,6 +8853,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           '</div><p class="ofs-note" style="margin-top:8px;">' + esc(t('ofsGrantInternal')) + ' <code>' + esc(r.internalEndpoint) + '</code></p></details>');
         await loadOffsite();
       } finally { btn.disabled = false; }
+    }
+
+    async function publicOffUi() {
+      const r = await ofsPost('/api/offsite/public/off', {}, 'ofsGrantMsg');
+      if (r) loadOffsite();
     }
 
     async function revokeGrantUi(name) {
@@ -9612,7 +9729,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const skipHealthcheck = document.getElementById('depNoHealth').checked ? true : undefined;
       if (!appName || !repoSource) return;
       // Storage and e-mail go into the app's vault first, so this deploy already starts with them.
-      if (document.getElementById('depStorage').checked && !(await postJson('/api/storage', { appName }))) return;
+      if (document.getElementById('depStorage').checked && !(await provisionAppStorage('dep', appName))) return;
       if (document.getElementById('depEmail').checked && !(await postJson('/api/email/provision', { appName }))) return;
       const btn = document.getElementById('btnDeploy');
       btn.textContent = t('toastDeploying');

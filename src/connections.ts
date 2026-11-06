@@ -88,12 +88,24 @@ export async function discoverCloudflare(givenToken?: unknown): Promise<Cloudfla
     throw fail("Cloudflare refused this token.", "A Cloudflare recusou este token. Ele pode ter sido apagado, ter expirado ou estar copiado pela metade.");
   }
   if (!accounts.ok) throw fail(`Cloudflare answered HTTP ${accounts.status}.`, `A Cloudflare respondeu com erro (HTTP ${accounts.status}). Tente de novo em alguns minutos.`);
-  const zonesRes = await cf<{ id: string; name: string; status?: string; account?: { id: string } }[]>(token, "GET", "/zones?per_page=50");
+  const zonesRes = await cf<{ id: string; name: string; status?: string; account?: { id: string; name?: string } }[]>(token, "GET", "/zones?per_page=50");
   const zones = (zonesRes.ok ? zonesRes.result || [] : [])
     .filter((z) => HOSTNAME_RE.test(String(z.name || "")) && (!z.status || z.status === "active"))
     .map((z) => ({ id: String(z.id), name: String(z.name), accountId: String(z.account?.id || "") }));
+  // A token without "Account Settings: Read" lists no account, yet its zones name theirs and it may
+  // manage that account's tunnels and Access: take the accounts from the zones then (each one is
+  // still probed below, so nothing the token cannot do is offered).
+  let listed = (accounts.result || []).filter((x) => ACCOUNT_RE.test(String(x.id)));
+  if (!listed.length) {
+    const seen = new Map<string, string>();
+    for (const z of zonesRes.ok ? zonesRes.result || [] : []) {
+      const id = String(z.account?.id || "");
+      if (ACCOUNT_RE.test(id) && !seen.has(id)) seen.set(id, String(z.account?.name || id));
+    }
+    listed = [...seen].map(([id, name]) => ({ id, name }));
+  }
   const out: CloudflareDiscovery["accounts"] = [];
-  for (const a of (accounts.result || []).filter((x) => ACCOUNT_RE.test(String(x.id))).slice(0, 20)) {
+  for (const a of listed.slice(0, 20)) {
     const t = await cf<{ id: string; name: string; status?: string; remote_config?: boolean; deleted_at?: string | null }[]>(
       token, "GET", `/accounts/${a.id}/cfd_tunnel?is_deleted=false&per_page=50`);
     const access = await cf<unknown[]>(token, "GET", `/accounts/${a.id}/access/apps?per_page=1`);

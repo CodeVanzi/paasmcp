@@ -3813,6 +3813,216 @@ volumes:
     }
   });
 
+  await t.test("61. Big backups go in parts, and this server's S3 can be published over HTTPS on the tunnel for keys used outside Tailscale", async () => {
+    const backup = await import("./backup.js");
+    const offsite = await import("./offsite.js");
+    const guard = await import("./guard.js");
+    const http = await import("node:http");
+
+    // A fake S3 with multipart: parts are kept per upload id and joined on completion.
+    const objects = new Map<string, Buffer>();
+    const uploads = new Map<string, Map<number, Buffer>>();
+    const seen: string[] = [];
+    let failPart = 0;
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const url = new URL(req.url!, "http://x");
+        const body = Buffer.concat(chunks);
+        if (!/Credential=AK\//.test(String(req.headers.authorization))) return res.writeHead(403).end();
+        if (req.headers["x-amz-content-sha256"] !== crypto.createHash("sha256").update(body).digest("hex")) return res.writeHead(400).end("bad hash");
+        const id = url.searchParams.get("uploadId");
+        seen.push(`${req.method} ${[...url.searchParams.keys()].join(",")}`);
+        if (req.method === "POST" && url.searchParams.has("uploads")) {
+          const u = "up" + (uploads.size + 1);
+          uploads.set(u, new Map());
+          return res.writeHead(200).end(`<InitiateMultipartUploadResult><UploadId>${u}</UploadId></InitiateMultipartUploadResult>`);
+        }
+        if (req.method === "PUT" && id) {
+          const n = Number(url.searchParams.get("partNumber"));
+          if (n === failPart) return res.writeHead(500).end("boom");
+          assert.ok(body.length <= 5 * 1024 * 1024, "each part within the part size");
+          uploads.get(id)!.set(n, body);
+          return res.writeHead(200, { ETag: `"etag-${n}"` }).end();
+        }
+        if (req.method === "POST" && id) {
+          const parts = uploads.get(id)!;
+          const listed = [...body.toString().matchAll(/<PartNumber>(\d+)<\/PartNumber><ETag>&quot;etag-(\d+)&quot;<\/ETag>/g)];
+          assert.equal(listed.length, parts.size, "every part listed with its ETag");
+          objects.set(url.pathname, Buffer.concat([...parts.keys()].sort((a, b) => a - b).map((k) => parts.get(k)!)));
+          uploads.delete(id);
+          return res.writeHead(200).end("<CompleteMultipartUploadResult/>");
+        }
+        if (req.method === "DELETE" && id) {
+          uploads.delete(id);
+          return res.writeHead(204).end();
+        }
+        if (req.method === "PUT") { objects.set(url.pathname, body); return res.writeHead(200).end(); }
+        if (req.method === "GET") return objects.has(url.pathname) ? res.writeHead(200).end(objects.get(url.pathname)) : res.writeHead(404).end();
+        res.writeHead(400).end();
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const cfg = { endpoint: `http://127.0.0.1:${(srv.address() as { port: number }).port}`, bucket: "bk", accessKeyId: "AK", secretAccessKey: "SK", region: "auto", prefix: "p" };
+    process.env.PAASMCP_S3_PART_MB = "5";
+    try {
+      const big = crypto.randomBytes(12 * 1024 * 1024 + 7);
+      await backup.s3Request(cfg, "PUT", "p/big.enc.bak", big);
+      assert.ok(objects.get("/bk/p/big.enc.bak")!.equals(big), "joined back exactly");
+      assert.equal(seen.filter((x) => x === "PUT partNumber,uploadId").length, 3);
+      assert.ok((await backup.s3Request(cfg, "GET", "p/big.enc.bak")).equals(big));
+      // Small files still go in one request.
+      seen.length = 0;
+      await backup.s3Request(cfg, "PUT", "p/small", Buffer.from("x"));
+      assert.deepEqual(seen, ["PUT "]);
+      // A part that fails aborts the upload, so no parts are left behind.
+      failPart = 2;
+      await assert.rejects(backup.s3Request(cfg, "PUT", "p/broken", big), /HTTP 500/);
+      assert.equal(uploads.size, 0, "aborted");
+      assert.ok(!objects.has("/bk/p/broken"));
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_S3_PART_MB;
+    }
+
+    // Publishing S3 on the tunnel: a fake Cloudflare API and a fake Garage admin API.
+    const cf = { ingress: [{ hostname: "app.example.org", service: "http://app:3000" }, { service: "http_status:404" }] as { hostname?: string; service: string }[], dns: [] as { id: string; name: string; content: string }[] };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(input instanceof Request ? input.url : input));
+      if (u.hostname !== "api.cloudflare.com") return realFetch(input, init);
+      const method = init?.method || "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      const ok = (o: unknown) => new Response(JSON.stringify({ success: true, result: o }), { status: 200 });
+      if (u.pathname.endsWith("/configurations")) {
+        if (method === "PUT") cf.ingress = body.config.ingress;
+        return ok({ config: { ingress: cf.ingress } });
+      }
+      if (u.pathname === "/client/v4/zones") return ok([{ id: "z1" }]);
+      if (u.pathname === "/client/v4/zones/z1/dns_records" && method === "GET") return ok(cf.dns.filter((d) => d.name === u.searchParams.get("name")));
+      if (u.pathname === "/client/v4/zones/z1/dns_records" && method === "POST") { cf.dns.push({ id: "r" + cf.dns.length, name: body.name, content: body.content }); return ok({}); }
+      const m = u.pathname.match(/dns_records\/(\w+)$/);
+      if (m && method === "DELETE") { cf.dns = cf.dns.filter((d) => d.id !== m[1]); return ok({}); }
+      if (m && method === "PUT") { cf.dns = cf.dns.map((d) => (d.id === m[1] ? { ...d, content: body.content } : d)); return ok({}); }
+      return new Response("{}", { status: 404 });
+    }) as typeof fetch;
+    let n = 0;
+    const adm = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const url = new URL(req.url!, "http://x");
+        const json = (o: unknown, code = 200) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(o));
+        if (url.pathname === "/v1/status") return json({ node: "node1" });
+        if (url.pathname === "/v1/layout") return json({ version: 1, roles: [{ id: "node1" }] });
+        if (url.pathname === "/v1/bucket" && req.method === "GET" && url.searchParams.get("globalAlias")) return json({}, 404);
+        if (url.pathname === "/v1/bucket") return json({ id: "b-" + (raw ? JSON.parse(raw).globalAlias : url.searchParams.get("id")) });
+        if (url.pathname === "/v1/key") return json({ accessKeyId: `GK${++n}0000000`, secretAccessKey: `sec-${n}-abcdefgh` });
+        json({});
+      });
+    });
+    await new Promise<void>((r) => adm.listen(0, "127.0.0.1", r));
+    process.env.PAASMCP_GARAGE_ADMIN_URL = `http://127.0.0.1:${(adm.address() as { port: number }).port}`;
+    const st0 = config.loadState();
+    const cfBefore = st0.cloudflare;
+    st0.cloudflare = { ...st0.cloudflare, accountId: "acc", tunnelId: "tun1", baseDomain: "example.org" };
+    config.saveState(st0);
+    const cfTokenBefore = vault.getSecrets("system").CF_API_TOKEN;
+    vault.setSecretEntries("system", { CF_API_TOKEN: "cf-token", GARAGE_ADMIN_TOKEN: "adm" });
+    const human = (action: string, confirmed: boolean) => (params: Record<string, unknown>) => guard.authorizeHuman(action, params, { confirmed, by: "test" });
+    try {
+      assert.equal(offsite.publicStorageUrl(), null);
+      // A key for the internet asks once, mentions the new address, then publishes it and hands it out.
+      await assert.rejects(offsite.createBackupGrant("render-app", { internet: true }, human("backup.grant", false)), (err: { risk?: { warning: { en: string } } }) =>
+        /internet \(HTTPS\)/.test(err.risk!.warning.en) && /public HTTPS address/.test(err.risk!.warning.en));
+      assert.equal(cf.ingress.length, 2, "nothing published before the person confirms");
+      const g = await offsite.createBackupGrant("render-app", { internet: true }, human("backup.grant", true));
+      assert.equal(g.access.endpoint, "https://s3.example.org");
+      assert.equal(g.grant.internet, true);
+      assert.deepEqual(cf.ingress.map((r) => r.hostname || "*"), ["app.example.org", "s3.example.org", "*"], "other routes kept, catch-all last");
+      assert.equal(cf.ingress[1].service, "http://paasmcp-garage:3900", "only the S3 API, never the admin port");
+      assert.deepEqual(cf.dns.map((d) => [d.name, d.content]), [["s3.example.org", "tun1.cfargotunnel.com"]]);
+      assert.equal(offsite.publicStorageUrl(), "https://s3.example.org");
+      // A second internet key reuses the address and does not mention publishing again.
+      await assert.rejects(offsite.createBackupGrant("vercel", { internet: true }, human("backup.grant", false)), (err: { risk?: { warning: { en: string } } }) => !/public HTTPS address/.test(err.risk!.warning.en));
+      // Moving or clashing with an app's address is refused.
+      await assert.rejects(offsite.enablePublicStorage("files", human("storage.public", true)), /already published/);
+      // Turning it off names the keys that stop working from outside, then removes only our route and record.
+      cf.dns.push({ id: "other", name: "s3.example.org", content: "1.2.3.4" });
+      await assert.rejects(offsite.disablePublicStorage(human("storage.public.off", false)), (err: { risk?: { warning: { en: string } } }) => /render-app/.test(err.risk!.warning.en));
+      await offsite.disablePublicStorage(human("storage.public.off", true));
+      assert.deepEqual(cf.ingress.map((r) => r.hostname || "*"), ["app.example.org", "*"]);
+      assert.deepEqual(cf.dns.map((d) => d.id), ["other"], "a record that is not ours stays");
+      assert.equal(offsite.publicStorageUrl(), null);
+      const st1 = config.loadState();
+      st1.apps["s3"] = { domains: [{ hostname: "s3.example.org" }] } as never;
+      config.saveState(st1);
+      await assert.rejects(offsite.enablePublicStorage("s3", human("storage.public", true)), /already used by an app/);
+    } finally {
+      globalThis.fetch = realFetch;
+      adm.close();
+      delete process.env.PAASMCP_GARAGE_ADMIN_URL;
+      const st = config.loadState();
+      delete st.apps["s3"];
+      delete st.backupShare;
+      st.cloudflare = cfBefore;
+      config.saveState(st);
+      if (cfTokenBefore) vault.setSecretEntries("system", { CF_API_TOKEN: cfTokenBefore });
+      else vault.deleteSecretKey("system", "CF_API_TOKEN");
+    }
+  });
+
+  await t.test("62. App files at the person's own account: tested, same variables, guarded switch, never copied by the mirror", async () => {
+    const offsite = await import("./offsite.js");
+    const storage = await import("./storage.js");
+    const guard = await import("./guard.js");
+    const http = await import("node:http");
+    const store = new Map<string, Buffer>();
+    const srv = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        if (!/Credential=AKAPP\//.test(String(req.headers.authorization))) return res.writeHead(403).end();
+        if (req.method === "PUT") store.set(req.url!, Buffer.concat(chunks));
+        if (req.method === "DELETE") { store.delete(req.url!); return res.writeHead(204).end(); }
+        const f = store.get(req.url!);
+        if (req.method === "GET" && !f) return res.writeHead(404).end();
+        res.writeHead(200).end(req.method === "GET" ? f : undefined);
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const endpoint = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const human = (confirmed: boolean) => (params: Record<string, unknown>) => guard.authorizeHuman("storage.app.replace", params, { confirmed, by: "test" });
+    try {
+      await assert.rejects(offsite.useExternalStorage("fotos-ext", { provider: "custom", endpoint, bucket: "fotos", accessKeyId: "NOPE", secretAccessKey: "abcdefghij" }, human(false)), /key was refused/);
+      assert.equal(vault.getSecrets("fotos-ext").S3_BUCKET, undefined, "nothing written when the test fails");
+      const r = await offsite.useExternalStorage("Fotos Ext", { provider: "custom", endpoint, bucket: "fotos", accessKeyId: "AKAPP", secretAccessKey: "abcdefghij" }, human(false));
+      const env = vault.getSecrets("fotos-ext");
+      assert.equal(env.S3_ENDPOINT, endpoint);
+      assert.equal(env.AWS_ENDPOINT_URL_S3, endpoint);
+      assert.equal(env.S3_SECRET_ACCESS_KEY, "abcdefghij");
+      assert.equal(env.AWS_REGION, "us-east-1");
+      assert.equal(r.record.provider, "custom");
+      assert.equal(r.record.bucketId, "");
+      assert.ok(!JSON.stringify(config.loadState().storage).includes("abcdefghij"), "secret only in the vault");
+      assert.equal(store.size, 0, "test file removed");
+      // The mirror only copies buckets that live in this server's Garage.
+      assert.equal(storage.usesLocalGarage(env), false);
+      assert.equal(storage.usesLocalGarage({ S3_BUCKET: "app-x", S3_ENDPOINT: storage.GARAGE_INTERNAL_ENDPOINT }), true);
+      // An agent or the CLI cannot silently move it back to this server.
+      await assert.rejects(storage.provisionStorage("fotos-ext"), /keeps its files at/);
+      // Another bucket for the same app is confirmed; the same one again is not.
+      await assert.rejects(offsite.useExternalStorage("fotos-ext", { provider: "custom", endpoint, bucket: "fotos-2", accessKeyId: "AKAPP", secretAccessKey: "abcdefghij" }, human(false)), guard.ConfirmationRequiredError);
+      await offsite.useExternalStorage("fotos-ext", { provider: "custom", endpoint, bucket: "fotos", accessKeyId: "AKAPP", secretAccessKey: "abcdefghij" }, human(false));
+    } finally {
+      srv.close();
+      const st = config.loadState();
+      delete st.storage?.["fotos-ext"];
+      config.saveState(st);
+    }
+  });
+
   await t.test("42. Connections: Cloudflare from one token (account, domain, tunnel found or created) and GitHub token check", async () => {
     const conn = await import("./connections.js");
     const dashboard = await import("./dashboard.js");
@@ -3827,6 +4037,7 @@ volumes:
       { id: "66666666-2222-3333-4444-555555555555", name: "old", status: "down", remote_config: false },
     ];
     let created = 0;
+    let noAccountRead = false;
     const seenAuth: string[] = [];
     const srv = http.createServer((req, res) => {
       let raw = "";
@@ -3842,7 +4053,7 @@ volumes:
           return res.writeHead(200).end(JSON.stringify({ login: "octo-cat", name: "Octo" }));
         }
         if (auth !== `Bearer ${CF_TOKEN}`) return res.writeHead(403).end(JSON.stringify({ success: false }));
-        if (p === "/accounts") return ok([{ id: ACC, name: "Home" }, { id: "not-an-id", name: "x" }]);
+        if (p === "/accounts") return ok(noAccountRead ? [] : [{ id: ACC, name: "Home" }, { id: "not-an-id", name: "x" }]);
         if (p === "/zones") return ok([{ id: "z1", name: "loja.dev", status: "active", account: { id: ACC } }, { id: "z2", name: "pending.dev", status: "pending", account: { id: ACC } }]);
         if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "GET") return ok(tunnels);
         if (p === `/accounts/${ACC}/cfd_tunnel` && req.method === "POST") {
@@ -3882,6 +4093,13 @@ volumes:
       assert.equal(found.accounts[0].tunnels[1].remote, false);
       assert.deepEqual(found.missing, ["access"], "a token without Access is reported, not refused");
       assert.equal(vault.getSecrets("system").CF_API_TOKEN, undefined, "checking saves nothing");
+      // A token without "Account Settings: Read": the account comes from its zones, and is still probed.
+      noAccountRead = true;
+      const viaZone = await conn.discoverCloudflare(CF_TOKEN);
+      noAccountRead = false;
+      assert.deepEqual(viaZone.accounts.map((a) => a.id), [ACC]);
+      assert.equal(viaZone.accounts[0].tunnels.length, 2);
+      assert.deepEqual(viaZone.missing, ["access"]);
 
       const noConfirm = () => assert.fail("first connection needs no confirmation");
       await assert.rejects(conn.saveCloudflare({ token: CF_TOKEN, accountId: ACC, baseDomain: "other.dev", tunnelId: "new" }, noConfirm), /DNS/);

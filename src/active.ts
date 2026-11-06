@@ -21,7 +21,7 @@ import { deployApp, manageAppLifecycle, validateHealthcheckPath, validateHealthc
 import { audit } from "./guard.js";
 import { FileSyncResult, syncBucket } from "./filesync.js";
 import { applyPeerTunnel, routeActiveTunnel, validTunnelToken } from "./activetunnel.js";
-import { ensureBucketWithImportedKey, ensureGarage, localS3Url, PAAS_GARAGE_DIR } from "./storage.js";
+import { ensureBucketWithImportedKey, ensureGarage, localS3Url, PAAS_GARAGE_DIR, usesLocalGarage } from "./storage.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, saveSecrets } from "./vault.js";
 
 // Active-active: an app marked here also runs on the mirror peer, and both servers take requests.
@@ -302,7 +302,7 @@ export function redisNeedsRebind(state = loadState()): boolean {
 export function garageNeedsRebind(state: PaaSState, env: Record<string, string>): boolean {
   const bind = state.mirror?.bindIp;
   const file = path.join(PAAS_GARAGE_DIR, "compose.yaml");
-  if (!bind || !env.S3_BUCKET || !fs.existsSync(file)) return false;
+  if (!bind || !usesLocalGarage(env) || !fs.existsSync(file)) return false;
   return !fs.readFileSync(file, "utf-8").includes(`${bind}:3900:3900`);
 }
 
@@ -421,7 +421,8 @@ export async function syncActiveFiles(
       if (!stillFollowing(rec.peerName)) break;
       if (app.originNodeId !== rec.peerNodeId || !app.activeActive || app.trashedAt) continue;
       const env = getSecrets(app.name);
-      if (!env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
+      // Files at another provider are reachable from both servers already: nothing to copy.
+      if (!usesLocalGarage(env) || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) continue;
       const last = app.activeSync?.files;
       if (last?.at && !last.error && !last.pending && now - Date.parse(last.at) < FILES_EVERY_MS) continue;
       if (Date.now() >= deadline) break;

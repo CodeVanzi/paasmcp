@@ -289,6 +289,11 @@ There is still **one writer**: the origin's Postgres.
   bucket and key on this server's Garage, with an optional quota, reachable on the Tailscale IP (only the
   S3 port; `state.backupShare.bindIp` when no mirror or helper pool published it). The secret is returned
   once and never stored outside Garage; `revokeBackupGrant` deletes the key and keeps the data.
+- Opt-in HTTPS (`enablePublicStorage`, guard `storage.public`, or a grant with `internet`): the S3 API only
+  (`http://paasmcp-garage:3900`) becomes `https://s3.<baseDomain>` on the main tunnel via
+  `routeHostnameOnTunnel` (exposure.ts: ingress rule + proxied CNAME). `disablePublicStorage` removes the
+  rule and only the CNAME that points at this tunnel. Uploads above 50 MB use S3 multipart (`putMultipart`,
+  aborted on failure) to fit Cloudflare's 100 MB request limit.
 - Local copies are pruned **only after** they exist off-site. `backup test <id>` restores into a
   scratch container to prove the backup actually opens.
 
@@ -296,6 +301,11 @@ There is still **one writer**: the origin's Postgres.
 
 - **Storage:** one Garage node per server; `paas_storage_provision` creates a bucket and a key per app and
   injects both `S3_*` and `AWS_*` variables (boto3 and the AWS SDKs work without code changes).
+  `useExternalStorage` (offsite.ts) does the same with the person's own account (any provider of the
+  off-site picker), tested first; the record keeps `provider` + `host`, the secret stays in the vault.
+  Switching an app's storage is guard `storage.app.replace`; `provisionStorage` refuses to replace an
+  external bucket unless the dashboard passes `replaceExternal` after that confirmation. The mirror and
+  active-active only copy buckets in this server's Garage (`usesLocalGarage`).
 - **Email:** one relay (Brevo, SES, Mailgun...) configured once in the `system` vault; `paas_email_provision`
   injects `SMTP_*`, `EMAIL_URL` and `DEFAULT_FROM_EMAIL`. The built-in test client refuses to send the
   password without TLS.
