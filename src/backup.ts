@@ -86,9 +86,16 @@ function requireOffsite(): OffsiteConfig {
   return cfg;
 }
 
-export async function s3Request(cfg: OffsiteConfig, method: "PUT" | "GET" | "DELETE", key: string, body?: Buffer): Promise<Buffer> {
+async function s3Call(
+  cfg: OffsiteConfig,
+  method: "PUT" | "GET" | "DELETE" | "POST",
+  key: string,
+  body?: Buffer,
+  query: Record<string, string> = {}
+): Promise<{ body: Buffer; headers: Headers }> {
   // Path-style addressing: the one style every S3-compatible server accepts.
   const url = new URL(`${cfg.endpoint}/${cfg.bucket}/${key.split("/").map(encodeURIComponent).join("/")}`);
+  for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
   const payloadHash = sha256Hex(body || "");
   const amzDate = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
   const headers: Record<string, string> = {
@@ -103,7 +110,47 @@ export async function s3Request(cfg: OffsiteConfig, method: "PUT" | "GET" | "DEL
   if (!res.ok) {
     throw new Error(`Off-site ${method} ${key} failed: HTTP ${res.status} ${out.toString("utf-8").slice(0, 300)}`);
   }
-  return out;
+  return { body: out, headers: res.headers };
+}
+
+export async function s3Request(cfg: OffsiteConfig, method: "PUT" | "GET" | "DELETE", key: string, body?: Buffer): Promise<Buffer> {
+  if (method === "PUT" && body && body.length > partBytes()) return (await putMultipart(cfg, key, body), Buffer.alloc(0));
+  return (await s3Call(cfg, method, key, body)).body;
+}
+
+/**
+ * Part size for big uploads. 50 MB stays under the 100 MB a request may carry through Cloudflare
+ * (another PaaSMCP published over HTTPS) and above S3's 5 MB minimum.
+ */
+const partBytes = () => Math.max(5, Number(process.env.PAASMCP_S3_PART_MB) || 50) * 1024 * 1024;
+
+/** S3 multipart upload: start, send equal parts, complete; aborted on any failure so no parts linger. */
+export async function putMultipart(cfg: OffsiteConfig, key: string, body: Buffer): Promise<{ parts: number }> {
+  const started = (await s3Call(cfg, "POST", key, undefined, { uploads: "" })).body.toString("utf-8");
+  const uploadId = started.match(/<UploadId>([^<]+)<\/UploadId>/)?.[1];
+  if (!uploadId) throw new Error(`Off-site upload of ${key} did not start: ${started.slice(0, 200)}`);
+  const size = partBytes();
+  const etags: string[] = [];
+  try {
+    for (let i = 0, n = 1; i < body.length; i += size, n++) {
+      const r = await s3Call(cfg, "PUT", key, body.subarray(i, i + size), { partNumber: String(n), uploadId });
+      const etag = r.headers.get("etag");
+      if (!etag) throw new Error(`Off-site part ${n} of ${key} came back without an ETag.`);
+      etags.push(etag);
+    }
+    const esc = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const xml =
+      "<CompleteMultipartUpload>" +
+      etags.map((e, i) => `<Part><PartNumber>${i + 1}</PartNumber><ETag>${esc(e)}</ETag></Part>`).join("") +
+      "</CompleteMultipartUpload>";
+    const done = (await s3Call(cfg, "POST", key, Buffer.from(xml), { uploadId })).body.toString("utf-8");
+    // S3 can answer 200 with an error inside the body.
+    if (/<Error>/.test(done)) throw new Error(`Off-site upload of ${key} failed to complete: ${done.slice(0, 200)}`);
+  } catch (err) {
+    await s3Call(cfg, "DELETE", key, undefined, { uploadId }).catch(() => {});
+    throw err;
+  }
+  return { parts: etags.length };
 }
 
 // ---------------------------------------------------------------------------

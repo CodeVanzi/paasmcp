@@ -247,6 +247,11 @@ paasmcp backup target                        # show it (no secret), 'test' or 'c
 # The other way round: let another computer keep ITS backups on this server's Garage, over Tailscale
 paasmcp backup grant laptop --max-gb 50      # one bucket + one key for it, shown once (code + fields)
 paasmcp backup grants                        # list with space used; 'paasmcp backup revoke laptop'
+# For something outside Tailscale (an app on Render, a VPS): --internet hands out https://s3.<your domain>,
+# this server's S3 API (only it) published through the Cloudflare tunnel. No open port; every request needs a key.
+paasmcp backup grant render-app --max-gb 20 --internet
+paasmcp storage public status                # or 'off' (the keys made with --internet stop working outside Tailscale)
+# Uploads above 50 MB go in parts (S3 multipart), so they fit Cloudflare's 100 MB per request.
 sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
 paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
 paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it

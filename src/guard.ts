@@ -196,6 +196,16 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `As cópias vão passar a ir para ${String(params.target)} em vez de ${String(params.previous)}. O que já foi enviado continua lá; este servidor só para de mandar cópias novas para lá.`,
         params);
     }
+    case "storage.public":
+      return risk(action, String(params.hostname), "confirm",
+        `This server's S3 API (Garage; not its admin API, not the databases) will answer at https://${String(params.hostname)} through the Cloudflare tunnel. No port is opened and your IP stays hidden. Every request needs a valid key, and each key only reaches its own bucket.`,
+        `O S3 deste servidor (Garage; não a administração dele, nem os bancos) vai responder em https://${String(params.hostname)} pelo túnel da Cloudflare. Nenhuma porta é aberta e o seu IP continua escondido. Toda requisição precisa de uma chave válida, e cada chave só alcança o bucket dela.`,
+        params);
+    case "storage.public.off":
+      return risk(action, String(params.hostname), "confirm",
+        `https://${String(params.hostname)} stops answering.${params.users ? ` These keys stop working from outside Tailscale: ${String(params.users)}.` : ""} Nothing stored is deleted.`,
+        `https://${String(params.hostname)} para de responder.${params.users ? ` Estas chaves param de funcionar fora da Tailscale: ${String(params.users)}.` : ""} Nada do que está guardado é apagado.`,
+        params);
     case "backup.target.clear":
       return risk(action, "backup-target", "confirm",
         "This server stops sending backups off the server. Copies already sent stay there, and local copies are no longer pruned (they only are after reaching the destination).",
@@ -205,9 +215,17 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
       const name = String(params.name);
       const limit = Number(params.maxGb) > 0 ? ` up to ${Number(params.maxGb)} GB` : " with no size limit";
       const limitPt = Number(params.maxGb) > 0 ? ` até ${Number(params.maxGb)} GB` : " sem limite de tamanho";
+      const via = params.internet ? " from anywhere on the internet (HTTPS)" : " over Tailscale only";
+      const viaPt = params.internet ? " de qualquer lugar da internet (HTTPS)" : " só pela Tailscale";
+      const pub = params.publishing
+        ? " First, this server's S3 API (only it) gets a public HTTPS address on your domain through the Cloudflare tunnel; every request there still needs a valid key."
+        : "";
+      const pubPt = params.publishing
+        ? " Antes, o S3 deste servidor (só ele) ganha um endereço HTTPS público no seu domínio pelo túnel da Cloudflare; toda requisição lá continua precisando de uma chave válida."
+        : "";
       return risk(action, name, "confirm",
-        `Creates a key for '${name}': whoever has it can write and read files in its own bucket on this server${limit}, over Tailscale only. It sees nothing else here. The key is shown once; revoke it any time.`,
-        `Cria uma chave para '${name}': quem tiver a chave pode gravar e ler arquivos num bucket só dele neste servidor,${limitPt}, só pela Tailscale. Ela não enxerga mais nada aqui. A chave aparece uma vez só; dá para revogar quando quiser.`,
+        `Creates a key for '${name}': whoever has it can write and read files in its own bucket on this server${limit},${via}. It sees nothing else here. The key is shown once; revoke it any time.${pub}`,
+        `Cria uma chave para '${name}': quem tiver a chave pode gravar e ler arquivos num bucket só dele neste servidor,${limitPt},${viaPt}. Ela não enxerga mais nada aqui. A chave aparece uma vez só; dá para revogar quando quiser.${pubPt}`,
         params);
     }
     case "update.apply":

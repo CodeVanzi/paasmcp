@@ -43,7 +43,7 @@ import {
   watchTick,
 } from "./mirror.js";
 import { listStorage, provisionStorage } from "./storage.js";
-import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteInput, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
+import { clearOffsiteTarget, createBackupGrant, disablePublicStorage, enablePublicStorage, listBackupGrants, publicStorageUrl, OffsiteInput, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import {
   backupAppVolumes,
   fetchOffsite,
@@ -854,8 +854,17 @@ async function runCli() {
         console.log(JSON.stringify(await provisionStorage(arg1), null, 2));
       } else if (!sub || sub === "list") {
         console.log(JSON.stringify(listStorage(), null, 2));
+      } else if (sub === "public") {
+        if (arg1 === "on") {
+          const sub2 = getFlagValue(rest, "--subdomain") || "s3";
+          console.log(JSON.stringify(await enablePublicStorage(sub2, (p) => confirmInCli("storage.public", p, rest)), null, 2));
+        } else if (arg1 === "off") {
+          console.log(JSON.stringify(await disablePublicStorage((p) => confirmInCli("storage.public.off", p, rest)), null, 2));
+        } else {
+          console.log(JSON.stringify({ url: publicStorageUrl() }, null, 2));
+        }
       } else {
-        throw new Error("Usage: paasmcp storage <provision <appName>|list>");
+        throw new Error("Usage: paasmcp storage <provision <appName>|list|public <on [--subdomain s3]|off|status> [--yes]>");
       }
       break;
     }
@@ -880,9 +889,9 @@ async function runCli() {
       } else if (sub === "target") {
         await backupTargetCli(rest.slice(1));
       } else if (sub === "grant") {
-        if (!arg1) throw new Error("Usage: paasmcp backup grant <name> [--max-gb N] [--yes]");
+        if (!arg1) throw new Error("Usage: paasmcp backup grant <name> [--max-gb N] [--internet] [--yes]");
         const gb = getFlagValue(rest, "--max-gb");
-        const r = await createBackupGrant(arg1, { maxGb: gb === undefined ? undefined : Number(gb) }, (p) => confirmInCli("backup.grant", p, rest));
+        const r = await createBackupGrant(arg1, { maxGb: gb === undefined ? undefined : Number(gb), internet: rest.includes("--internet") }, (p) => confirmInCli("backup.grant", p, rest));
         console.error("Shown only now. Copy it before closing the terminal; if lost, revoke and make another.\n");
         console.log(`Access code (paste it in the other PaaSMCP, provider "paasmcp"):\n${r.code}\n`);
         console.log(`For other programs (rclone, restic, apps):\n  endpoint          ${r.access.endpoint}\n  bucket            ${r.access.bucket}\n  access key id     ${r.access.accessKeyId}\n  secret access key ${r.access.secretAccessKey}\n  region            ${r.access.region}`);
@@ -1126,7 +1135,8 @@ Commands:
   paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key>
                                                     Restore test, off-site sync (S3/R2/B2), daily timer, master key export
   paasmcp backup target [show|set <provider>|test|clear]  Where backups go (r2, s3, gcs, b2, wasabi, paasmcp, custom), tested before saving
-  paasmcp backup grant <name> [--max-gb N]          Revocable key for another computer to keep its backups here (Tailscale)
+  paasmcp backup grant <name> [--max-gb N] [--internet]  Revocable key for another computer or app to keep files here (Tailscale, or HTTPS on your domain)
+  paasmcp storage public <on [--subdomain s3]|off|status>  This server's S3 over HTTPS through the Cloudflare tunnel
   paasmcp backup grants | revoke <name>             List / revoke those keys
   paasmcp deploy <app> <repo> [--postgres]           Build & deploy repo (or multi-service compose.yaml)
   paasmcp expose <app> <public|zero-trust|tailscale> [subdomain]

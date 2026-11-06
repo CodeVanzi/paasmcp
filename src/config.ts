@@ -241,6 +241,8 @@ export interface BackupGrantRecord {
   bucketId: string;
   accessKeyId: string;
   maxGb?: number;
+  /** The key was handed out with the HTTPS address (reachable from the internet), not the Tailscale one. */
+  internet?: boolean;
   createdAt: string;
   revokedAt?: string;
 }
@@ -248,6 +250,8 @@ export interface BackupGrantRecord {
 export interface BackupShareConfig {
   /** Tailscale IP where Garage's S3 API (only S3, not the admin API) is published for the grants. */
   bindIp?: string;
+  /** Hostname on the main Cloudflare tunnel that serves Garage's S3 API over HTTPS (opt-in). */
+  publicHostname?: string;
   grants: Record<string, BackupGrantRecord>;
 }
 

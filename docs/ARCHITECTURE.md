@@ -259,6 +259,11 @@ There is still **one writer**: the origin's Postgres.
   bucket and key on this server's Garage, with an optional quota, reachable on the Tailscale IP (only the
   S3 port; `state.backupShare.bindIp` when no mirror or helper pool published it). The secret is returned
   once and never stored outside Garage; `revokeBackupGrant` deletes the key and keeps the data.
+- Opt-in HTTPS (`enablePublicStorage`, guard `storage.public`, or a grant with `internet`): the S3 API only
+  (`http://paasmcp-garage:3900`) becomes `https://s3.<baseDomain>` on the main tunnel via
+  `routeHostnameOnTunnel` (exposure.ts: ingress rule + proxied CNAME). `disablePublicStorage` removes the
+  rule and only the CNAME that points at this tunnel. Uploads above 50 MB use S3 multipart (`putMultipart`,
+  aborted on failure) to fit Cloudflare's 100 MB request limit.
 - Local copies are pruned **only after** they exist off-site. `backup test <id>` restores into a
   scratch container to prove the backup actually opens.
 

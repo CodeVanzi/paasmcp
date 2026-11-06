@@ -13,7 +13,7 @@ import { activeTunnelStatus, disableActiveTunnel, enableActiveTunnel } from "./a
 import { addEdgeSite, edgeStatus, removeEdgeSite } from "./edge.js";
 import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
-import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
+import { clearOffsiteTarget, createBackupGrant, disablePublicStorage, listBackupGrants, OffsiteError, publicStorageUrl, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -729,7 +729,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         // Off-site destination (receiving side) and keys for other computers (providing side).
         if (pathname === "/api/offsite" && req.method === "GET") {
-          return reply({ target: offsiteSummary(), grants: await listBackupGrants() });
+          return reply({ target: offsiteSummary(), grants: await listBackupGrants(), publicUrl: publicStorageUrl() });
         }
         if (pathname === "/api/offsite/target" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -758,13 +758,17 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const body = await readJsonBody(req);
           const r = await createBackupGrant(
             String(body.name || ""),
-            { maxGb: body.maxGb === undefined || body.maxGb === "" || body.maxGb === null ? undefined : Number(body.maxGb) },
+            { maxGb: body.maxGb === undefined || body.maxGb === "" || body.maxGb === null ? undefined : Number(body.maxGb), internet: body.internet === true },
             (params) => confirmFromBody("backup.grant", params, body)
           );
           // The secret is in this answer only: never cached, never logged.
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           res.end(JSON.stringify(r));
           return true;
+        }
+        if (pathname === "/api/offsite/public/off" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await disablePublicStorage((params) => confirmFromBody("storage.public.off", params, body)));
         }
         if (pathname === "/api/offsite/grants/revoke" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -2372,6 +2376,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
                 <input id="ofsGrantGb" type="number" min="1" step="1" placeholder="50" />
               </div>
             </div>
+            <label style="display:flex;gap:8px;align-items:flex-start;margin-top:10px;font-size:13px;cursor:pointer;">
+              <input type="checkbox" id="ofsGrantNet" style="width:auto;flex:none;margin-top:3px;" />
+              <span><span data-i18n="ofsGrantNet"></span><br><span class="ofs-note" data-i18n="ofsGrantNetHint"></span></span>
+            </label>
+            <div id="ofsPublic"></div>
             <div class="ofs-msg" id="ofsGrantMsg" role="status" aria-live="polite"></div>
             <div style="margin-top:10px;"><button class="secondary" onclick="createGrantUi()" id="btnOfsGrant" data-i18n="ofsBtnGrant"></button></div>
             <div id="ofsGrantResult"></div>
@@ -3370,7 +3379,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsBtnStop": "Parar de enviar",
           "ofsSending": "Enviando…",
           "ofsGiveTitle": "Guardar cópias de outro computador aqui",
-          "ofsGiveDesc": "Gera uma chave que outro PaaSMCP, um computador ou um app usa para guardar cópias num bucket só dele neste servidor, pela Tailscale. Ele não enxerga mais nada daqui, e você pode revogar a chave quando quiser.",
+          "ofsGiveDesc": "Gera uma chave que outro PaaSMCP, um computador ou um app usa para guardar cópias num bucket só dele neste servidor, pela Tailscale (ou pela internet, se você marcar a opção abaixo). Ele não enxerga mais nada daqui, e você pode revogar a chave quando quiser.",
           "ofsGrantName": "Nome de quem vai usar",
           "ofsGrantGb": "Limite em GB (vazio = sem limite)",
           "ofsBtnGrant": "Gerar chave",
@@ -3386,6 +3395,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsStored": "guardando",
           "ofsLimit": "limite",
           "ofsRevoked": "Revogada",
+          "ofsGrantNet": "Acesso pela internet (HTTPS)",
+          "ofsGrantNetHint": "Para um app ou servidor fora da sua Tailscale (Render, Vercel, outro provedor). O S3 deste servidor ganha um endereço HTTPS no seu domínio pelo túnel da Cloudflare, sem abrir porta.",
+          "ofsPublishing": "Criando o endereço HTTPS no seu domínio…",
+          "ofsPublicOn": "Endereço público do S3 deste servidor:",
+          "ofsPublicOff": "Desligar",
+          "ofsInternet": "internet",
           "ofsBtnRevoke": "Revogar",
           "ofsRevokedMsg": "A chave de {name} não funciona mais. O que já foi guardado continua aqui.",
           "storageTitle": "🗂️ Arquivos dos apps",
@@ -3709,7 +3724,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsBtnStop": "Stop sending",
           "ofsSending": "Sending…",
           "ofsGiveTitle": "Keep another computer's backups here",
-          "ofsGiveDesc": "Makes a key that another PaaSMCP, a computer or an app uses to keep backups in a bucket of its own on this server, over Tailscale. It sees nothing else here, and you can revoke the key any time.",
+          "ofsGiveDesc": "Makes a key that another PaaSMCP, a computer or an app uses to keep backups in a bucket of its own on this server, over Tailscale (or the internet, if you tick the option below). It sees nothing else here, and you can revoke the key any time.",
           "ofsGrantName": "Name of who will use it",
           "ofsGrantGb": "Limit in GB (empty = no limit)",
           "ofsBtnGrant": "Make key",
@@ -3725,6 +3740,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "ofsStored": "storing",
           "ofsLimit": "limit",
           "ofsRevoked": "Revoked",
+          "ofsGrantNet": "Access over the internet (HTTPS)",
+          "ofsGrantNetHint": "For an app or server outside your Tailscale (Render, Vercel, another host). This server's S3 gets an HTTPS address on your domain through the Cloudflare tunnel, no open port.",
+          "ofsPublishing": "Creating the HTTPS address on your domain…",
+          "ofsPublicOn": "Public address of this server's S3:",
+          "ofsPublicOff": "Turn off",
+          "ofsInternet": "internet",
           "ofsBtnRevoke": "Revoke",
           "ofsRevokedMsg": "{name}'s key no longer works. What it already stored stays here.",
           "storageTitle": "🗂️ App files",
@@ -5941,12 +5962,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     function renderGrants() {
       const grants = (ofsData && ofsData.grants) || [];
+      const pub = ofsData && ofsData.publicUrl;
+      document.getElementById('ofsPublic').innerHTML = pub
+        ? '<div class="ofs-note" style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">' + esc(t('ofsPublicOn')) + ' <code>' + esc(pub) + '</code>' +
+          '<button class="secondary chip" onclick="publicOffUi()">' + esc(t('ofsPublicOff')) + '</button></div>'
+        : '';
       document.getElementById('ofsGrants').innerHTML = grants.map((g) => card(
         '<div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center;">' +
         '<div><strong>' + esc(g.name) + '</strong> · <code>' + esc(g.bucket) + '</code>' +
         '<div style="color:var(--muted);margin-top:4px;">' + esc(t('ofsKey')) + ' <code>' + esc(String(g.accessKeyId).slice(0, 6)) + '…</code>' +
         (typeof g.bytes === 'number' ? ' · ' + esc(t('ofsStored')) + ' ' + esc(fmtBytes(g.bytes)) + (g.maxGb ? ' / ' + esc(g.maxGb) + ' GB' : '') : (g.maxGb ? ' · ' + esc(t('ofsLimit')) + ' ' + esc(g.maxGb) + ' GB' : '')) +
         ' · ' + esc(new Date(g.createdAt).toLocaleDateString()) + '</div></div>' +
+        (g.internet && !g.revokedAt ? badge('', t('ofsInternet')) + ' ' : '') +
         (g.revokedAt ? badge('warning', t('ofsRevoked')) : '<button class="danger" onclick="revokeGrantUi(&#39;' + esc(g.name) + '&#39;)">' + esc(t('ofsBtnRevoke')) + '</button>') +
         '</div>')).join('');
     }
@@ -5959,7 +5986,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       btn.disabled = true;
       ofsMsg('ofsGrantMsg', '');
       try {
-        const r = await ofsPost('/api/offsite/grants', { name, maxGb: gb || undefined }, 'ofsGrantMsg');
+        const internet = document.getElementById('ofsGrantNet').checked;
+        ofsMsg('ofsGrantMsg', internet && !(ofsData && ofsData.publicUrl) ? t('ofsPublishing') : '');
+        const r = await ofsPost('/api/offsite/grants', { name, maxGb: gb || undefined, internet }, 'ofsGrantMsg');
+        if (r) ofsMsg('ofsGrantMsg', '');
         if (!r) return;
         document.getElementById('ofsGrantName').value = '';
         const a = r.access;
@@ -5976,6 +6006,11 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           '</div><p class="ofs-note" style="margin-top:8px;">' + esc(t('ofsGrantInternal')) + ' <code>' + esc(r.internalEndpoint) + '</code></p></details>');
         await loadOffsite();
       } finally { btn.disabled = false; }
+    }
+
+    async function publicOffUi() {
+      const r = await ofsPost('/api/offsite/public/off', {}, 'ofsGrantMsg');
+      if (r) loadOffsite();
     }
 
     async function revokeGrantUi(name) {

@@ -288,3 +288,80 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
     details: `Cloudflare Tunnel route ${publicUrl} -> ${internalServiceUrl} configured with proxied CNAME DNS. ${zeroTrustStatus}${tunnelNote}`,
   };
 }
+
+// ---------------------------------------------------------------------------
+// A hostname on the main tunnel for something that is not an app (Garage's S3 API, offsite.ts)
+// ---------------------------------------------------------------------------
+
+type Ingress = { hostname?: string; service: string; originRequest?: Record<string, unknown> };
+
+async function cfApi<T = any>(token: string, method: string, url: string, body?: unknown): Promise<T> {
+  const res = await fetch(`https://api.cloudflare.com/client/v4${url}`, {
+    method,
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(20000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Cloudflare ${method} ${url.split("?")[0]}: HTTP ${res.status} ${text.slice(0, 300)}`);
+  return (text ? JSON.parse(text) : {}) as T;
+}
+
+function tunnelContext() {
+  const { accountId, tunnelId, baseDomain } = loadState().cloudflare;
+  if (!accountId || !tunnelId || !baseDomain || baseDomain === "example.com") {
+    throw new Error("Cloudflare Tunnel is not configured yet (paasmcp config --account-id <id> --tunnel-id <id> --domain <domain>).");
+  }
+  const token = getSecrets("system").CF_API_TOKEN || process.env.CF_API_TOKEN;
+  if (!token) throw new Error("Missing 'CF_API_TOKEN' in the 'system' vault (Cloudflare Tunnel:Edit and DNS:Edit).");
+  return { accountId, tunnelId, baseDomain, token };
+}
+
+/** The full hostname a subdomain gets on this server's domain (pure apart from reading state). */
+export function hostnameOnDomain(subdomain: string): string {
+  const { baseDomain } = loadState().cloudflare;
+  const sub = sanitizeSlug(subdomain);
+  if (!sub) throw new Error("Invalid subdomain.");
+  return `${sub}.${baseDomain}`;
+}
+
+/** Adds (or replaces) one hostname → service rule on the main tunnel and its proxied CNAME. */
+export async function routeHostnameOnTunnel(hostname: string, service: string): Promise<string> {
+  const { accountId, tunnelId, baseDomain, token } = tunnelContext();
+  if (!hostname.endsWith(`.${baseDomain}`)) throw new Error(`'${hostname}' is not under ${baseDomain}.`);
+  const cfgUrl = `/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`;
+  const cfg = await cfApi<{ result?: { config?: { ingress?: Ingress[] } } }>(token, "GET", cfgUrl);
+  const current = cfg.result?.config?.ingress || [{ service: "http_status:404" }];
+  const catchAll = current.find((r) => !r.hostname) || { service: "http_status:404" };
+  const rules = current.filter((r) => r.hostname && r.hostname !== hostname);
+  rules.push({ hostname, service, originRequest: {} });
+  await cfApi(token, "PUT", cfgUrl, { config: { ...(cfg.result?.config || {}), ingress: [...rules, catchAll] } });
+
+  const zone = await cfApi<{ result?: { id: string }[] }>(token, "GET", `/zones?name=${encodeURIComponent(baseDomain)}`);
+  const zoneId = zone.result?.[0]?.id;
+  if (!zoneId) throw new Error(`Could not find the Cloudflare zone for '${baseDomain}'.`);
+  const existing = await cfApi<{ result?: { id: string }[] }>(token, "GET", `/zones/${zoneId}/dns_records?name=${encodeURIComponent(hostname)}`);
+  const record = { type: "CNAME", name: hostname, content: `${tunnelId}.cfargotunnel.com`, proxied: true };
+  if (existing.result?.length) await cfApi(token, "PUT", `/zones/${zoneId}/dns_records/${existing.result[0].id}`, record);
+  else await cfApi(token, "POST", `/zones/${zoneId}/dns_records`, record);
+  return `https://${hostname}`;
+}
+
+/** Removes that hostname's rule and its CNAME (missing ones are fine). */
+export async function unrouteHostnameOnTunnel(hostname: string): Promise<void> {
+  const { accountId, tunnelId, baseDomain, token } = tunnelContext();
+  const cfgUrl = `/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`;
+  const cfg = await cfApi<{ result?: { config?: { ingress?: Ingress[] } } }>(token, "GET", cfgUrl);
+  const current = cfg.result?.config?.ingress || [];
+  if (current.some((r) => r.hostname === hostname)) {
+    await cfApi(token, "PUT", cfgUrl, { config: { ...(cfg.result?.config || {}), ingress: current.filter((r) => r.hostname !== hostname) } });
+  }
+  const zone = await cfApi<{ result?: { id: string }[] }>(token, "GET", `/zones?name=${encodeURIComponent(baseDomain)}`);
+  const zoneId = zone.result?.[0]?.id;
+  if (!zoneId) return;
+  const existing = await cfApi<{ result?: { id: string; content?: string }[] }>(token, "GET", `/zones/${zoneId}/dns_records?name=${encodeURIComponent(hostname)}`);
+  for (const r of existing.result || []) {
+    // Only the record that points at this tunnel; anything else under that name is not ours.
+    if (r.content === `${tunnelId}.cfargotunnel.com`) await cfApi(token, "DELETE", `/zones/${zoneId}/dns_records/${r.id}`);
+  }
+}
