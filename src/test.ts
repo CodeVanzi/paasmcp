@@ -478,6 +478,13 @@ volumes:
       const names = ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((x) => x.name);
       assert.ok(names.includes("paas_system_status"));
       assert.equal(names.includes("paas_app_deploy"), false);
+      // A real tool call marks "Connect your AI" as done; listing tools alone does not.
+      tokens.resetMcpUseThrottle();
+      assert.equal(tokens.readMcpUse(), null);
+      const used = await call({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "paas_approvals", arguments: {} } }, token);
+      assert.equal(used.status, 200);
+      assert.equal(tokens.readMcpUse()?.via, "http");
+      assert.equal(JSON.stringify(tokens.readMcpUse()).includes("paas_approvals"), false);
     } finally {
       srv.close();
     }

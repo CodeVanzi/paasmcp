@@ -142,7 +142,7 @@ tailscale serve --bg --https=8443 http://127.0.0.1:4098
 }
 ```
 
-Web-only assistants (ChatGPT / Claude.ai connectors) need a public URL with an OAuth login; that is planned, and a bearer token alone on the open internet is refused on purpose. `sudo paasmcp mcp install-service` keeps it up as a systemd service (this is the one always-on part of remote MCP). The dashboard tab **Connect AI** creates tokens and shows the exact command or config for Claude Code, Codex, Cursor, VS Code and Gemini CLI.
+Web-only assistants (ChatGPT / Claude.ai connectors) need a public URL with an OAuth login; that is planned, and a bearer token alone on the open internet is refused on purpose. `sudo paasmcp mcp install-service` keeps it up as a systemd service (this is the one always-on part of remote MCP). The dashboard tab **Connect AI** creates tokens and shows the exact command or config for Claude Code, Codex, Cursor, VS Code and Gemini CLI. Each tool call (at most once a minute) records only the time and transport in `mcp-usage.json`, never the arguments, so the dashboard tutorial knows your AI is already connected, even over stdio with no token.
 
 ### Two-factor login for the dashboard
 

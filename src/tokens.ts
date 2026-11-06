@@ -83,3 +83,43 @@ export function verifyToken(bearer: string): TokenRecord | null {
   }
   return rec;
 }
+
+/**
+ * Notes that an AI really used the MCP server (any tool call, stdio or HTTP), so the dashboard can
+ * tell "Connect your AI" is done even with no personal token (stdio on the server needs none).
+ * Stores only the time and the transport, never arguments. Best effort: a read-only data dir
+ * must not break the tool call. Written at most once a minute.
+ */
+export type McpVia = "stdio" | "http";
+export interface McpUse {
+  lastUsedAt: string;
+  via: McpVia;
+}
+const MCP_USE_PATH = path.join(PAAS_DATA_DIR, "mcp-usage.json");
+let lastMcpNote = 0;
+
+export function noteMcpUse(via: McpVia, now = Date.now()): void {
+  if (now - lastMcpNote < 60_000) return;
+  lastMcpNote = now;
+  try {
+    ensureDirectories();
+    writeFileAtomic(MCP_USE_PATH, JSON.stringify({ lastUsedAt: new Date(now).toISOString(), via }));
+  } catch {
+    /* ignore: usage marks are only a hint for the tutorial */
+  }
+}
+
+export function readMcpUse(): McpUse | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(MCP_USE_PATH, "utf-8")) as Partial<McpUse>;
+    if (typeof raw.lastUsedAt !== "string" || Number.isNaN(Date.parse(raw.lastUsedAt))) return null;
+    return { lastUsedAt: raw.lastUsedAt, via: raw.via === "http" ? "http" : "stdio" };
+  } catch {
+    return null;
+  }
+}
+
+/** Test hook: forget the once-a-minute throttle. */
+export function resetMcpUseThrottle(): void {
+  lastMcpNote = 0;
+}

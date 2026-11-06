@@ -96,7 +96,7 @@ export function startMcpHttpServer(port = 4098, requestedHost = "127.0.0.1"): ht
       return sendJson(res, 400, { error: "Invalid JSON" });
     }
 
-    const mcp = createMcpServer(record.level);
+    const mcp = createMcpServer(record.level, "http");
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on("close", () => {
       void transport.close();
