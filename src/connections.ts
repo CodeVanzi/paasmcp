@@ -5,6 +5,7 @@ import path from "node:path";
 import { DOCKER_NETWORK, HOMELAB_ROOT, loadState, sanitizeSlug, updatePlatformConfig, writeFileAtomic, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { audit } from "./guard.js";
 import { CLOUDFLARED_IMAGE, validTunnelToken } from "./activetunnel.js";
+import { notifySummary } from "./notify.js";
 import { getSecrets, setSecretEntries } from "./vault.js";
 
 // Connections set up from the dashboard, so nobody needs the terminal or an AI to publish with a
@@ -286,6 +287,7 @@ export function connectionsSummary(): Record<string, unknown> {
       connectorHere: mainConnectorState(),
     },
     github: { tokenSaved: Boolean(sys.GITHUB_TOKEN) },
+    notify: notifySummary(),
     tailscaleDomain: state.tailscaleDomain || "",
   };
 }

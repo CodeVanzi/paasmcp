@@ -15,6 +15,7 @@ import { createToken, listTokens, revokeToken, TokenLevel } from "./tokens.js";
 import { listStorage, provisionStorage } from "./storage.js";
 import { checkGitHub, ConnectionError, connectionsSummary, discoverCloudflare, listGitHubRepos, saveCloudflare } from "./connections.js";
 import { explainDeployError } from "./deployhelp.js";
+import { clearNotify, NotifyError, notifySummary, saveNotify } from "./notify.js";
 import { clearOffsiteTarget, createBackupGrant, listBackupGrants, OffsiteError, offsiteSummary, retestOffsiteTarget, revokeBackupGrant, saveOffsiteTarget } from "./offsite.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { execFileSync } from "node:child_process";
@@ -846,6 +847,16 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const body = await readJsonBody(req);
           return reply(await checkGitHub(body.token));
         }
+        // Notices (Discord, Slack, ntfy): a test notice must arrive before the address is saved.
+        if (pathname === "/api/connections/notify" && req.method === "GET") return reply(notifySummary());
+        if (pathname === "/api/connections/notify" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          return reply(await saveNotify({ url: String(body.url || ""), onSuccess: Boolean(body.onSuccess), lang: String(body.lang || "pt") }));
+        }
+        if (pathname === "/api/connections/notify" && req.method === "DELETE") {
+          clearNotify();
+          return reply(notifySummary());
+        }
 
         if (pathname === "/api/storage" && req.method === "GET") return reply({ storage: listStorage() });
         if (pathname === "/api/storage" && req.method === "POST") {
@@ -990,13 +1001,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const userError = err instanceof OffsiteError || err instanceof ConnectionError;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError;
         const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError).pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError).pt } : {}),
           })
         );
         return;
@@ -1209,6 +1220,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .dep-more { margin: 4px 0 14px; }
     .dep-more summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 4px; }
     .dep-pick { margin: -4px 0 14px; max-width: 520px; }
+    .nt-list { margin: 0 0 12px; padding-left: 18px; }
+    .nt-list li { margin-bottom: 4px; }
     .dep-result { margin-top: 14px; padding: 12px 14px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 720px; }
     .dep-result.ok { background: var(--success-soft); }
     .dep-result.err { background: var(--danger-soft); }
@@ -2597,6 +2610,29 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div><button onclick="ghSave()" id="btnGhSave" data-i18n="cnBtnGhSave"></button></div>
             </div>
             <div class="ofs-msg" id="ghMsg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="card" data-sub="alerts">
+            <div class="card-header">
+              <h2 data-i18n="ntTitle"></h2>
+              <p class="card-desc" data-i18n="ntDesc"></p>
+            </div>
+            <div id="ntStatus"></div>
+            <div id="ntForm">
+              <p class="ofs-note" data-i18n="ntHow"></p>
+              <ul class="ofs-note nt-list">
+                <li data-i18n="ntHowNtfy"></li>
+                <li data-i18n="ntHowDiscord"></li>
+                <li data-i18n="ntHowSlack"></li>
+              </ul>
+              <label class="field-label" for="ntUrl" data-i18n="ntUrl"></label>
+              <input id="ntUrl" type="password" autocomplete="off" spellcheck="false" placeholder="https://ntfy.sh/..." />
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;margin:10px 0 12px;">
+                <input type="checkbox" id="ntSuccess" style="width:auto;" />
+                <span data-i18n="ntOnSuccess"></span>
+              </label>
+              <button onclick="ntSave()" id="btnNtSave" data-i18n="ntSave"></button>
+            </div>
+            <div class="ofs-msg" id="ntMsg" role="status" aria-live="polite"></div>
           </div>
         </div>
 
@@ -5226,6 +5262,51 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       return txt;
     }
 
+    Object.assign(I18N.pt, {
+      "sub_connect_alerts": "Avisos",
+      "ntTitle": "🔔 Avisos no celular ou no chat",
+      "ntDesc": "O painel avisa quando uma publicação automática (git push ou atualização sozinha) falha. Assim você fica sabendo sem abrir o painel.",
+      "ntHow": "Cole um destes endereços:",
+      "ntHowNtfy": "Celular: instale o app ntfy (grátis), assine um tópico com um nome difícil de adivinhar e cole https://ntfy.sh/seu-topico.",
+      "ntHowDiscord": "Discord: no canal, Editar canal → Integrações → Webhooks → Novo webhook → Copiar URL.",
+      "ntHowSlack": "Slack: crie um app com Incoming Webhooks e copie a Webhook URL.",
+      "ntUrl": "Endereço dos avisos",
+      "ntOnSuccess": "Avisar também quando a publicação automática der certo",
+      "ntSave": "Mandar teste e salvar",
+      "ntSending": "Mandando um aviso de teste...",
+      "ntSaved": "Aviso de teste enviado e endereço salvo.",
+      "ntOn": "Avisos ligados",
+      "ntOnDesc": "Para {host}. Publicações que falharem vão gerar um aviso{success}.",
+      "ntOnSuccessShort": ", e as automáticas que derem certo também",
+      "ntChange": "Trocar endereço",
+      "ntOff": "Desligar avisos",
+      "ntOffConfirm": "Desligar os avisos?",
+      "tut_alerts": "Receber avisos quando algo falhar",
+      "tut_alertsDesc": "No celular (ntfy), no Discord ou no Slack."
+    });
+    Object.assign(I18N.en, {
+      "sub_connect_alerts": "Notices",
+      "ntTitle": "🔔 Notices on your phone or chat",
+      "ntDesc": "The dashboard tells you when an automatic publish (git push or self-update) fails, so you know without opening the dashboard.",
+      "ntHow": "Paste one of these addresses:",
+      "ntHowNtfy": "Phone: install the ntfy app (free), subscribe to a topic with a hard-to-guess name and paste https://ntfy.sh/your-topic.",
+      "ntHowDiscord": "Discord: in the channel, Edit channel → Integrations → Webhooks → New webhook → Copy URL.",
+      "ntHowSlack": "Slack: create an app with Incoming Webhooks and copy the Webhook URL.",
+      "ntUrl": "Notice address",
+      "ntOnSuccess": "Also tell me when an automatic publish works",
+      "ntSave": "Send a test and save",
+      "ntSending": "Sending a test notice...",
+      "ntSaved": "Test notice sent and address saved.",
+      "ntOn": "Notices on",
+      "ntOnDesc": "To {host}. Failed publishes send a notice{success}.",
+      "ntOnSuccessShort": ", and so do automatic ones that work",
+      "ntChange": "Change address",
+      "ntOff": "Turn notices off",
+      "ntOffConfirm": "Turn notices off?",
+      "tut_alerts": "Get a notice when something fails",
+      "tut_alertsDesc": "On your phone (ntfy), Discord or Slack."
+    });
+
     function esc(str) {
       return String(str ?? '')
         .replace(/&/g, '&amp;')
@@ -5271,7 +5352,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
       agents: ['connect', 'examples'],
-      connect: ['cloudflare', 'github'],
+      connect: ['cloudflare', 'github', 'alerts'],
     };
     let activeSubs = {};
     try { activeSubs = JSON.parse(localStorage.getItem('paasmcp_active_subs') || '{}') || {}; } catch { activeSubs = {}; }
@@ -6215,6 +6296,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         { id: 'backup', group: 'recommended', done: (s.backups || []).length > 0, go: ['databases', 'backups'] },
         { id: 'doctor', group: 'recommended', done: false, go: ['doctor', ''], always: true },
         { id: 'github', group: 'recommended', done: Boolean(sys.GITHUB_TOKEN), go: ['connect', 'github'], guide: 'github', optional: true },
+        { id: 'alerts', group: 'recommended', done: Boolean(sys.NOTIFY_URL), go: ['connect', 'alerts'] },
         { id: 'mirror', group: 'grow', done: Object.keys(m.replicas || {}).length + Object.keys(m.offers || {}).length > 0, go: ['mirror', 'connect'] },
         { id: 'pool', group: 'grow', done: tutExtra.pool > 0, go: ['pool', 'add'] },
         { id: 'ai', group: 'grow', done: tutExtra.ai > 0, go: ['agents', 'connect'] },
@@ -6648,6 +6730,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!res.ok) return;
       cnData = await res.json();
       renderConnections();
+      renderNotify();
     }
     function renderConnections() {
       if (!cnData) return;
@@ -6752,6 +6835,45 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         btn.disabled = false;
       }
     }
+    function renderNotify() {
+      const n = (cnData && cnData.notify) || { configured: false };
+      const st = document.getElementById('ntStatus');
+      const form = document.getElementById('ntForm');
+      if (!st || !form) return;
+      st.innerHTML = n.configured
+        ? card(badge('success', t('ntOn')) + ' <span style="color:var(--muted);">' + esc(t('ntOnDesc').split('{host}').join(n.host || '?').split('{success}').join(n.onSuccess ? t('ntOnSuccessShort') : '')) + '</span>' +
+            '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;"><button class="secondary" onclick="ntShowForm()">' + esc(t('ntChange')) + '</button>' +
+            '<button class="secondary" onclick="ntClear()">' + esc(t('ntOff')) + '</button></div>')
+        : '';
+      if (!form.dataset.forced) form.style.display = n.configured ? 'none' : '';
+      document.getElementById('ntSuccess').checked = Boolean(n.onSuccess);
+    }
+    function ntShowForm() {
+      const form = document.getElementById('ntForm');
+      form.dataset.forced = '1';
+      form.style.display = '';
+      document.getElementById('ntUrl').focus();
+    }
+    async function ntSave() {
+      const url = document.getElementById('ntUrl').value.trim();
+      if (!url) return;
+      ofsMsg('ntMsg', t('ntSending'), '');
+      const r = await ofsPost('/api/connections/notify', { url, onSuccess: document.getElementById('ntSuccess').checked, lang: currentLang }, 'ntMsg');
+      if (!r) return;
+      document.getElementById('ntUrl').value = '';
+      delete document.getElementById('ntForm').dataset.forced;
+      ofsMsg('ntMsg', t('ntSaved'), 'ok');
+      loadConnections();
+      loadAll();
+    }
+    async function ntClear() {
+      if (!confirm(t('ntOffConfirm'))) return;
+      await fetch('/api/connections/notify', { method: 'DELETE' });
+      ofsMsg('ntMsg', '', '');
+      loadConnections();
+      loadAll();
+    }
+
     async function ghSave() {
       ofsMsg('ghMsg', t('cnChecking'), '');
       const r = await ofsPost('/api/connections/github', { token: document.getElementById('ghToken').value.trim() }, 'ghMsg');

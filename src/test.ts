@@ -4020,6 +4020,7 @@ volumes:
       for (const k of ["lifePoolUpdating", "lifePoolFailed", "lifeErrNoPrevious", "lifeErr", "logsEmpty", "logsHint", "actionRollbackTip"]) twice(k);
       assert.ok(!page.includes("showToast('✅ ' + data.output)"));
       // The app list speaks plainly: no bare 127.0.0.1 pill, no raw access mode, no English limits.
+      for (const k of ["sub_connect_alerts", "ntTitle", "ntDesc", "ntHowNtfy", "ntHowDiscord", "ntHowSlack", "ntSave", "ntOnDesc", "tut_alerts", "tut_alertsDesc"]) twice(k);
       for (const k of ["appNoAddressTip", "pillLocalOnly", "mode_public", "mode_zero-trust", "mode_tailscale", "limitsLabel"]) twice(k);
       assert.ok(!page.includes("(Limits: "));
       // Every doctor finding with a code has its text in both languages (the screen falls back to English otherwise).
@@ -4037,6 +4038,69 @@ volumes:
       assert.ok(data.error && data.failure && typeof data.failure.kind === "string");
     } finally {
       dsrv.close();
+    }
+  });
+
+  await t.test("47. Notices: a failed automatic publish reaches Discord/Slack/ntfy; the address is tested first and never shown", async () => {
+    const notify = await import("./notify.js");
+    const deploys = await import("./deploys.js");
+    const http = await import("node:http");
+    const got: Array<{ path: string; type: string; title: string; body: string }> = [];
+    let status = 200;
+    const srv = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        got.push({ path: req.url || "", type: String(req.headers["content-type"] || ""), title: String(req.headers.title || ""), body });
+        res.writeHead(status);
+        res.end();
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+    const base = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    try {
+      // Who gets a notice: failures unless the person is on the dashboard; successes only automatic and when asked.
+      const on = { onSuccess: true, lang: "pt" as const };
+      assert.equal(notify.deployNoticeText({ app: "loja", trigger: "dashboard", ok: false }, on), undefined);
+      assert.match(notify.deployNoticeText({ app: "loja", trigger: "poll", ok: false, commit: "abcdef1234", error: "boom" }, on)!.text, /loja \(abcdef1\) falhou: boom/);
+      assert.ok(notify.deployNoticeText({ app: "loja", trigger: "webhook", ok: true }, on));
+      assert.equal(notify.deployNoticeText({ app: "loja", trigger: "cli", ok: true }, on), undefined);
+      assert.equal(notify.deployNoticeText({ app: "loja", trigger: "webhook", ok: true }, { onSuccess: false, lang: "en" }), undefined);
+      assert.match(notify.deployNoticeText({ app: "loja", trigger: "mcp", ok: false }, { onSuccess: false, lang: "en" })!.text, /Publishing loja failed/);
+      // Addresses: https only (loopback http allowed in tests), no user:password, kind by host.
+      assert.throws(() => notify.validateNotifyUrl("http://example.com/x"), /https/);
+      assert.throws(() => notify.validateNotifyUrl("https://u:p@ntfy.sh/x"), /user or password/);
+      assert.throws(() => notify.validateNotifyUrl("nope"), /Invalid/);
+      assert.equal(notify.notifyKind("https://discord.com/api/webhooks/1/abc"), "discord");
+      assert.equal(notify.notifyKind("https://hooks.slack.com/services/T/B/x"), "slack");
+      assert.equal(notify.notifyKind("https://ntfy.sh/meu-topico"), "ntfy");
+      // A failing test notice saves nothing.
+      status = 500;
+      await assert.rejects(notify.saveNotify({ url: `${base}/topic` }), (e: Error & { pt?: string }) => /did not go through/.test(e.message) && /não chegou/.test(e.pt || ""));
+      assert.equal(notify.notifySummary().configured, false);
+      status = 200;
+      const saved = await notify.saveNotify({ url: `${base}/topic-secreto`, onSuccess: false, lang: "pt" });
+      assert.equal(saved.configured, true);
+      assert.ok(!JSON.stringify(saved).includes("topic-secreto"), "the address itself is never returned");
+      assert.ok(!JSON.stringify((await import("./connections.js")).connectionsSummary()).includes("topic-secreto"));
+      assert.equal(got.length, 2);
+      assert.match(got[1].body, /Teste/);
+      assert.equal(got[1].title, "PaaSMCP");
+      // A failed automatic deploy sends one notice; a failed dashboard deploy does not.
+      got.length = 0;
+      deploys.startDeployRun({ app: "nt-a", trigger: "poll", branch: "main" }).fail(new Error("Command failed: docker build\nlog"));
+      deploys.startDeployRun({ app: "nt-a", trigger: "dashboard", branch: "main" }).fail(new Error("x"));
+      for (let i = 0; i < 50 && got.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(got.length, 1);
+      assert.match(got[0].body, /nt-a falhou: Command failed: docker build/);
+      assert.ok(/^[\x20-\x7e]*$/.test(got[0].title), "ntfy title header is plain ASCII");
+      notify.clearNotify();
+      assert.equal(notify.notifySummary().configured, false);
+      deploys.forgetDeploys("nt-a");
+    } finally {
+      srv.close();
+      notify.clearNotify();
     }
   });
 
