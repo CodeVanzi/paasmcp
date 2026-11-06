@@ -4834,5 +4834,85 @@ volumes:
     fs.rmSync(path.join(config.PAAS_DATA_DIR, "owner-test"), { recursive: true, force: true });
   });
 
+  await t.test("58. Vault keys: description and dates, kept encrypted, with built-in text for PaaSMCP's own keys", async () => {
+    const vm = await import("node:vm");
+    const vaultdocs = await import("./vaultdocs.js");
+    const scope = "meta-test-app";
+    // A key saved before date tracking: value only, no metadata file entry.
+    vault.saveSecrets(scope, { OLD_KEY: "old-value-123" });
+    let d = vaultdocs.listSecretDetails(scope);
+    assert.equal(d.OLD_KEY.createdAt, undefined, "no invented creation date");
+    assert.equal(d.OLD_KEY.updatedAt, undefined);
+
+    vault.setSecretEntries(scope, { NEW_KEY: "first-value-1" });
+    d = vaultdocs.listSecretDetails(scope);
+    assert.ok(d.NEW_KEY.createdAt && d.NEW_KEY.createdAt === d.NEW_KEY.updatedAt);
+    const created = d.NEW_KEY.createdAt;
+
+    // Same value again (a redeploy re-applying variables) is not a change.
+    await new Promise((r) => setTimeout(r, 5));
+    vault.setSecretEntries(scope, { NEW_KEY: "first-value-1" });
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.updatedAt, created);
+    vault.setSecretEntries(scope, { NEW_KEY: "second-value-2", OLD_KEY: "old-value-456" });
+    d = vaultdocs.listSecretDetails(scope);
+    assert.equal(d.NEW_KEY.createdAt, created);
+    assert.ok(d.NEW_KEY.updatedAt! > created!);
+    assert.equal(d.OLD_KEY.createdAt, undefined, "an old key changed now still has an unknown creation date");
+    assert.ok(d.OLD_KEY.updatedAt);
+
+    vault.setSecretDescription(scope, "NEW_KEY", "  Stripe da loja\n(produção)  ");
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.description, "Stripe da loja (produção)");
+    assert.throws(() => vault.setSecretDescription(scope, "NEW_KEY", "a chave é second-value-2"), /own value/);
+    assert.throws(() => vault.setSecretDescription(scope, "NEW_KEY", "x".repeat(301)), /too long/);
+    assert.throws(() => vault.setSecretDescription(scope, "MISSING_KEY", "x"), /No key/);
+    const metaFile = path.join(config.PAAS_VAULT_DIR, `${scope}.meta.enc.json`);
+    assert.ok(!fs.readFileSync(metaFile, "utf-8").includes("Stripe"), "descriptions are encrypted on disk");
+    vault.setSecretDescription(scope, "NEW_KEY", "");
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.description, undefined);
+
+    // Removing a key drops its metadata; adding it again starts over.
+    vault.setSecretDescription(scope, "NEW_KEY", "temporária");
+    vault.deleteSecretKey(scope, "NEW_KEY");
+    assert.equal(vault.getSecretMeta(scope).NEW_KEY, undefined);
+    vault.setSecretEntries(scope, { NEW_KEY: "third-value-3" });
+    assert.equal(vaultdocs.listSecretDetails(scope).NEW_KEY.description, undefined);
+
+    // Built-in text: system keys only in system, app keys only in apps.
+    vault.setSecretEntries(scope, { DATABASE_URL: "postgresql://u:p@h/db", GITHUB_TOKEN: "ghp_" + "z".repeat(20) });
+    d = vaultdocs.listSecretDetails(scope);
+    assert.ok(d.DATABASE_URL.suggested?.pt && d.DATABASE_URL.suggested?.en);
+    assert.equal(d.GITHUB_TOKEN.suggested, undefined, "an app's own GITHUB_TOKEN is not the dashboard's");
+    assert.ok(vaultdocs.listSecretDetails("system").DASHBOARD_TOKEN?.suggested || !vault.getSecrets("system").DASHBOARD_TOKEN);
+
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      // Its own client address: earlier tests already spent most of 127.0.0.1's login attempts.
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "203.0.113.58" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+      const add = await post("/api/secrets", { scope, key: "API_KEY", value: "value-from-form-9", description: "Chave da API de fotos" });
+      assert.equal(add.status, 200);
+      const desc = await post("/api/secrets/description", { scope, key: "API_KEY", description: "Fotos do catálogo" });
+      assert.equal(desc.status, 200);
+      const noAuth = await fetch(`${baseUrl}/api/secrets/description`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope, key: "API_KEY", description: "x" }) });
+      assert.equal(noAuth.status, 401);
+      const list = await (await fetch(`${baseUrl}/api/secrets?scope=${scope}`, { headers: { cookie } })).text();
+      assert.ok(!list.includes("value-from-form-9") && !list.includes("third-value-3"), "values never come back");
+      const j = JSON.parse(list);
+      assert.equal(j.details.API_KEY.description, "Fotos do catálogo");
+      assert.ok(j.details.API_KEY.createdAt);
+      assert.equal(j.details.OLD_KEY.createdAt, undefined);
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes("editSecretDesc(") && page.includes('id="secDesc"'));
+    } finally {
+      dsrv.close();
+      for (const k of Object.keys(vault.getSecrets(scope))) vault.deleteSecretKey(scope, k);
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

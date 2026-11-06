@@ -107,8 +107,10 @@ import {
   importDotEnvFile,
   listMaskedSecrets,
   setSecretEntries,
+  setSecretDescription,
   setSecretFromFile,
 } from "./vault.js";
+import { listSecretDetails } from "./vaultdocs.js";
 
 function getFlagValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -367,11 +369,16 @@ async function runCli() {
       const [sub, scope, ...kvArgs] = rest;
       if (!scope) {
         throw new Error(
-          "Usage: paasmcp secret <set|set-file|import-env|list|delete> <scope> ..."
+          "Usage: paasmcp secret <set|set-file|import-env|list|describe|delete> <scope> ..."
         );
       }
       if (sub === "list") {
-        console.log(JSON.stringify(listMaskedSecrets(scope), null, 2));
+        console.log(JSON.stringify(listSecretDetails(scope), null, 2));
+      } else if (sub === "describe") {
+        const [keyName, ...words] = kvArgs;
+        if (!keyName) throw new Error('Usage: paasmcp secret describe <scope> <KEY> "what it is for" (no text clears it)');
+        setSecretDescription(scope, keyName, words.join(" "));
+        console.log(JSON.stringify(listSecretDetails(scope), null, 2));
       } else if (sub === "set") {
         const entries: Record<string, string> = {};
         for (const item of kvArgs) {
@@ -1129,7 +1136,8 @@ Commands:
   paasmcp secret set <scope> KEY=VAL ...             Encrypt & store secrets in AES-256-GCM Vault
   paasmcp secret set-file <scope> <KEY> <path>       Store secret from file without printing it
   paasmcp secret import-env <scope> <.env>           Import .env file into encrypted Vault
-  paasmcp secret list <scope>                        List masked secrets in scope
+  paasmcp secret list <scope>                        List masked secrets in scope, with description and dates
+  paasmcp secret describe <scope> <KEY> "text"       Say what a key is for (empty text clears it)
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>

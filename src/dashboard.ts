@@ -75,10 +75,12 @@ import {
   deleteSecretKey,
   getSecrets,
   listMaskedSecrets,
+  setSecretDescription,
   setSecretEntries,
   timingSafeCompare,
   parseDotenv,
 } from "./vault.js";
+import { listSecretDetails } from "./vaultdocs.js";
 
 const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
 
@@ -444,8 +446,22 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             JSON.stringify({
               scope,
               secrets: listMaskedSecrets(scope),
+              details: listSecretDetails(scope),
             })
           );
+          return true;
+        }
+
+        // A key's description (what it is and what it is for). Text only: the value never travels here.
+        if (pathname === "/api/secrets/description" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const scope = String(body.scope || "system");
+          const key = String(body.key || "").trim();
+          if (!key) throw new Error("Key is required");
+          setSecretDescription(scope, key, String(body.description ?? ""));
+          audit({ event: "secret.describe", scope: sanitizeSlug(scope), key, by: actor });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ scope, details: listSecretDetails(scope) }));
           return true;
         }
 
@@ -468,7 +484,10 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const key = String(body.key || "").trim();
           const value = String(body.value || "");
           if (!key) throw new Error("Key is required");
-          setSecretEntries(scope, { [key]: value });
+          const [savedKey] = setSecretEntries(scope, { [key]: value });
+          if (typeof body.description === "string" && body.description.trim()) {
+            setSecretDescription(scope, savedKey, body.description);
+          }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
@@ -1405,6 +1424,15 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     @media (max-width: 560px) { .tut-row { flex-wrap: wrap; } .tut-act { margin-left: 34px; } }
     .sec-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 6px; border-radius: 8px; background: var(--bg-subtle); border: 1px solid var(--border); font-size: 12.5px; flex-wrap: wrap; }
     .sec-k { min-width: 0; word-break: break-all; }
+    .sec-main { flex: 1 1 260px; min-width: 0; }
+    .sec-desc { margin-top: 4px; color: var(--text); line-height: 1.4; word-break: break-word; }
+    .sec-desc.sugg { color: var(--muted); }
+    .sec-desc.none { color: var(--muted); font-style: italic; }
+    .sec-tag { font-size: 10.5px; padding: 0 5px; border-radius: 4px; border: 1px solid var(--border); margin-left: 4px; font-style: normal; }
+    .sec-dates { margin-top: 3px; color: var(--muted); font-size: 11.5px; }
+    .sec-edit { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+    .sec-edit input { flex: 1 1 220px; min-width: 0; font-size: 12.5px; padding: 5px 8px; }
+    .sec-edit button { padding: 3px 9px; font-size: 11px; }
     .sec-act { display: flex; gap: 6px; }
     .sec-act button { padding: 3px 9px; font-size: 11px; }
     .sec-apply.changed { color: var(--text); border-left: 3px solid var(--warning, #d97706); padding-left: 8px; }
@@ -2679,6 +2707,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <div>
                 <label class="field-label" for="secVal" id="lblSecVal"></label>
                 <input id="secVal" type="password" autocomplete="new-password" />
+              </div>
+              <div style="grid-column:1/-1;">
+                <label class="field-label" for="secDesc" data-i18n="secDescLabel"></label>
+                <input id="secDesc" maxlength="300" autocomplete="off" />
               </div>
             </div>
             <div class="actions" style="margin-bottom:6px;">
@@ -5450,6 +5482,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "secListTitle": "Salvas",
       "secAddTitle": "Adicionar ou trocar uma",
       "secChange": "Trocar",
+      "secDescLabel": "Para que serve (opcional)",
+      "secDescPh": "ex: chave da Stripe da loja, conta de produção",
+      "secDescBtn": "Descrever",
+      "secDescEditBtn": "Editar descrição",
+      "secDescSave": "Salvar",
+      "secDescCancel": "Cancelar",
+      "secDescNone": "Sem descrição.",
+      "secDescDefault": "padrão",
+      "secDescDefaultTitle": "Explicação que vem com o PaaSMCP. Clique em Editar descrição para trocar pela sua.",
+      "secCreated": "Criada em {d}",
+      "secCreatedUnknown": "Criada antes de o painel registrar datas",
+      "secUpdated": "última alteração em {d}",
+      "secNeverChanged": "sem alterações",
+      "secUpdatedUnknown": "última alteração desconhecida",
+      "toastSecDescSaved": "Descrição salva.",
       "secPasteTitle": "Colar um arquivo .env inteiro",
       "secPasteDesc": "Cole o conteúdo do seu .env (uma linha NOME=valor por variável). Comentários com # e aspas funcionam. Variáveis com o mesmo nome são trocadas; as outras ficam como estão.",
       "secPasteBtn": "Salvar todas",
@@ -5467,6 +5514,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "secListTitle": "Saved",
       "secAddTitle": "Add or change one",
       "secChange": "Change",
+      "secDescLabel": "What it is for (optional)",
+      "secDescPh": "e.g.: the shop's Stripe key, live account",
+      "secDescBtn": "Describe",
+      "secDescEditBtn": "Edit description",
+      "secDescSave": "Save",
+      "secDescCancel": "Cancel",
+      "secDescNone": "No description.",
+      "secDescDefault": "default",
+      "secDescDefaultTitle": "Explanation that ships with PaaSMCP. Click Edit description to replace it with yours.",
+      "secCreated": "Created {d}",
+      "secCreatedUnknown": "Created before the dashboard recorded dates",
+      "secUpdated": "last changed {d}",
+      "secNeverChanged": "never changed",
+      "secUpdatedUnknown": "last change unknown",
+      "toastSecDescSaved": "Description saved.",
       "secPasteTitle": "Paste a whole .env file",
       "secPasteDesc": "Paste your .env content (one NAME=value line per variable). # comments and quotes work. Variables with the same name are replaced; the others stay as they are.",
       "secPasteBtn": "Save all",
@@ -6653,6 +6715,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           expApp: "ex: meu-saas",
           expSub: "ex: app",
           secKey: "ex: STRIPE_SECRET_KEY",
+          secDesc: "ex: chave da Stripe da loja, conta de produção",
           dbApp: "ex: meu-saas",
           bakApp: "ex: meu-saas",
           fedUrl: "https://paas.seudominio.com"
@@ -6665,6 +6728,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           expApp: "e.g.: my-saas",
           expSub: "e.g.: app",
           secKey: "e.g.: STRIPE_SECRET_KEY",
+          secDesc: "e.g.: the shop's Stripe key, live account",
           dbApp: "e.g.: my-saas",
           bakApp: "e.g.: my-saas",
           fedUrl: "https://paas.yourdomain.com"
@@ -9154,6 +9218,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     // Which app's variables: a list of apps instead of typing a "scope". "system" holds the dashboard's own keys.
     const secChanged = {};
+    let secDetails = {};
     function fillScopeSelect(apps) {
       const sel = document.getElementById('secScope');
       if (!sel) return;
@@ -9180,15 +9245,64 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const res = await fetch('/api/secrets?scope=' + encodeURIComponent(scope));
       if (!res.ok) return;
       const data = await res.json();
+      secDetails = data.details || {};
       const entries = Object.entries(data.secrets || {});
       document.getElementById('secretsList').innerHTML = entries.length
         ? entries.map(function (e) {
             const k = e[0];
-            return '<div class="sec-row"><span class="sec-k"><strong>' + esc(k) + '</strong> <code>' + esc(e[1]) + '</code></span>' +
-              '<span class="sec-act"><button class="secondary" onclick="editSecret(&#39;' + esc(k) + '&#39;)">' + esc(t('secChange')) + '</button>' +
+            const d = secDetails[k] || {};
+            const sugg = d.suggested ? (d.suggested[currentLang] || d.suggested.en) : '';
+            const descHtml = d.description
+              ? '<div class="sec-desc">' + esc(d.description) + '</div>'
+              : sugg
+                ? '<div class="sec-desc sugg">' + esc(sugg) + ' <span class="sec-tag" title="' + esc(t('secDescDefaultTitle')) + '">' + esc(t('secDescDefault')) + '</span></div>'
+                : '<div class="sec-desc none">' + esc(t('secDescNone')) + '</div>';
+            const created = d.createdAt ? t('secCreated').split('{d}').join(secWhen(d.createdAt)) : t('secCreatedUnknown');
+            const updated = !d.updatedAt ? t('secUpdatedUnknown')
+              : d.updatedAt === d.createdAt ? t('secNeverChanged')
+              : t('secUpdated').split('{d}').join(secWhen(d.updatedAt));
+            return '<div class="sec-row"><div class="sec-main"><span class="sec-k"><strong>' + esc(k) + '</strong> <code>' + esc(e[1]) + '</code></span>' +
+              descHtml + '<div class="sec-dates">' + esc(created) + ' · ' + esc(updated) + '</div>' +
+              '<div class="sec-edit" id="secEdit-' + esc(k) + '" style="display:none;"></div></div>' +
+              '<span class="sec-act"><button class="secondary" onclick="editSecretDesc(&#39;' + esc(k) + '&#39;)">' + esc(t(d.description || sugg ? 'secDescEditBtn' : 'secDescBtn')) + '</button>' +
+              '<button class="secondary" onclick="editSecret(&#39;' + esc(k) + '&#39;)">' + esc(t('secChange')) + '</button>' +
               '<button class="danger" onclick="delSecret(&#39;' + esc(scope) + '&#39;,&#39;' + esc(k) + '&#39;)">' + esc(t('btnRemoveSecret')) + '</button></span></div>';
           }).join('')
         : '<div style="color:var(--muted);font-size:12.5px">' + esc(t('emptySecrets')) + '</div>';
+    }
+    function secWhen(iso) {
+      try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return String(iso || ''); }
+    }
+    // Inline editor under the key: starts from the current text, or from the built-in one so it can be tweaked.
+    function editSecretDesc(key) {
+      const box = document.getElementById('secEdit-' + key);
+      if (!box) return;
+      if (box.style.display !== 'none') { box.style.display = 'none'; box.innerHTML = ''; return; }
+      const d = secDetails[key] || {};
+      const start = d.description || (d.suggested ? (d.suggested[currentLang] || d.suggested.en) : '');
+      box.innerHTML = '<input maxlength="300" autocomplete="off" aria-label="' + esc(t('secDescLabel')) + '" placeholder="' + esc(t('secDescPh')) + '" />' +
+        '<button onclick="saveSecretDesc(&#39;' + esc(key) + '&#39;)">' + esc(t('secDescSave')) + '</button>' +
+        '<button class="secondary" onclick="editSecretDesc(&#39;' + esc(key) + '&#39;)">' + esc(t('secDescCancel')) + '</button>';
+      box.style.display = 'flex';
+      const input = box.querySelector('input');
+      input.value = start;
+      input.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') saveSecretDesc(key); if (ev.key === 'Escape') editSecretDesc(key); });
+      input.focus();
+    }
+    async function saveSecretDesc(key) {
+      const scope = document.getElementById('secScope').value || 'system';
+      const box = document.getElementById('secEdit-' + key);
+      const input = box && box.querySelector('input');
+      if (!input) return;
+      const res = await fetch('/api/secrets/description', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: scope, key: key, description: input.value })
+      });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) return alert(data.error || ('HTTP ' + res.status));
+      showToast(t('toastSecDescSaved'));
+      loadSecrets();
     }
     function editSecret(key) {
       document.getElementById('secKey').value = key;
@@ -9205,16 +9319,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const scope = document.getElementById('secScope').value || 'system';
       const key = document.getElementById('secKey').value.trim();
       const value = document.getElementById('secVal').value;
+      const description = document.getElementById('secDesc').value;
       if (!key) return;
       const res = await fetch('/api/secrets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scope, key, value })
+        body: JSON.stringify({ scope, key, value, description })
       });
       const data = await res.json();
-      if (!res.ok) return alert(data.error);
+      if (!res.ok) { loadSecrets(); return alert(data.error); }
       document.getElementById('secKey').value = '';
       document.getElementById('secVal').value = '';
+      document.getElementById('secDesc').value = '';
       showToast(t('toastSecretSaved'));
       markSecChanged(scope);
       loadSecrets();
