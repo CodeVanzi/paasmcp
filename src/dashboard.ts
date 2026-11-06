@@ -902,16 +902,16 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
   const sharedCss = `
     :root, [data-theme="dark"] {
-      --bg: #07090e;
-      --bg-elevated: #0d1117;
-      --bg-subtle: #131924;
-      --card: #0d1117;
-      --card-hover: #131926;
-      --border: #1e2638;
-      --border-strong: #2d384e;
+      --bg: #121720;
+      --bg-elevated: #181e29;
+      --bg-subtle: #1e2532;
+      --card: #181e29;
+      --card-hover: #1e2533;
+      --border: #29324a;
+      --border-strong: #3a465f;
       --text: #f1f5f9;
       --muted: #8896aa;
-      --input-bg: #07090e;
+      --input-bg: #10141c;
       --accent: #00f0ff;
       --accent-hover: #38bdf8;
       --accent-soft: rgba(0, 240, 255, 0.12);
@@ -922,9 +922,9 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       --warning-soft: rgba(245, 158, 11, 0.12);
       --danger: #ff4757;
       --danger-soft: rgba(255, 71, 87, 0.12);
-      --code-bg: #05070b;
+      --code-bg: #0f131a;
       --code-text: #00f0ff;
-      --shadow: 0 4px 24px -2px rgba(0, 0, 0, 0.55);
+      --shadow: 0 4px 20px -4px rgba(0, 0, 0, 0.4);
     }
     /* Light theme: soft blue-grey tones, never plain white (easier on the eyes), with readable contrast */
     [data-theme="light"] {
@@ -1310,7 +1310,6 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       align-self: start;
       max-height: calc(100vh - 80px);
       overflow-y: auto;
-      scrollbar-width: thin;
       display: flex;
       flex-direction: column;
       gap: 1px;
@@ -1321,14 +1320,39 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       padding: 5px; background: transparent; border: 1px solid transparent; color: var(--muted); border-radius: 6px; display: inline-flex;
     }
     button.sidenav-collapse:hover { color: var(--text); background: var(--accent-soft); transform: none; filter: none; }
-    .nav-section {
+    button.nav-section {
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 6px;
+      width: 100%;
       font-size: 11px;
       font-weight: 650;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--muted);
-      padding: 14px 10px 4px;
+      padding: 14px 10px 4px 13px;
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      box-shadow: none;
+      cursor: pointer;
     }
+    button.nav-section:hover { color: var(--text); background: transparent; transform: none; filter: none; }
+    .nav-chevron { flex-shrink: 0; transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.2s ease; }
+    button.nav-section[aria-expanded="false"] .nav-chevron { transform: rotate(-90deg); }
+    /* Section groups open and close with a smooth height animation (grid rows 1fr <-> 0fr). */
+    .nav-group { display: grid; grid-template-rows: 1fr; transition: grid-template-rows 0.32s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.24s ease; }
+    .nav-group.closed { grid-template-rows: 0fr; opacity: 0; }
+    .nav-group-inner { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 1px; padding-left: 2px; }
+    /* Icon-only menu: groups always open, so every icon stays reachable. */
+    .nav-collapsed .nav-group.closed { grid-template-rows: 1fr; opacity: 1; }
+    .nav-collapsed .nav-chevron { opacity: 0; }
+    .console-sidenav { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+    .console-sidenav:hover { scrollbar-color: var(--border-strong) transparent; }
+    .console-sidenav::-webkit-scrollbar { width: 6px; }
+    .console-sidenav::-webkit-scrollbar-thumb { background: transparent; border-radius: 3px; }
+    .console-sidenav:hover::-webkit-scrollbar-thumb { background: var(--border-strong); }
     button.nav-item {
       position: relative;
       display: flex;
@@ -1378,8 +1402,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     button.nav-sub:hover { color: var(--text); background: var(--accent-soft); transform: none; filter: none; }
     button.nav-sub.active { color: var(--accent-text); font-weight: 650; }
 
-    .page-head { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; }
-    .page-head h1 { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -0.015em; display: flex; align-items: center; gap: 10px; }
+    .page-head { display: flex; flex-direction: column; gap: 2px; margin: 0 0 12px; }
+    .page-crumb { font-size: 12.5px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+    .page-head h1 { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -0.015em; display: flex; align-items: center; gap: 10px; text-wrap: balance; }
+    .page-head h1 .nav-counter { font-size: 12px; }
+    .page-lead { margin: 2px 0 0; color: var(--muted); font-size: 13.5px; max-width: 80ch; }
     .page-head .nav-icon { width: 20px; height: 20px; color: var(--accent); }
     /* Folder tabs at the top of a page that has more than one part */
     .page-tabs {
@@ -1388,8 +1415,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       border-bottom: 1px solid var(--border);
       margin: 0 0 18px;
       overflow-x: auto;
-      scrollbar-width: thin;
+      overflow-y: hidden;
+      scrollbar-width: none;
     }
+    .page-tabs::-webkit-scrollbar { display: none; }
     button.page-tab {
       background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0; box-shadow: none;
       padding: 9px 14px; margin-bottom: -1px; font-size: 13.5px; font-weight: 500; color: var(--muted); white-space: nowrap; cursor: pointer;
@@ -1399,21 +1428,41 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     .tab-pane [data-sub].sub-hidden { display: none !important; }
 
     /* Three-column workspace: navigation | page | telemetry */
+    /* Fills the screen up to 2400 px; the side columns grow on big screens. */
     .console-container {
-      max-width: 1560px;
+      --nav-w: 232px;
+      --aside-w: 300px;
+      max-width: 2400px;
       margin: 18px auto;
-      padding: 0 20px;
+      padding: 0 24px;
       display: grid;
-      grid-template-columns: 228px minmax(0, 1fr) 290px;
-      gap: 22px;
+      grid-template-columns: var(--nav-w) minmax(0, 1fr) var(--aside-w);
+      gap: 24px;
       align-items: start;
+      transition: grid-template-columns 0.34s cubic-bezier(0.32, 0.72, 0, 1);
     }
-    .console-container.nav-collapsed { grid-template-columns: 52px minmax(0, 1fr) 290px; }
-    .nav-collapsed .nav-label, .nav-collapsed .nav-counter, .nav-collapsed .nav-subs { display: none !important; }
-    .nav-collapsed .nav-section { font-size: 0; padding: 10px 8px 4px; }
-    .nav-collapsed .nav-section::after { content: ""; display: block; border-top: 1px solid var(--border); }
-    .nav-collapsed button.nav-item { justify-content: center; padding: 9px 0; }
-    .nav-collapsed .sidenav-head { justify-content: center; }
+    @media (min-width: 1700px) { .console-container { --nav-w: 252px; --aside-w: 330px; gap: 32px; padding: 0 32px; } }
+    @media (min-width: 2200px) { .console-container { --nav-w: 272px; --aside-w: 360px; } }
+    .console-container.nav-collapsed { --nav-w: 54px; }
+    /* Collapse animation: names fade and shrink while the column narrows; icons stay put. */
+    .console-sidenav { overflow-x: hidden; }
+    .console-sidenav button.nav-item { padding-left: 15px; overflow: hidden; }
+    .console-sidenav .nav-label, .console-sidenav .nav-counter {
+      max-width: 200px; opacity: 1;
+      transition: opacity 0.2s ease 0.08s, max-width 0.34s cubic-bezier(0.32, 0.72, 0, 1);
+    }
+    .console-sidenav .nav-section { white-space: nowrap; transition: color 0.2s ease; }
+    .console-sidenav .nav-section::after { content: ""; display: block; border-top: 1px solid var(--border); opacity: 0; transition: opacity 0.2s ease; margin-top: -1px; }
+    .console-sidenav .nav-subs { overflow: hidden; max-height: 320px; transition: max-height 0.34s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.2s ease; }
+    .sidenav-head { justify-content: flex-start; padding-left: 9px; }
+    .nav-collapsed .console-sidenav .nav-label, .nav-collapsed .console-sidenav .nav-counter { max-width: 0; opacity: 0; transition: opacity 0.12s ease, max-width 0.3s cubic-bezier(0.32, 0.72, 0, 1); }
+    .nav-collapsed .console-sidenav .nav-counter { padding: 0; border-width: 0; }
+    .nav-collapsed .console-sidenav .nav-section { color: transparent; }
+    .nav-collapsed .console-sidenav .nav-section::after { opacity: 1; }
+    .nav-collapsed .console-sidenav .nav-subs { max-height: 0; opacity: 0; margin-top: 0; margin-bottom: 0; }
+    @media (prefers-reduced-motion: reduce) {
+      .nav-group, .nav-chevron, .console-container, .console-sidenav .nav-label, .console-sidenav .nav-counter, .console-sidenav .nav-subs, .console-sidenav .nav-section, .console-sidenav .nav-section::after { transition: none !important; }
+    }
     .console-main {
       min-width: 0;
       display: flex;
@@ -1426,13 +1475,23 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       min-width: 0;
     }
     .nav-scrim { display: none; }
+    .header-actions button.icon-only { padding: 7px 9px; }
+    .ui-tip {
+      position: fixed; z-index: 100; pointer-events: none; max-width: 280px;
+      background: var(--text); color: var(--bg); font-size: 12px; font-weight: 500; line-height: 1.35;
+      padding: 5px 9px; border-radius: 6px; box-shadow: var(--shadow);
+      opacity: 0; transform: translateY(-2px); transition: opacity 0.12s ease, transform 0.12s ease;
+    }
+    .ui-tip.show { opacity: 1; transform: none; }
     @media (max-width: 1240px) {
       .console-container, .console-container.nav-collapsed { grid-template-columns: 52px minmax(0, 1fr); }
       .console-container .nav-label, .console-container .nav-counter, .console-container .nav-subs { display: none !important; }
       .console-container .nav-section { font-size: 0; padding: 10px 8px 4px; }
-      .console-container .nav-section::after { content: ""; display: block; border-top: 1px solid var(--border); }
+      .console-container .nav-section::after { content: ""; display: block; border-top: 1px solid var(--border); opacity: 1; }
       .console-container button.nav-item { justify-content: center; padding: 9px 0; }
       .console-container .sidenav-head { display: none; }
+      .console-container .nav-group.closed { grid-template-rows: 1fr; opacity: 1; }
+      .console-container .nav-chevron { display: none; }
       .console-sidebar { grid-column: 2; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; align-items: start; }
       .console-sidebar .telemetry-card { margin-bottom: 0; }
       #statsGrid { display: contents; }
@@ -1448,15 +1507,23 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       .console-sidenav {
         position: fixed; z-index: 40; top: 0; left: 0; bottom: 0; width: 272px; max-height: none; height: 100%;
         background: var(--bg-elevated); border-right: 1px solid var(--border); padding: 16px 10px;
-        transform: translateX(-100%); transition: transform 0.2s ease;
+        transform: translateX(-100%); visibility: hidden;
+        transition: transform 0.36s cubic-bezier(0.32, 0.72, 0, 1), visibility 0s linear 0.36s, box-shadow 0.36s ease;
       }
-      .console-container.nav-open .console-sidenav { transform: none; }
-      .console-container.nav-open .nav-scrim { display: block; position: fixed; inset: 0; z-index: 39; background: rgba(0, 0, 0, 0.45); }
+      .console-container.nav-open .console-sidenav { transform: none; visibility: visible; box-shadow: 8px 0 32px rgba(0, 0, 0, 0.35); transition: transform 0.36s cubic-bezier(0.32, 0.72, 0, 1), visibility 0s, box-shadow 0.36s ease; }
+      .nav-scrim { display: block; position: fixed; inset: 0; z-index: 39; background: rgba(0, 0, 0, 0.45); opacity: 0; pointer-events: none; transition: opacity 0.3s ease; }
+      .console-container.nav-open .nav-scrim { opacity: 1; pointer-events: auto; }
+      .console-container.nav-collapsed .console-sidenav .nav-label, .console-container.nav-collapsed .console-sidenav .nav-counter { max-width: 200px; opacity: 1; }
+      .console-container.nav-collapsed .console-sidenav .nav-section { color: var(--muted); }
+      .console-container.nav-collapsed .console-sidenav .nav-section::after { opacity: 0; }
+      .console-container.nav-collapsed .console-sidenav .nav-subs { max-height: 320px; opacity: 1; }
       .console-container .nav-label, .console-container .nav-counter { display: initial !important; }
       .console-container .nav-counter:empty, .console-container .nav-counter[hidden] { display: none !important; }
       .console-container button.nav-item.active + .nav-subs { display: flex !important; }
-      .console-container .nav-section { font-size: 11px; padding: 14px 10px 4px; }
+      .console-container .nav-section { font-size: 11px; padding: 14px 10px 4px 13px; }
       .console-container .nav-section::after { display: none; }
+      .console-container .nav-chevron { display: block; opacity: 1; }
+      .console-container .nav-group.closed { grid-template-rows: 0fr; opacity: 0; }
       .console-container button.nav-item { justify-content: flex-start; padding: 8px 10px; }
     }
     @media (prefers-reduced-motion: reduce) { .console-sidenav { transition: none; } }
@@ -1833,8 +1900,8 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     <div class="header-actions" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
       <span id="sidebarSubtitle" style="display:none;">Agent-First Micro-PaaS</span>
       <button class="secondary" onclick="toggleLang()" id="langBtn">🇧🇷 PT-BR</button>
-      <button class="secondary" onclick="toggleTheme()" id="themeBtn">🌙 Escuro</button>
-      <button class="secondary" onclick="loadAll()" id="btnRefresh">
+      <button class="secondary icon-only" onclick="toggleTheme()" id="themeBtn">🌙 Escuro</button>
+      <button class="secondary icon-only" onclick="loadAll()" id="btnRefresh">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
         <span>Atualizar</span>
       </button>
@@ -1855,61 +1922,69 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
         <span class="nav-label"></span>
       </button>
       <div class="nav-subs" data-subs-for="home"></div>
-      <div class="nav-section" data-i18n="navSecApps"></div>
-      <button class="nav-item nav-btn" onclick="goTo('overview')" id="navOverview">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
-        <span class="nav-label"></span>
-        <span class="nav-counter" id="tabCountApps" hidden></span>
-      </button>
-      <div class="nav-subs" data-subs-for="overview"></div>
-      <button class="nav-item nav-btn" onclick="goTo('databases')" id="navDatabases">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
-        <span class="nav-label"></span>
-        <span class="nav-counter" id="tabCountDbs" hidden></span>
-      </button>
-      <div class="nav-subs" data-subs-for="databases"></div>
-      <button class="nav-item nav-btn" onclick="goTo('vault')" id="navVault">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
-        <span class="nav-label"></span>
-        <span class="nav-counter" id="tabCountVault" hidden></span>
-      </button>
-      <div class="nav-subs" data-subs-for="vault"></div>
-      <div class="nav-section" data-i18n="navSecServers"></div>
-      <button class="nav-item nav-btn" onclick="goTo('mirror')" id="navMirror">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
-        <span class="nav-label"></span>
-        <span class="nav-counter" id="tabCountMirror" hidden></span>
-      </button>
-      <div class="nav-subs" data-subs-for="mirror"></div>
-      <button class="nav-item nav-btn" onclick="goTo('pool')" id="navPool">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
-        <span class="nav-label"></span>
-        <span class="nav-counter" id="tabCountPool" hidden></span>
-      </button>
-      <div class="nav-subs" data-subs-for="pool"></div>
-      <div class="nav-section" data-i18n="navSecIntegrations"></div>
-      <button class="nav-item nav-btn" onclick="goTo('agents')" id="navAgents">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
-        <span class="nav-label"></span>
-        <span class="nav-counter" id="tabCountAgents" hidden></span>
-      </button>
-      <div class="nav-subs" data-subs-for="agents"></div>
-      <button class="nav-item nav-btn" onclick="goTo('email')" id="navEmail">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
-        <span class="nav-label"></span>
-      </button>
-      <div class="nav-subs" data-subs-for="email"></div>
-      <div class="nav-section" data-i18n="navSecSystem"></div>
-      <button class="nav-item nav-btn" onclick="goTo('doctor')" id="navDoctor">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-        <span class="nav-label"></span>
-      </button>
-      <div class="nav-subs" data-subs-for="doctor"></div>
-      <button class="nav-item nav-btn" onclick="goTo('updates')" id="navUpdates">
-        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-        <span class="nav-label"></span>
-      </button>
-      <div class="nav-subs" data-subs-for="updates"></div>
+      <button class="nav-section" data-section="apps" aria-expanded="true" aria-controls="navGroup-apps" onclick="toggleNavSection('apps')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecApps"></span></button>
+      <div class="nav-group" id="navGroup-apps"><div class="nav-group-inner">
+        <button class="nav-item nav-btn" onclick="goTo('overview')" id="navOverview">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountApps" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="overview"></div>
+        <button class="nav-item nav-btn" onclick="goTo('databases')" id="navDatabases">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountDbs" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="databases"></div>
+        <button class="nav-item nav-btn" onclick="goTo('vault')" id="navVault">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountVault" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="vault"></div>
+      </div></div>
+      <button class="nav-section" data-section="servers" aria-expanded="true" aria-controls="navGroup-servers" onclick="toggleNavSection('servers')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecServers"></span></button>
+      <div class="nav-group" id="navGroup-servers"><div class="nav-group-inner">
+        <button class="nav-item nav-btn" onclick="goTo('mirror')" id="navMirror">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountMirror" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="mirror"></div>
+        <button class="nav-item nav-btn" onclick="goTo('pool')" id="navPool">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountPool" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="pool"></div>
+      </div></div>
+      <button class="nav-section" data-section="integrations" aria-expanded="true" aria-controls="navGroup-integrations" onclick="toggleNavSection('integrations')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecIntegrations"></span></button>
+      <div class="nav-group" id="navGroup-integrations"><div class="nav-group-inner">
+        <button class="nav-item nav-btn" onclick="goTo('agents')" id="navAgents">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountAgents" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="agents"></div>
+        <button class="nav-item nav-btn" onclick="goTo('email')" id="navEmail">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
+          <span class="nav-label"></span>
+        </button>
+        <div class="nav-subs" data-subs-for="email"></div>
+      </div></div>
+      <button class="nav-section" data-section="system" aria-expanded="true" aria-controls="navGroup-system" onclick="toggleNavSection('system')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecSystem"></span></button>
+      <div class="nav-group" id="navGroup-system"><div class="nav-group-inner">
+        <button class="nav-item nav-btn" onclick="goTo('doctor')" id="navDoctor">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
+          <span class="nav-label"></span>
+        </button>
+        <div class="nav-subs" data-subs-for="doctor"></div>
+        <button class="nav-item nav-btn" onclick="goTo('updates')" id="navUpdates">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+          <span class="nav-label"></span>
+        </button>
+        <div class="nav-subs" data-subs-for="updates"></div>
+      </div></div>
     </nav>
     <div class="nav-scrim" onclick="toggleNavDrawer(false)"></div>
     <div class="console-main">
@@ -2132,14 +2207,20 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <h3 data-i18n="scaleCapTitle" style="margin-top:18px;"></h3>
               <p class="card-desc" data-i18n="scaleCapDesc"></p>
               <div id="scaleCapacity"></div>
-              <h3 data-i18n="scaleDiaryTitle" style="margin-top:18px;"></h3>
-              <p class="card-desc" data-i18n="scaleDiaryDesc"></p>
-              <div id="scaleDiary"></div>
-              <div class="form-grid" style="grid-template-columns:minmax(0,320px);margin-top:8px;">
-                <div><label class="field-label" for="scaleLang" data-i18n="lblScaleLang"></label>
-                  <select id="scaleLang" onchange="saveScaleLang()"><option value="pt">Português</option><option value="en">English</option></select></div>
-              </div>
             </div>
+          </div>
+
+          <div class="card" data-sub="diary" id="diaryCard">
+            <div class="card-header">
+              <h2 data-i18n="scaleDiaryTitle"></h2>
+              <p class="card-desc" data-i18n="scaleDiaryDesc"></p>
+            </div>
+            <div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),320px));">
+              <div><label class="field-label" for="diaryApp" data-i18n="lblScaleApp"></label><select id="diaryApp" onchange="document.getElementById('scaleApp').value = this.value; loadScale();"></select></div>
+              <div><label class="field-label" for="scaleLang" data-i18n="lblScaleLang"></label>
+                <select id="scaleLang" onchange="saveScaleLang()"><option value="pt">Português</option><option value="en">English</option></select></div>
+            </div>
+            <div id="scaleDiary" style="margin-top:6px;"></div>
           </div>
 
           <div class="card" data-sub="webhook">
@@ -4109,6 +4190,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sub_overview_deploy": "Publicar um app",
           "sub_overview_expose": "Deixar acessível",
           "sub_overview_scale": "Escala automática",
+          "sub_overview_diary": "Diário do decisor",
           "sub_overview_webhook": "Publicar a cada push",
           "sub_databases_dbs": "Bancos",
           "sub_databases_backups": "Cópias de segurança",
@@ -4144,7 +4226,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "healthMirror": "Segundo servidor",
           "healthEmail": "E-mail",
           "healthOn": "Ligado",
-          "healthOff": "Não usado"
+          "healthOff": "Não usado",
+          "lead_home": "Por onde começar e o que configurar na primeira vez.",
+          "lead_overview": "Publique, deixe acessível e acompanhe os apps deste servidor.",
+          "lead_databases": "Cada app ganha o seu próprio banco, separado dos outros, com cópias cifradas.",
+          "lead_vault": "As senhas e chaves que seus apps usam, cifradas no disco.",
+          "lead_mirror": "Os dois servidores guardam uma cópia ao vivo um do outro. Se um cair, o outro assume.",
+          "lead_pool": "PCs da casa que emprestam força quando o servidor aperta.",
+          "lead_agents": "Qualquer IA compatível com MCP pode cuidar do servidor por você. Ações arriscadas pedem sua confirmação.",
+          "lead_email": "Um serviço de envio configurado uma vez para todos os apps.",
+          "lead_doctor": "Procura problemas nos apps e no servidor em volta e diz o que fazer em cada caso.",
+          "lead_updates": "Atualizações seguras do PaaSMCP: cópia antes e volta sozinho se algo falhar."
     });
     Object.assign(I18N.en, {
           "navSecApps": "Apps",
@@ -4159,6 +4251,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "sub_overview_deploy": "Publish an app",
           "sub_overview_expose": "Make reachable",
           "sub_overview_scale": "Automatic scaling",
+          "sub_overview_diary": "Decision diary",
           "sub_overview_webhook": "Publish on every push",
           "sub_databases_dbs": "Databases",
           "sub_databases_backups": "Backups",
@@ -4194,7 +4287,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "healthMirror": "Second server",
           "healthEmail": "Email",
           "healthOn": "On",
-          "healthOff": "Not used"
+          "healthOff": "Not used",
+          "lead_home": "Where to start and what to set up the first time.",
+          "lead_overview": "Publish, make reachable and follow the apps on this server.",
+          "lead_databases": "Each app gets its own database, separate from the others, with encrypted backups.",
+          "lead_vault": "The passwords and keys your apps use, encrypted on disk.",
+          "lead_mirror": "Both servers keep a live copy of each other. If one goes down, the other takes over.",
+          "lead_pool": "PCs at home that lend power when the server is busy.",
+          "lead_agents": "Any MCP-compatible AI can run the server for you. Risky actions ask for your confirmation.",
+          "lead_email": "One sending service, set up once for every app.",
+          "lead_doctor": "Looks for problems in the apps and the server around them and says what to do.",
+          "lead_updates": "Safe PaaSMCP updates: a backup first, and an automatic roll back if something fails."
     });
 
     function t(key) {
@@ -4262,7 +4365,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     // Pages with more than one part get folder tabs on top and nested items in the side menu.
     const PAGE_SUBS = {
       home: ['start', 'setup'],
-      overview: ['list', 'deploy', 'expose', 'scale', 'webhook'],
+      overview: ['list', 'deploy', 'expose', 'scale', 'diary', 'webhook'],
       databases: ['dbs', 'backups', 'offsite', 'files'],
       mirror: ['connect', 'copy', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
@@ -4308,6 +4411,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         pane.querySelectorAll('[data-sub]').forEach(function (el) {
           el.classList.toggle('sub-hidden', el.getAttribute('data-sub') !== cur);
         });
+        // On narrow screens the tab row scrolls sideways: keep the open tab in view.
+        const act = bar.querySelector('.page-tab.active');
+        if (act && bar.scrollWidth > bar.clientWidth) bar.scrollLeft = Math.max(0, act.offsetLeft - (bar.clientWidth - act.offsetWidth) / 2);
       });
       // Page title (same icon and name as the menu item), like a repository page on GitHub.
       document.querySelectorAll('.console-main > .tab-pane').forEach(function (pane) {
@@ -4322,15 +4428,48 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         }
         const icon = btn.querySelector('.nav-icon');
         const label = btn.querySelector('.nav-label');
-        head.innerHTML = '<h1>' + (icon ? icon.outerHTML : '') + '<span></span></h1>';
-        head.querySelector('span').textContent = label ? label.textContent : '';
+        const counter = btn.querySelector('.nav-counter');
+        const name = label ? label.textContent : '';
+        const subs = PAGE_SUBS[tab];
+        const part = subs ? t('sub_' + tab + '_' + currentSub(tab)) : '';
+        head.innerHTML =
+          '<div class="page-crumb">' + esc(name) + (part ? ' <span aria-hidden="true">/</span> ' + esc(part) : '') + '</div>' +
+          '<h1>' + (icon ? icon.outerHTML : '') + '<span>' + esc(name) + '</span>' +
+          (counter && !counter.hidden ? '<span class="nav-counter" data-tip="' + esc(counter.getAttribute('data-tip') || '') + '">' + esc(counter.textContent) + '</span>' : '') + '</h1>' +
+          '<p class="page-lead">' + esc(t('lead_' + tab)) + '</p>';
       });
       // Icon-only menu (collapsed or narrow screen): the name shows on hover.
       document.querySelectorAll('.console-sidenav .nav-item').forEach(function (btn) {
         const label = btn.querySelector('.nav-label');
         const counter = btn.querySelector('.nav-counter');
-        btn.title = (label ? label.textContent : '') + (counter && !counter.hidden && counter.title ? ' · ' + counter.title : '');
+        btn.removeAttribute('title');
+        btn.setAttribute('data-tip', (label ? label.textContent : '') + (counter && !counter.hidden && counter.getAttribute('data-tip') ? ' · ' + counter.getAttribute('data-tip') : ''));
       });
+    }
+
+    // Menu sections (Apps, Servers, ...) open and close; the choice is remembered.
+    let closedSections = {};
+    try { closedSections = JSON.parse(localStorage.getItem('paasmcp_nav_closed') || '{}') || {}; } catch { closedSections = {}; }
+    function applyNavSections() {
+      document.querySelectorAll('.console-sidenav button.nav-section').forEach(function (btn) {
+        const name = btn.getAttribute('data-section');
+        const closed = Boolean(closedSections[name]);
+        btn.setAttribute('aria-expanded', closed ? 'false' : 'true');
+        const group = document.getElementById('navGroup-' + name);
+        if (group) group.classList.toggle('closed', closed);
+      });
+    }
+    function toggleNavSection(name) {
+      closedSections[name] = !closedSections[name];
+      try { localStorage.setItem('paasmcp_nav_closed', JSON.stringify(closedSections)); } catch {}
+      applyNavSections();
+    }
+    function openSectionOf(tab) {
+      const btn = navBtnFor(tab);
+      const group = btn ? btn.closest('.nav-group') : null;
+      if (!group) return;
+      const name = group.id.replace(/^navGroup-/, '');
+      if (closedSections[name]) { closedSections[name] = false; try { localStorage.setItem('paasmcp_nav_closed', JSON.stringify(closedSections)); } catch {} applyNavSections(); }
     }
 
     function goTo(tab, sub, mode) {
@@ -4343,6 +4482,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       }
       const moved = tab !== currentTab || currentSub(tab) !== prevSub;
       if (tab !== currentTab) switchTab(tab, navBtnFor(tab));
+      if (mode !== 'init') openSectionOf(tab);
       currentTab = tab;
       renderSubNav();
       const hash = '#' + tab + (subs ? '/' + currentSub(tab) : '');
@@ -4391,7 +4531,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const btn = document.getElementById('navCollapseBtn');
       if (!box || !btn) return;
       const label = box.classList.contains('nav-collapsed') ? t('navExpand') : t('navCollapse');
-      btn.title = label;
+      btn.setAttribute('data-tip', label);
       btn.setAttribute('aria-label', label);
     }
     function toggleNavDrawer(open) {
@@ -4403,6 +4543,41 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
     try { if (localStorage.getItem('paasmcp_nav_collapsed') === '1') document.getElementById('consoleContainer').classList.add('nav-collapsed'); } catch {}
 
+    // Small tooltip for anything with data-tip (menu counters, icon buttons, the icon-only menu).
+    (function () {
+      const tip = document.createElement('div');
+      tip.className = 'ui-tip';
+      tip.setAttribute('role', 'tooltip');
+      document.body.appendChild(tip);
+      let target = null;
+      function show(el) {
+        const text = el.getAttribute('data-tip');
+        if (!text) return;
+        // A menu item only needs its tooltip when its name is hidden (icon-only menu).
+        if (el.classList.contains('nav-item')) { const lb = el.querySelector('.nav-label'); if (lb && lb.offsetWidth > 20) return; }
+        target = el;
+        tip.textContent = text;
+        tip.classList.add('show');
+        const r = el.getBoundingClientRect();
+        const tw = tip.offsetWidth, th = tip.offsetHeight;
+        let x = r.left + r.width / 2 - tw / 2;
+        let y = r.bottom + 6;
+        if (el.classList.contains('nav-item')) { x = r.right + 8; y = r.top + r.height / 2 - th / 2; }
+        x = Math.max(8, Math.min(x, window.innerWidth - tw - 8));
+        if (y + th > window.innerHeight - 8) y = r.top - th - 6;
+        tip.style.left = x + 'px';
+        tip.style.top = y + 'px';
+      }
+      function hide() { target = null; tip.classList.remove('show'); }
+      document.addEventListener('mouseover', function (e) {
+        const el = e.target.closest ? e.target.closest('[data-tip]') : null;
+        if (el && el !== target) show(el); else if (!el && target) hide();
+      });
+      document.addEventListener('focusin', function (e) { const el = e.target.closest ? e.target.closest('[data-tip]') : null; if (el) show(el); });
+      document.addEventListener('focusout', hide);
+      window.addEventListener('scroll', hide, true);
+    })();
+
     // Menu counters: hidden at zero; hovering says what is being counted.
     function setNavCounter(id, n, tipKey) {
       const el = document.getElementById(id);
@@ -4411,7 +4586,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       el.textContent = num > 0 ? String(num) : '';
       el.hidden = num <= 0;
       const tip = t(tipKey + (num === 1 ? 'One' : '')).replace('{n}', String(num));
-      el.title = tip;
+      el.removeAttribute('title');
+      el.setAttribute('data-tip', tip);
       el.setAttribute('aria-label', tip);
     }
 
@@ -4457,16 +4633,22 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     function applyPreferences() {
       const isPt = currentLang === 'pt';
       document.documentElement.setAttribute('data-theme', currentTheme);
-      document.getElementById('themeBtn').innerHTML = currentTheme === 'dark' ? '☀️ <span class="btn-text">' + (isPt ? 'Claro' : 'Light') + '</span>' : '🌙 <span class="btn-text">' + (isPt ? 'Escuro' : 'Dark') + '</span>';
-      document.getElementById('themeBtn').title = currentTheme === 'dark' ? (isPt ? 'Tema claro' : 'Light theme') : (isPt ? 'Tema escuro' : 'Dark theme');
+      const sunSvg = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"></circle><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path></svg>';
+      const moonSvg = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>';
+      const themeBtn = document.getElementById('themeBtn');
+      const themeTip = currentTheme === 'dark' ? (isPt ? 'Mudar para o tema claro' : 'Switch to light theme') : (isPt ? 'Mudar para o tema escuro' : 'Switch to dark theme');
+      themeBtn.innerHTML = currentTheme === 'dark' ? sunSvg : moonSvg;
+      themeBtn.setAttribute('data-tip', themeTip);
+      themeBtn.setAttribute('aria-label', themeTip);
       document.getElementById('langBtn').innerHTML = isPt ? '🇧🇷 <span class="btn-text">PT-BR</span>' : '🇺🇸 <span class="btn-text">EN</span>';
-      document.getElementById('langBtn').title = isPt ? 'Idioma' : 'Language';
+      document.getElementById('langBtn').setAttribute('data-tip', isPt ? 'Idioma (Language)' : 'Language (Idioma)');
       const btnLogout = document.getElementById('btnLogout');
       if (btnLogout) btnLogout.textContent = isPt ? 'Sair' : 'Log out';
       const refreshBtn = document.getElementById('btnRefresh');
       if (refreshBtn) {
-        refreshBtn.innerHTML = \`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:2px;"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg> <span class="btn-text">\${isPt ? 'Atualizar' : 'Refresh'}</span>\`;
-        refreshBtn.title = isPt ? 'Atualizar' : 'Refresh';
+        refreshBtn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>';
+        refreshBtn.setAttribute('data-tip', isPt ? 'Atualizar os dados' : 'Refresh data');
+        refreshBtn.setAttribute('aria-label', isPt ? 'Atualizar os dados' : 'Refresh data');
       }
       document.getElementById('webhookUrlBox').textContent = window.location.origin + '/api/webhooks/github';
       const fedUrlEl = document.getElementById('fedUrl');
@@ -4498,6 +4680,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       // Side menu: page names, nested parts, collapse button and counter tips follow the language.
       applyNavCollapseLabel();
+      applyNavSections();
       setNavCounter('tabCountAgents', (lastStatus && lastStatus.mcpToolCount) || 0, 'cntAgents');
       if (!navInitDone) {
         navInitDone = true;
@@ -5468,12 +5651,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         : '<div class="arch-box" style="border-color:var(--warning);margin-bottom:10px;font-size:13px;">' + t('scaleNoTimer') + '</div>';
       const sel = document.getElementById('scaleApp');
       sel.innerHTML = d.apps.map(a => '<option value="' + esc(a.app) + '"' + (a.app === d.app ? ' selected' : '') + '>' + esc(a.app) + '</option>').join('');
+      const diarySel = document.getElementById('diaryApp');
+      if (diarySel) diarySel.innerHTML = sel.innerHTML;
       document.getElementById('scaleLang').value = d.language;
       const a = d.apps.find(x => x.app === d.app);
       const body = document.getElementById('scaleBody');
       if (!a) {
         document.getElementById('scaleNow').innerHTML = '<p class="card-desc">' + esc(t('scaleNoApps')) + '</p>';
         document.getElementById('scaleCharts').innerHTML = '';
+        document.getElementById('scaleDiary').innerHTML = '<p class="card-desc">' + esc(t('scaleNoApps')) + '</p>';
         body.style.display = 'none';
         return;
       }

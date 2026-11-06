@@ -567,13 +567,16 @@ told. Nothing is resident on a helper: each order is one SSH session that runs `
 ## 10f. Dashboard layout (`src/dashboard.ts`)
 
 One page, three columns: a side menu, the page, and telemetry (host, resources, and a "quick health" box whose lines
-open the page that fixes them). The menu groups pages under Apps, Servers, Integrations and System, collapses to
+open the page that fixes them). The menu groups pages under Apps, Servers, Integrations and System (each section opens and closes,
+remembered in `paasmcp_nav_closed`; going to a page opens its section), collapses to
 icons (`paasmcp_nav_collapsed` in localStorage) and becomes a drawer below 720 px; between 720 and 1240 px it shows icons
 only and the telemetry moves under the page. A page with several parts lists them in `PAGE_SUBS`; each card carries
 `data-sub="<part>"`, and `goTo(tab, part)` shows only that part's cards, marks the folder tab and the nested menu item,
 and writes `#<tab>/<part>` to the URL (back button and bookmarks work). Code that needs a field on another part calls
 `revealEl(id)`, which opens the right page and part first. Menu counters are hidden at zero and their tooltip says
-what is counted (the AI count comes from `mcpToolCount` in `paas_status`). The light theme uses blue-grey tones, not
+what is counted (the AI count comes from `mcpToolCount` in `paas_status`). Each page shows a breadcrumb, its title
+with the menu counter and a one-line lead (`lead_<tab>`); anything with `data-tip` gets the same small tooltip.
+Opening and closing the menu, its sections and the phone drawer are animated (off with reduced motion). The light theme uses blue-grey tones, not
 white.
 
 ## 11. Environment variables
