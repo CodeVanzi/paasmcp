@@ -9948,7 +9948,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
     function jobCommandArgs() {
       const raw = document.getElementById('jobCommand').value;
-      const args = raw.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean);
+      const args = raw.split(/\\r?\\n/).map(function (line) { return line.trim(); }).filter(Boolean);
       return args.length ? args : undefined;
     }
     function renderJobsTask(task) {
@@ -10006,10 +10006,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           '<div style="color:var(--muted);margin-top:5px;overflow-wrap:anywhere;">' + esc(job.schedule) + ' · ' + esc(job.repoUrl) + ' · ' + esc(job.branch) + '</div>' +
           '<div style="color:var(--muted);margin-top:4px;">' + esc(t('jobsLastRun')) + ': ' + esc(runText) + '</div>' + command + timerNote + '</div>' +
           '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">' +
-          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="runJobUi(\'' + esc(job.name) + '\')">' + esc(t('jobsManualRun')) + '</button>' +
-          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="buildJobUi(\'' + esc(job.name) + '\')">' + esc(t('jobsBuild')) + '</button>' +
-          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="toggleJobUi(\'' + esc(job.name) + '\',' + (!job.enabled) + ')">' + esc(job.enabled ? t('jobsDisable') : t('jobsEnable')) + '</button>' +
-          '<button class="danger" style="padding:5px 9px;font-size:11.5px;" onclick="removeJobUi(\'' + esc(job.name) + '\')">' + esc(t('jobsRemove')) + '</button>' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="runJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsManualRun')) + '</button>' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="buildJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsBuild')) + '</button>' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="toggleJobUi(&#39;' + esc(job.name) + '&#39;,' + (!job.enabled) + ')">' + esc(job.enabled ? t('jobsDisable') : t('jobsEnable')) + '</button>' +
+          '<button class="danger" style="padding:5px 9px;font-size:11.5px;" onclick="removeJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsRemove')) + '</button>' +
           '</div></div></div>';
       }).join('');
     }
