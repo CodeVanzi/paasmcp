@@ -70,6 +70,7 @@ import {
 import { getSystemStatusSummary, resourceSnapshot } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
 import { startPollLoop } from "./pollloop.js";
+import { startMirrorWatchLoop } from "./mirrorwatchloop.js";
 import { startAppWatch } from "./appwatch.js";
 import { startNightlyLoop } from "./nightly.js";
 import { readDbHistory, readLatestUsage, setDatabaseLimit, startUsageLoop, usageRoundOnce } from "./usage.js";
@@ -1360,6 +1361,9 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
   // ...and it measures the disk split and the size of each database every 10 minutes (usage.ts).
   const stopUsage = startUsageLoop();
   server.on("close", stopUsage);
+  // ...and it runs the mirror watchdog so automatic failover is active without host commands.
+  const stopMirrorWatch = startMirrorWatchLoop();
+  server.on("close", stopMirrorWatch);
   return server;
 }
 
