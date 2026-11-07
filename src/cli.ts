@@ -542,7 +542,7 @@ async function runCli() {
         if (arg1 === "on") {
           await confirmInCli("active.tunnel", {}, rest);
           console.log(JSON.stringify(await enableActiveTunnel(), null, 2));
-          console.error("Run 'sudo paasmcp mirror install-watch' on both servers: it moves each address once the other server's copy answers, and takes a sick copy out of the tunnel.");
+          console.error("Watchdog: runs automatically when the dashboard container is active (or run 'sudo paasmcp mirror install-watch' on servers without dashboard) to move addresses once the copy answers.");
         } else if (arg1 === "off") {
           console.log(JSON.stringify(await disableActiveTunnel(), null, 2));
         } else if (!arg1 || arg1 === "status") {
