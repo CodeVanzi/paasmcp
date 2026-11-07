@@ -1073,13 +1073,15 @@ async function runCli() {
         if (!target) throw new Error(`This server is not paired with '${arg1}' (see 'paasmcp node paired').`);
         if (target.blockers.length) throw new Error(`Not yet: ${target.blockers.map((b) => b.code).join(", ")} (see 'paasmcp node paired').`);
         await confirmInCli("pc.unpair", { peer: target.name, key: target.key }, rest);
-        console.log(JSON.stringify(await withStateLock(() => unpairServer(target.key, { by: `cli:${process.env.USER || "unknown"}` })), null, 2));
+        // The CLI entry point already runs under the global state lock.
+        console.log(JSON.stringify(await unpairServer(target.key, { by: `cli:${process.env.USER || "unknown"}` }), null, 2));
       } else if (sub === "unpair-judge") {
         const { judgeInUse, unpairJudge } = await import("./unpair.js");
         const inUse = judgeInUse();
         if (!inUse) throw new Error("This server uses no judge.");
         await confirmInCli("judge.unpair", { url: inUse.url }, rest);
-        console.log(JSON.stringify(await withStateLock(() => unpairJudge({ by: `cli:${process.env.USER || "unknown"}` })), null, 2));
+        // The CLI entry point already runs under the global state lock.
+        console.log(JSON.stringify(unpairJudge({ by: `cli:${process.env.USER || "unknown"}` }), null, 2));
       } else {
         throw new Error("Usage: paasmcp node <status|invite|join|export-sync|import-sync|paired|unpair|unpair-judge>");
       }

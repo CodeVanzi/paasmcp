@@ -5361,6 +5361,19 @@ volumes:
       fs.writeFileSync(path.join(copyDir, "PG_VERSION"), "16");
     };
     try {
+      // A federation join can retain the generic name while the mirror offer has the hostname.
+      // Matching the endpoint and CIDR keeps that one server as one row.
+      {
+        const s = config.loadState();
+        s.federation = { nodeId: "node-local", nodeName: "local", role: "replica", redundancyMode: "warm-standby", peers: { "node-lab": { ...peerRec("node-lab", "primary-node"), endpointUrl: "http://100.64.0.8:4099" } } };
+        s.mirror = { epoch: 0, offers: { labserver: { peerCidr: "100.64.0.8/32", slot: "mirror_labserver", offeredAt: "2026-11-01T00:00:00Z" } }, replicas: {} };
+        config.saveState(s);
+        const merged = unpair.pairedServers();
+        assert.equal(merged.length, 1);
+        assert.equal(merged[0].name, "labserver");
+        assert.equal(merged[0].key, "id:node-lab");
+        assert.deepEqual([merged[0].federation, merged[0].offers], [["node-lab"], ["labserver"]]);
+      }
       seed();
       vault.setSecretEntries("system", { FEDERATION_CLUSTER_KEY: "ab".repeat(32), MIRROR_REPLICATOR_PASSWORD: "old-pass", BACKUP_S3_PROVIDER: "paasmcp", BACKUP_S3_ENDPOINT: "http://100.64.0.2:3900", BACKUP_S3_BUCKET: "mirror-labserver" });
       let list = unpair.pairedServers();

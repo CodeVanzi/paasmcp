@@ -64,6 +64,7 @@ export interface PairedServer {
 interface Group {
   names: string[];
   nodeIds: Set<string>;
+  hosts: Set<string>;
   federation: string[];
   offers: string[];
   replicas: string[];
@@ -73,8 +74,21 @@ function groupsOf(state: PaaSState): Group[] {
   const groups: Group[] = [];
   const byId = (id: string | undefined) => (id ? groups.find((g) => g.nodeIds.has(id)) : undefined);
   const byName = (name: string) => (name && name !== GENERIC ? groups.find((g) => g.names.includes(name)) : undefined);
+  const byHost = (host: string | undefined) => (host ? groups.find((g) => g.hosts.has(host)) : undefined);
+  const endpointHost = (endpoint: string | undefined): string | undefined => {
+    if (!endpoint) return undefined;
+    try {
+      return new URL(endpoint).hostname;
+    } catch {
+      return undefined;
+    }
+  };
+  const cidrHost = (cidr: string | undefined): string | undefined => {
+    const host = cidr?.split("/", 1)[0];
+    return host?.replace(/^\[|\]$/g, "");
+  };
   const make = () => {
-    const g: Group = { names: [], nodeIds: new Set(), federation: [], offers: [], replicas: [] };
+    const g: Group = { names: [], nodeIds: new Set(), hosts: new Set(), federation: [], offers: [], replicas: [] };
     groups.push(g);
     return g;
   };
@@ -86,19 +100,24 @@ function groupsOf(state: PaaSState): Group[] {
   for (const [k, r] of Object.entries(state.mirror?.replicas || {})) {
     const g = byId(r.peerNodeId) || byName(r.peerName) || make();
     if (r.peerNodeId) g.nodeIds.add(r.peerNodeId);
+    if (r.peerHost) g.hosts.add(r.peerHost);
     named(g, r.peerName, true);
     g.replicas.push(k);
   }
   for (const [k, p] of Object.entries(state.federation?.peers || {})) {
+    const host = endpointHost(p.endpointUrl);
     const g = byId(p.nodeId) || byName(p.name) || make();
     if (p.nodeId) g.nodeIds.add(p.nodeId);
+    if (host) g.hosts.add(host);
     named(g, p.name);
     g.federation.push(k);
   }
   // Offers are keyed by the name a person typed for the peer (no node id).
   for (const [k, o] of Object.entries(state.mirror?.offers || {})) {
     const name = o.peer || k;
-    const g = byName(name) || make();
+    const g = byName(name) || byHost(cidrHost(o.peerCidr)) || make();
+    const host = cidrHost(o.peerCidr);
+    if (host) g.hosts.add(host);
     named(g, name, !g.names.length || g.names[0] === GENERIC);
     g.offers.push(k);
   }
