@@ -655,6 +655,37 @@ which says how the dashboard could log in there. The list itself logs in nowhere
 4. *Records.* `audit.log` (`pc.install.connect|start|done|failed|cancelled`, no password),
    `<data>/pcinstall/installs.json` (name, IP, role, commit, who), so the list knows the PC.
 
+## 10e-2. Disconnecting a linked PC (`src/unpair.ts`)
+
+The first card of **Connections → PCs** (`GET /api/paired`) lists what ties this server to others:
+
+- **Paired servers.** `pairedServers` groups, per server, its `federation.peers` records, the mirror
+  offers this server sends it and the copies it keeps of it. Copies and pairing records merge by node id;
+  offers only carry the name a person typed, so they merge by name. The generic `primary-node` never
+  merges two servers. Each entry carries `effects` (what a disconnect does) and `blockers` (refused while
+  this server is fenced by it, serves its data, follows it in a failback, or runs apps on both servers /
+  the active-active tunnel with it).
+- **The judge this server uses** (`mirror.arbiterUrl`), **helper PCs** (existing `pool remove`), and the
+  **pairs this PC judges** (`judgedPairs`, from the arbiter container's key file and state; one served by
+  the systemd service is removed with `arbiter remove-key`).
+
+`unpairServer` (guard `pc.unpair`, strong: the name is typed): stops copies of its apps that run here
+(active-active peer side) and its tunnel connector; `dropOffers` removes the peer's `pg_hba` replication
+line (unless another offer of the same source uses that address), ends its walsender and drops its
+replication slot (retried while the slot is still in use; an offer whose slot cannot be dropped stays
+listed), and deletes the Garage keys named `mirror-<peer>` (the backups it sent stay); `dropCopy` removes
+the copy container and renames its data folder `data.disconnected-<time>` (never deleted, never the
+server's own database); off-site backups that went to that server's Garage are unset; its pairing records
+go. When no paired server is left, `FEDERATION_CLUSTER_KEY` is replaced (the old one let the other server
+push `/api/federation/sync` bundles here and sign arbiter requests) and the judge is unset; when no offer
+is left, `MIRROR_REPLICATOR_PASSWORD` and the role's password change (that role can also log in to the
+databases). The other server keeps its own records until it disconnects too. `unpairJudge` (guard
+`judge.unpair`) unsets the judge and automatic takeover; `forgetJudgedPair` (guard `judge.forget`)
+removes one key from the arbiter container's key file (re-read on change) and stops the container when
+none is left. The same actions: CLI `node paired|unpair|unpair-judge`, MCP `paas_mirror`
+`paired|unpair|unpair_judge|judge_forget` (a person approves each). Audit events `pc.unpair`,
+`mirror.offers-dropped`, `mirror.copy-dropped`, `judge.unpair`, `judge.forget`.
+
 ## 10f. Dashboard layout (`src/dashboard.ts`)
 
 One page, three columns: a side menu, the page, and telemetry (host, resources, and a "quick health" box whose lines

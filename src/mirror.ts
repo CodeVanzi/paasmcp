@@ -22,7 +22,7 @@ import { bucketTargets } from "./active.js";
 import { syncBucket } from "./filesync.js";
 import { audit } from "./guard.js";
 import { exposeApplication } from "./exposure.js";
-import { createBucketWithKey, usesLocalGarage } from "./storage.js";
+import { createBucketWithKey, garageAdmin, usesLocalGarage } from "./storage.js";
 import { imageFor } from "./updater.js";
 import { decryptBinaryPayload, encryptBinaryPayload, getSecrets, setSecretEntries } from "./vault.js";
 
@@ -739,6 +739,124 @@ export function supersedeCopy(peerName: string, by: { nodeId: string; epoch: num
   });
   audit({ event: "mirror.copy-superseded", peer, by: by.nodeId, epoch: by.epoch, stoppedApps });
   return { peer, by: by.nodeId, stoppedApps };
+}
+
+// ---- Disconnecting a paired server (unpair.ts decides when; these do the mirror's part) ----
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Sending side of a disconnect: the peer loses its way in. Its pg_hba line goes first (so its copy
+ * cannot reconnect), then its walsender is ended and the replication slot dropped (a slot left
+ * behind keeps WAL until the 10 GB cap), and the S3 keys made for its backups are deleted (the
+ * backups it already sent stay in the bucket). With no offer left at all, the replication password
+ * changes too: the old one also opens normal connections to the databases.
+ * An offer whose slot cannot be dropped stays recorded, so it is still shown and can be retried.
+ */
+export async function dropOffers(keys: string[]): Promise<{ dropped: string[]; errors: string[]; passwordChanged: boolean }> {
+  const m = mirrorState();
+  const dropped: string[] = [];
+  const errors: string[] = [];
+  const sources = new Set<string>([PRIMARY]);
+  for (const key of keys) {
+    const o = m.offers[key];
+    if (!o) continue;
+    const source = o.source || PRIMARY;
+    sources.add(source);
+    const peer = o.peer || key;
+    if (!OFFLINE()) {
+      try {
+        if (!/^[a-z0-9_]{1,63}$/.test(o.slot)) throw new Error(`unexpected slot name '${o.slot}'`);
+        // The same address may also be allowed for another offer of this source: keep its line then.
+        const sharedLine = Object.entries(m.offers).some(([k, other]) => !keys.includes(k) && (other.source || PRIMARY) === source && other.peerCidr === o.peerCidr);
+        if (!sharedLine && /^[0-9a-fA-F:.]+\/\d{1,3}$/.test(o.peerCidr)) {
+          const hbaLine = `host replication ${REPLICATOR} ${o.peerCidr} scram-sha-256`;
+          // Rewritten in place (cat keeps the file's owner and mode), only when something is left.
+          execFileSync("docker", ["exec", source, "sh", "-c", 'f="$PGDATA/pg_hba.conf"; grep -vxF "$1" "$f" > "$f.unpair" || true; [ -s "$f.unpair" ] && cat "$f.unpair" > "$f"; rm -f "$f.unpair"', "sh", hbaLine], { stdio: "pipe" });
+          sql(source, "SELECT pg_reload_conf()");
+        }
+        let gone = false;
+        for (let i = 0; i < 10 && !gone; i++) {
+          sql(source, `SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name='${o.slot}' AND active_pid IS NOT NULL`);
+          try {
+            sql(source, `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name='${o.slot}'`);
+          } catch {
+            // still in use for a moment after the walsender ended
+          }
+          gone = sql(source, `SELECT count(*) FROM pg_replication_slots WHERE slot_name='${o.slot}'`) === "0";
+          if (!gone) await sleep(500);
+        }
+        if (!gone) throw new Error(`the replication slot ${o.slot} is still in use`);
+      } catch (err) {
+        errors.push(`${peer}: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`);
+        continue;
+      }
+      if (!o.dataOf) {
+        try {
+          const want = `mirror-${sanitizeSlug(peer)}`;
+          const list = await garageAdmin<{ id: string; name: string }[]>("GET", "/v1/key?list");
+          for (const k of (Array.isArray(list) ? list : []).filter((k) => k && k.name === want)) {
+            await garageAdmin("DELETE", `/v1/key?id=${encodeURIComponent(k.id)}`);
+          }
+        } catch (err) {
+          errors.push(`${peer}: backups key not deleted (${err instanceof Error ? err.message.split("\n")[0] : String(err)})`);
+        }
+      }
+    }
+    dropped.push(key);
+  }
+  saveMirror((mm) => {
+    for (const k of dropped) delete mm.offers[k];
+  });
+  let passwordChanged = false;
+  if (dropped.length && !Object.keys(mirrorState().offers).length && getSecrets("system").MIRROR_REPLICATOR_PASSWORD) {
+    const password = crypto.randomBytes(24).toString("hex");
+    setSecretEntries("system", { MIRROR_REPLICATOR_PASSWORD: password });
+    passwordChanged = true;
+    if (!OFFLINE()) {
+      for (const source of sources) {
+        try {
+          sql(source, `DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='${REPLICATOR}') THEN ALTER ROLE ${REPLICATOR} WITH PASSWORD '${password}'; END IF; END $$;`);
+        } catch {
+          // that copy is gone: its role goes with it
+        }
+      }
+    }
+  }
+  audit({ event: "mirror.offers-dropped", offers: dropped, errors: errors.length, passwordChanged });
+  return { dropped, errors, passwordChanged };
+}
+
+/**
+ * Receiving side of a disconnect: the copy of `peerName` stops and leaves the list. Its data folder
+ * is renamed, never deleted (it may hold the last writes of a server that is gone). Refused while
+ * this server serves that data or its own database follows the peer (failback).
+ */
+export function dropCopy(peerName: string): { peer: string; movedAside?: string } {
+  const peer = sanitizeSlug(peerName);
+  const rec = mirrorState().replicas[peer];
+  if (!rec) throw new Error(`This server holds no copy of '${peer}'.`);
+  if (rec.promotedAt && !rec.handedBackAt && !rec.supersededBy) throw new Error(`This server serves the data of '${peer}': hand it back first.`);
+  if (rec.failback || rec.container === PRIMARY || path.resolve(rec.dataDir) === path.resolve(PAAS_DB_DIR, "data")) {
+    throw new Error(`This server's own database follows '${peer}' (failback): finish it first.`);
+  }
+  let movedAside: string | undefined;
+  if (!OFFLINE()) {
+    try {
+      execFileSync("docker", ["rm", "-f", rec.container], { stdio: "pipe" });
+    } catch {
+      // already gone
+    }
+  }
+  // Only a folder where copies live is renamed (the record could point anywhere after a hand edit).
+  const inMirrorDir = path.resolve(rec.dataDir).startsWith(path.join(PAAS_DATA_DIR, "mirror") + path.sep);
+  if (inMirrorDir && fs.existsSync(rec.dataDir) && dirHasEntries(rec.dataDir)) movedAside = moveAside(rec.dataDir, "disconnected");
+  saveMirror((mm) => {
+    delete mm.replicas[peer];
+    if (mm.auto) mm.auto = mm.auto.filter((p) => p !== peer);
+  });
+  audit({ event: "mirror.copy-dropped", peer, movedAside });
+  return { peer, ...(movedAside ? { movedAside } : {}) };
 }
 
 /** Manual failover with several copies: on each copy that did NOT take over, stop following that server. */

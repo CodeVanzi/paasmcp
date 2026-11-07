@@ -100,6 +100,21 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "This PC stops being an arbiter. The pairs of servers it serves lose their arbiter: no automatic takeover until they get another one (their apps keep running).",
         "Este PC deixa de ser juiz. Os pares de servidores que ele atende ficam sem juiz: sem troca automática até ganharem outro (os apps continuam rodando).",
         params);
+    case "pc.unpair":
+      return risk(action, subject, "strong",
+        `This server disconnects from '${subject}': the copy of the data between the two stops (a copy kept here is set aside on disk, not deleted), automatic takeover with it turns off, and '${subject}' is forgotten. Pairing again needs a new invite. Do the same on '${subject}' so it forgets this server too.`,
+        `Este servidor se desconecta de '${subject}': a cópia dos dados entre os dois para (uma cópia guardada aqui fica separada no disco, não é apagada), a troca automática com ele desliga e '${subject}' é esquecido. Para parear de novo é preciso um convite novo. Faça o mesmo em '${subject}' para ele esquecer este servidor também.`,
+        params);
+    case "judge.unpair":
+      return risk(action, "judge", "confirm",
+        `This server stops using its judge (${String(params.url || "")}): automatic takeover turns off here (the apps keep running). Do the same on the other server of the pair: while it keeps using that judge with automatic takeover on, a network split could let it take this server's apps without this server knowing.`,
+        `Este servidor deixa de usar o juiz (${String(params.url || "")}): a troca automática desliga aqui (os apps continuam rodando). Faça o mesmo no outro servidor do par: enquanto ele usar esse juiz com a troca automática ligada, uma queda de rede poderia fazer ele assumir os apps deste servidor sem este ficar sabendo.`,
+        params);
+    case "judge.forget":
+      return risk(action, String(params.cluster || "judge"), "confirm",
+        "This PC stops being the judge of that pair of servers: they lose automatic takeover until they get another judge (their apps keep running). They see it as a judge that does not answer: remove it on their dashboard too (Connections → PCs).",
+        "Este PC deixa de ser juiz desse par de servidores: eles ficam sem troca automática até ganharem outro juiz (os apps continuam rodando). Eles vão ver um juiz que não responde: tire o juiz no painel deles também (Conexões → PCs).",
+        params);
     case "mirror.retire":
       return risk(action, subject, "confirm",
         `This server stops following '${subject}' for good: the copies of its apps here stop and its copy of the database stays on disk, read-only. Do this on every server that did NOT take over '${subject}'. A new offer rebuilds the copy later.`,
