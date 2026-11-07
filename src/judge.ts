@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { HOMELAB_ROOT, loadState, WATCHTOWER_OFF_LABEL, hostName } from "./config.js";
-import { ARBITER_DIR, arbiterClusterId, arbiterPairingStatus, closeArbiterPairing, openArbiterPairing, parseArbiterKeys } from "./arbiter.js";
+import { HOMELAB_ROOT, loadState, PAAS_DATA_DIR, WATCHTOWER_OFF_LABEL, hostName } from "./config.js";
+import { ARBITER_DIR, arbiterClusterId, arbiterPairingStatus, closeArbiterPairing, loadArbiterFile, openArbiterPairing, parseArbiterKeys } from "./arbiter.js";
 import { audit } from "./guard.js";
+import { UnpairError } from "./unpair.js";
 
 // A PC that already runs PaaSMCP can be the arbiter (third vote) of another pair of servers, set up
 // from its own dashboard: the arbiter runs in a small container (host network, so it answers on the
@@ -67,18 +68,86 @@ export function writeJudgeBundle(fromDist = path.dirname(new URL(import.meta.url
   return codeDir;
 }
 
+const serviceKeyFile = () => process.env.PAASMCP_ARBITER_ENV_FILE || "/etc/paasmcp-arbiter.env";
+
+function keysIn(f: string): string[] {
+  try {
+    const line = fs.readFileSync(f, "utf-8").split("\n").find((l) => l.startsWith("PAASMCP_ARBITER_KEY="));
+    return parseArbiterKeys(line?.slice("PAASMCP_ARBITER_KEY=".length));
+  } catch {
+    return []; // not readable here
+  }
+}
+
 /** Keys this PC serves as an arbiter, as cluster ids (never the keys). */
 function servedClusters(): string[] {
   const ids = new Set<string>();
-  for (const f of [keyFile(), process.env.PAASMCP_ARBITER_ENV_FILE || "/etc/paasmcp-arbiter.env"]) {
+  for (const f of [keyFile(), serviceKeyFile()]) for (const k of keysIn(f)) ids.add(arbiterClusterId(k));
+  return [...ids];
+}
+
+export interface JudgedPair {
+  cluster: string;
+  /** "container": started from this dashboard (it can let go of the pair); "service": `paasmcp arbiter install-service`. */
+  where: "container" | "service";
+  /** Servers of that pair the arbiter has heard from, and the last time any of them spoke. */
+  servers: number;
+  lastSeen?: number;
+}
+
+/** The pairs this PC judges, with what its arbiter last heard from each. */
+export function judgedPairs(): JudgedPair[] {
+  const seen: Record<string, { servers: number; lastSeen?: number }> = {};
+  for (const f of [stateFile(), process.env.PAASMCP_ARBITER_STATE_FILE || path.join(PAAS_DATA_DIR, "arbiter.json")]) {
     try {
-      const line = fs.readFileSync(f, "utf-8").split("\n").find((l) => l.startsWith("PAASMCP_ARBITER_KEY="));
-      for (const k of parseArbiterKeys(line?.slice("PAASMCP_ARBITER_KEY=".length))) ids.add(arbiterClusterId(k));
+      for (const [id, st] of Object.entries(loadArbiterFile(f, undefined).clusters)) {
+        const times = Object.values(st.nodes || {}).map((n) => Number(n.lastSeen) || 0);
+        const prev = seen[id];
+        seen[id] = { servers: Math.max(prev?.servers || 0, times.length), lastSeen: Math.max(prev?.lastSeen || 0, ...times) || undefined };
+      }
     } catch {
-      // not readable here
+      // no state yet, or not readable here
     }
   }
-  return [...ids];
+  const out: JudgedPair[] = [];
+  const mine = new Set(keysIn(keyFile()).map(arbiterClusterId));
+  for (const id of mine) out.push({ cluster: id, where: "container", servers: seen[id]?.servers || 0, ...(seen[id]?.lastSeen ? { lastSeen: seen[id].lastSeen } : {}) });
+  for (const k of keysIn(serviceKeyFile())) {
+    const id = arbiterClusterId(k);
+    if (!mine.has(id)) out.push({ cluster: id, where: "service", servers: seen[id]?.servers || 0, ...(seen[id]?.lastSeen ? { lastSeen: seen[id].lastSeen } : {}) });
+  }
+  return out;
+}
+
+/**
+ * This PC stops judging one pair (guard "judge.forget"): its key leaves the arbiter's key file, which
+ * the running arbiter re-reads, so that pair's requests are refused from then on. With no pair left
+ * the arbiter container stops. A pair served by the systemd service is let go with the CLI instead.
+ */
+export function forgetJudgedPair(cluster: string, run?: (args: string[]) => void): { cluster: string; left: number; stopped: boolean } {
+  const id = String(cluster || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{16}$/.test(id)) throw new UnpairError("Unknown pair.", "Par desconhecido.");
+  const keys = keysIn(keyFile());
+  const left = keys.filter((k) => arbiterClusterId(k) !== id);
+  if (left.length === keys.length) {
+    if (keysIn(serviceKeyFile()).some((k) => arbiterClusterId(k) === id)) {
+      throw new UnpairError(
+        `That pair is served by the arbiter service: run 'sudo paasmcp arbiter remove-key ${id}' on this PC.`,
+        `Esse par é atendido pelo serviço do juiz: rode 'sudo paasmcp arbiter remove-key ${id}' neste PC.`
+      );
+    }
+    throw new UnpairError("This PC does not judge that pair.", "Este PC não é juiz desse par.");
+  }
+  const file = keyFile();
+  fs.writeFileSync(file, `PAASMCP_ARBITER_KEY=${left.join(",")}\n`, { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  let stopped = false;
+  if (!left.length && !OFFLINE()) {
+    stopLocalJudge(run);
+    stopped = true;
+  }
+  audit({ event: "judge.forget", cluster: id, left: left.length, stopped });
+  return { cluster: id, left: left.length, stopped };
 }
 
 function containerRunning(): boolean {
@@ -99,6 +168,8 @@ export interface LocalJudge {
   url?: string;
   /** Pairs of servers it serves (cluster ids). */
   clusters: string[];
+  /** The same pairs with what the arbiter last heard from each (Connections → PCs). */
+  pairs: JudgedPair[];
   pairing: { open: boolean; code?: string; expiresAt?: number; triesLeft?: number };
   /** Why it cannot run here, when it cannot. */
   problem?: "noTailscale";
@@ -113,6 +184,7 @@ export async function localJudgeStatus(): Promise<LocalJudge> {
     container: containerRunning(),
     ...(ip ? { ip, url } : { problem: "noTailscale" as const }),
     clusters: servedClusters(),
+    pairs: judgedPairs(),
     pairing: arbiterPairingStatus(),
   };
 }

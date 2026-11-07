@@ -42,7 +42,8 @@ import { getEmailRelay, provisionEmail, sendTestEmail } from "./email.js";
 import { setPolling } from "./poller.js";
 import { applyUpdate, checkUpdates, Component, PINNED } from "./updater.js";
 import { checkArbiter, handbackMirror, mirrorStatus, pairArbiterAndSave, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
-import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { beJudge, cancelJudgePairing, findJudgeCandidates, forgetJudgedPair, judgedPairs, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { judgeInUse, pairedServers, unpairJudge, unpairServer } from "./unpair.js";
 import { listTailnetPcs } from "./pcinstall.js";
 import { checkGitHub, connectionsSummary, ensureRepoHook, githubRepoOf, listGitHubRepos, listRepoHooks } from "./connections.js";
 import { clearNotify, notifySummary, saveNotify } from "./notify.js";
@@ -434,15 +435,16 @@ function toolCatalog() {
       {
         name: "paas_mirror",
         description:
-          "Two-server mirror. 'status' shows, per peer, whether its Postgres copy is streaming, caught up and how many seconds behind, plus WAL kept for a peer that is away and the current epoch. 'promote' makes this server take over a peer's apps with its copy (manual failover): needs a person's strong confirmation, raises the epoch, redeploys the peer's apps here and points their DNS here. 'retire' (needs a person's confirmation): with several copies of one server, after another server took it over by hand, this copy stops following it for good (its app copies stop; a new offer rebuilds it). With an arbiter this happens on its own. 'handback' (needs a person's confirmation): on the server that took over, give the peer its apps back once its copy caught up (then promote on the peer). Arbiter (the 'judge', a third machine that decides who serves when the two servers lose each other): 'arbiter_check' tests it (the saved one, or `url`); 'arbiter_candidates' lists Tailscale devices that can be one; 'arbiter_pair' pairs with a PC showing a pairing code (`host` + `code`) and saves it, 'arbiter_set' saves an address by hand (both need a person's confirmation: the judge's vote can stop a server); 'auto' turns automatic takeover of `peer` on (needs an arbiter and a person's strong confirmation) or off (`enabled`). This server as the judge of another pair: 'judge_status', 'judge_open' (starts the judge here and opens a pairing window: give the code to the other pair's server, it lasts a few minutes), 'judge_cancel', 'judge_stop' (needs a person's confirmation; the pairs it serves lose automatic takeover). Pairing (offer/accept) and the judge's install command are CLI/dashboard-only because they carry passwords and keys.",
+          "Two-server mirror. 'status' shows, per peer, whether its Postgres copy is streaming, caught up and how many seconds behind, plus WAL kept for a peer that is away and the current epoch. 'promote' makes this server take over a peer's apps with its copy (manual failover): needs a person's strong confirmation, raises the epoch, redeploys the peer's apps here and points their DNS here. 'retire' (needs a person's confirmation): with several copies of one server, after another server took it over by hand, this copy stops following it for good (its app copies stop; a new offer rebuilds it). With an arbiter this happens on its own. 'handback' (needs a person's confirmation): on the server that took over, give the peer its apps back once its copy caught up (then promote on the peer). Arbiter (the 'judge', a third machine that decides who serves when the two servers lose each other): 'arbiter_check' tests it (the saved one, or `url`); 'arbiter_candidates' lists Tailscale devices that can be one; 'arbiter_pair' pairs with a PC showing a pairing code (`host` + `code`) and saves it, 'arbiter_set' saves an address by hand (both need a person's confirmation: the judge's vote can stop a server); 'auto' turns automatic takeover of `peer` on (needs an arbiter and a person's strong confirmation) or off (`enabled`). This server as the judge of another pair: 'judge_status', 'judge_open' (starts the judge here and opens a pairing window: give the code to the other pair's server, it lasts a few minutes), 'judge_cancel', 'judge_stop' (needs a person's confirmation; the pairs it serves lose automatic takeover). Disconnecting: 'paired' lists every server this one is paired with (what a disconnect would do, and blockers to clear first), the judge it uses and the pairs this PC judges; 'unpair' (`peer`, needs a person's strong confirmation) disconnects from one server: the copy each way stops (a copy kept here is set aside on disk, never deleted), automatic takeover with it turns off, and it is forgotten; refused while this server serves its data or it serves this one's; 'unpair_judge' (needs a person's confirmation) stops using the judge; 'judge_forget' (`cluster`, needs a person's confirmation) stops judging one pair. Helper PCs leave with paas_pool. Pairing (offer/accept) and the judge's install command are CLI/dashboard-only because they carry passwords and keys.",
         inputSchema: {
           type: "object",
           properties: {
             action: {
               type: "string",
-              enum: ["status", "promote", "retire", "handback", "auto", "arbiter_check", "arbiter_candidates", "arbiter_pair", "arbiter_set", "judge_status", "judge_open", "judge_cancel", "judge_stop"],
+              enum: ["status", "promote", "retire", "handback", "auto", "arbiter_check", "arbiter_candidates", "arbiter_pair", "arbiter_set", "judge_status", "judge_open", "judge_cancel", "judge_stop", "paired", "unpair", "unpair_judge", "judge_forget"],
             },
-            peer: { type: "string", description: "Peer server name (required for promote, retire, handback and auto)." },
+            peer: { type: "string", description: "Peer server name (required for promote, retire, handback and auto; unpair also takes the key from 'paired')." },
+            cluster: { type: "string", description: "judge_forget: the pair's id from 'paired' → judging." },
             enabled: { type: "boolean", description: "auto: true turns automatic takeover on, false turns it off." },
             url: { type: "string", description: "arbiter_check / arbiter_set / auto: the arbiter's address, e.g. http://100.64.0.9:4097." },
             host: { type: "string", description: "arbiter_pair: the judge PC's Tailscale IP or name." },
@@ -1218,6 +1220,32 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
             authorize("judge.stop", {});
             stopLocalJudge();
             return json({ ok: true });
+          // Disconnecting (the dashboard's Connections → PCs, "Linked to this server").
+          case "paired": {
+            const state = loadState();
+            return json({ servers: pairedServers(state), judge: judgeInUse(state) || null, judging: judgedPairs() });
+          }
+          case "unpair": {
+            const want = String(args.peer || "");
+            if (!want) throw new Error("'peer' is required for unpair (a name or key from 'paired').");
+            const target = pairedServers().find((p) => p.key === want || p.name === want);
+            if (!target) throw new Error(`This server is not paired with '${want}' (see action 'paired').`);
+            if (target.blockers.length) return json({ refused: true, blockers: target.blockers });
+            authorize("pc.unpair", { peer: target.name, key: target.key });
+            return json(await unpairServer(target.key, { by: "mcp" }));
+          }
+          case "unpair_judge": {
+            const inUse = judgeInUse();
+            if (!inUse) throw new Error("This server uses no judge.");
+            authorize("judge.unpair", { url: inUse.url });
+            return json(unpairJudge({ by: "mcp" }));
+          }
+          case "judge_forget": {
+            const cluster = String(args.cluster || "");
+            if (!cluster) throw new Error("'cluster' is required for judge_forget (from 'paired' → judging).");
+            authorize("judge.forget", { cluster });
+            return json(forgetJudgedPair(cluster));
+          }
         }
         return json(mirrorStatus());
       }

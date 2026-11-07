@@ -5330,5 +5330,185 @@ volumes:
     config.saveState(afterJobs);
   });
 
+  await t.test("65. Disconnecting a paired PC: one place, what happens said first, nothing that may be the only copy deleted", async () => {
+    const unpair = await import("./unpair.js");
+    const guard = await import("./guard.js");
+    const judge = await import("./judge.js");
+    const arbiter = await import("./arbiter.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const saved = config.loadState();
+    const keep = { federation: saved.federation, mirror: saved.mirror, apps: saved.apps, activeTunnel: saved.activeTunnel, activeTunnelCopy: saved.activeTunnelCopy };
+    const sysBefore = vault.getSecrets("system");
+    const peerRec = (nodeId: string, name: string) => ({ nodeId, name, endpointUrl: "https://x", mode: "warm-standby" as const, publicKeyFingerprint: "f", pairedAt: "2026-11-01T00:00:00Z", status: "standby" as const });
+    const copyDir = path.join(config.PAAS_DATA_DIR, "mirror", "aspire", "data");
+    const seed = () => {
+      const s = config.loadState();
+      s.apps = {};
+      delete s.activeTunnel;
+      delete s.activeTunnelCopy;
+      // The joiner side keeps the generic name; the copy carries the hostname: one server, by node id.
+      s.federation = { nodeId: "node-a", nodeName: "labserver", role: "replica", redundancyMode: "warm-standby", peers: { "node-b": peerRec("node-b", "primary-node") } };
+      s.mirror = {
+        epoch: 3,
+        offers: { aspire: { peerCidr: "100.64.0.2/32", slot: "mirror_aspire", offeredAt: "2026-11-01T00:00:00Z", source: "paasmcp-postgres" } },
+        replicas: { aspire: { peerName: "aspire", peerNodeId: "node-b", peerHost: "100.64.0.2", slot: "mirror_labserver", container: "paasmcp-mirror-aspire", localPort: 5433, dataDir: copyDir, acceptedAt: "2026-11-01T00:00:00Z", streamedAt: new Date().toISOString() } },
+        arbiterUrl: "http://100.64.0.9:4097",
+        auto: ["aspire"],
+      };
+      config.saveState(s);
+      fs.mkdirSync(copyDir, { recursive: true });
+      fs.writeFileSync(path.join(copyDir, "PG_VERSION"), "16");
+    };
+    try {
+      seed();
+      vault.setSecretEntries("system", { FEDERATION_CLUSTER_KEY: "ab".repeat(32), MIRROR_REPLICATOR_PASSWORD: "old-pass", BACKUP_S3_PROVIDER: "paasmcp", BACKUP_S3_ENDPOINT: "http://100.64.0.2:3900", BACKUP_S3_BUCKET: "mirror-labserver" });
+      let list = unpair.pairedServers();
+      assert.equal(list.length, 1, "pairing + copy each way = one server");
+      const p = list[0];
+      assert.equal(p.name, "aspire");
+      assert.equal(p.key, "id:node-b");
+      assert.deepEqual([p.federation, p.offers, p.replicas], [["node-b"], ["aspire"], ["aspire"]]);
+      assert.deepEqual(p.links.sort(), ["auto", "paired", "receiving", "sending"]);
+      assert.deepEqual(p.blockers, []);
+      const codes = p.effects.map((e) => e.code);
+      for (const c of ["stopSending", "revokeBackups", "dropCopy", "autoOff", "backupsTarget", "forget", "rotateKey", "judgeDropped", "otherSide"]) assert.ok(codes.includes(c as never), c);
+      assert.equal(codes.includes("keyKept" as never), false);
+
+      // Blockers: serving its data here, its data serving ours, apps on both servers from here.
+      let s = config.loadState();
+      s.mirror!.replicas.aspire.promotedAt = "2026-11-02T00:00:00Z";
+      config.saveState(s);
+      assert.deepEqual(unpair.pairedServers()[0].blockers, [{ code: "dataHere" }]);
+      await assert.rejects(unpair.unpairServer("id:node-b"), (e: unknown) => e instanceof unpair.UnpairError && /devolva/i.test((e as InstanceType<typeof unpair.UnpairError>).pt));
+      s = config.loadState();
+      s.mirror!.replicas.aspire.handedBackAt = "2026-11-03T00:00:00Z"; // handed back: the copy is stale, fine to drop
+      s.mirror!.fenced = { byNodeId: "node-b", epoch: 4, at: "x" };
+      s.apps.shop = { name: "shop", activeActive: true, domains: [], localPort: 4010 } as never;
+      config.saveState(s);
+      assert.deepEqual(unpair.pairedServers()[0].blockers.map((b) => b.code), ["fenced", "activeOrigin"]);
+      seed();
+
+      // A copy of one of its apps runs here (app on both servers): it stops, the record stays.
+      s = config.loadState();
+      s.apps.loja = { name: "loja", originNodeId: "node-b", activeActive: true, activeSync: { commit: "c", at: "x" }, status: "running", domains: [], localPort: 4011 } as never;
+      config.saveState(s);
+      list = unpair.pairedServers();
+      assert.deepEqual(list[0].effects.find((e) => e.code === "stopCopies"), { code: "stopCopies", apps: ["loja"] });
+      assert.deepEqual(list[0].effects.find((e) => e.code === "importedKept"), { code: "importedKept", apps: ["loja"] });
+
+      // The guard: typing the name; the judge and judged pairs a plain confirmation.
+      const r = guard.assessRisk("pc.unpair", { peer: "aspire", key: "id:node-b" })!;
+      assert.equal(r.level, "strong");
+      assert.equal(r.subject, "aspire");
+      assert.match(r.warning.pt, /não é apagada/);
+      assert.equal(guard.assessRisk("judge.unpair", { url: "http://100.64.0.9:4097" })!.level, "confirm");
+      assert.equal(guard.assessRisk("judge.forget", { cluster: "0123456789abcdef" })!.level, "confirm");
+      assert.throws(() => guard.authorizeHuman("pc.unpair", { peer: "aspire" }, { confirmed: true, confirmName: "other", by: "test" }));
+
+      // Through the dashboard: 409 until the name is typed, then done.
+      const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+      await new Promise((ok) => dsrv.once("listening", ok));
+      const base = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+      try {
+        const secret = totp.getDashboardTotpSecret();
+        const login = await fetch(`${base}/api/login`, { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "test-65" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+        const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+        const post = (u: string, b: unknown) => fetch(`${base}${u}`, { method: "POST", headers: { "Content-Type": "application/json", cookie }, body: JSON.stringify(b) });
+        const got = await (await fetch(`${base}/api/paired`, { headers: { cookie } })).json();
+        assert.equal(got.servers[0].name, "aspire");
+        assert.equal(got.judge.url, "http://100.64.0.9:4097");
+        assert.equal(JSON.stringify(got).includes("old-pass"), false);
+        const no = await post("/api/paired/server", { key: "id:node-b", confirmed: true });
+        assert.equal(no.status, 409);
+        assert.equal((await no.json()).level, "strong");
+        const unknown = await post("/api/paired/server", { key: "id:nobody", confirmName: "nobody", confirmed: true });
+        assert.equal(unknown.status, 400);
+        assert.match((await unknown.json()).errorPt, /não está pareado/);
+        const ok = await post("/api/paired/server", { key: "id:node-b", confirmName: "aspire", confirmed: true });
+        assert.equal(ok.status, 200);
+        const res = await ok.json();
+        assert.equal(res.stillPaired, false);
+        for (const c of ["stopCopies", "stopSending", "dropCopy", "backupsTarget", "forget", "rotateKey", "judgeDropped"]) assert.ok(res.done.includes(c), c);
+        assert.equal(res.movedAside.length, 1);
+        assert.match(res.movedAside[0], /data\.disconnected-/);
+        assert.ok(fs.existsSync(path.join(res.movedAside[0], "PG_VERSION")), "the copy is set aside, never deleted");
+        // The page's own texts: every effect and blocker has words in both languages.
+        const page = await (await fetch(`${base}/`, { headers: { cookie } })).text();
+        for (const c of ["stopSending", "revokeBackups", "dropCopy", "autoOff", "stopCopies", "tunnelCopy", "backupsTarget", "forget", "rotateKey", "judgeDropped", "keyKept", "importedKept", "otherSide"]) {
+          assert.equal(page.split(`"prFx_${c}"`).length - 1, 2, `prFx_${c} in pt and en`);
+        }
+        for (const c of ["fenced", "dataHere", "failback", "activeOrigin", "activeTunnel"]) assert.equal(page.split(`"prBl_${c}"`).length - 1, 2, `prBl_${c}`);
+      } finally {
+        dsrv.close();
+      }
+      s = config.loadState();
+      assert.deepEqual([s.mirror!.offers, s.mirror!.replicas, s.mirror!.auto, s.mirror!.arbiterUrl], [{}, {}, [], undefined]);
+      assert.deepEqual(s.federation!.peers, {});
+      assert.equal(s.federation!.role, "standalone");
+      assert.equal(s.apps.loja.activeActive, undefined);
+      assert.equal(s.apps.loja.status, "stopped");
+      const sys = vault.getSecrets("system");
+      assert.notEqual(sys.FEDERATION_CLUSTER_KEY, "ab".repeat(32), "nobody left: a new key");
+      assert.equal(sys.FEDERATION_CLUSTER_KEY.length, 64);
+      assert.notEqual(sys.MIRROR_REPLICATOR_PASSWORD, "old-pass", "no offer left: a new copy password");
+      assert.equal(sys.BACKUP_S3_ENDPOINT, undefined);
+      assert.deepEqual(unpair.pairedServers(), []);
+
+      // Two servers: the key stays (the other one still needs it), and two generic names stay two servers.
+      seed();
+      s = config.loadState();
+      s.federation!.peers["node-c"] = peerRec("node-c", "primary-node");
+      config.saveState(s);
+      vault.setSecretEntries("system", { FEDERATION_CLUSTER_KEY: "cd".repeat(32) });
+      list = unpair.pairedServers();
+      assert.equal(list.length, 2);
+      assert.deepEqual(list.map((x) => x.name).sort(), ["aspire", "primary-node"]);
+      assert.deepEqual(list.find((x) => x.name === "aspire")!.effects.find((e) => e.code === "keyKept"), { code: "keyKept", others: ["primary-node"] });
+      const two = await unpair.unpairServer("id:node-b");
+      assert.equal(two.done.includes("rotateKey"), false);
+      assert.equal(vault.getSecrets("system").FEDERATION_CLUSTER_KEY, "cd".repeat(32));
+      assert.equal(config.loadState().mirror!.arbiterUrl, "http://100.64.0.9:4097", "the judge stays while a pair is left");
+      assert.equal(config.loadState().federation!.role, "replica");
+
+      // MCP: listing needs a deploy token; disconnecting a destroy token and a person's approval (typing the name).
+      const mcp = await import("./mcp-server.js");
+      const mcall = async (args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => (await mcp.handleToolCall("paas_mirror", args, level)).content[0].text as string;
+      assert.deepEqual(JSON.parse(await mcall({ action: "paired" }, "deploy")).servers.map((x: { name: string }) => x.name), ["primary-node"]);
+      assert.match(await mcall({ action: "unpair", peer: "primary-node" }, "deploy"), /level 'destroy'/);
+      const asked = JSON.parse(await mcall({ action: "unpair", peer: "primary-node" }, "destroy"));
+      assert.equal(asked.confirmationRequired, true);
+      assert.equal(config.loadState().federation!.peers["node-c"].name, "primary-node", "nothing happens before a person approves");
+
+      // The judge: automatic takeover off, address gone.
+      const j = unpair.unpairJudge();
+      assert.equal(j.url, "http://100.64.0.9:4097");
+      assert.equal(config.loadState().mirror!.arbiterUrl, undefined);
+      assert.throws(() => unpair.unpairJudge(), unpair.UnpairError);
+
+      // This PC as the judge of other pairs: one pair at a time, from the key file the arbiter re-reads.
+      const k1 = "1".repeat(64), k2 = "2".repeat(64);
+      const dir = arbiter.ARBITER_DIR();
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "keys.env"), `PAASMCP_ARBITER_KEY=${k1},${k2}\n`, { mode: 0o600 });
+      fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ v: 2, clusters: { [arbiter.arbiterClusterId(k1)]: { nodes: { "node-x": { lastSeen: 1700000000000, epoch: 1 }, "node-y": { lastSeen: 1700000050000, epoch: 1 } }, owners: {} } } }));
+      const pairs = judge.judgedPairs().filter((x) => x.where === "container");
+      assert.deepEqual(pairs.find((x) => x.cluster === arbiter.arbiterClusterId(k1)), { cluster: arbiter.arbiterClusterId(k1), where: "container", servers: 2, lastSeen: 1700000050000 });
+      const f1 = judge.forgetJudgedPair(arbiter.arbiterClusterId(k1));
+      assert.equal(f1.left, 1);
+      assert.match(fs.readFileSync(path.join(dir, "keys.env"), "utf-8"), new RegExp(`=${k2}\\n$`));
+      assert.equal(fs.statSync(path.join(dir, "keys.env")).mode & 0o777, 0o600);
+      assert.throws(() => judge.forgetJudgedPair(arbiter.arbiterClusterId(k1)), unpair.UnpairError);
+      assert.throws(() => judge.forgetJudgedPair("../../etc"), unpair.UnpairError);
+      assert.equal(judge.forgetJudgedPair(arbiter.arbiterClusterId(k2)).left, 0);
+      fs.rmSync(dir, { recursive: true, force: true });
+    } finally {
+      const s = config.loadState();
+      Object.assign(s, keep);
+      config.saveState(s);
+      vault.saveSecrets("system", sysBefore);
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

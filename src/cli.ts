@@ -1061,8 +1061,27 @@ async function runCli() {
         console.log(
           JSON.stringify(applyEncryptedFederationSyncBundle(arg1, sig), null, 2)
         );
+      } else if (sub === "paired") {
+        const { judgeInUse, pairedServers } = await import("./unpair.js");
+        const { judgedPairs } = await import("./judge.js");
+        console.log(JSON.stringify({ servers: pairedServers(), judge: judgeInUse() || null, judging: judgedPairs() }, null, 2));
+      } else if (sub === "unpair") {
+        // Same as the dashboard's Connections → PCs → Disconnect (strong confirmation: type the name).
+        const { pairedServers, unpairServer } = await import("./unpair.js");
+        if (!arg1) throw new Error("Usage: paasmcp node unpair <server name or key from 'node paired'> [--confirm-name <name>]");
+        const target = pairedServers().find((p) => p.key === arg1 || p.name === arg1);
+        if (!target) throw new Error(`This server is not paired with '${arg1}' (see 'paasmcp node paired').`);
+        if (target.blockers.length) throw new Error(`Not yet: ${target.blockers.map((b) => b.code).join(", ")} (see 'paasmcp node paired').`);
+        await confirmInCli("pc.unpair", { peer: target.name, key: target.key }, rest);
+        console.log(JSON.stringify(await withStateLock(() => unpairServer(target.key, { by: `cli:${process.env.USER || "unknown"}` })), null, 2));
+      } else if (sub === "unpair-judge") {
+        const { judgeInUse, unpairJudge } = await import("./unpair.js");
+        const inUse = judgeInUse();
+        if (!inUse) throw new Error("This server uses no judge.");
+        await confirmInCli("judge.unpair", { url: inUse.url }, rest);
+        console.log(JSON.stringify(await withStateLock(() => unpairJudge({ by: `cli:${process.env.USER || "unknown"}` })), null, 2));
       } else {
-        throw new Error("Usage: paasmcp node <status|invite|join|export-sync|import-sync>");
+        throw new Error("Usage: paasmcp node <status|invite|join|export-sync|import-sync|paired|unpair|unpair-judge>");
       }
       break;
     }
@@ -1262,7 +1281,10 @@ Commands:
   paasmcp token <create|list|revoke> ...             Personal MCP tokens (levels: read, deploy, destroy)
   paasmcp approvals [--all]                          List confirmation requests made by AI agents
   paasmcp approve|reject <id> [--confirm-name <x>]   Decide a confirmation request (people only)
-  paasmcp node <status|invite|join|export-sync>      Multi-Server HA Handshake & Federation`);
+  paasmcp node <status|invite|join|export-sync>      Multi-Server HA Handshake & Federation
+  paasmcp node paired                                What this server is linked to (servers, judge, pairs it judges)
+  paasmcp node unpair <server> [--confirm-name <x>]  Disconnect from a paired server (strong confirmation)
+  paasmcp node unpair-judge [--yes]                  Stop using the judge (automatic takeover turns off)`);
       break;
     }
   }
