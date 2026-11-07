@@ -757,6 +757,7 @@ volumes:
       assert.ok(typeof good.latencyMs === "number");
       assert.ok(good.owners?.some((o) => o.owner === "other-server" && o.epoch === 5), "the claim above is listed");
       assert.ok(good.watch?.okAt, "watchTick records its last talk with the arbiter");
+      assert.equal(good.watchActive, true, "watchActive is true when watch was seen recently even without systemd");
       assert.equal(JSON.stringify(await (await fetch(`${url}/health`)).json()).includes(os.hostname()), false, "the unsigned probe reveals nothing");
       // Install command: this cluster's key, a repository URL without credentials, nothing else.
       const inst = arbiter.arbiterInstallCommand("https://user:ghp_secret@github.com/me/paasmcp.git");

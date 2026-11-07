@@ -376,6 +376,11 @@ export function acceptMirror(
   saveMirror((m) => {
     m.replicas[peer] = replica;
     m.epoch = Math.max(m.epoch, offer.epoch || 0);
+    if (m.arbiterUrl) {
+      const set = new Set(m.auto || []);
+      set.add(peer);
+      m.auto = [...set];
+    }
   });
   return { replica, backupsTarget, movedAside };
 }
@@ -582,6 +587,12 @@ export function setArbiterUrl(arbiterUrl: string): MirrorConfig {
   if (!ARBITER_URL_RE.test(url)) throw new Error(`Invalid arbiter URL '${arbiterUrl}'. Use http://<Tailscale IP of the arbiter>:4097`);
   return saveMirror((m) => {
     m.arbiterUrl = url;
+    if (!m.auto || m.auto.length === 0) {
+      const activePeers = Object.values(m.replicas)
+        .filter((r) => !r.promotedAt && !r.failback && !r.supersededBy)
+        .map((r) => r.peerName);
+      if (activePeers.length) m.auto = activePeers;
+    }
   });
 }
 
@@ -655,16 +666,20 @@ function recordWatchContact(ok: boolean, error?: string): void {
 export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> {
   const m = mirrorState();
   const url = (urlOverride || m.arbiterUrl || "").trim().replace(/\/+$/, "").replace(/\/arbiter$/, "");
-  const watchActive = OFFLINE()
-    ? null
-    : (() => {
-        try {
-          return execFileSync("systemctl", ["is-active", "paasmcp-mirror-watch.service"], { encoding: "utf-8" }).trim() === "active";
-        } catch {
-          return false;
-        }
-      })();
-  const base = { watchActive, auto: m.auto || [], watch: readWatchContact() };
+  const watchContact = readWatchContact();
+  const watchFresh = Boolean(watchContact.okAt && Date.now() - Date.parse(watchContact.okAt) <= 60_000);
+  const watchActive = watchFresh
+    ? true
+    : OFFLINE()
+      ? null
+      : (() => {
+          try {
+            return execFileSync("systemctl", ["is-active", "paasmcp-mirror-watch.service"], { encoding: "utf-8" }).trim() === "active";
+          } catch {
+            return false;
+          }
+        })();
+  const base = { watchActive, auto: m.auto || [], watch: watchContact };
   if (!url) return { configured: false, ...base };
   if (!ARBITER_URL_RE.test(url)) return { configured: true, url, ok: false, errorCode: "badUrl", error: "Invalid address. Use http://<Tailscale IP of the arbiter>:4097", ...base };
   const state = loadState();
@@ -676,7 +691,9 @@ export async function checkArbiter(urlOverride?: string): Promise<ArbiterCheck> 
     const started = Date.now();
     const r = await askArbiter(url, { op: "heartbeat", node: me, epoch: m.epoch });
     const latencyMs = Date.now() - started;
+    const knownNodeIds = new Set([me, ...Object.keys(names)]);
     const nodes = Object.entries(r.nodes || {})
+      .filter(([nodeId, n]) => knownNodeIds.has(nodeId) || (r.now - n.lastSeen <= 15 * 60_000))
       .map(([nodeId, n]) => ({ nodeId, name: names[nodeId] || nodeId, isMe: nodeId === me, secondsAgo: Math.max(0, Math.round((r.now - n.lastSeen) / 1000)) }))
       .sort((a, b) => Number(b.isMe) - Number(a.isMe) || a.secondsAgo - b.secondsAgo);
     const owners = Object.entries(r.owners || {}).map(([dataOf, o]) => ({ dataOf: names[dataOf] || dataOf, owner: names[o.owner] || o.owner, epoch: o.epoch }));

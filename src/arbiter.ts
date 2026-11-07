@@ -54,6 +54,12 @@ type Op = "heartbeat" | "claim" | "handover";
 export function arbiterDecide(state: ArbiterState, req: { op: Op; node: string; epoch: number; dataOf?: string; to?: string }, now: number) {
   const seen = state.nodes[req.node];
   state.nodes[req.node] = { lastSeen: now, epoch: Math.max(req.epoch, seen?.epoch || 0) };
+  // Prune dead nodes not heard from in over 1 hour that do not own any data
+  for (const [nodeId, n] of Object.entries(state.nodes)) {
+    if (now - n.lastSeen > 3600_000 && !Object.values(state.owners).some((o) => o.owner === nodeId)) {
+      delete state.nodes[nodeId];
+    }
+  }
   if (req.op === "claim" && req.dataOf) {
     const target = state.nodes[req.dataOf];
     const current = state.owners[req.dataOf] || { owner: req.dataOf, epoch: 0 };
