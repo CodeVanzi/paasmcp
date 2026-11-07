@@ -264,6 +264,38 @@ export interface BackupShareConfig {
   grants: Record<string, BackupGrantRecord>;
 }
 
+/** A disposable container built from a repository and started by a systemd calendar timer. */
+export interface JobRecord {
+  name: string;
+  repoUrl: string;
+  branch: string;
+  repoDir: string;
+  image: string;
+  /** Vault scope used for the job's runtime environment; never returned with values. */
+  secretScope: string;
+  /** A systemd OnCalendar expression (for example: daily or Mon *-*-* 03:00:00). */
+  schedule: string;
+  command?: string[];
+  timeoutSeconds: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  builtAt?: string;
+  lastCommit?: string;
+  lastCommitSha?: string;
+  lastRun?: {
+    startedAt: string;
+    finishedAt: string;
+    ok: boolean;
+    error?: string;
+  };
+  timer?: {
+    service: string;
+    timer: string;
+    by: "systemd" | "systemd-user" | "manual";
+  };
+}
+
 export interface MirrorReplicaRecord {
   peerName: string;
   peerNodeId: string;
@@ -369,6 +401,7 @@ export interface PaaSState {
   apps: Record<string, AppRecord>;
   databases: Record<string, DatabaseRecord>;
   backups?: Record<string, BackupRecord>;
+  jobs?: Record<string, JobRecord>;
   storage?: Record<string, StorageRecord>;
   /** Other computers that send their backups here (offsite.ts). */
   backupShare?: BackupShareConfig;
@@ -521,6 +554,7 @@ export function loadState(): PaaSState {
       apps: {},
       databases: {},
       backups: {},
+      jobs: {},
       federation: {
         nodeId: `node-${crypto.randomBytes(4).toString("hex")}`,
         nodeName: "primary-node",
@@ -535,6 +569,7 @@ export function loadState(): PaaSState {
   const raw = fs.readFileSync(STATE_FILE_PATH, "utf-8");
   const parsed = JSON.parse(raw) as PaaSState;
   if (!parsed.backups) parsed.backups = {};
+  if (!parsed.jobs) parsed.jobs = {};
   if (!parsed.federation) {
     parsed.federation = {
       nodeId: `node-${crypto.randomBytes(4).toString("hex")}`,

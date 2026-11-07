@@ -112,6 +112,7 @@ import {
   setSecretFromFile,
 } from "./vault.js";
 import { listSecretDetails } from "./vaultdocs.js";
+import { buildJob, listJobs, removeJob, runJob, scheduleJob, setJobEnabled } from "./jobs.js";
 
 function getFlagValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -960,6 +961,57 @@ async function runCli() {
         console.log(getOrCreateMasterKey().toString("hex"));
       } else {
         throw new Error("Usage: paasmcp backup <test|sync|fetch|prune|nightly|install-timer|export-key|target|grant|grants|revoke> [--days N] [--hour H]");
+      }
+      break;
+    }
+
+    case "job":
+    case "jobs": {
+      const [sub, arg1] = rest;
+      if (!sub || sub === "list" || sub === "status") {
+        console.log(JSON.stringify({ jobs: listJobs() }, null, 2));
+      } else if (sub === "schedule" && arg1) {
+        const repoSource = getFlagValue(rest, "--repo");
+        const schedule = getFlagValue(rest, "--on-calendar") || getFlagValue(rest, "--schedule");
+        if (!repoSource || !schedule) {
+          throw new Error("Usage: paasmcp jobs schedule <name> --repo <git URL|directory> --on-calendar <systemd expression> [--branch main] [--scope <vault-scope>] [--timeout 3600] [--command-json '[\"node\",\"scripts/job.js\"]'] [--yes]");
+        }
+        const commandJson = getFlagValue(rest, "--command-json");
+        let command: string[] | undefined;
+        if (commandJson !== undefined) {
+          try {
+            const parsed = JSON.parse(commandJson);
+            if (!Array.isArray(parsed)) throw new Error("not an array");
+            command = parsed.map(String);
+          } catch {
+            throw new Error("--command-json must be a JSON array of arguments, for example '[\"node\",\"scripts/job.js\"]'.");
+          }
+        }
+        const params = { name: sanitizeSlug(arg1), repoUrl: repoSource, schedule, secretScope: getFlagValue(rest, "--scope") || sanitizeSlug(arg1) };
+        await confirmInCli("job.schedule", params, rest);
+        console.log(JSON.stringify(await scheduleJob({
+          name: arg1,
+          repoSource,
+          branch: getFlagValue(rest, "--branch") || "main",
+          schedule,
+          secretScope: getFlagValue(rest, "--scope"),
+          command,
+          timeoutSeconds: Number(getFlagValue(rest, "--timeout") || 3600),
+        }), null, 2));
+      } else if (sub === "build" && arg1) {
+        console.log(JSON.stringify(await buildJob(arg1), null, 2));
+      } else if (sub === "run" && arg1) {
+        const scheduled = rest.includes("--scheduled");
+        if (!scheduled) await confirmInCli("job.run", { appName: sanitizeSlug(arg1) }, rest);
+        console.log(JSON.stringify(await runJob(arg1, { allowDisabled: !scheduled }), null, 2));
+      } else if ((sub === "enable" || sub === "disable") && arg1) {
+        console.log(JSON.stringify(setJobEnabled(arg1, sub === "enable"), null, 2));
+      } else if (sub === "remove" && arg1) {
+        const name = sanitizeSlug(arg1);
+        await confirmInCli("job.remove", { appName: name }, rest);
+        console.log(JSON.stringify(removeJob(name), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp jobs <list|schedule <name> --repo <source> --on-calendar <expression>|build <name>|run <name>|enable <name>|disable <name>|remove <name>>");
       }
       break;
     }

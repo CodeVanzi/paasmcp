@@ -55,9 +55,9 @@ Every PR or AI Agent modification **must** enforce these rules:
 
 1. Security base (done above).
 2. ✅ MCP over HTTP (Streamable HTTP, stateless) with personal tokens and levels (read / deploy / destroy), loopback/Tailscale only; TOTP second factor and signed sessions for the dashboard. Follow-up: OAuth 2.1 + PKCE login so web assistants (ChatGPT / Claude.ai connectors) can use a public URL.
-3. ✅ Off-site encrypted backups (item 4 below, native SigV4 to R2/B2/S3/Garage) including app volumes, a restore test tool, a daily systemd timer and safe local pruning (only what is already off-site). Big volumes still go through memory; restic replaces that in item 5.
+3. ✅ Off-site encrypted backups (native SigV4 to R2/B2/S3/Garage) including app volumes, a restore test tool, a daily systemd timer and safe local pruning (only what is already off-site). Big volumes still go through memory; restic remains optional future work.
 4. ✅ S3 storage for apps (Garage, pinned image, admin API on loopback): `paas_storage_provision` creates a bucket + key per app and injects `S3_*` + `AWS_*`. Open: a public S3 endpoint for presigned browser URLs, and removing the bucket on purge (today it is kept).
-5. ✅ Federation as a mirror, part 1 (`src/mirror.ts`, lab: `scripts/mirror-lab.sh`). Done: Postgres streaming with a slot (10 GB cap), backups to the peer's Garage, status, manual strong-confirmed promote with epoch + redeploy + DNS. Changed from the plan: no Garage 2-zone layout yet (replication factor cannot change on a live cluster; app buckets still need a peer copy) and volumes go through the existing backup sync instead of restic. Original text: per-app modes `mirror` / `stateless` / `local`; each server streams its Postgres to the other over Tailscale (item 5 below, both directions), Garage in two zones, hourly restic of volumes, replication lag in status, manual failover with confirmation, epoch number and DNS switch.
+5. ✅ Federation as a mirror, part 1 (`src/mirror.ts`, lab: `scripts/mirror-lab.sh`). Done: Postgres streaming with a slot (10 GB cap), backups to the peer's Garage, status, manual strong-confirmed promote with epoch + redeploy + DNS. Changed from the plan: no Garage 2-zone layout yet (replication factor cannot change on a live cluster; app buckets need a peer copy) and volumes go through the existing encrypted backup sync instead of restic.
 6. ✅ Mirror, part 2 (`src/arbiter.ts`, `mirror watch|auto|handback`, `accept --rejoin`, `offer --from-copy-of`): HMAC-signed arbiter with derived key, claims only when the arbiter also lost the peer, epochs only go up, fencing stops own apps and blocks deploys, guided failback tested in `scripts/mirror-lab.sh`. Original text: optional arbiter (tiny VPS, Raspberry or Cloudflare Worker) for automatic failover; guided failback. Automatic failover without an arbiter stays forbidden.
 7. ✅ Email: one relay (Brevo, SES…) configured once (`paasmcp email set`, password never on the command line), `paas_email_provision` injects SMTP_* / EMAIL_FROM / EMAIL_URL / BREVO_API_KEY per app, `email test` with a dependency-free SMTP client that refuses to authenticate without TLS. Open: per-app credentials (today every app holds the relay key; a local relay container would isolate them).
 8. ✅ Updater (`src/updater.ts`, `paas_update`, `paasmcp update`; tested on a real container: 16.15 → 16.10 with data kept, then a broken image rolled back in 61 s). Not covered: cloudflared (host package) and the dashboard base image. Original text: Updater: pinned versions for Postgres/Redis/Garage/cloudflared, `paas_update check|apply` with backup, health check and rollback (mirror replicas first).
@@ -68,31 +68,16 @@ Every PR or AI Agent modification **must** enforce these rules:
 
 ## 🗺️ Next Improvements Blueprint (For LLMs & Contributors)
 
-Each item below is designed to preserve **0 MB Idle Daemon Overhead** while expanding PaaSMCP's capabilities:
+The major backup, mirror, blue/green and scheduled-job foundations are implemented. The remaining work is intentionally limited so PaaSMCP keeps its **0 MB Idle Daemon Overhead** model.
 
-### 1. Ephemeral Pull Request Preview Environments (`paas_app_preview`)
-- **Goal:** Spin up temporary staging deployments (e.g., `https://pr-42-my-saas.example.com`) for a Git branch or PR and tear them down automatically when merged.
-- **Implementation Spec:**
-  - **Files:** `src/deployer.ts`, `src/database.ts`, `src/exposure.ts`, `src/mcp-server.ts`.
-  - **Logic:** Given `appName` and `prNumber` / `branch`, create a derived slug `${appName}-pr-${prNumber}`, clone the target branch, optionally clone the schema/data of `db_${appName}` into `db_${appName}_pr_${prNumber}` (`CREATE DATABASE ... TEMPLATE`), allocate an ephemeral port (`4500–4899`), and expose via `exposeApplication` with a `ttlHours` metadata field in `AppRecord`.
+### 1. Deferred: Ephemeral Pull Request Preview Environments (`paas_app_preview`)
 
-### 2. ✅ Zero-Downtime Blue/Green Healthchecked Cutover (`deployApp` enhancement)
-- **Done:** see item 10 in the roadmap above and "Blue/green cutover with healthcheck" in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
+Temporary branch/PR deployments remain a later feature. Before implementation, define isolated database snapshots, secret separation, merge/close cleanup, mandatory TTLs and safe defaults for production integrations. Do not copy production data by default.
 
-### 3. Serverless Scheduled Jobs / Cron Containers (`paas_job_schedule`)
-- **Goal:** Run periodic scripts (scrapers, billing jobs, cleanup workers) inside Docker with full access to Vault secrets and `paasmcp-postgres`, consuming **0 MB of RAM** when not executing.
-- **Implementation Spec:**
-  - **Files:** `src/jobs.ts` (new), `src/mcp-server.ts`, `src/cli.ts`.
-  - **Logic:** Build the repository image `paasmcp/job-${slug}:latest`, write `.env.runtime` (`0600`), and generate a native Linux `systemd` user timer (`~/.config/systemd/user/paasmcp-job-${slug}.timer` + `.service`) or `/etc/cron.d/` entry that runs `docker run --rm --network homelab-network --env-file .env.runtime paasmcp/job-${slug}:latest`.
+### 2. ✅ Scheduled Jobs / Cron Containers (`paas_jobs`)
 
-### 4. Automated Off-Site Encrypted Backup Sync (Cloudflare R2 / S3) & Systemd Timer
-- **Goal:** Automatically upload `.enc.bak` files from `/opt/homelab/paasmcp/backups/` to an S3-compatible bucket (Cloudflare R2, Backblaze B2, AWS S3) on a daily schedule.
-- **Implementation Spec:**
-  - **Files:** `src/database.ts`.
-  - **Logic:** Read `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY` from the `system` Vault. Use AWS Signature V4 (`node:crypto` native HMAC-SHA256 — zero heavy SDK dependencies) to `PUT` the already-encrypted `.enc.bak` file to R2/S3, and prune local backups older than `retentionDays`.
+Implemented in `src/jobs.ts`, with CLI and MCP support. A job builds `paasmcp/job-<slug>:latest`, receives only the selected Vault scope at runtime through a `0600` env file, runs with `docker run --rm` on `homelab-network`, refuses overlapping executions, enforces a timeout, and is triggered by a native systemd `OnCalendar` timer. Commands are argument arrays, never shell strings. See `paasmcp jobs --help` in the CLI usage and the `paas_jobs` MCP tool.
 
-### 5. Automated PostgreSQL Streaming Replication over Tailscale (HA Phase 2)
-- **Goal:** Upgrade `warm-standby` federation nodes to real-time PostgreSQL streaming replicas over a private Tailscale mesh (`100.x.y.z`).
-- **Implementation Spec:**
-  - **Files:** `src/federation.ts`, `src/database.ts`.
-  - **Logic:** Configure a dedicated replication role (`paasmcp_replicator`) on the primary node's `paasmcp-postgres` bound to the host's Tailscale IP (`tailscale ip -4`), run `pg_basebackup` on the replica node during `paasmcp node join`, and add a `paas_node_failover` tool that executes `pg_ctl promote` on the replica if the primary is unreachable.
+### 3. Deferred: Incremental platform polish
+
+Later improvements may reduce the small cutover gap of `tailscale serve`, improve job history/observability, add richer dashboard controls, and remove retained storage buckets on an explicit purge. These are deliberately lower priority than the core deployment, backup and HA paths.

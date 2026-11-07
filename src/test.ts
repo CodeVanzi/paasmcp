@@ -5223,9 +5223,9 @@ volumes:
     const callJson = async (tool: string, args: Record<string, unknown>, level: "read" | "deploy" | "destroy") => JSON.parse(await call(tool, args, level));
 
     const all = (await mcp.listToolsFor("destroy")).tools.map((x) => x.name);
-    for (const n of ["paas_app_templates", "paas_connections", "paas_usage", "paas_pcs"]) assert.ok(all.includes(n), n);
+    for (const n of ["paas_app_templates", "paas_connections", "paas_usage", "paas_pcs", "paas_jobs"]) assert.ok(all.includes(n), n);
     const readNames = (await mcp.listToolsFor("read")).tools.map((x) => x.name);
-    for (const n of ["paas_usage", "paas_connections", "paas_pcs"]) assert.ok(readNames.includes(n), `read lists ${n}`);
+    for (const n of ["paas_usage", "paas_connections", "paas_pcs", "paas_jobs"]) assert.ok(readNames.includes(n), `read lists ${n}`);
     assert.equal(readNames.includes("paas_app_templates"), false);
 
     // Ready-made apps: the list is free, publishing needs a deploy token.
@@ -5288,6 +5288,46 @@ volumes:
     delete s2.apps["mcp-new"];
     delete s2.databases["mcp-new-postgres"];
     config.saveState(s2);
+  });
+
+  await t.test("61. Scheduled jobs validate calendar/argv inputs and stay visible without exposing secrets", async () => {
+    const jobs = await import("./jobs.js");
+    const mcpJobs = await import("./mcp-server.js");
+    const callJob = async (tool: string, args: Record<string, unknown>, level: "read" | "deploy" | "destroy") =>
+      (await mcpJobs.handleToolCall(tool, args, level)).content[0].text;
+    assert.equal(jobs.validateJobSchedule("daily"), "daily");
+    assert.equal(jobs.validateJobSchedule("Mon *-*-* 03:00:00"), "Mon *-*-* 03:00:00");
+    assert.throws(() => jobs.validateJobSchedule("daily\nExecStart=/bin/sh"), /Invalid job schedule/);
+    assert.throws(() => jobs.validateJobSchedule("daily;id"), /Invalid job schedule/);
+    assert.deepEqual(jobs.validateJobCommand(["node", "scripts/job.js"]), ["node", "scripts/job.js"]);
+    assert.throws(() => jobs.validateJobCommand(["node", "bad\0arg"]), /NUL/);
+    assert.equal(guard.assessRisk("job.schedule", { appName: "cleanup" })?.level, "confirm");
+    assert.equal(guard.assessRisk("job.remove", { appName: "cleanup" })?.level, "confirm");
+
+    const state = config.loadState();
+    state.jobs!["cleanup"] = {
+      name: "cleanup",
+      repoUrl: "owner/maintenance",
+      branch: "main",
+      repoDir: path.join(tempRoot, "paasmcp", "jobs", "cleanup", "repo"),
+      image: "paasmcp/job-cleanup:latest",
+      secretScope: "cleanup",
+      schedule: "daily",
+      command: ["node", "scripts/job.js"],
+      timeoutSeconds: 60,
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    config.saveState(state);
+    assert.equal(jobs.listJobs()[0].name, "cleanup");
+    const jobList = JSON.parse(await callJob("paas_jobs", { action: "list" }, "read"));
+    assert.equal(jobList.jobs[0].secretScope, "cleanup");
+    assert.equal(JSON.stringify(jobList).includes("secret-value"), false);
+    assert.match(await callJob("paas_jobs", { action: "schedule", name: "new", repoSource: "owner/new", schedule: "daily" }, "read"), /level 'deploy'/);
+    const afterJobs = config.loadState();
+    delete afterJobs.jobs!["cleanup"];
+    config.saveState(afterJobs);
   });
 
   fs.rmSync(tempRoot, { recursive: true, force: true });

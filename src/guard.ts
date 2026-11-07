@@ -346,6 +346,21 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         "Turns off two-factor login: the dashboard token alone will be enough again. If the dashboard is public, unpublish it first.",
         "Desliga o login com dois fatores: o token do painel volta a bastar sozinho. Se o painel estiver público, tire-o do ar antes.",
         params);
+    case "job.schedule":
+      return risk(action, subject, "confirm",
+        `Scheduled job '${subject}' will build an image and run automatically with the selected Vault scope. Its command can change data every time the timer fires.`,
+        `O job agendado '${subject}' vai montar uma imagem e rodar automaticamente com o escopo escolhido do Cofre. O comando pode mudar dados toda vez que o timer disparar.`,
+        params);
+    case "job.remove":
+      return risk(action, subject, "confirm",
+        `Scheduled job '${subject}' will be disabled and removed, including its local checkout and image.`,
+        `O job agendado '${subject}' será desligado e removido, incluindo a cópia local do código e a imagem.`,
+        params);
+    case "job.run":
+      return risk(action, subject, "confirm",
+        `Scheduled job '${subject}' will run now with its Vault secrets.`,
+        `O job agendado '${subject}' vai rodar agora com os segredos do Cofre.`,
+        params);
     case "federation.invite":
       return risk(action, subject, "confirm",
         "Creates a join token that carries the cluster key. Whoever holds it in the next 15 minutes can pair a server with this one.",

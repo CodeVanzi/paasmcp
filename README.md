@@ -185,6 +185,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_email_provision` | Lets an app send email through the server's relay (Brevo, SES...): injects `SMTP_*`, `EMAIL_FROM`, `EMAIL_URL` (and `BREVO_API_KEY`), sender `<app>@<domain>`. `action: "status"` shows the relay (never the password), `"test"` sends a test email. |
 | `paas_storage_provision` | Gives an app its own S3 bucket and key on this server (Garage, started on first use) and injects `S3_*` / `AWS_*` into its vault. |
 | `paas_db_backup` | Creates, lists, restores and **tests** AES-256-GCM encrypted `pg_dump` / Redis / Docker volume snapshots (SHA-256 checked); `sync` sends them off-site (S3/R2/B2/Google/Wasabi/MinIO or another PaaSMCP, set up in the dashboard or with `paasmcp backup target`), `fetch` brings one back. `offsite_status` (destination without secrets, keys given to other computers), `offsite_test`, `grant_revoke`. Setting the destination and creating keys stay in the dashboard/CLI. |
+| `paas_jobs` | Lists disposable scheduled jobs with any token. With a deploy token, builds/rebuilds an image, schedules or enables/disables a systemd `OnCalendar` timer, runs once, or removes a job. Runtime secrets come from the selected Vault scope and commands are argument arrays, never shell strings. |
 | `paas_app_deploy` | Clones/updates a GitHub repo or local folder, builds Dockerfile or sanitized `docker-compose.yml`, sets CPU/RAM limits, healthchecks the new version in a candidate container (blue/green; `healthcheckPath`, `healthcheckTimeoutSeconds`, `skipHealthcheck`), tags `:previous` image, and swaps containers. A failed healthcheck keeps the running version and returns the candidate's logs. |
 | `paas_app_expose` | Exposes an app via Cloudflare Tunnel (`public` or `zero-trust` OTP gate) or `tailscale`. |
 | `paas_app_lifecycle` | Reads container `logs`, or runs `restart`, `stop`, `start`, `rollback` (1-second revert to `:previous`), `destroy` (to the 30-day trash), `restore` (from the trash) or `purge`. `redeploy` publishes again with the same repository and branch (changed variables only load this way), `unexpose` takes one address off the air (a person confirms), `autodeploy_on` / `autodeploy_off`. |
@@ -232,6 +233,14 @@ paasmcp backup test <backup-id>              # restores into a temporary DB; liv
 # Auto-deploy without a public webhook: git is checked every 2 min. The dashboard does the checks
 # when it runs; without it, a systemd timer is set up by itself (no sudo needed)
 paasmcp poll enable my-saas
+
+# Disposable scheduled job: builds once, then runs with the named Vault scope
+paasmcp jobs schedule cleanup --repo owner/maintenance --on-calendar daily --scope cleanup \
+  --command-json '["node","scripts/cleanup.js"]'
+paasmcp jobs list
+paasmcp jobs run cleanup                         # asks for confirmation
+paasmcp jobs disable cleanup                     # stop the timer
+paasmcp jobs remove cleanup                     # asks before removing checkout/image
 
 # The dashboard updates itself from a branch (default: main of the repository it came from).
 # Each commit is built and tested in its own folder first; it rolls back if the new one does not answer

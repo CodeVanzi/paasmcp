@@ -82,6 +82,7 @@ import {
   parseDotenv,
 } from "./vault.js";
 import { listSecretDetails } from "./vaultdocs.js";
+import { buildJob, listJobs, removeJob, runJob, scheduleJob, setJobEnabled } from "./jobs.js";
 
 const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
 
@@ -111,6 +112,40 @@ interface PoolJob {
   error?: string;
 }
 let poolJob: PoolJob | undefined;
+
+interface DashboardJobTask {
+  id: string;
+  action: "schedule" | "build" | "run";
+  name: string;
+  startedAt: string;
+  done: boolean;
+  finishedAt?: string;
+  result?: unknown;
+  error?: string;
+}
+let dashboardJobTask: DashboardJobTask | undefined;
+
+function startDashboardJobTask(action: DashboardJobTask["action"], name: string, fn: () => Promise<unknown>): DashboardJobTask {
+  if (dashboardJobTask && !dashboardJobTask.done) throw new Error(`Wait for the current job task to finish (${dashboardJobTask.action} ${dashboardJobTask.name}).`);
+  const task: DashboardJobTask = {
+    id: crypto.randomBytes(4).toString("hex"),
+    action,
+    name,
+    startedAt: new Date().toISOString(),
+    done: false,
+  };
+  dashboardJobTask = task;
+  // Defer the first call until the request's withStateLock callback has returned; cloning and
+  // Docker builds must never hold the dashboard's state lock for minutes.
+  void Promise.resolve().then(fn)
+    .then((result) => { task.result = result; })
+    .catch((err) => { task.error = err instanceof Error ? err.message : String(err); })
+    .finally(() => {
+      task.done = true;
+      task.finishedAt = new Date().toISOString();
+    });
+  return task;
+}
 
 function startPoolJob(kind: string, subject: string, fn: (log: (l: string) => void) => Promise<unknown>): PoolJob {
   if (poolJob && !poolJob.done) throw new Error(`Wait for the current helper task to finish (${poolJob.kind} ${poolJob.subject}).`);
@@ -746,6 +781,43 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           res.end(JSON.stringify(data));
           return true;
         };
+
+        if (pathname === "/api/jobs" && req.method === "GET") return reply({ jobs: listJobs() });
+        if (pathname === "/api/jobs/task" && req.method === "GET") return reply({ task: dashboardJobTask || null });
+        if (pathname === "/api/jobs/schedule" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = sanitizeSlug(String(body.name || ""));
+          const repoSource = String(body.repoSource || "");
+          const branch = String(body.branch || "main");
+          const schedule = String(body.schedule || "");
+          const secretScope = body.secretScope ? String(body.secretScope) : undefined;
+          const command = body.command === undefined ? undefined : body.command as string[];
+          const timeoutSeconds = body.timeoutSeconds === undefined ? undefined : Number(body.timeoutSeconds);
+          confirmFromBody("job.schedule", { job: name, repoSource, branch, schedule }, body);
+          return reply({ task: startDashboardJobTask("schedule", name, () => scheduleJob({ name, repoSource, branch, schedule, secretScope, command, timeoutSeconds })) });
+        }
+        if (pathname === "/api/jobs/build" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = sanitizeSlug(String(body.name || ""));
+          return reply({ task: startDashboardJobTask("build", name, () => buildJob(name)) });
+        }
+        if (pathname === "/api/jobs/run" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = sanitizeSlug(String(body.name || ""));
+          confirmFromBody("job.run", { job: name }, body);
+          return reply({ task: startDashboardJobTask("run", name, () => runJob(name, { allowDisabled: body.allowDisabled === true })) });
+        }
+        if (pathname === "/api/jobs/enable" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = sanitizeSlug(String(body.name || ""));
+          return reply(setJobEnabled(name, body.enabled === true));
+        }
+        if (pathname === "/api/jobs/remove" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const name = sanitizeSlug(String(body.name || ""));
+          confirmFromBody("job.remove", { job: name }, body);
+          return reply(removeJob(name));
+        }
 
         if (pathname === "/api/tokens" && req.method === "GET") return reply({ tokens: listTokens(), mcpUse: readMcpUse() });
         if (pathname === "/api/tokens" && req.method === "POST") {
@@ -2382,6 +2454,12 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
           <span class="nav-counter" id="tabCountApps" hidden></span>
         </button>
         <div class="nav-subs" data-subs-for="overview"></div>
+        <button class="nav-item nav-btn" onclick="goTo('jobs')" id="navJobs">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 15 14"></polyline></svg>
+          <span class="nav-label"></span>
+          <span class="nav-counter" id="tabCountJobs" hidden></span>
+        </button>
+        <div class="nav-subs" data-subs-for="jobs"></div>
         <button class="nav-item nav-btn" onclick="goTo('databases')" id="navDatabases">
           <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>
           <span class="nav-label"></span>
@@ -2716,6 +2794,82 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </div>
               <pre id="sshKeyBox" style="margin-top:6px;user-select:all;"></pre>
             </details>
+          </div>
+        </div>
+
+        <!-- TAB: SCHEDULED JOBS -->
+        <div class="tab-pane" id="tab-jobs">
+          <div class="card">
+            <div class="card-header">
+              <h2 id="jobsTitle"></h2>
+              <p class="card-desc" id="jobsDesc"></p>
+            </div>
+            <div class="arch-grid" style="margin-bottom:16px;">
+              <div class="arch-box"><h3 data-i18n="jobsStep1"></h3><p data-i18n="jobsStep1Desc"></p></div>
+              <div class="arch-box"><h3 data-i18n="jobsStep2"></h3><p data-i18n="jobsStep2Desc"></p></div>
+              <div class="arch-box"><h3 data-i18n="jobsStep3"></h3><p data-i18n="jobsStep3Desc"></p></div>
+            </div>
+            <div id="jobsTask" role="status" aria-live="polite"></div>
+            <details open>
+              <summary style="cursor:pointer;font-weight:600;font-size:14px;" data-i18n="jobsNewTitle"></summary>
+              <p class="ofs-note" data-i18n="jobsNewDesc" style="margin-top:8px;"></p>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" for="jobName" data-i18n="jobsName"></label>
+                  <input id="jobName" placeholder="ex: faturamento" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="jobRepo" data-i18n="jobsRepo"></label>
+                  <input id="jobRepo" placeholder="ex: seu-usuario/meu-job" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="jobBranch" data-i18n="jobsBranch"></label>
+                  <input id="jobBranch" value="main" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="jobScope" data-i18n="jobsScope"></label>
+                  <input id="jobScope" placeholder="igual ao nome do job" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="jobSchedulePreset" data-i18n="jobsSchedule"></label>
+                  <select id="jobSchedulePreset" onchange="toggleJobCustomSchedule()">
+                    <option value="hourly" data-i18n="jobsEveryHour"></option>
+                    <option value="daily" data-i18n="jobsEveryDay"></option>
+                    <option value="weekly" data-i18n="jobsEveryWeek"></option>
+                    <option value="custom" data-i18n="jobsCustom"></option>
+                  </select>
+                </div>
+                <div id="jobCustomScheduleBox" style="display:none;">
+                  <label class="field-label" for="jobCustomSchedule" data-i18n="jobsCustomLabel"></label>
+                  <input id="jobCustomSchedule" placeholder="*-*-* 03:00:00" autocomplete="off" />
+                </div>
+                <div>
+                  <label class="field-label" for="jobTimeout" data-i18n="jobsTimeout"></label>
+                  <select id="jobTimeout">
+                    <option value="900">15 min</option>
+                    <option value="3600" selected>1 h</option>
+                    <option value="14400">4 h</option>
+                    <option value="86400">24 h</option>
+                  </select>
+                </div>
+                <div style="grid-column:1/-1;">
+                  <label class="field-label" for="jobCommand" data-i18n="jobsCommand"></label>
+                  <textarea id="jobCommand" rows="4" placeholder="python&#10;run.py&#10;--mode&#10;billing" spellcheck="false"></textarea>
+                  <p class="ofs-note" data-i18n="jobsCommandHint" style="margin-top:6px;"></p>
+                </div>
+              </div>
+              <div class="actions" style="margin-top:10px;">
+                <button onclick="scheduleJobUi()" id="btnScheduleJob" data-i18n="jobsCreate"></button>
+              </div>
+              <div class="ofs-msg" id="jobsMsg" role="status" aria-live="polite"></div>
+            </details>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="jobsListTitle"></h2>
+              <p class="card-desc" data-i18n="jobsListDesc"></p>
+            </div>
+            <div id="jobsList"></div>
           </div>
         </div>
 
@@ -4097,7 +4251,58 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "compRedis": "Cache (Redis)",
           "compGarage": "Arquivos (Garage)",
           "updatesMajorQ": "E as versões grandes (ex.: PostgreSQL 17)?",
-          "updatesMajorA": "Mudam o formato dos dados e precisam de migração própria. O painel não instala sozinho."
+          "updatesMajorA": "Mudam o formato dos dados e precisam de migração própria. O painel não instala sozinho.",
+          "navJobs": "Tarefas agendadas",
+          "cntJobs": "{n} tarefas",
+          "cntJobsOne": "1 tarefa",
+          "lead_jobs": "Automatize tarefas do seu código, com os segredos certos e sem deixar um processo rodando o tempo todo.",
+          "jobsTitle": "⏱️ Tarefas agendadas",
+          "jobsDesc": "Rode cobranças, sincronizações e limpezas em containers descartáveis. O container só existe durante a tarefa e os segredos são apagados ao terminar.",
+          "jobsStep1": "1. Escolha o código",
+          "jobsStep1Desc": "Informe o repositório e a branch. O painel monta a imagem do job uma vez.",
+          "jobsStep2": "2. Escolha o horário",
+          "jobsStep2Desc": "Use uma opção simples ou um horário personalizado. O servidor agenda pelo relógio do sistema.",
+          "jobsStep3": "3. Use o Cofre",
+          "jobsStep3Desc": "O job recebe apenas os segredos do escopo escolhido. Os valores nunca aparecem nesta tela.",
+          "jobsNewTitle": "Criar uma tarefa",
+          "jobsNewDesc": "Cada linha do comando vira um argumento separado. Isso evita que texto do job seja interpretado como shell.",
+          "jobsName": "Nome da tarefa",
+          "jobsRepo": "Repositório ou pasta do servidor",
+          "jobsBranch": "Branch",
+          "jobsScope": "Escopo de segredos",
+          "jobsSchedule": "Quando executar",
+          "jobsEveryHour": "A cada hora",
+          "jobsEveryDay": "Todos os dias às 03:00",
+          "jobsEveryWeek": "Toda segunda às 03:00",
+          "jobsCustom": "Escolher um horário…",
+          "jobsCustomLabel": "Horário personalizado",
+          "jobsTimeout": "Tempo máximo",
+          "jobsCommand": "Comando (opcional, uma linha por argumento)",
+          "jobsCommandHint": "Exemplo: primeira linha python, segunda linha run.py. Não precisa escrever docker ou cron.",
+          "jobsCreate": "Criar e programar",
+          "jobsListTitle": "Suas tarefas",
+          "jobsListDesc": "Você pode testar uma tarefa agora, reconstruir a imagem ou desligar o agendamento sem apagar a tarefa.",
+          "jobsEmpty": "Ainda não há tarefas agendadas.",
+          "jobsEnabled": "Agendada",
+          "jobsDisabled": "Desligada",
+          "jobsManualTimer": "A imagem foi criada. Para ligar o relógio do servidor, rode no servidor: paasmcp jobs enable NOME.",
+          "jobsSystemTimer": "Relógio do servidor ligado",
+          "jobsManualRun": "Rodar agora",
+          "jobsBuild": "Reconstruir imagem",
+          "jobsDisable": "Desligar",
+          "jobsEnable": "Ligar",
+          "jobsRemove": "Apagar",
+          "jobsLastRun": "Última execução",
+          "jobsNever": "Ainda não executou",
+          "jobsSuccess": "Concluída",
+          "jobsFailed": "Falhou",
+          "jobsRunning": "Trabalhando…",
+          "jobsTaskDone": "Tarefa concluída.",
+          "jobsTaskError": "Não foi possível concluir a tarefa.",
+          "jobsTaskWorking": "O painel está preparando a tarefa. Esta tela atualiza sozinha.",
+          "jobsRemoveConfirm": "Apagar esta tarefa, a imagem e o agendamento?",
+          "jobsScheduledToast": "Tarefa criada.",
+          "jobsDisabledToast": "Agendamento atualizado."
     });
     Object.assign(I18N.en, {
           "sidebarSubtitle": "Your app server",
@@ -5164,6 +5369,57 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lead_email": "One sending service, set up once for every app.",
           "lead_doctor": "Looks for problems in the apps and the server around them and says what to do.",
           "lead_updates": "Safe PaaSMCP updates: a backup first, and an automatic roll back if something fails."
+          ,"navJobs": "Scheduled jobs",
+          "cntJobs": "{n} jobs",
+          "cntJobsOne": "1 job",
+          "lead_jobs": "Automate code tasks with the right secrets, without leaving a process running all the time.",
+          "jobsTitle": "⏱️ Scheduled jobs",
+          "jobsDesc": "Run billing, sync and cleanup tasks in disposable containers. The container exists only while the task runs, and secrets are removed afterwards.",
+          "jobsStep1": "1. Choose the code",
+          "jobsStep1Desc": "Enter the repository and branch. The dashboard builds the job image once.",
+          "jobsStep2": "2. Choose the time",
+          "jobsStep2Desc": "Use a simple option or a custom time. The server uses its own system clock.",
+          "jobsStep3": "3. Use the Vault",
+          "jobsStep3Desc": "The job receives only the secrets from the selected scope. Values never appear on this screen.",
+          "jobsNewTitle": "Create a job",
+          "jobsNewDesc": "Each command line becomes a separate argument. This keeps job text from being interpreted as a shell.",
+          "jobsName": "Job name",
+          "jobsRepo": "Repository or server folder",
+          "jobsBranch": "Branch",
+          "jobsScope": "Secret scope",
+          "jobsSchedule": "When to run",
+          "jobsEveryHour": "Every hour",
+          "jobsEveryDay": "Every day at 03:00",
+          "jobsEveryWeek": "Every Monday at 03:00",
+          "jobsCustom": "Choose a custom time…",
+          "jobsCustomLabel": "Custom time",
+          "jobsTimeout": "Maximum runtime",
+          "jobsCommand": "Command (optional, one argument per line)",
+          "jobsCommandHint": "Example: first line python, second line run.py. You do not need to write docker or cron.",
+          "jobsCreate": "Create and schedule",
+          "jobsListTitle": "Your jobs",
+          "jobsListDesc": "Test a job now, rebuild its image, or turn its schedule off without deleting the job.",
+          "jobsEmpty": "There are no scheduled jobs yet.",
+          "jobsEnabled": "Scheduled",
+          "jobsDisabled": "Off",
+          "jobsManualTimer": "The image was created. To turn on the server clock, run on the server: paasmcp jobs enable NAME.",
+          "jobsSystemTimer": "Server clock is on",
+          "jobsManualRun": "Run now",
+          "jobsBuild": "Rebuild image",
+          "jobsDisable": "Turn off",
+          "jobsEnable": "Turn on",
+          "jobsRemove": "Delete",
+          "jobsLastRun": "Last run",
+          "jobsNever": "Has not run yet",
+          "jobsSuccess": "Completed",
+          "jobsFailed": "Failed",
+          "jobsRunning": "Working…",
+          "jobsTaskDone": "Job task completed.",
+          "jobsTaskError": "The job task could not be completed.",
+          "jobsTaskWorking": "The dashboard is preparing the job. This screen updates automatically.",
+          "jobsRemoveConfirm": "Delete this job, its image and its schedule?",
+          "jobsScheduledToast": "Job created.",
+          "jobsDisabledToast": "Schedule updated."
     });
 
     function t(key) {
@@ -5176,7 +5432,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'setupGithubDocsLink',
       'setupLocalDesc',
       'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'navJobs', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect',
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -6687,6 +6943,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
       if (tabName === 'databases') { loadStorage(); loadOffsite(); }
       if (tabName === 'overview') loadScale();
+      if (tabName === 'jobs') loadJobs();
       if (tabName === 'pool') loadPool(true);
     }
 
@@ -7294,6 +7551,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       // Counters in the side menu
       setNavCounter('tabCountApps', Object.keys(s.apps || {}).length, 'cntApps');
+      setNavCounter('tabCountJobs', Object.keys(s.jobs || {}).length, 'cntJobs');
       setNavCounter('tabCountDbs', Object.keys(s.databases || {}).length, 'cntDbs');
       // systemSecretsConfigured is an object (key -> masked value), not a list.
       setNavCounter('tabCountVault', Object.keys(s.systemSecretsConfigured || {}).length, 'cntVault');
@@ -9353,6 +9611,127 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       liveResources = null;
       applyPreferences();
       if (!resourcesTimer) resourcesTimer = setTimeout(pollResources, 15000);
+    }
+
+    // ---- Scheduled jobs: a small guided surface over the same MCP/CLI capability ----
+    let jobsTaskPollTimer = null;
+    let jobsCache = [];
+    function toggleJobCustomSchedule() {
+      const custom = document.getElementById('jobSchedulePreset').value === 'custom';
+      document.getElementById('jobCustomScheduleBox').style.display = custom ? '' : 'none';
+    }
+    function selectedJobSchedule() {
+      const preset = document.getElementById('jobSchedulePreset').value;
+      if (preset === 'hourly') return 'hourly';
+      if (preset === 'daily') return '*-*-* 03:00:00';
+      if (preset === 'weekly') return 'Mon *-*-* 03:00:00';
+      return document.getElementById('jobCustomSchedule').value.trim();
+    }
+    function jobCommandArgs() {
+      const raw = document.getElementById('jobCommand').value;
+      const args = raw.split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean);
+      return args.length ? args : undefined;
+    }
+    function renderJobsTask(task) {
+      const box = document.getElementById('jobsTask');
+      if (!box) return;
+      if (!task) { box.innerHTML = ''; return; }
+      if (!task.done) {
+        box.innerHTML = '<div class="preset-hint show" style="margin-bottom:14px;">' + esc(t('jobsRunning')) + ' · ' + esc(t('jobsTaskWorking')) + '</div>';
+        return;
+      }
+      if (task.error) {
+        box.innerHTML = '<div class="preset-hint show changed" style="margin-bottom:14px;">' + esc(t('jobsTaskError')) + ' ' + esc(task.error) + '</div>';
+        return;
+      }
+      const result = task.result || {};
+      const note = result.timerInstall && result.timerInstall.note ? '<br><span style="color:var(--warning);">⚠️ ' + esc(result.timerInstall.note) + '</span>' : '';
+      box.innerHTML = '<div class="preset-hint show" style="margin-bottom:14px;">✅ ' + esc(t('jobsTaskDone')) + note + '</div>';
+    }
+    async function pollJobsTask() {
+      if (jobsTaskPollTimer) { clearTimeout(jobsTaskPollTimer); jobsTaskPollTimer = null; }
+      try {
+        const res = await fetch('/api/jobs/task');
+        if (!res.ok) return;
+        const data = await res.json();
+        renderJobsTask(data.task);
+        if (data.task && !data.task.done) {
+          jobsTaskPollTimer = setTimeout(pollJobsTask, 1500);
+        } else if (data.task) {
+          loadJobsList();
+        }
+      } catch { /* the next screen refresh can try again */ }
+    }
+    async function loadJobsList() {
+      const res = await fetch('/api/jobs');
+      if (!res.ok) return;
+      const data = await res.json();
+      jobsCache = data.jobs || [];
+      renderJobsList();
+    }
+    function renderJobsList() {
+      const box = document.getElementById('jobsList');
+      if (!box) return;
+      if (!jobsCache.length) {
+        box.innerHTML = '<div style="padding:18px 4px;color:var(--muted);font-size:13px;">' + esc(t('jobsEmpty')) + '</div>';
+        return;
+      }
+      box.innerHTML = jobsCache.map(function (job) {
+        const run = job.lastRun;
+        const runText = !run ? t('jobsNever') : (run.ok ? t('jobsSuccess') : t('jobsFailed')) + ' · ' + fmtWhen(run.finishedAt);
+        const timerNote = job.timer && job.timer.by === 'manual' ? '<div style="color:var(--warning);margin-top:5px;font-size:12px;">⚠️ ' + esc(t('jobsManualTimer')) + '</div>' : '<div style="color:var(--muted);margin-top:5px;font-size:12px;">' + esc(t('jobsSystemTimer')) + '</div>';
+        const command = job.command && job.command.length ? '<div style="color:var(--muted);margin-top:5px;font-size:12px;">' + esc(job.command.join(' ')) + '</div>' : '';
+        return '<div style="padding:13px 14px;margin-bottom:8px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;">' +
+          '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">' +
+          '<div style="min-width:220px;flex:1;"><strong>' + esc(job.name) + '</strong> ' + badge(job.enabled ? 'success' : 'warning', job.enabled ? t('jobsEnabled') : t('jobsDisabled')) +
+          '<div style="color:var(--muted);margin-top:5px;overflow-wrap:anywhere;">' + esc(job.schedule) + ' · ' + esc(job.repoUrl) + ' · ' + esc(job.branch) + '</div>' +
+          '<div style="color:var(--muted);margin-top:4px;">' + esc(t('jobsLastRun')) + ': ' + esc(runText) + '</div>' + command + timerNote + '</div>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="runJobUi(\'' + esc(job.name) + '\')">' + esc(t('jobsManualRun')) + '</button>' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="buildJobUi(\'' + esc(job.name) + '\')">' + esc(t('jobsBuild')) + '</button>' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="toggleJobUi(\'' + esc(job.name) + '\',' + (!job.enabled) + ')">' + esc(job.enabled ? t('jobsDisable') : t('jobsEnable')) + '</button>' +
+          '<button class="danger" style="padding:5px 9px;font-size:11.5px;" onclick="removeJobUi(\'' + esc(job.name) + '\')">' + esc(t('jobsRemove')) + '</button>' +
+          '</div></div></div>';
+      }).join('');
+    }
+    async function loadJobs() {
+      await Promise.all([loadJobsList(), pollJobsTask()]);
+      toggleJobCustomSchedule();
+    }
+    async function scheduleJobUi() {
+      const name = document.getElementById('jobName').value.trim();
+      const repoSource = document.getElementById('jobRepo').value.trim();
+      if (!name || !repoSource) return alert(currentLang === 'pt' ? 'Informe o nome e o repositório da tarefa.' : 'Enter the job name and repository.');
+      const btn = document.getElementById('btnScheduleJob');
+      btn.disabled = true;
+      try {
+        const data = await postJson('/api/jobs/schedule', {
+          name, repoSource,
+          branch: document.getElementById('jobBranch').value.trim() || 'main',
+          secretScope: document.getElementById('jobScope').value.trim() || undefined,
+          schedule: selectedJobSchedule(),
+          timeoutSeconds: Number(document.getElementById('jobTimeout').value),
+          command: jobCommandArgs()
+        });
+        if (data && data.task) { renderJobsTask(data.task); pollJobsTask(); }
+      } finally { btn.disabled = false; }
+    }
+    async function buildJobUi(name) {
+      const data = await postJson('/api/jobs/build', { name });
+      if (data && data.task) { renderJobsTask(data.task); pollJobsTask(); }
+    }
+    async function runJobUi(name) {
+      const data = await postJson('/api/jobs/run', { name });
+      if (data && data.task) { renderJobsTask(data.task); pollJobsTask(); }
+    }
+    async function toggleJobUi(name, enabled) {
+      const data = await postJson('/api/jobs/enable', { name, enabled });
+      if (data) { showToast(t('jobsDisabledToast')); loadJobsList(); }
+    }
+    async function removeJobUi(name) {
+      if (!confirm(t('jobsRemoveConfirm'))) return;
+      const data = await postJson('/api/jobs/remove', { name });
+      if (data) { showToast(t('jobsRemove')); loadJobsList(); loadAll(); }
     }
 
     // Which app's variables: a list of apps instead of typing a "scope". "system" holds the dashboard's own keys.

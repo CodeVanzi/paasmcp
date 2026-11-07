@@ -89,6 +89,7 @@ import {
   setSecretFromFile,
 } from "./vault.js";
 import { listSecretDetails } from "./vaultdocs.js";
+import { buildJob, listJobs, removeJob, runJob, scheduleJob, setJobEnabled } from "./jobs.js";
 
 /** One `docker stats` call feeds both the per-app numbers and the server split; CPU is read around it. */
 function diskSplit() {
@@ -150,12 +151,14 @@ export function getSystemStatusSummary(includeMetrics = true) {
     appsCount: Object.keys(state.apps).length,
     databasesCount: Object.keys(state.databases).length,
     backupsCount: Object.keys(state.backups || {}).length,
+    jobsCount: Object.keys(state.jobs || {}).length,
     apps: state.apps,
     /** Per app: version running (commit, GitHub links), deploy in progress, last deploy result. */
     deploys: deploySummary(state.apps),
     containerMetrics,
     databases: state.databases,
     backups: listDatabaseBackups(),
+    jobs: listJobs(),
     /** Last nightly backup run (dashboard loop or systemd timer). */
     nightlyBackup: readNightlyMark() || null,
     storage: Object.values(state.storage || {}),
@@ -183,12 +186,13 @@ const TOOLS_WITH_APPROVAL = new Set([
   "paas_node_federation",
   "paas_scale",
   "paas_pool",
+  "paas_jobs",
 ]);
 // Read-only tools skip the state lock so they answer while a long deploy runs; they are all a "read" token sees.
 // paas_scale and paas_pool are read-only except for their changing actions, which check the token level
 // and take the lock themselves.
 // paas_usage and paas_connections work the same way (their changing actions need a deploy token); paas_pcs only reads.
-const READ_ONLY_TOOLS = new Set(["paas_system_status", "paas_secret_list", "paas_doctor", "paas_approvals", "paas_scale", "paas_pool", "paas_usage", "paas_connections", "paas_pcs"]);
+const READ_ONLY_TOOLS = new Set(["paas_system_status", "paas_secret_list", "paas_doctor", "paas_approvals", "paas_scale", "paas_pool", "paas_usage", "paas_connections", "paas_pcs", "paas_jobs"]);
 
 /**
  * One MCP server per connection. `level` comes from the caller: stdio runs on the server itself
@@ -765,6 +769,25 @@ function toolCatalog() {
             name: { type: "string", description: "wake: the PC's Tailscale name (set up with 'paasmcp wake add')." },
             probe: { type: "boolean", description: "Ask each online PC whether PaaSMCP answers (default true)." },
           },
+        },
+      },
+      {
+        name: "paas_jobs",
+        description:
+          "Manages disposable scheduled Docker jobs. 'list' or 'status' is read-only. 'schedule' builds a repository image, stores only the selected Vault scope name, and installs a systemd OnCalendar timer; 'build' rebuilds it; 'enable'/'disable' control the timer; 'run' runs it once; 'remove' deletes the timer, checkout and image. Job commands are argument arrays, never shell strings.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["list", "status", "schedule", "build", "enable", "disable", "run", "remove"] },
+            name: { type: "string", description: "Job slug." },
+            repoSource: { type: "string", description: "schedule: Git URL, GitHub owner/repo, or local directory." },
+            branch: { type: "string", description: "schedule: Git branch (default main)." },
+            schedule: { type: "string", description: "schedule: systemd OnCalendar expression, for example daily or *-*-* 03:00:00." },
+            secretScope: { type: "string", description: "schedule: Vault scope whose values are mounted only for the run (default job name)." },
+            command: { type: "array", items: { type: "string" }, description: "schedule: optional executable and arguments, passed directly without a shell." },
+            timeoutSeconds: { type: "number", description: "schedule: run timeout, from 1 to 86400 seconds (default 3600)." },
+          },
+          required: ["action"],
         },
       },
       {
@@ -1524,6 +1547,42 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
         }
         if (args.action !== undefined && args.action !== "list") throw new Error("action must be list or wake.");
         return json(await listTailnetPcs({ probe: args.probe !== false }));
+
+      case "paas_jobs": {
+        const action = String(args.action || "list");
+        if (action === "list" || action === "status") return json({ jobs: listJobs() });
+        needDeploy(level, `Scheduled job action '${action}'`);
+        const name = sanitizeSlug(String(args.name || ""));
+        if (action === "schedule") {
+          if (!args.repoSource || !args.schedule) throw new Error("'repoSource' and 'schedule' are required when action='schedule'.");
+          authorize("job.schedule", { appName: name, repoUrl: String(args.repoSource), schedule: String(args.schedule), secretScope: String(args.secretScope || name) });
+          const command = args.command === undefined
+            ? undefined
+            : Array.isArray(args.command)
+              ? args.command.map(String)
+              : (() => { throw new Error("'command' must be an array of arguments, never a shell string."); })();
+          return json(await scheduleJob({
+            name,
+            repoSource: String(args.repoSource),
+            branch: args.branch ? String(args.branch) : "main",
+            schedule: String(args.schedule),
+            secretScope: args.secretScope ? String(args.secretScope) : undefined,
+            command,
+            timeoutSeconds: args.timeoutSeconds === undefined ? undefined : Number(args.timeoutSeconds),
+          }));
+        }
+        if (action === "build") return json(await buildJob(name));
+        if (action === "enable" || action === "disable") return json(setJobEnabled(name, action === "enable"));
+        if (action === "run") {
+          authorize("job.run", { appName: name });
+          return json(await runJob(name, { allowDisabled: true }));
+        }
+        if (action === "remove") {
+          authorize("job.remove", { appName: name });
+          return json(removeJob(name));
+        }
+        throw new Error("action must be list, status, schedule, build, enable, disable, run or remove.");
+      }
 
       case "paas_doctor": {
         const report = runPaaSDoctor(
