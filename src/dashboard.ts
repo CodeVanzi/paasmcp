@@ -2,7 +2,8 @@ import { backupAppVolumes, syncOffsite, testRestore } from "./backup.js";
 import { deploySummary } from "./deploys.js";
 import { getEmailRelay, provisionEmail, sendTestEmail, setEmailRelay } from "./email.js";
 import { arbiterInstallCommand, PairError } from "./arbiter.js";
-import { beJudge, cancelJudgePairing, findJudgeCandidates, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { beJudge, cancelJudgePairing, findJudgeCandidates, forgetJudgedPair, judgedPairs, localJudgeStatus, stopLocalJudge } from "./judge.js";
+import { judgeInUse, pairedServers, unpairJudge, unpairServer, UnpairError } from "./unpair.js";
 import { listTailnetPcs } from "./pcinstall.js";
 import { cancelPcJob, currentPcJob, PcInstallError, startPcCheck, startPcInstall, validatePcName } from "./pcremote.js";
 import { acceptMirror, checkArbiter, pairArbiterAndSave, handbackMirror, mirrorStatus, offerMirror, promoteMirror, retireCopy, setArbiterUrl, setAutoFailover } from "./mirror.js";
@@ -1142,6 +1143,37 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             return true;
           }
         }
+        // Connections → PCs: everything this server is linked to, and disconnecting each one.
+        if (pathname === "/api/paired" && req.method === "GET") {
+          const state = loadState();
+          return reply({
+            servers: pairedServers(state),
+            judge: judgeInUse(state) || null,
+            helpers: Object.values(state.pool?.helpers || {}).map((h) => ({ name: h.name, ip: h.ip, paused: Boolean(h.paused) })),
+            judging: judgedPairs(),
+          });
+        }
+        if (pathname === "/api/paired/server" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const key = String(body.key || "");
+          const target = pairedServers().find((p) => p.key === key);
+          if (!target) throw new UnpairError("This server is not paired with that one any more.", "Este servidor já não está pareado com esse.");
+          confirmFromBody("pc.unpair", { peer: target.name, key }, body);
+          return reply(await unpairServer(key, { by: actor }));
+        }
+        if (pathname === "/api/paired/judge" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const inUse = judgeInUse();
+          if (!inUse) throw new UnpairError("This server uses no judge.", "Este servidor não usa juiz.");
+          confirmFromBody("judge.unpair", { url: inUse.url }, body);
+          return reply(unpairJudge({ by: actor }));
+        }
+        if (pathname === "/api/paired/judging" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const cluster = String(body.cluster || "");
+          confirmFromBody("judge.forget", { cluster }, body);
+          return reply(forgetJudgedPair(cluster));
+        }
         // This PC as the arbiter of another pair.
         if (pathname === "/api/judge" && req.method === "GET") {
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -1225,13 +1257,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError || err instanceof PcInstallError;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError || err instanceof PcInstallError || err instanceof UnpairError;
         const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError | PcInstallError).pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError | PcInstallError | UnpairError).pt } : {}),
             ...(err instanceof PcInstallError ? { errorCode: err.code } : {}),
           })
         );
@@ -2947,6 +2979,13 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               <button onclick="ntSave()" id="btnNtSave" data-i18n="ntSave"></button>
             </div>
             <div class="ofs-msg" id="ntMsg" role="status" aria-live="polite"></div>
+          </div>
+          <div class="card" data-sub="pcs" id="pairedCard">
+            <div class="card-header">
+              <h2 data-i18n="prTitle"></h2>
+              <p class="card-desc" data-i18n="prDesc"></p>
+            </div>
+            <div id="pairedBox"></div>
           </div>
           <div class="card" data-sub="pcs">
             <div class="card-header">
@@ -5992,6 +6031,136 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     Object.assign(I18N.pt, {
+      "prTitle": "🔗 Ligados a este servidor",
+      "prDesc": "Outros servidores, o juiz e os PCs ajudantes ligados a este. Desconectar mostra antes o que vai acontecer, e nada que possa ser a única cópia de algum dado é apagado.",
+      "prNone": "Nenhum PC ligado a este servidor.",
+      "prKindServer": "Servidor pareado",
+      "prKindJudge": "Juiz deste servidor",
+      "prKindHelper": "Ajudante",
+      "prKindJudging": "Este PC é o juiz deste par",
+      "prPairN": "Par de servidores {n}",
+      "prServers1": "1 servidor",
+      "prServers": "{n} servidores",
+      "prLastHeard": "último sinal {when}",
+      "prNeverHeard": "nenhum sinal ainda",
+      "prJudgingService": "Atendido pelo serviço do juiz. Para tirar, rode neste PC:",
+      "prPaused": "Pausado",
+      "prLink_paired": "Pareado",
+      "prLink_sending": "Recebe a cópia daqui",
+      "prLink_receiving": "Cópia dele aqui",
+      "prLink_auto": "Troca automática ligada",
+      "prLink_servingHere": "Dados dele servidos aqui",
+      "prLink_behind": "Cópia ficou para trás",
+      "prBtnUnpair": "Desconectar",
+      "prBtnGo": "Desconectar de vez",
+      "prWorking": "Desconectando…",
+      "prOpenThere": "Abrir",
+      "prWhatTitle": "O que acontece:",
+      "prBlockedTitle": "Ainda não dá para desconectar:",
+      "prTypeName": "Para confirmar, digite {name}",
+      "prFx_stopSending": "Este servidor para de mandar a cópia do banco para {name}, e {name} perde o acesso de cópia aqui.",
+      "prFx_revokeBackups": "{name} não consegue mais guardar cópias de segurança aqui. As que já mandou continuam guardadas.",
+      "prFx_dropCopy": "A cópia do banco de {name} que fica aqui é desligada. Os arquivos dela continuam no disco, numa pasta renomeada: nada é apagado.",
+      "prFx_autoOff": "A troca automática com {name} desliga.",
+      "prFx_stopCopies": "Param as cópias dos apps de {name} que rodam aqui: {apps}.",
+      "prFx_tunnelCopy": "Para o túnel dos apps nos dois servidores que {name} rodava aqui.",
+      "prFx_backupsTarget": "As cópias de segurança deste servidor deixam de ir para {name}. Depois, escolha outro destino em Cópias fora do servidor.",
+      "prFx_forget": "{name} sai da lista de servidores pareados.",
+      "prFx_rotateKey": "Como não sobra outro servidor pareado, a chave do par é trocada: {name} não consegue mais falar com este servidor.",
+      "prFx_judgeDropped": "O juiz deixa de ser usado, porque não sobra par para ele julgar.",
+      "prFx_keyKept": "A chave do grupo continua a mesma, porque este servidor ainda está pareado com {others}. {name} ainda conhece essa chave.",
+      "prFx_importedKept": "Os apps de {name} guardados aqui ({apps}) continuam na lista de apps, parados. Apague-os lá se não quiser mais.",
+      "prFx_otherSide": "Faça o mesmo no painel de {name}, para ele também esquecer este servidor.",
+      "prBl_fenced": "{name} está servindo os dados deste servidor desde uma troca. Desconectar agora deixaria seus apps parados aqui: traga os dados de volta antes.",
+      "prBl_dataHere": "Este servidor está servindo os dados de {name} desde que assumiu. Devolva os apps a ele antes (ou continue com eles aqui).",
+      "prBl_failback": "O banco deste servidor está seguindo {name} para receber os dados de volta. Deixe a devolução terminar antes.",
+      "prBl_activeOrigin": "Estes apps rodam também em {name}: {apps}. Passe-os para Rodar só aqui antes.",
+      "prBl_activeTunnel": "O túnel dos apps nos dois servidores está ligado. Desligue antes.",
+      "prJudgeFx1": "A troca automática desliga neste servidor. Os apps continuam rodando.",
+      "prJudgeFx2": "Faça o mesmo em {others}: enquanto ele usar esse juiz com a troca automática ligada, uma queda de rede poderia fazer ele assumir os apps deste servidor sem este ficar sabendo.",
+      "prJudgeFx3": "O PC do juiz continua guardando a chave deste par até você tirar o par lá (Conexões → PCs, no painel do juiz).",
+      "prHelperFx1": "As cópias de apps que rodam em {name} saem do balanceador, têm 30 s para terminar as visitas em curso e param. Elas vão para outros ajudantes quando houver espaço.",
+      "prHelperFx2": "A chave deste servidor é apagada de {name}: ele não recebe mais ordens daqui.",
+      "prJudgingFx1": "Os servidores desse par ficam sem troca automática até ganharem outro juiz. Os apps deles continuam rodando.",
+      "prJudgingFx2": "No painel deles, tire este juiz também (Conexões → PCs).",
+      "prJudgingLast": "Era o último par: o juiz deste PC é desligado.",
+      "prDoneServer": "Desconectado de {name}.",
+      "prDonePartial": "Parte da desconexão de {name} não deu certo. Veja os detalhes e tente de novo.",
+      "prMovedAside": "A cópia dos dados ficou guardada em:",
+      "prDoneBackups": "As cópias de segurança deste servidor estão sem destino fora dele agora.",
+      "prDoneHelper": "{name} está saindo do pool. O andamento aparece na lista de ajudantes.",
+      "prDoneJudge": "Este servidor não usa mais juiz. Faça o mesmo no outro servidor do par.",
+      "prDoneJudging": "Este PC não é mais juiz desse par.",
+      "prDoneJudgingStopped": "Este PC não é mais juiz de nenhum par, e o juiz foi desligado.",
+      "prFromPeers": "Para desconectar um servidor, o juiz ou um ajudante:",
+      "prFromPeersLink": "Conexões → PCs",
+    });
+    Object.assign(I18N.en, {
+      "prTitle": "🔗 Linked to this server",
+      "prDesc": "Other servers, the judge and helper PCs linked to this one. Disconnect first shows what will happen, and nothing that may be the only copy of some data is deleted.",
+      "prNone": "No PC is linked to this server.",
+      "prKindServer": "Paired server",
+      "prKindJudge": "This server's judge",
+      "prKindHelper": "Helper",
+      "prKindJudging": "This PC is the judge of this pair",
+      "prPairN": "Pair of servers {n}",
+      "prServers1": "1 server",
+      "prServers": "{n} servers",
+      "prLastHeard": "last heard {when}",
+      "prNeverHeard": "not heard from yet",
+      "prJudgingService": "Served by the judge service. To remove it, run on this PC:",
+      "prPaused": "Paused",
+      "prLink_paired": "Paired",
+      "prLink_sending": "Gets the copy from here",
+      "prLink_receiving": "Its copy is here",
+      "prLink_auto": "Automatic takeover on",
+      "prLink_servingHere": "Its data is served here",
+      "prLink_behind": "Copy fell behind",
+      "prBtnUnpair": "Disconnect",
+      "prBtnGo": "Disconnect for good",
+      "prWorking": "Disconnecting…",
+      "prOpenThere": "Open",
+      "prWhatTitle": "What happens:",
+      "prBlockedTitle": "It cannot be disconnected yet:",
+      "prTypeName": "To confirm, type {name}",
+      "prFx_stopSending": "This server stops sending the database copy to {name}, and {name} loses its copy access here.",
+      "prFx_revokeBackups": "{name} can no longer store backups here. The ones it already sent stay stored.",
+      "prFx_dropCopy": "The copy of {name}'s database kept here is turned off. Its files stay on disk in a renamed folder: nothing is deleted.",
+      "prFx_autoOff": "Automatic takeover with {name} turns off.",
+      "prFx_stopCopies": "The copies of {name}'s apps running here stop: {apps}.",
+      "prFx_tunnelCopy": "The tunnel for apps on both servers that {name} ran here stops.",
+      "prFx_backupsTarget": "This server's backups stop going to {name}. Afterwards, choose another destination in Off-server backups.",
+      "prFx_forget": "{name} leaves the list of paired servers.",
+      "prFx_rotateKey": "With no other paired server left, the pair's key changes: {name} can no longer talk to this server.",
+      "prFx_judgeDropped": "The judge is no longer used, since there is no pair left for it to judge.",
+      "prFx_keyKept": "The group's key stays the same, because this server is still paired with {others}. {name} still knows that key.",
+      "prFx_importedKept": "{name}'s apps kept here ({apps}) stay in the app list, stopped. Delete them there if you no longer want them.",
+      "prFx_otherSide": "Do the same on {name}'s dashboard, so it forgets this server too.",
+      "prBl_fenced": "{name} serves this server's data since a takeover. Disconnecting now would leave your apps stopped here: get the data back first.",
+      "prBl_dataHere": "This server serves {name}'s data since it took over. Hand the apps back to it first (or keep them here).",
+      "prBl_failback": "This server's database is following {name} to get its data back. Let the hand-back finish first.",
+      "prBl_activeOrigin": "These apps also run on {name}: {apps}. Switch them to Run here only first.",
+      "prBl_activeTunnel": "The tunnel for apps on both servers is on. Turn it off first.",
+      "prJudgeFx1": "Automatic takeover turns off on this server. The apps keep running.",
+      "prJudgeFx2": "Do the same on {others}: while it keeps using that judge with automatic takeover on, a network split could let it take this server's apps without this server knowing.",
+      "prJudgeFx3": "The judge's PC keeps this pair's key until you remove the pair there (Connections → PCs, on the judge's dashboard).",
+      "prHelperFx1": "The app copies running on {name} leave the balancer, get 30 s to finish the visits in progress and stop. They move to other helpers when there is room.",
+      "prHelperFx2": "This server's key is removed from {name}: it takes no more orders from here.",
+      "prJudgingFx1": "The servers of that pair lose automatic takeover until they get another judge. Their apps keep running.",
+      "prJudgingFx2": "On their dashboard, remove this judge too (Connections → PCs).",
+      "prJudgingLast": "It was the last pair: this PC's judge is turned off.",
+      "prDoneServer": "Disconnected from {name}.",
+      "prDonePartial": "Part of disconnecting {name} did not work. See the details and try again.",
+      "prMovedAside": "The copy of the data was kept at:",
+      "prDoneBackups": "This server's backups have no off-server destination now.",
+      "prDoneHelper": "{name} is leaving the pool. Progress shows in the helper list.",
+      "prDoneJudge": "This server no longer uses a judge. Do the same on the other server of the pair.",
+      "prDoneJudging": "This PC is no longer the judge of that pair.",
+      "prDoneJudgingStopped": "This PC is no longer the judge of any pair, and its judge was turned off.",
+      "prFromPeers": "To disconnect a server, the judge or a helper:",
+      "prFromPeersLink": "Connections → PCs",
+    });
+    Object.assign(I18N.pt, {
       "sub_connect_pcs": "PCs",
       "pcsDesc": "Todos os aparelhos da sua rede Tailscale, e quais já têm o PaaSMCP. Num PC Linux sem PaaSMCP, o botão Instalar entra nele uma vez, confere o que ele tem e só instala depois da sua confirmação.",
       "pcsBtnInstall": "Instalar o PaaSMCP",
@@ -6563,7 +6732,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       renderSubNav();
       if (tab === 'guide') { if (sub) currentGuide = sub; renderGuide(); }
       if (tab === 'overview' && currentSub('overview') === 'webhook' && (moved || mode === 'init')) loadHooks();
-      if (tab === 'connect' && currentSub('connect') === 'pcs' && (moved || mode === 'init')) loadPcs();
+      if (tab === 'connect' && currentSub('connect') === 'pcs' && (moved || mode === 'init')) { loadPaired(); loadPcs(); }
       const hash = '#' + tab + (subs ? '/' + currentSub(tab) : tab === 'guide' && currentGuide ? '/' + currentGuide : '');
       if (mode !== 'hash' && location.hash !== hash) {
         try {
@@ -7520,7 +7689,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             <span style="color:var(--muted);font-size:11.5px;">Endpoint: \${esc(p.endpointUrl)} · Key: <code>\${esc(p.publicKeyFingerprint)}</code></span>
           </div>
         \`).join('')
-        : copyOnly.length ? '' : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>');
+        : copyOnly.length ? '' : '<span style="color:var(--muted);font-size:12.5px;">' + esc(t('emptyPeers')) + '</span>') +
+        (peers.length || copyOnly.length ? '<p class="card-desc" style="margin-top:6px;">' + esc(t('prFromPeers')) + ' <a href="javascript:void(0)" data-go-tab="connect" data-go-sub="pcs">' + esc(t('prFromPeersLink')) + '</a></p>' : '');
     }
 
     // Server answers 409 for risky actions: show its warning, ask the person, and resend with the confirmation.
@@ -8258,6 +8428,155 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
     // Connections > PCs: the devices of the Tailscale network, with and without PaaSMCP.
+    // Connections → PCs, first card: everything linked to this server, each with a Disconnect button
+    // that opens what will happen (and what has to be done first) right under its row.
+    let pairedData = null;
+    let pairedOpen = '';
+    let pairedResult = null;
+    async function loadPaired() {
+      const box = document.getElementById('pairedBox');
+      if (!box) return;
+      const res = await fetch('/api/paired').catch(() => null);
+      const d = res ? await res.json().catch(() => ({})) : {};
+      if (!res || !res.ok) { box.innerHTML = badge('danger', d.error || 'error'); return; }
+      pairedData = d;
+      renderPaired();
+    }
+    function prFill(key, vars) {
+      let txt = t(key);
+      Object.keys(vars || {}).forEach(k => { txt = txt.split('{' + k + '}').join(String(vars[k])); });
+      return txt;
+    }
+    const PR_GO = { fenced: ['mirror', 'back'], dataHere: ['mirror', 'copy'], failback: ['mirror', 'copy'], activeOrigin: ['mirror', 'aa'], activeTunnel: ['mirror', 'aa'] };
+    function prList(items, icon) {
+      return '<ul style="list-style:none;padding:0;margin:6px 0;">' + items.map(x => '<li style="padding:3px 0;display:flex;gap:8px;"><span aria-hidden="true">' + icon + '</span><span>' + x + '</span></li>').join('') + '</ul>';
+    }
+    function prPanel(id, kind, name, effects, blockers, ask) {
+      let html = '<div class="pr-panel" style="margin:6px 0 10px;padding:12px 14px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);font-size:13px;">';
+      if (blockers.length) {
+        html += '<strong>' + esc(t('prBlockedTitle')) + '</strong>' + prList(blockers, '⚠️');
+        html += '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" onclick="prClose()">' + esc(t('pcsCloseBtn')) + '</button></div>';
+        return html;
+      }
+      html += '<strong>' + esc(t('prWhatTitle')) + '</strong>' + prList(effects, '•');
+      if (ask === 'name') {
+        html += '<label class="field-label" for="prConfirm" style="margin-top:6px;">' + esc(prFill('prTypeName', { name: name })) + '</label>' +
+          '<input id="prConfirm" autocomplete="off" spellcheck="false" style="max-width:280px;" />';
+      }
+      html += '<div class="ofs-msg" id="prMsg" role="status" aria-live="polite"></div>';
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;"><button class="danger" id="btnPrGo" onclick="prGo()">' + esc(t('prBtnGo')) + '</button>' +
+        '<button class="secondary" onclick="prClose()">' + esc(t('pcsCancelBtn')) + '</button></div></div>';
+      return html;
+    }
+    function prRow(id, icon, title, sub, btn) {
+      return '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border);">' +
+        '<div style="flex:1 1 260px;min-width:0;"><span aria-hidden="true">' + icon + '</span> <strong>' + esc(title) + '</strong> ' + sub + '</div>' +
+        '<div style="flex:0 0 auto;">' + (btn ? '<button class="secondary" style="padding:4px 12px;font-size:12.5px;" data-pr="' + esc(id) + '" onclick="prOpen(this.dataset.pr)"' + (pairedOpen === id ? ' disabled' : '') + '>' + esc(btn) + '</button>' : '') + '</div></div>';
+    }
+    function prWhen(ms) {
+      if (!ms) return t('prNeverHeard');
+      return prFill('prLastHeard', { when: fmtWhen(new Date(ms).toISOString()) });
+    }
+    function renderPaired() {
+      const box = document.getElementById('pairedBox');
+      const d = pairedData || {};
+      const rows = [];
+      const goLink = (tab, sub) => ' <a href="javascript:void(0)" data-go-tab="' + tab + '" data-go-sub="' + sub + '">' + esc(t('prOpenThere')) + '</a>';
+      (d.servers || []).forEach(p => {
+        const id = 'server:' + p.key;
+        const links = (p.links || []).map(l => badge(l === 'servingHere' || l === 'behind' ? 'warning' : l === 'auto' ? 'success' : '', t('prLink_' + l))).join(' ');
+        rows.push(prRow(id, '🖥️', p.name, '<span style="color:var(--muted);font-size:12px;">' + esc(t('prKindServer')) + '</span> ' + links, t('prBtnUnpair')));
+        if (pairedOpen === id) {
+          const v = { name: esc(p.name) };
+          const effects = (p.effects || []).map(e => prFill('prFx_' + e.code, Object.assign({}, v, { apps: esc((e.apps || []).join(', ')), others: esc((e.others || []).join(', ')) })));
+          const blockers = (p.blockers || []).map(b => prFill('prBl_' + b.code, Object.assign({}, v, { apps: esc((b.apps || []).join(', ')) })) + (PR_GO[b.code] ? goLink(PR_GO[b.code][0], PR_GO[b.code][1]) : ''));
+          rows.push(prPanel(id, 'server', p.name, effects, blockers, 'name'));
+        }
+      });
+      if (d.judge) {
+        const id = 'judge';
+        rows.push(prRow(id, '⚖️', t('prKindJudge'), '<span style="color:var(--muted);font-size:12px;">' + esc(d.judge.url) + '</span>' + ((d.judge.auto || []).length ? ' ' + badge('success', t('prLink_auto')) : ''), t('prBtnUnpair')));
+        if (pairedOpen === id) {
+          const partners = (d.judge.partners || []).map(esc).join(', ');
+          const effects = [t('prJudgeFx1')];
+          if (partners) effects.push(prFill('prJudgeFx2', { others: partners }));
+          effects.push(t('prJudgeFx3'));
+          rows.push(prPanel(id, 'judge', '', effects, [], ''));
+        }
+      }
+      (d.helpers || []).forEach(h => {
+        const id = 'helper:' + h.name;
+        rows.push(prRow(id, '🤝', h.name, '<span style="color:var(--muted);font-size:12px;">' + esc(t('prKindHelper')) + ' · ' + esc(h.ip) + '</span>' + (h.paused ? ' ' + badge('', t('prPaused')) : ''), t('prBtnUnpair')));
+        if (pairedOpen === id) rows.push(prPanel(id, 'helper', h.name, [prFill('prHelperFx1', { name: esc(h.name) }), prFill('prHelperFx2', { name: esc(h.name) })], [], ''));
+      });
+      (d.judging || []).forEach((j, i) => {
+        const id = 'judging:' + j.cluster;
+        const sub = '<span style="color:var(--muted);font-size:12px;">' + esc(t('prKindJudging')) + ' · ' + esc(prFill(j.servers === 1 ? 'prServers1' : 'prServers', { n: j.servers })) + ' · ' + esc(prWhen(j.lastSeen)) + '</span>';
+        if (j.where === 'service') {
+          rows.push(prRow(id, '⚖️', prFill('prPairN', { n: i + 1 }), sub + '<div style="color:var(--muted);font-size:12px;margin-top:2px;">' + esc(t('prJudgingService')) + ' <code>sudo paasmcp arbiter remove-key ' + esc(j.cluster) + '</code></div>', ''));
+          return;
+        }
+        rows.push(prRow(id, '⚖️', prFill('prPairN', { n: i + 1 }), sub, t('prBtnUnpair')));
+        if (pairedOpen === id) {
+          const last = (d.judging || []).filter(x => x.where === 'container').length === 1;
+          const effects = [t('prJudgingFx1'), t('prJudgingFx2')];
+          if (last) effects.push(t('prJudgingLast'));
+          rows.push(prPanel(id, 'judging', '', effects, [], ''));
+        }
+      });
+      let html = rows.length ? rows.join('') : '<p class="card-desc">' + esc(t('prNone')) + '</p>';
+      if (pairedResult) html = pairedResult + html;
+      box.innerHTML = html;
+      const input = document.getElementById('prConfirm');
+      if (input) input.focus();
+    }
+    function prOpen(id) { pairedOpen = id; pairedResult = null; renderPaired(); }
+    function prClose() { pairedOpen = ''; renderPaired(); }
+    async function prGo() {
+      const id = pairedOpen;
+      const btn = document.getElementById('btnPrGo');
+      const d = pairedData || {};
+      let url, body;
+      if (id.indexOf('server:') === 0) {
+        const p = (d.servers || []).find(x => 'server:' + x.key === id);
+        if (!p) return;
+        const typed = (document.getElementById('prConfirm') || {}).value || '';
+        if (typed.trim() !== p.name) { ofsMsg('prMsg', prFill('prTypeName', { name: p.name }), 'err'); return; }
+        url = '/api/paired/server'; body = { key: p.key, confirmName: typed.trim(), confirmed: true };
+      } else if (id === 'judge') {
+        url = '/api/paired/judge'; body = { confirmed: true };
+      } else if (id.indexOf('helper:') === 0) {
+        url = '/api/pool/remove'; body = { name: id.slice(7), confirmed: true };
+      } else if (id.indexOf('judging:') === 0) {
+        url = '/api/paired/judging'; body = { cluster: id.slice(8), confirmed: true };
+      } else return;
+      btn.disabled = true;
+      btn.textContent = t('prWorking');
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null);
+      const r = res ? await res.json().catch(() => ({})) : {};
+      if (!res || !res.ok) {
+        if (document.getElementById('btnPrGo')) { btn.disabled = false; btn.textContent = t('prBtnGo'); }
+        if (!r.confirmationRequired) ofsMsg('prMsg', (currentLang === 'pt' && r.errorPt) || r.error || ('HTTP ' + (res ? res.status : '?')), 'err');
+        return;
+      }
+      pairedOpen = '';
+      if (id.indexOf('server:') === 0) {
+        let msg = badge(r.stillPaired || (r.errors || []).length ? 'warning' : 'success', r.stillPaired ? '!' : '✓') + ' ' + esc(prFill(r.stillPaired ? 'prDonePartial' : 'prDoneServer', { name: r.name }));
+        if ((r.movedAside || []).length) msg += '<div style="color:var(--muted);font-size:12px;margin-top:4px;">' + esc(t('prMovedAside')) + ' <code>' + r.movedAside.map(esc).join('</code>, <code>') + '</code></div>';
+        if ((r.done || []).indexOf('backupsTarget') !== -1) msg += '<div style="font-size:12.5px;margin-top:4px;">' + esc(t('prDoneBackups')) + goLink('databases', 'offsite') + '</div>';
+        if ((r.errors || []).length) msg += '<details style="margin-top:4px;font-size:12px;"><summary>' + esc(t('pcsLog')) + '</summary><pre style="white-space:pre-wrap;">' + esc(r.errors.join('\\n')) + '</pre></details>';
+        msg += '<div style="font-size:12.5px;margin-top:4px;">' + esc(prFill('prFx_otherSide', { name: r.name })) + '</div>';
+        pairedResult = card(msg);
+        loadAll();
+      } else if (id.indexOf('helper:') === 0) {
+        pairedResult = card(badge('success', '✓') + ' ' + esc(prFill('prDoneHelper', { name: id.slice(7) })) + goLink('pool', 'list'));
+      } else if (id === 'judge') {
+        pairedResult = card(badge('success', '✓') + ' ' + esc(t('prDoneJudge')));
+      } else {
+        pairedResult = card(badge('success', '✓') + ' ' + esc(t(r.stopped ? 'prDoneJudgingStopped' : 'prDoneJudging')));
+      }
+      loadPaired();
+    }
     async function loadPcs() {
       const box = document.getElementById('pcsBox');
       const btn = document.getElementById('btnPcsLoad');
