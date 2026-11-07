@@ -23,7 +23,8 @@ export interface JobScheduleInput {
   branch?: string;
   schedule: string;
   secretScope?: string;
-  command?: string[];
+  /** null explicitly clears a previously saved command when editing. */
+  command?: string[] | null;
   timeoutSeconds?: number;
 }
 
@@ -293,7 +294,8 @@ export async function scheduleJob(input: JobScheduleInput): Promise<JobSummary &
   const branch = validateBranchName(input.branch || "main");
   const schedule = validateJobSchedule(input.schedule);
   const secretScope = sanitizeSlug(input.secretScope || name);
-  const command = validateJobCommand(input.command);
+  const commandProvided = input.command !== undefined;
+  const command = input.command === null ? undefined : validateJobCommand(input.command);
   const timeoutSeconds = validateTimeout(input.timeoutSeconds);
   const built = await buildImage(name, repoSource, branch);
   const now = new Date().toISOString();
@@ -307,9 +309,9 @@ export async function scheduleJob(input: JobScheduleInput): Promise<JobSummary &
     image: imageName(name),
     secretScope,
     schedule,
-    ...(command ? { command } : {}),
+    ...(commandProvided ? (command ? { command } : {}) : {}),
     timeoutSeconds,
-    enabled: true,
+    enabled: previous?.enabled ?? true,
     createdAt: previous?.createdAt || now,
     updatedAt: now,
     builtAt: now,
@@ -317,6 +319,10 @@ export async function scheduleJob(input: JobScheduleInput): Promise<JobSummary &
     lastCommitSha: built.commitSha,
   };
   const timerInstall = installJobTimer(job);
+  if (!job.enabled) {
+    uninstallJobTimer(name);
+    timerInstall.enabled = false;
+  }
   job.timer = {
     service: timerInstall.service,
     timer: timerInstall.timer,

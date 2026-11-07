@@ -2844,6 +2844,10 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
             <div id="jobsTask" role="status" aria-live="polite"></div>
             <details open>
               <summary style="cursor:pointer;font-weight:600;font-size:14px;" data-i18n="jobsNewTitle"></summary>
+              <div id="jobsEditMode" class="preset-hint show" style="display:none;margin-top:10px;">
+                <span data-i18n="jobsEditing"></span>
+                <button class="secondary" onclick="cancelJobEdit()" id="btnCancelJobEdit" data-i18n="jobsCancelEdit" style="margin-left:8px;padding:4px 9px;font-size:12px;"></button>
+              </div>
               <p class="ofs-note" data-i18n="jobsNewDesc" style="margin-top:8px;"></p>
               <div class="form-grid">
                 <div>
@@ -2892,6 +2896,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
               </div>
               <div class="actions" style="margin-top:10px;">
                 <button onclick="scheduleJobUi()" id="btnScheduleJob" data-i18n="jobsCreate"></button>
+                <button class="secondary" onclick="cancelJobEdit()" id="btnCancelJobEditBottom" data-i18n="jobsCancelEdit" style="display:none;"></button>
               </div>
               <div class="ofs-msg" id="jobsMsg" role="status" aria-live="polite"></div>
             </details>
@@ -4305,6 +4310,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsStep3Desc": "O job recebe apenas os segredos do escopo escolhido. Os valores nunca aparecem nesta tela.",
           "jobsNewTitle": "Criar uma tarefa",
           "jobsNewDesc": "Cada linha do comando vira um argumento separado. Isso evita que texto do job seja interpretado como shell.",
+          "jobsEditing": "Editando a tarefa. O nome não muda nesta edição.",
+          "jobsCancelEdit": "Cancelar edição",
           "jobsName": "Nome da tarefa",
           "jobsRepo": "Repositório ou pasta do servidor",
           "jobsBranch": "Branch",
@@ -4327,6 +4334,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsManualTimer": "A imagem foi criada. Para ligar o relógio do servidor, rode no servidor: paasmcp jobs enable NOME.",
           "jobsSystemTimer": "Relógio do servidor ligado",
           "jobsManualRun": "Rodar agora",
+          "jobsEdit": "Editar",
+          "jobsSaveChanges": "Salvar alterações",
           "jobsBuild": "Reconstruir imagem",
           "jobsDisable": "Desligar",
           "jobsEnable": "Ligar",
@@ -5422,6 +5431,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsStep3Desc": "The job receives only the secrets from the selected scope. Values never appear on this screen.",
           "jobsNewTitle": "Create a job",
           "jobsNewDesc": "Each command line becomes a separate argument. This keeps job text from being interpreted as a shell.",
+          "jobsEditing": "Editing this job. The name does not change here.",
+          "jobsCancelEdit": "Cancel editing",
           "jobsName": "Job name",
           "jobsRepo": "Repository or server folder",
           "jobsBranch": "Branch",
@@ -5444,6 +5455,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsManualTimer": "The image was created. To turn on the server clock, run on the server: paasmcp jobs enable NAME.",
           "jobsSystemTimer": "Server clock is on",
           "jobsManualRun": "Run now",
+          "jobsEdit": "Edit",
+          "jobsSaveChanges": "Save changes",
           "jobsBuild": "Rebuild image",
           "jobsDisable": "Turn off",
           "jobsEnable": "Turn on",
@@ -9935,6 +9948,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     // ---- Scheduled jobs: a small guided surface over the same MCP/CLI capability ----
     let jobsTaskPollTimer = null;
     let jobsCache = [];
+    let editingJobName = '';
     function toggleJobCustomSchedule() {
       const custom = document.getElementById('jobSchedulePreset').value === 'custom';
       document.getElementById('jobCustomScheduleBox').style.display = custom ? '' : 'none';
@@ -9977,6 +9991,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         if (data.task && !data.task.done) {
           jobsTaskPollTimer = setTimeout(pollJobsTask, 1500);
         } else if (data.task) {
+          if (data.task.action === 'schedule' && !data.task.error) cancelJobEdit();
           loadJobsList();
         }
       } catch { /* the next screen refresh can try again */ }
@@ -10006,12 +10021,52 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           '<div style="color:var(--muted);margin-top:5px;overflow-wrap:anywhere;">' + esc(job.schedule) + ' · ' + esc(job.repoUrl) + ' · ' + esc(job.branch) + '</div>' +
           '<div style="color:var(--muted);margin-top:4px;">' + esc(t('jobsLastRun')) + ': ' + esc(runText) + '</div>' + command + timerNote + '</div>' +
           '<div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">' +
+          '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="editJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsEdit')) + '</button>' +
           '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="runJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsManualRun')) + '</button>' +
           '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="buildJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsBuild')) + '</button>' +
           '<button class="secondary" style="padding:5px 9px;font-size:11.5px;" onclick="toggleJobUi(&#39;' + esc(job.name) + '&#39;,' + (!job.enabled) + ')">' + esc(job.enabled ? t('jobsDisable') : t('jobsEnable')) + '</button>' +
           '<button class="danger" style="padding:5px 9px;font-size:11.5px;" onclick="removeJobUi(&#39;' + esc(job.name) + '&#39;)">' + esc(t('jobsRemove')) + '</button>' +
           '</div></div></div>';
       }).join('');
+    }
+    function editJobUi(name) {
+      const job = jobsCache.find(function (item) { return item.name === name; });
+      if (!job) return;
+      editingJobName = job.name;
+      document.getElementById('jobName').value = job.name;
+      document.getElementById('jobName').readOnly = true;
+      document.getElementById('jobRepo').value = job.repoUrl || '';
+      document.getElementById('jobBranch').value = job.branch || 'main';
+      document.getElementById('jobScope').value = job.secretScope || '';
+      document.getElementById('jobTimeout').value = String(job.timeoutSeconds || 3600);
+      document.getElementById('jobCommand').value = job.command && job.command.length ? job.command.join('\\n') : '';
+      const known = { hourly: 'hourly', daily: '*-*-* 03:00:00', weekly: 'Mon *-*-* 03:00:00' };
+      const preset = Object.keys(known).find(function (key) { return known[key] === job.schedule; });
+      document.getElementById('jobSchedulePreset').value = preset || 'custom';
+      document.getElementById('jobCustomSchedule').value = preset ? '' : (job.schedule || '');
+      toggleJobCustomSchedule();
+      document.getElementById('jobsEditMode').style.display = '';
+      document.getElementById('btnCancelJobEditBottom').style.display = '';
+      document.getElementById('btnScheduleJob').textContent = t('jobsSaveChanges');
+      document.querySelector('#tab-jobs details').open = true;
+      document.getElementById('jobRepo').focus();
+      document.getElementById('jobName').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    function cancelJobEdit() {
+      editingJobName = '';
+      document.getElementById('jobName').readOnly = false;
+      document.getElementById('jobName').value = '';
+      document.getElementById('jobRepo').value = '';
+      document.getElementById('jobBranch').value = 'main';
+      document.getElementById('jobScope').value = '';
+      document.getElementById('jobSchedulePreset').value = 'hourly';
+      document.getElementById('jobCustomSchedule').value = '';
+      document.getElementById('jobTimeout').value = '3600';
+      document.getElementById('jobCommand').value = '';
+      toggleJobCustomSchedule();
+      document.getElementById('jobsEditMode').style.display = 'none';
+      document.getElementById('btnCancelJobEditBottom').style.display = 'none';
+      document.getElementById('btnScheduleJob').textContent = t('jobsCreate');
     }
     async function loadJobs() {
       await Promise.all([loadJobsList(), pollJobsTask()]);
@@ -10030,7 +10085,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           secretScope: document.getElementById('jobScope').value.trim() || undefined,
           schedule: selectedJobSchedule(),
           timeoutSeconds: Number(document.getElementById('jobTimeout').value),
-          command: jobCommandArgs()
+          command: jobCommandArgs() || (editingJobName ? null : undefined)
         });
         if (data && data.task) { renderJobsTask(data.task); pollJobsTask(); }
       } finally { btn.disabled = false; }
