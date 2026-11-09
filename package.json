@@ -1,7 +1,7 @@
 {
   "name": "paasmcp",
   "version": "1.0.0",
-  "description": "Agent-First Micro-PaaS & Model Context Protocol (MCP) Server for self-hosted servers and homelabs.",
+  "description": "Self-hosted PaaS for Linux servers and homelabs, run from a full web dashboard, by AI agents through MCP (with human approval), or from the CLI.",
   "license": "MIT",
   "author": "PaaSMCP Contributors",
   "keywords": [
@@ -14,7 +14,11 @@
     "cloudflare-tunnel",
     "tailscale",
     "ai-agents",
-    "micro-paas"
+    "micro-paas",
+    "dashboard",
+    "web-ui",
+    "failover",
+    "high-availability"
   ],
   "type": "module",
   "engines": {
