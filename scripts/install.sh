@@ -31,12 +31,21 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$PROJECT_ROOT/dist/cli.js" "$HOME/.local/bin/paasmcp"
 ln -sf "$PROJECT_ROOT/dist/mcp-server.js" "$HOME/.local/bin/paasmcp-mcp"
 
+# Also link into /usr/local/bin so 'sudo paasmcp' and system-wide PATH find it
+if [ -w /usr/local/bin ]; then
+  ln -sf "$PROJECT_ROOT/dist/cli.js" /usr/local/bin/paasmcp
+  ln -sf "$PROJECT_ROOT/dist/mcp-server.js" /usr/local/bin/paasmcp-mcp
+elif command -v sudo >/dev/null 2>&1; then
+  sudo ln -sf "$PROJECT_ROOT/dist/cli.js" /usr/local/bin/paasmcp 2>/dev/null || true
+  sudo ln -sf "$PROJECT_ROOT/dist/mcp-server.js" /usr/local/bin/paasmcp-mcp 2>/dev/null || true
+fi
+
 echo "🔐 Initializing PaaSMCP state, AES-256-GCM Master Key & SSH Deploy Key..."
 node "$PROJECT_ROOT/dist/cli.js" init
 
 echo ""
 echo "✅ PaaSMCP installed successfully!"
-echo "   CLI binary: $HOME/.local/bin/paasmcp"
+echo "   CLI binary: $HOME/.local/bin/paasmcp (and /usr/local/bin/paasmcp)"
 echo "   MCP binary: $HOME/.local/bin/paasmcp-mcp"
 echo ""
 echo "🔌 Add this to your MCP Client configuration:"

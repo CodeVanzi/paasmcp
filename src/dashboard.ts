@@ -3351,7 +3351,10 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-ge
 
             <h3 data-i18n="autoStep6" style="margin-top:16px;"></h3>
             <p class="card-desc" data-i18n="autoStep6Desc"></p>
-            <pre style="user-select:all;">sudo paasmcp mirror install-watch</pre>
+            <details style="margin-top:8px;font-size:12px;">
+              <summary style="cursor:pointer;opacity:0.8;color:var(--text-muted);" data-i18n="autoStep6Fallback"></summary>
+              <pre style="user-select:all;margin-top:4px;">sudo paasmcp mirror install-watch</pre>
+            </details>
 
             <h3 data-i18n="autoStep7" style="margin-top:16px;"></h3>
             <p class="card-desc" data-i18n="autoStep7Desc"></p>
@@ -4254,8 +4257,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblAutoPeer": "Servidor que este pode substituir",
           "autoNoCopy": "Nenhuma cópia recebida ainda (use “Receber cópia”, na aba “Cópia ao vivo”)",
           "autoNoPeer": "Escolha o servidor na lista. Se ela estiver vazia, este servidor ainda não guarda cópia de nenhum outro.",
-          "autoStep6": "2. Ligue o vigia (nos dois servidores)",
-          "autoStep6Desc": "O vigia conversa com o juiz a cada 15 segundos. É ele que avisa o juiz que o servidor está vivo, troca sozinho quando precisa e bloqueia o servidor que volta depois de ter sido substituído. Rode o comando abaixo no terminal de cada um dos dois servidores.",
+          "autoStep6": "2. Vigia automático (watchdog)",
+          "autoStep6Desc": "O vigia conversa com o juiz a cada 15 segundos. Ele já roda automaticamente em segundo plano dentro do container do painel. Nenhum comando manual é necessário se o painel estiver ativo.",
+          "autoStep6Fallback": "Opção para servidores sem o painel (modo terminal puro/headless):",
           "autoStep7": "3. Confira se está funcionando",
           "autoStep7Desc": "O quadro no topo deste cartão mostra o que o juiz está ouvindo. Está pronto quando tudo fica verde: o juiz respondeu, ouviu este servidor e o outro há menos de 1 minuto, o vigia está rodando aqui e a troca está ligada. Se o outro servidor não aparece ou aparece com tempo alto, falta informar o juiz (aba “Juiz”) ou ligar o vigia nele.",
           "btnArbRefresh": "Verificar de novo",
@@ -4705,8 +4709,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lblAutoPeer": "Server this one may replace",
           "autoNoCopy": "No copy received yet (use “Receive a copy”, in the “Live copy” tab)",
           "autoNoPeer": "Pick the server in the list. If it is empty, this server holds no copy of another one yet.",
-          "autoStep6": "2. Turn on the watchdog (on both servers)",
-          "autoStep6Desc": "The watchdog talks to the arbiter every 15 seconds. It tells the arbiter the server is alive, takes over when needed and blocks a server that comes back after being replaced. Run the command below in the terminal of each of the two servers.",
+          "autoStep6": "2. Automatic watchdog",
+          "autoStep6Desc": "The watchdog talks to the arbiter every 15 seconds. It runs automatically in the background inside the dashboard container. No manual command is needed while the dashboard is running.",
+          "autoStep6Fallback": "Option for servers without the dashboard (pure terminal/headless mode):",
           "autoStep7": "3. Check that it works",
           "autoStep7Desc": "The box at the top of this card shows what the arbiter hears. It is ready when everything is green: the arbiter answered, heard this server and the other one less than 1 minute ago, the watchdog runs here and the takeover is on. If the other server is missing or shows a long time, it still needs the arbiter address (“Arbiter” tab) or its watchdog.",
           "btnArbRefresh": "Check again",
