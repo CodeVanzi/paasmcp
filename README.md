@@ -1,47 +1,121 @@
-# 🚀 PaaSMCP — Agent-First Micro-PaaS & MCP Server
+# 🚀 PaaSMCP — Self-hosted PaaS with a Web Dashboard *and* an MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Node.js >= 20](https://img.shields.io/badge/Node.js-%3E%3D20.0.0-brightgreen)](https://nodejs.org)
-[![MCP Compatible](https://img.shields.io/badge/MCP-Model%20Context%20Protocol-purple)](https://modelcontextprotocol.io)
+[![MCP Compatible](https://img.shields.io/badge/MCP-28%20tools-purple)](https://modelcontextprotocol.io)
+[![Web dashboard](https://img.shields.io/badge/Web%20dashboard-EN%20%7C%20PT--BR-0ea5e9)](#-the-web-dashboard)
 
-> **Turn any Linux server or Homelab into a modern automated Cloud PaaS operated directly by AI Agents via MCP (Model Context Protocol) or Humans via a sleek Web Control Plane — with zero idle RAM overhead.**  
-> 🇧🇷 **[Leia a Documentação Completa em Português aqui (docs/PT-BR.md)](./docs/PT-BR.md)**
+> **Turn any Linux server or homelab into your own Vercel/Render-style platform.** Publish apps from GitHub, get databases, HTTPS addresses, encrypted backups and a second server that takes over when the first one fails.
+>
+> **Use it the way you like:** click through a full **web dashboard** (no terminal needed after install), ask an **AI agent** through **MCP** ("publish my app", "back up now"), or use the **CLI**. All three drive the same actions with the same safety rules.
+>
+> 🇧🇷 **[Documentação completa em português (docs/PT-BR.md)](./docs/PT-BR.md)**
+
+![PaaSMCP dashboard: the apps list with live status, addresses, databases and one-click actions](docs/images/dashboard-apps.png)
+
+---
+
+## 🧭 Three ways to use it
+
+| | 🖥️ **Web dashboard** | 🤖 **AI agent (MCP)** | ⌨️ **CLI** |
+| :--- | :--- | :--- | :--- |
+| **For** | Anyone: no terminal, no YAML | Claude Code, Codex, Cursor, VS Code, Gemini CLI, local models | Scripts and people who like the shell |
+| **How** | Browser, on your Tailscale network or behind Cloudflare Zero Trust (2FA optional) | 28 MCP tools, over stdio on the server or HTTP with a token on your Tailscale network | `paasmcp …` on the server |
+| **Covers** | Every feature, with a self-ticking tutorial and step-by-step guides on the screen where each feature lives | Everything except steps that would carry a password or key through an AI chat (those stay in the dashboard/CLI on purpose) | Everything |
+| **Risky actions** | Confirm in a dialog (type the name for the dangerous ones) | The agent can only *ask*; a person approves in the dashboard or with `paasmcp approve` | Asks for confirmation |
+
+You can mix them: an agent publishes an app, you approve the public address from your phone in the dashboard, and a cron script reads `paasmcp deploys`.
 
 ---
 
-## 💡 Why PaaSMCP?
+## 🖥️ The web dashboard
 
-Traditional self-hosted PaaS dashboards are great for manual clicking, but they:
-1. Consume **300MB–1GB+ of RAM** continuously just to run their control plane daemons and internal queues.
-2. Require manual multi-step setup for SSH deploy keys, database bindings, and Cloudflare Tunnel / Zero Trust rules.
-3. Were **not designed from day one to be operated by AI Agents via MCP**.
+A complete control panel in English and Portuguese, light and dark, that works on a phone. It is not a viewer for the CLI: you can install PaaSMCP, open the dashboard and never touch the terminal again.
 
-**PaaSMCP** takes a radically lightweight, **Agent-First & Security-First** approach:
-- **0 MB Idle Daemon Overhead:** Runs on-demand via MCP stdio or CLI, orchestrating native Docker Compose stacks directly on your host. (The optional web dashboard and GitHub webhook receiver are a small always-on service.)
-- **Human-in-the-loop for risky actions:** Agents run safe actions freely; destroying, purging, restoring, deleting secrets, public exposure, trusted apps and federation changes wait for a person to approve them in the dashboard or with `paasmcp approve <id>`. Destroyed apps go to a 30-day trash. See [Security model](#-security-model).
-- **AES-256-GCM Encrypted Secrets & Backups Vault:** Secrets (`/opt/homelab/paasmcp/vault/<app>.enc.json`) and database snapshots (`/opt/homelab/paasmcp/backups/<id>.enc.bak`) are encrypted at rest with a `0600` master key. Values are masked in MCP outputs (`sk_l****def`) and can be ingested directly from files so sensitive keys never pass through LLM chat histories.
-- **Instant Multi-Tenant Databases + Encrypted Snapshots:** Provision isolated PostgreSQL 16 databases (`db_<app>` + `user_<app>`) or Redis 7 logical instances in 1 second, automatically injecting `DATABASE_URL` and `REDIS_URL`, with 1-click encrypted `pg_dump` backup & zero-plaintext-disk restore.
-- **Zero-Config Buildpacks + Multi-Service Docker Compose Pass-Through:** Automatically builds repositories with a custom `Dockerfile`, sanitized multi-service `docker-compose.yml` (stripping unsafe `privileged`/`host` flags and injecting Vault secrets), or generates optimized multi-stage Dockerfiles for **Node.js, Next.js, Vite/React/Astro SPAs, Python (FastAPI/Flask/Django), Go, C# / ASP.NET Core, and Static HTML**. Other stacks (Rails, Laravel, Java…) build from your own `Dockerfile`; the dashboard has one-click presets for each of these.
-- **Zero-Downtime Blue/Green Deploys:** Each new version first runs as a candidate container on a free loopback port and must answer an HTTP healthcheck (`healthcheckPath`, default `/`, status < 500, 20 s) before it replaces the running one. If it crashes or keeps failing, the running version is left untouched and the deploy returns the candidate's logs to the agent. During the swap the candidate also answers for the app's container name, so Cloudflare Tunnel traffic keeps reaching a healthy copy while production is recreated (`scripts/bluegreen-lab.sh`).
-- **Live Deploy Status:** Every deploy, whoever starts it (dashboard, CLI, MCP, GitHub webhook, poll timer), writes its phase as it goes: new version found, fetching, building the image, testing the new version, switching, live or failed (with the error and the last log lines; the previous version keeps serving). The dashboard's apps table follows it live and shows each app's GitHub repository, branch and running commit (message, author, how long ago it was committed), linked to GitHub. `paasmcp deploys [app]` lists the same from the shell; `paas_status` includes it for agents (`scripts/deploy-status-lab.sh`).
-- **1-Second Image Rollback & `paas_doctor` Diagnostics:** Automatically tags the previous working image (`paasmcp/<app>:previous`) before every deploy for instant 1-second rollback, and inspects containers for `OOMKilled`, crash-loops, and live CPU/RAM metrics (`docker stats`).
-- **Two-Server Mirror:** Pair a second server (`paasmcp-join://`, `HMAC-SHA256` + SSH fingerprint), then `paasmcp mirror offer/accept`: each server keeps a live read-only copy of the other's Postgres (physical streaming over Tailscale, a replication slot keeps up to 10 GB of changes while the peer is away) and receives the other's backups in its Garage. `paas_mirror status` shows streaming / caught up / seconds behind; `promote` is a manual failover with a strong confirmation that raises an epoch number, redeploys the peer's apps and points their DNS here. Automatic failover needs an arbiter (`paasmcp arbiter install-service` on a small third device, which can serve several clusters with `arbiter add-key`; forbidden without one; the dashboard's Arbiter tab shows its state (device, version, servers it hears, last watchdog contact, who serves whose data) and generates the install command with the key already in it; a PC that already runs PaaSMCP becomes an arbiter from its own dashboard and pairs with a 6-digit code (`arbiter pair` / `arbiter pair-with`), and the other server adopts the address through the control channel and `paasmcp arbiter check` / its "Test" button shows whether the arbiter answers and hears both servers): `mirror watch` heartbeats, takes over only when both it and the arbiter lost the peer and the copy stopped streaming, and **fences** a server whose data moved (its apps stop, deploys are refused). Guided failback: `offer --from-copy-of`, `accept --rejoin` (old data moved aside, never deleted), `handback` (waits for zero lag), `promote`. One server can also send copies to several others (star): on failure exactly one copy takes over and the others step aside until rebuilt (`mirror retire` for a manual failover). The full outage → failover → failback cycle runs in `scripts/mirror-lab.sh` and, with three servers and a real arbiter, in `scripts/star-lab.sh` (real Postgres containers).
-- **Active-active (app on both servers):** `paasmcp active on <app>` (confirmation) runs a mirrored app on both servers at once. Writes still go to the origin's Postgres; the peer reaches it, Redis and S3 over Tailscale, and builds the **exact commit** the origin runs, received through an encrypted manifest that travels inside the existing Postgres stream (no new port or daemon). Entry: `paasmcp active tunnel on` (a Cloudflare Tunnel just for those apps, run on both servers; a sick copy steps out of it by itself), or the self-hosted **edge** (`paasmcp edge install` / `edge add <app> <hostname>`): a Caddy with Let's Encrypt, round robin and health checks every 5 s, no cloud needed. Uploaded files in the app's S3 bucket are copied to the peer every minute with the same key, and come back on handback. Tested in `scripts/active-lab.sh` and `scripts/files-lab.sh`.
-- **Connections from the dashboard (no terminal, no ids to copy):** **Connections → Domain** takes one Cloudflare token, lists the accounts, active domains and tunnels it can see, and saves the choice; *Create a new tunnel* makes a remotely-managed tunnel in your account and runs a pinned `cloudflared` here (`paasmcp-tunnel` on `homelab-network`, token in a 0600 `.env`). Tunnels configured by a local file are flagged, since PaaSMCP cannot add addresses to them; replacing a working domain or tunnel asks for confirmation. **Connections → GitHub** tests a token (says whose it is) and saves it; with it, **Publish an app** lists your repositories (like Vercel's import) and private code is fetched with the token sent as an HTTP header, never written into the clone's `.git/config` or the app image. If the token also has `Webhooks: Read and write`, **Apps → Publish on every push** turns on the push webhook for each app's repository in one click (create or fix, then GitHub's test call is checked and the result shown); only webhooks pointing at this dashboard's address are touched.
-- **Ready-made apps:** **Publish an app** also offers one-click installs of Uptime Kuma, Memos and IT Tools, without a repository: PaaSMCP writes a small compose file with a pinned, multi-arch image (`src/templates.ts`) and publishes it like a local folder, so it gets the same sanitizing, loopback-only port and blue/green check, with data in a named volume. Apps whose first visitor creates the admin account say so right after install.
-- **PCs of your Tailscale:** **Connections → PCs** lists every device of your Tailscale network and marks which ones already run PaaSMCP (the other server of a pair, a helper, an arbiter…), which Linux PCs have none yet, which are off, and which cannot get it from here (phones, Windows/Mac, devices shared from another account or owned by someone else). For the candidates it also says whether Tailscale SSH or regular SSH answers. **Install PaaSMCP** on one of them (Debian/Ubuntu, x86-64 or ARM64): the dashboard logs in once over Tailscale (Tailscale SSH, or the PC's user and password typed there, kept in memory for that install only), runs a read-only check (system, space, what is missing) and waits. You pick what the PC will be (an independent server with its own dashboard, a helper of this server, or the arbiter of this pair) and confirm; then, as root, it installs git and Docker from apt, Node.js 20+ (apt or the official tarball, checksum pinned), this server's exact PaaSMCP commit in `/opt/paasmcp`, and sets the role, with each step on screen. No key of this server is left on the PC; Tailscale SSH can be switched off at the end (always, for a helper). A PC of the same home network that sleeps or is off gets a **Turn on** button there once it is set up with `paasmcp wake add <name> --mac <its card>` (and `sudo paasmcp pool wake-setup` once on that PC): this server sends the Wake-on-LAN packet, so a server at home can be woken from the dashboard of another one, from anywhere (`paasmcp wake <name>` or MCP `paas_pcs` action `wake` too).
-- **Disconnecting a PC:** the first card of **Connections → PCs**, *Linked to this server*, lists every computer tied to this one: paired servers (the pairing and the data copy each way, merged into one row per server), this server's judge, helper PCs, and the pairs this PC judges. **Disconnect** first shows, in plain words, what will happen and what has to be done first (it refuses while this server serves the other one's data, the other serves this one's, or apps run on both); a server needs its name typed. Nothing that may be the only copy of some data is deleted: a copy kept here is set aside in a renamed folder. The other server's replication slot, its `pg_hba` line and its backups key here go away; with no paired server left the pair's key and the copy password change, so the disconnected server can no longer talk to this one. CLI: `paasmcp node paired`, `node unpair <server>`, `node unpair-judge`; MCP: `paas_mirror` actions `paired`, `unpair`, `unpair_judge`, `judge_forget` (each needs a person's approval).
-- **Notices:** **Connections → Notices** takes an ntfy topic (free phone app), a Discord or a Slack webhook. A failed publish that nobody started from the dashboard (git push, polling, mirror) sends a notice, and, if asked, so does an automatic one that works. The dashboard also checks every minute that each app is running and sends a notice when one stops on its own for two checks in a row (not while it is being published, not when you stopped it), and another when it is back. A test notice must arrive before the address is saved; the address stays in the `system` vault and the dashboard only shows its host.
-- **Tutorial in the dashboard:** **Home → Tutorial** is a checklist of what is done and what can still be done (essential, recommended, when you need more), ticked from the server's real state, with step-by-step guides on pages of their own (`#guide/firstapp`, `address`, `offsite`, `autoupdate`, `email`, `github`). **Home → Summary** shows only the next one or two steps.
-- **App variables like on Railway/Render:** **Secrets & keys** picks the app from a list (no "scope" to type), takes a whole pasted `.env` file (`export`, quotes and `#` comments understood; lines that are not `NAME=value` are reported by number, never echoed), and says when a change still needs **Publish again** (a button there and on every app row: same repository and branch, blue/green, the live version stays until the new one passes the health check). Restarting alone does not reload variables, since they are written at deploy time.
-- **Measuring for automatic scaling (phase 1: measure and rehearse, never act):** `sudo paasmcp scale install-timer` runs a systemd oneshot timer every 15 s (nothing stays in memory between rounds). Each round reads every running app's CPU, memory and network traffic (`docker stats`) and times an answer of its health path, keeping the last 10 minutes at full detail and one point per minute for 24 hours under `paasmcp/scale/`. A **rehearsal** runs the scaling rule on those numbers (add a copy when CPU per copy stays above the target for 3 rounds, remove one after 10 minutes below half of it, 2 minutes between steps) and writes what it *would* do, with the reason, to a **decision diary** shown in Portuguese or English (`paasmcp scale diary`, `scale language pt|en`). `paasmcp scale test <app>` (confirmation) is a **capacity test**: it doubles parallel GET requests on the app's own loopback port until it chokes and says how many requests per second one copy handles and whether the app's CPU or the database gave out. Dashboard: 24 h charts, the rehearsal line, the rule and the diary on the Apps tab. Tested in `scripts/scale-lab.sh`.
-- **Helper PCs (scale phase 3: your own machines, copies set by hand):** your other Linux PCs can run extra copies of an app. `paasmcp pool invite <name>` (confirmation) gives a one-use invite (15 min); on the PC, `sudo node dist/cli.js pool join '<invite>'` (no `init`, nothing left running) creates a `paasmcp-worker` user whose only SSH key is this server's, accepted **only from this server's Tailscale IP** and **only to run the worker** (`restrict`: no terminal, no forwarding); `paasmcp pool add <name> <ip>` checks the PC holds the invite (HMAC of a fresh nonce) and pins its host key. Then `paasmcp scale <app> 3` (confirmation the first time) runs this server's copy plus two on helpers: the image travels by `docker save | ssh | docker load` and is checked by fingerprint, the app's variables go with the order into a **tmpfs** folder on the PC (never its disk, never `docker inspect`), copies are published only on the PC's Tailscale IP and reach Postgres, Redis and S3 here. Visitors still enter only through this server: a small Caddy (`paasmcp-pool-lb`, only while an app uses helpers) splits the visits with health checks every 3 s, and Cloudflare Tunnel (or the edge) points at it. Copies follow deploys, rollbacks and restarts one at a time; `pool pause` drains a PC before its owner needs it; `scale off <app>` goes back to one copy; `pool remove` revokes the key on the PC. Only single-container apps with an HTTP health check that run only on this server qualify. `paasmcp pool acl` prints the Tailscale access rules that fence helpers in. Dashboard: a **Helpers** tab with the step-by-step guide and a copies selector on the Apps tab. Tested in `scripts/pool-lab.sh` (two Docker-in-Docker PCs: traffic split, a PC pulled from the network leaves the traffic within 10 s, no secret on a PC's disk, the key opens no terminal).
-- **Automatic scaling (scale phase 4: the rule acts):** `paasmcp scale auto on <app> --min 1 --max 3` (confirmation) puts the app behind the pool balancer, which now counts its **visits per second**, and from then on each measuring round decides by itself: a copy is added on a helper PC when CPU per copy, or visits per copy (`scale rule <app> --target-rps 20`; the capacity test suggests a value), stay above the rule's target for a few rounds in a row, and one is removed when both stay below half of it for the rule's time. Never outside the minimum and maximum, one step at a time, with a wait between steps; a copy leaves the balancer and drains before it stops. No copy is added while Postgres uses 80% of its connections, and a step that cannot happen (no room on helpers, a copy that does not start) is retried after a growing wait (the rule's wait between steps, at least a minute, doubling up to 30 minutes), written once in the diary. A step cut short (the server restarted halfway) is repaired by the next round: the helpers are asked what they run and copies nobody knows stop. Moving within the limits is free; turning it on and raising the maximum ask a person; everything is audited and each step goes to the diary with its reason (pt/en). `scale auto off` leaves the copies as they are; `scale off` (**Stop everything** on the dashboard) turns it off and goes back to one copy here. Dashboard: the switch, visits and copies charts and the guide on the Apps tab. Tested in `scripts/autoscale-lab.sh` (two Docker-in-Docker PCs: a step of load and back, fast waves, Postgres near its limit, a round killed while adding a copy).
-- **Courteous mode (helper PCs whose owner uses them):** every minute, each helper says how much CPU the PC used outside the copies since the last question (nothing runs on the PC in between: the worker reads the PC's and the copies' CPU counters at each order). At or above the PC's limit (50% of its CPUs by default) twice in a row, the owner is using it: in `auto` mode (default) its copies leave the balancer, finish the visits in progress, stop, and go to another PC with room (or wait); in `warn` mode they stay and the diary says so; either way no new copy goes there. After 5 minutes below 80% of the limit the PC takes copies again. `paasmcp pool courtesy <name> auto|warn|off [--cpu 50]`, or the selector on each PC's card in the dashboard. Needs the measuring timer and the worker updated on the PC (`pool update-worker`). Tested in `scripts/courtesy-lab.sh`.
-- **Wake-on-LAN (helper PCs that sleep):** a helper on the same home network as this server can sleep while nobody needs it. When a copy must run and no awake helper has room (or a PC holding a copy stops answering), this server sends its network card a magic packet; the PC answers in 30 s to a minute and gets the copy, so this helps load that lasts. Automatic scaling waits for it (about a minute) instead of the long wait of "no room", and the diary says what happened. A PC that does not answer gets 3 packets, 3 minutes apart, then is left alone until a person wakes it by hand. Once on the PC: `sudo paasmcp pool wake-setup` (arms the wired card now and at every boot; Wi-Fi is refused). On this server: `paasmcp pool wake <name> on` (the MAC and network come from what the PC reported; this server must be on that network, and only private networks are accepted), `pool wake <name> now` to test, or the switch on each PC's card. Putting the PC back to sleep is its own power settings. Tested in `scripts/wake-lab.sh`.
-- **Built-in Workspace Web UI (`paasmcp-dashboard`):** Optional ultra-lightweight dark/light web workspace (collapsible side menu grouped into Apps, Servers, Integrations and System; bigger screens split into folder tabs with bookmarkable URLs such as `#overview/deploy`; a drawer menu on phones; protected by constant-time `DASHBOARD_TOKEN`, login rate-limiting, CSP headers, and Cloudflare Zero Trust Access) with built-in **GitHub Push Webhook (`X-Hub-Signature-256`)** auto-deploy receiver.
+| Publish an app | Self-ticking tutorial |
+| :---: | :---: |
+| ![Publish an app: pick a preset or a GitHub repository, tick database, auto-update, file space or email, and publish](docs/images/dashboard-publish.png) | ![Home → Tutorial: what is done and what can still be done, ticked from the server's real state](docs/images/dashboard-tutorial.png) |
+| **Connect your AI** | **On a phone** |
+| ![Connect AI: create an access token with a level and get the exact config for your AI client](docs/images/dashboard-connect-ai.png) | <img src="docs/images/dashboard-phone.png" alt="The apps list on a phone, with a drawer menu" width="260"> |
+
+What you can do there, without a terminal:
+
+- **Publish** from a list of your GitHub repositories (or a folder on the server), with presets for Next.js, Django, FastAPI, Node, Go, ASP.NET, static sites, multi-service Compose and your own Dockerfile. **Ready-made apps** (Uptime Kuma, Memos, IT Tools) install in one click.
+- **Follow every deploy live**: building, testing the new version, switching, live or failed, with the running commit linked to GitHub. A failed deploy is explained in plain words and the previous version keeps serving.
+- **Give an app an address**: paste one Cloudflare token, pick the domain, and the tunnel is found or created for you; or keep it private on Tailscale.
+- **Variables like on Railway/Render**: paste a whole `.env`, values stored encrypted, "Publish again" when they change.
+- **Databases, backups and off-site copies**: create Postgres/Redis per app, nightly encrypted backups, test-restore a backup, send copies to R2, S3, B2, Google, Wasabi, MinIO or another PaaSMCP. See database sizes and growth over 90 days.
+- **Notices** on your phone (ntfy, Discord, Slack) when an app stops or a deploy fails.
+- **Second server, judge and helpers**: pair a second server for a live copy and automatic takeover, pick a judge (arbiter) by a 6-digit code, list the PCs of your Tailscale network and **install PaaSMCP on them from the dashboard**, wake sleeping PCs (Wake-on-LAN), scale apps onto them.
+- **Connect your AI**: create MCP tokens with a level and copy the ready config for Claude Code, Codex, Cursor, VS Code or Gemini CLI. Approve what the agent asked for.
 
 ---
+
+## ✨ What makes it different
+
+- **Built for AI agents *and* people, with a human in the loop.** 28 MCP tools cover what the dashboard does. Agents run safe actions freely; destroying, restoring, public exposure, failover and similar actions wait for a person's approval, bound to the exact parameters and valid once. Secrets are masked in agent output and can be loaded from files, so keys never pass through a chat.
+- **High availability for a homelab.** A second server keeps a live streaming copy of Postgres and the backups; with a small third device as judge, it takes over by itself when the first one goes down, fences the old one, and hands everything back when it returns. Apps can also run on both servers at once (active-active).
+- **Borrow power from your own PCs.** Home PCs on your Tailscale network can run extra copies of an app. Automatic scaling adds and removes copies by CPU and visits, gives the PC back when its owner is using it (courteous mode), and wakes PCs that sleep. Every decision is written to a diary with its reason.
+- **Safe deploys.** Blue/green with a health check: a new version replaces the old one only after it answers. One-second rollback to the previous image.
+- **Encrypted by default.** AES-256-GCM vault for variables and backups, a backup can be test-restored without touching live data, the destroy button goes to a 30-day trash first.
+- **Light.** Without the dashboard nothing stays running (MCP over stdio and the CLI run on demand); the dashboard is one small service. Native Docker Compose underneath, no Kubernetes.
+- **Open source, MIT.** For homelabs, freelancers and companies alike.
+
+---
+
+## ⚖️ How it compares
+
+PaaSMCP sits between two kinds of self-hosted tools. This is a rough map to help you choose, not a feature-by-feature scorecard; check each project's own documentation for details.
+
+| | **Docker management UIs**<br>(e.g. Portainer, [Dockhand](https://dockhand.pro)) | **Self-hosted PaaS dashboards**<br>(e.g. Coolify, Dokploy, CapRover) | **PaaSMCP** |
+| :--- | :--- | :--- | :--- |
+| Main idea | Manage containers, stacks, images and hosts | Push code, get a running app | Push code, get a running app |
+| Web dashboard | ✅ | ✅ | ✅ |
+| Operated by AI agents through MCP, with human approval of risky actions | Not the focus | Not the focus | ✅ Core design goal |
+| Apps from a GitHub repo with build detection | Compose stacks from Git | ✅ | ✅ |
+| Database per app, encrypted backups, off-site copies | Varies | ✅ (varies) | ✅ |
+| Live database copy on a second server + automatic takeover with a judge | — | Varies | ✅ |
+| Extra copies on your own home PCs (scaling, courteous mode, Wake-on-LAN) | — | — | ✅ |
+| License | Varies (Dockhand: BSL 1.1) | Open source (varies) | MIT |
+
+If what you need is a full Docker console (container shells, image layers, vulnerability scans, many remote Docker hosts), a Docker management UI is the better tool, and it can run alongside PaaSMCP. If you want an app platform that both you and your AI can drive safely, with failover and your own PCs as extra capacity, that is what PaaSMCP is for.
+
+---
+
+## ⚡ Quick start
+
+**Requirements:** Linux (Ubuntu/Debian/Fedora/Arch, x86-64 or ARM64), Docker Engine with the Compose plugin, Node.js 20+ and `git`.
+
+```bash
+git clone https://github.com/CodeVanzi/paasmcp.git
+cd paasmcp
+./scripts/install.sh                         # builds, links the `paasmcp` command and initializes the vault
+paasmcp init --postgres --redis --dashboard  # shared Postgres/Redis + the web dashboard on 127.0.0.1:4099
+paasmcp dashboard token                      # the login token
+```
+
+Then pick your path:
+
+- **Dashboard:** open `http://127.0.0.1:4099` (on the server, or through `tailscale serve` / an SSH tunnel), log in with the token and follow **Home → Tutorial**. To reach it from anywhere, use **Make reachable** in the dashboard (Tailscale or Cloudflare Zero Trust) and turn on 2FA with `paasmcp dashboard 2fa enable`.
+- **AI agent:** in the dashboard, **Connect AI** gives you a token and the config for your client; or see [MCP Server Configuration](#-mcp-server-configuration-28-tools) below.
+- **CLI:** `paasmcp deploy my-app owner/repo --postgres`, and the [CLI reference](#-cli-reference).
+
+📖 **Every feature in detail:** [docs/FEATURES.md](./docs/FEATURES.md).
+
+### Installing on a homelab that already runs other things
+
+
+PaaSMCP lives next to your other services. After installing, run `paasmcp doctor` (or open **Diagnostics** in the dashboard): besides your apps, it checks the server around them and says what to fix. These are the usual traps:
+
+- **DNS on the same machine.** If AdGuard Home or Pi-hole runs as a container on this server and the host uses only it, the host loses DNS whenever that container does not come back, and with it Cloudflare Tunnel, image pulls and deploys. Give the host a fallback: `FallbackDNS=1.1.1.1 9.9.9.9` in `/etc/systemd/resolved.conf`, with `/etc/resolv.conf` pointing to systemd-resolved.
+- **Watchtower.** It restarts containers whenever their image changes upstream. Every container PaaSMCP creates carries `com.centurylinklabs.watchtower.enable=false`, because PaaSMCP pins and updates its own images. Containers created before this label existed get it on their next recreate; running Watchtower with `WATCHTOWER_LABEL_ENABLE=true` covers them right away. Pause Watchtower while you test active-active or scaling.
+- **Docker networks.** Docker hands out 172.17-172.31 first, then 192.168.x.0/20, which can cover a home LAN like 192.168.31.0/24. Set `"default-address-pools": [{"base": "10.200.0.0/16", "size": 24}]` in `/etc/docker/daemon.json` before you get there.
+- **Ports.** Apps get loopback ports 4000-4998, skipping 4097 (arbiter), 4099 (dashboard) and anything already listening. The self-hosted entry (`paasmcp edge on`) needs ports 80 and 443 free; with Nginx Proxy Manager or another proxy there, keep Cloudflare Tunnel or put the entry on another machine.
+- **Your own Cloudflare Tunnel container.** PaaSMCP sends public addresses to apps by container name on the `homelab-network` Docker network, so the `cloudflared` container must be on it.
+- **Wired network for servers.** Active-active and the arbiter judge a server by whether it answers; flaky Wi-Fi causes false alarms.
+
+---
+
 
 ## 🏗️ Architecture
 
@@ -74,32 +148,6 @@ flowchart LR
 
 ---
 
-## ⚡ Quick Installation
-
-### Requirements
-- Linux (Ubuntu/Debian/Fedora/Arch)
-- Docker Engine & Docker Compose plugin (`docker compose`)
-- Node.js `>= 20.0.0` & `git`
-
-### 1-Command Setup
-```bash
-git clone <repository-url>
-cd paasmcp
-./scripts/install.sh
-```
-
-### Installing on a homelab that already runs other things
-
-PaaSMCP lives next to your other services. After installing, run `paasmcp doctor` (or open **Diagnostics** in the dashboard): besides your apps, it checks the server around them and says what to fix. These are the usual traps:
-
-- **DNS on the same machine.** If AdGuard Home or Pi-hole runs as a container on this server and the host uses only it, the host loses DNS whenever that container does not come back, and with it Cloudflare Tunnel, image pulls and deploys. Give the host a fallback: `FallbackDNS=1.1.1.1 9.9.9.9` in `/etc/systemd/resolved.conf`, with `/etc/resolv.conf` pointing to systemd-resolved.
-- **Watchtower.** It restarts containers whenever their image changes upstream. Every container PaaSMCP creates carries `com.centurylinklabs.watchtower.enable=false`, because PaaSMCP pins and updates its own images. Containers created before this label existed get it on their next recreate; running Watchtower with `WATCHTOWER_LABEL_ENABLE=true` covers them right away. Pause Watchtower while you test active-active or scaling.
-- **Docker networks.** Docker hands out 172.17-172.31 first, then 192.168.x.0/20, which can cover a home LAN like 192.168.31.0/24. Set `"default-address-pools": [{"base": "10.200.0.0/16", "size": 24}]` in `/etc/docker/daemon.json` before you get there.
-- **Ports.** Apps get loopback ports 4000-4998, skipping 4097 (arbiter), 4099 (dashboard) and anything already listening. The self-hosted entry (`paasmcp edge on`) needs ports 80 and 443 free; with Nginx Proxy Manager or another proxy there, keep Cloudflare Tunnel or put the entry on another machine.
-- **Your own Cloudflare Tunnel container.** PaaSMCP sends public addresses to apps by container name on the `homelab-network` Docker network, so the `cloudflared` container must be on it.
-- **Wired network for servers.** Active-active and the arbiter judge a server by whether it answers; flaky Wi-Fi causes false alarms.
-
----
 
 ## 🛡️ Security Model
 
@@ -118,7 +166,7 @@ Limit: this protects against an agent acting **through MCP**. An agent with a sh
 
 ---
 
-## 🔌 MCP Server Configuration (23 Tools)
+## 🔌 MCP Server Configuration (28 Tools)
 
 ### Remote clients (MCP over HTTP)
 
@@ -182,6 +230,7 @@ Add `paasmcp` to your MCP client configuration:
 | `paas_secret_list` | Lists secret keys for an app or `system` with masked values (`sk_l****def`), each key's description and when it was created and last changed. `paas_secret_set` takes optional `descriptions`. |
 | `paas_secret_delete` | Deletes a secret key from the encrypted vault. |
 | `paas_db_provision` | Creates an isolated PostgreSQL or Redis database and binds `DATABASE_URL` / `REDIS_URL` into the app's vault. |
+| `paas_active` | Active-active: `status`, `check` (what is missing first), `on` / `off` (a person confirms) runs an app on both mirrored servers at once; `tunnel_on` / `tunnel_status` / `tunnel_off` for a Cloudflare Tunnel just for those apps. The self-hosted edge stays CLI-only. |
 | `paas_update` | `check` newer Postgres/Redis/Garage releases within the same major; `apply` (confirmation) backs up, switches (mirror copies first), health-checks and rolls back on failure. |
 | `paas_email_provision` | Lets an app send email through the server's relay (Brevo, SES...): injects `SMTP_*`, `EMAIL_FROM`, `EMAIL_URL` (and `BREVO_API_KEY`), sender `<app>@<domain>`. `action: "status"` shows the relay (never the password), `"test"` sends a test email. |
 | `paas_storage_provision` | Gives an app its own S3 bucket and key on this server (Garage, started on first use) and injects `S3_*` / `AWS_*` into its vault. |
@@ -271,17 +320,13 @@ paasmcp backup target                        # show it (no secret), 'test' or 'c
 # The other way round: let another computer keep ITS backups on this server's Garage, over Tailscale
 paasmcp backup grant laptop --max-gb 50      # one bucket + one key for it, shown once (code + fields)
 paasmcp backup grants                        # list with space used; 'paasmcp backup revoke laptop'
-<<<<<<< HEAD
 # For something outside Tailscale (an app on Render, a VPS): --internet hands out https://s3.<your domain>,
 # this server's S3 API (only it) published through the Cloudflare tunnel. No open port; every request needs a key.
 paasmcp backup grant render-app --max-gb 20 --internet
 paasmcp storage public status                # or 'off' (the keys made with --internet stop working outside Tailscale)
 # Uploads above 50 MB go in parts (S3 multipart), so they fit Cloudflare's 100 MB per request.
-sudo paasmcp backup install-timer --hour 3   # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
-=======
 sudo paasmcp backup install-timer --hour 3   # optional: the dashboard container already runs this every night from 3:30 (server time)
                                              # daily: DB + volume backups, upload, prune local copies older than 7 days (only if already off-site)
->>>>>>> origin/main
 paasmcp backup export-key                    # store the master key OUTSIDE the server; off-site backups are useless without it
 paasmcp backup fetch <backup-id>             # on a fresh server: bring a backup back, then restore it
 
@@ -338,8 +383,12 @@ paasmcp node unpair aspire                # disconnect from a paired server (typ
 
 ---
 
+
+---
+
 ## 📚 Additional Documentation
 
+- 📖 **[Full feature reference (`docs/FEATURES.md`)](./docs/FEATURES.md)**
 - 🇧🇷 **[Guia Completo em Português (`docs/PT-BR.md`)](./docs/PT-BR.md)**
 - 🏛️ **[Technical Architecture, Security Model & Roadmap Specs (`docs/ARCHITECTURE.md`)](./docs/ARCHITECTURE.md)**
 - 🤝 **[Contributing & Detailed Roadmap for Developers / LLMs (`CONTRIBUTING.md`)](./CONTRIBUTING.md)**

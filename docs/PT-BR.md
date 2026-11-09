@@ -4,6 +4,21 @@ O **PaaSMCP** é um Micro-PaaS open-source *"Agent-First & Security-First"* (fei
 
 Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pessoal automatizada, com **0 MB de consumo ocioso de RAM** quando usado só pelo MCP e pela linha de comando. O painel web e o webhook do GitHub, se ligados, são um serviço sempre ativo (pequeno, mas não zero).
 
+
+## 🧭 Três jeitos de usar
+
+| | 🖥️ **Painel web** | 🤖 **IA (MCP)** | ⌨️ **Linha de comando** |
+| :--- | :--- | :--- | :--- |
+| **Para quem** | Qualquer pessoa: sem terminal, sem YAML | Claude Code, Codex, Cursor, VS Code, Gemini CLI, modelos locais | Scripts e quem gosta do terminal |
+| **Cobre** | Todas as funções, com um tutorial que se marca sozinho e guias na própria tela de cada função | Tudo, menos os passos que levariam senha ou chave pelo chat da IA (esses ficam no painel e na linha de comando de propósito) | Tudo |
+| **Ações arriscadas** | Confirmação na tela (digitar o nome nas mais perigosas) | A IA só *pede*; uma pessoa aprova no painel ou com `paasmcp approve` | Pede confirmação |
+
+O painel é completo, em português e inglês, claro ou escuro, e funciona no celular: dá para instalar o PaaSMCP, abrir o painel e não voltar ao terminal. Ele mostra os apps com o status do deploy ao vivo, publica a partir da lista de repositórios do GitHub, cria bancos, cópias e cópias fora do servidor, liga domínio da Cloudflare com um token, pareia o segundo servidor e o juiz, instala o PaaSMCP em outros PCs da Tailscale e cria o acesso da sua IA.
+
+![Painel do PaaSMCP: lista de apps com status ao vivo, endereços, bancos e ações](images/dashboard-apps.png)
+
+Mais telas no [README](../README.md#-the-web-dashboard).
+
 ---
 
 ## 🎯 Tudo o que o PaaSMCP faz por você
