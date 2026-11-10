@@ -5572,6 +5572,17 @@ volumes:
       assert.throws(() => ai.validateModel("--help"), ai.AssistantError);
       assert.equal(ai.validateModel("qwen3.5:4b-q4_K_M"), "qwen3.5:4b-q4_K_M");
 
+      // A failed model test is explained (address + what to check), never a bare "fetch failed".
+      const unreachable = Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_CONNECT_TIMEOUT" } });
+      const explained = ai.explainModelError(unreachable, "http://100.64.0.7:11434");
+      assert.ok(explained instanceof ai.AssistantError);
+      assert.match(explained.message, /100\.64\.0\.7:11434.*timeout/);
+      assert.match(explained.pt, /tempo esgotado.*firewall/);
+      assert.match(ai.explainModelError(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } })).pt, /conexão recusada/);
+      assert.match(ai.explainModelError(new Error("The model answered HTTP 404: model not found")).pt, /HTTP 404/);
+      const own = new ai.AssistantError("x", "y");
+      assert.equal(ai.explainModelError(own), own);
+
       // The local model's container: never on 0.0.0.0; shared only on the Tailscale IP; GPU only when asked.
       const plain = ai.ollamaCompose({ gpu: false, cpus: 2 });
       assert.doesNotMatch(plain, /ports:|0\.0\.0\.0|nvidia/);
