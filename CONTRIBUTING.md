@@ -18,6 +18,7 @@ Thank you for contributing to **PaaSMCP**! This document serves as both a contri
    ```bash
    npm test
    ```
+4. **Try it in the test environment before it reaches `main`:** pull requests target the `staging` branch. A test copy of PaaSMCP (`sudo scripts/staging.sh up`) follows `staging` in its own box, with its own Docker engine and data, so nothing touches the official install. Once a change is approved there, a `staging → main` pull request promotes it; the official dashboard follows `main`. See "Ambiente de testes no mesmo servidor" in `docs/PT-BR.md`.
 
 ---
 

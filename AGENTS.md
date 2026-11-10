@@ -69,3 +69,4 @@
    - Every risky action goes through `src/guard.ts`: classify it in `assessRisk`, call `authorizeAgent` from MCP tools and `authorizeHuman` from the dashboard/CLI. Agents must never be able to approve their own requests.
    - Prefer "allow with warning + confirmation" over removing a feature; forbid only what has no safe use.
 3. **Always run `npm run build && npm test`** after modifying any TypeScript file in `src/`.
+4. **Open pull requests against `staging`, not `main`.** The test copy (`scripts/staging.sh`, a box named `staging-paasmcp` with its own Docker engine and `PAASMCP_ENV_LABEL` set) follows `staging`; `main` only receives a `staging → main` promotion after the change was tried there. Never name test containers `paasmcp-*` (that prefix is counted as the official install's).
