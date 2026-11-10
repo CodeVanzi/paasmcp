@@ -411,6 +411,7 @@ export function startSwapHelper(image: string, sha: string, runId: string): void
       "--network", DOCKER_NETWORK,
       "-e", `PAASMCP_ROOT=${HOMELAB_ROOT}`,
       "-e", "PAASMCP_SWAP_HELPER=1",
+      ...(process.env.PAASMCP_ENV_LABEL ? ["-e", `PAASMCP_ENV_LABEL=${process.env.PAASMCP_ENV_LABEL}`] : []),
       "-v", `${HOMELAB_ROOT}:${HOMELAB_ROOT}`,
       "-v", "/var/run/docker.sock:/var/run/docker.sock",
       ...(tsDir ? ["-v", `${tsDir}:${tsDir}`] : []),

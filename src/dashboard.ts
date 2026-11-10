@@ -1387,10 +1387,18 @@ function tellPeerAboutArbiter(): void {
 
 /**
  * Name of this installation's environment when it is not the official one (e.g. "AMBIENTE DE TESTES").
- * Set by scripts/staging.sh; empty on a normal install. Shown as a strip on every page and in the tab title.
+ * Set by scripts/staging.sh (variable PAASMCP_ENV_LABEL or the file paasmcp/environment-label); empty on a normal install. Shown as a strip on every page and in the tab title.
  */
 export function environmentLabel(): string {
-  return (process.env.PAASMCP_ENV_LABEL || "").replace(/[^\p{L}\p{N} ._:()·!-]+/gu, " ").replace(/ {2,}/g, " ").trim().slice(0, 60);
+  // The file (written by scripts/staging.sh) survives every way the dashboard is recreated:
+  // a self-update swap, a restart, an install command run by hand.
+  let fromFile = "";
+  try {
+    fromFile = fs.readFileSync(path.join(PAAS_DATA_DIR, "environment-label"), "utf-8");
+  } catch {
+    /* normal install: no file */
+  }
+  return (process.env.PAASMCP_ENV_LABEL || fromFile).replace(/[^\p{L}\p{N} ._:()·!-]+/gu, " ").replace(/ {2,}/g, " ").trim().slice(0, 60);
 }
 
 export function environmentStrip(label: string, branch?: string): string {
