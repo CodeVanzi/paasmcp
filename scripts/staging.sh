@@ -10,10 +10,11 @@
 #   sudo scripts/staging.sh status    Is it running, which branch and commit, how to open it
 #   sudo scripts/staging.sh token     Login token of the test dashboard
 #   sudo scripts/staging.sh update    Check the followed branch now (instead of waiting ~2 min)
-#   sudo scripts/staging.sh domain <subdomain>
+#   sudo scripts/staging.sh domain <subdomain> [e-mail]
 #                                     Publish the test dashboard at https://<subdomain>.<your domain>,
 #                                     behind Cloudflare Access. First connect Cloudflare in the TEST
-#                                     dashboard (Connections > Domain, "Create a new tunnel", your e-mail).
+#                                     dashboard (Connections > Domain, "Create a new tunnel"). The e-mail
+#                                     given here (or saved there) is the only one let in.
 #   sudo scripts/staging.sh logs      Logs of the test dashboard
 #   sudo scripts/staging.sh shell     A shell inside the box (paasmcp CLI of the test copy)
 #   sudo scripts/staging.sh stop      Stop the box (data kept)
@@ -130,6 +131,11 @@ cmd_domain() {
   [[ "$sub" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
     || die "Usage: $0 domain <subdomain>   (only the first part, e.g. testepaasmcp for testepaasmcp.yourdomain.com)"
   running || die "The box is not running. Start it with: sudo $0 up"
+  local email="${2:-}"
+  if [ -n "$email" ]; then
+    [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "Invalid e-mail: $email"
+    cli config --zero-trust-emails "$email" >/dev/null || die "Could not save the e-mail in the test copy."
+  fi
   # What is missing in the test copy's Cloudflare settings: tunnel, domain, e-mail for Access.
   local missing
   missing=$(cli config 2>/dev/null | inbox node -e '
@@ -141,7 +147,10 @@ cmd_domain() {
       if (!(cf.zeroTrustEmails || []).length) m.push("e-mail");
       console.log(m.join(", "));
     });') || die "Could not read the test copy's settings."
-  [ -z "$missing" ] || die "Missing in the TEST dashboard: $missing. Open it, go to Connections > Domain, paste the Cloudflare token, pick the domain, choose \"Create a new tunnel\" and fill in your e-mail (only it gets in). Then run this again."
+  if [ "$missing" = "e-mail" ]; then
+    die "Missing the e-mail allowed in (Cloudflare Access). Run: sudo $0 domain $sub you@example.com"
+  fi
+  [ -z "$missing" ] || die "Missing in the TEST dashboard: $missing. Open it, go to Connections > Domain, paste the Cloudflare token, pick the domain and choose \"Create a new tunnel\". Then run: sudo $0 domain $sub you@example.com"
   say "Publishing the test dashboard at ${sub}.<domain> (own tunnel of the test copy, Cloudflare Access)..."
   cli dashboard start --expose zero-trust --subdomain "$sub" --yes \
     | grep -E '"(url|details)"' | sed 's/^ */  /' || true
@@ -163,7 +172,7 @@ case "${1:-status}" in
   status)   cmd_status ;;
   token)    running || die "The box is not running."; cli dashboard token ;;
   update)   running || die "The box is not running."; cli dashboard update --force ;;
-  domain)   cmd_domain "${2:-}" ;;
+  domain)   cmd_domain "${2:-}" "${3:-}" ;;
   logs)     running || die "The box is not running."; inbox docker logs --tail "${2:-200}" paasmcp-dashboard ;;
   shell)    running || die "The box is not running."; docker exec -it -w "$SRC" "$BOX" bash ;;
   stop)     exists && docker stop "$BOX" >/dev/null; echo "Stopped (data kept). Start again with: sudo $0 up" ;;
