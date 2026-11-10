@@ -5536,7 +5536,7 @@ volumes:
       const strip = dashboard.environmentStrip(dashboard.environmentLabel(), "staging");
       assert.match(strip, /AMBIENTE DE TESTES/);
       assert.match(strip, /<code>staging<\/code>/);
-      assert.match(dashboard.renderDashboardHtml(false), /sudo scripts\/staging\.sh token/, "the test login points to the test token, not the official one");
+      assert.match(dashboard.renderDashboardHtml(false), /sudo paasmcp staging token/, "the test login points to the test token, not the official one");
       process.env.PAASMCP_ENV_LABEL = 'TESTE <script>x</script> ${HOME} "a"\nb';
       const label = dashboard.environmentLabel();
       assert.doesNotMatch(label, /[<>$"{}\n]/, "only plain characters reach the page and the compose file");

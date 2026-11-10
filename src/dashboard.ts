@@ -1744,7 +1744,7 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
     <div class="err" id="err"></div>
     <div class="help-box">
       <strong id="helpTitle"></strong><br/>
-      <code>${envLabel ? "sudo scripts/staging.sh token" : "paasmcp dashboard token"}</code>
+      <code>${envLabel ? "sudo paasmcp staging token" : "paasmcp dashboard token"}</code>
     </div>
   </div>
   <script>
