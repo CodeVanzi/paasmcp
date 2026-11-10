@@ -9,6 +9,8 @@
 >
 > **Use it the way you like:** click through a full **web dashboard** (no terminal needed after install), ask an **AI agent** through **MCP** ("publish my app", "back up now"), or use the **CLI**. All three drive the same actions with the same safety rules.
 >
+> **Or just chat with it.** The dashboard has its own chat that runs the same tools, with a **free local LLM** (Ollama on the server or on another PC of yours, on an NVIDIA GPU if you have one) or an **external LLM** through your API key (Gemini, OpenRouter, Groq, OpenAI or any OpenAI-compatible service, or Claude). [How it works ↓](#-chat-with-your-server-local-or-external-llm)
+>
 > 🇧🇷 **[Documentação completa em português (docs/PT-BR.md)](./docs/PT-BR.md)**
 
 ![PaaSMCP dashboard: the apps list with live status, addresses, databases and one-click actions](docs/images/dashboard-apps.png)
@@ -52,11 +54,36 @@ What you can do there, without a terminal:
 
 ---
 
+## 💬 Chat with your server: local or external LLM
+
+Open **Chat** in the dashboard and ask in plain words: "publish user/my-app at app.mydomain.com", "why is the blog down?", "back up the shop's database now". The assistant answers with the same 28 tools as MCP, running inside the dashboard. Risky actions stop at the usual approval and show **Approve** / **Refuse** right in the chat, so the model can never approve its own request.
+
+**Chat → Model** picks who does the thinking:
+
+| Where the model runs | Cost | What you need |
+| :--- | :--- | :--- |
+| **On this server** (local LLM) | Free and private | One click: PaaSMCP starts Ollama in a pinned container and downloads the model. Uses an NVIDIA GPU when Docker can see it. |
+| **On another PC of yours** (local LLM) | Free and private | A PC with PaaSMCP that ticked *Share with my other PCs*: its model answers on its Tailscale IP only. A server without a GPU can use the card of a PC at home. |
+| **An API** (external LLM) | Your plan with the provider | A key for any OpenAI-compatible service (Gemini, OpenRouter and Groq have free tiers; OpenAI) or for the Claude API. The key stays in the encrypted vault and never comes back to the screen. |
+
+**Real numbers.** On a GTX 1060 with 6 GB, `qwen3.5:4b-q4_K_M` runs entirely on the card (about 3.7 GB of video memory) at about 32 tokens per second. Without a GPU, for example on a 3-core ARM VM, each answer takes from tens of seconds to minutes and multi-step maintenance often fails: use another PC's GPU or an API there.
+
+**Turning on an NVIDIA GPU** (once, on the host, needs root and a reboot, so it is not a dashboard button):
+
+1. Install the NVIDIA driver. For GTX 10xx (Pascal) cards use the **570 or 580** series and hold it (`apt-mark hold`): the 590 series dropped those cards, so avoid `ubuntu-drivers autoinstall`. Reboot and check with `nvidia-smi`.
+2. Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), then run `sudo nvidia-ctk runtime configure --runtime=docker` and `sudo systemctl restart docker` (this restarts every container for a moment).
+3. Check with `docker run --rm --gpus all ubuntu:24.04 nvidia-smi`. The **Chat → Model** screen then offers *Use the NVIDIA graphics card*.
+
+CLI: `paasmcp assistant status|install [--model] [--gpu] [--share]|remove|test`.
+
+---
+
 ## ✨ What makes it different
 
 - **Built for AI agents *and* people, with a human in the loop.** 28 MCP tools cover what the dashboard does. Agents run safe actions freely; destroying, restoring, public exposure, failover and similar actions wait for a person's approval, bound to the exact parameters and valid once. Secrets are masked in agent output and can be loaded from files, so keys never pass through a chat.
 - **High availability for a homelab.** A second server keeps a live streaming copy of Postgres and the backups; with a small third device as judge, it takes over by itself when the first one goes down, fences the old one, and hands everything back when it returns. Apps can also run on both servers at once (active-active).
 - **Borrow power from your own PCs.** Home PCs on your Tailscale network can run extra copies of an app. Automatic scaling adds and removes copies by CPU and visits, gives the PC back when its owner is using it (courteous mode), and wakes PCs that sleep. Every decision is written to a diary with its reason.
+- **Works with a local or an external LLM.** Talk to the server in the dashboard's chat with a free model running on your own hardware, or with Gemini, OpenRouter, Groq, OpenAI or Claude through your key. Same tools, same approvals either way.
 - **Safe deploys.** Blue/green with a health check: a new version replaces the old one only after it answers. One-second rollback to the previous image.
 - **Encrypted by default.** AES-256-GCM vault for variables and backups, a backup can be test-restored without touching live data, the destroy button goes to a 30-day trash first.
 - **Light.** Without the dashboard nothing stays running (MCP over stdio and the CLI run on demand); the dashboard is one small service. Native Docker Compose underneath, no Kubernetes.
