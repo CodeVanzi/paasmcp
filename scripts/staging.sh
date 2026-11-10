@@ -96,6 +96,8 @@ cmd_up() {
     docker network connect "$NETWORK" "$BOX" 2>/dev/null || true
   fi
   wait_docker
+  # The strip on the test dashboard: kept in its data, so every new version of the dashboard shows it.
+  inbox sh -c 'mkdir -p /opt/homelab/paasmcp && printf "%s" "$PAASMCP_ENV_LABEL" > /opt/homelab/paasmcp/environment-label'
 
   if ! inbox test -f "$SRC/dist/cli.js"; then
     say "Installing PaaSMCP ($BRANCH) inside the box..."
