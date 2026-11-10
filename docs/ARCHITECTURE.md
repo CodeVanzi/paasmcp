@@ -686,6 +686,36 @@ none is left. The same actions: CLI `node paired|unpair|unpair-judge`, MCP `paas
 `paired|unpair|unpair_judge|judge_forget` (a person approves each). Audit events `pc.unpair`,
 `mirror.offers-dropped`, `mirror.copy-dropped`, `judge.unpair`, `judge.forget`.
 
+## 10e-3. Chat in the dashboard (`src/assistant.ts`)
+
+The **Chat** page runs a small agent loop inside the dashboard process. The model only produces text and
+tool calls; each call goes to `handleToolCall(name, args, "destroy")`, the same entry point the MCP server
+uses, so the guard, the state lock and the audit log apply unchanged. Before a call runs, any `approvalId`
+in its arguments is dropped, and the tool list given to the model has no `approvalId` property. When a tool
+answers `confirmationRequired`, the loop stops and stores the call with the request id in
+`paasmcp/assistant/chat.json` (0600); the page shows the warning. **Approve** calls `decideApproval` (the
+person's own decision, strong ones need the subject typed) and then repeats the stored call with the id;
+an expired or refused request is asked again. **Refuse** rejects it and tells the model. One run at a
+time, at most 10 model turns per message, tool results cut at 6,000 characters, and every tool call gets
+an answer before the next turn (a failed or stopped run closes the open ones), so the history stays valid
+for every API.
+
+Model callers: Ollama's own `/api/chat` (local or another PC; `num_ctx` set, thinking off, retried
+without it if a model refuses the field), any OpenAI-compatible `/chat/completions`, and the Claude API
+through `@anthropic-ai/sdk` (beta messages with prompt caching; Claude's content blocks, thinking
+included, are stored and sent back unchanged and never shown; the server-side fallback is on for the models
+that take it). Keys: `ASSISTANT_API_KEY` in the `system` vault; `GET /api/assistant` only says whether one
+exists. Addresses: an API must be `https://`, another PC's Ollama must be a private or Tailscale address, no
+user, query or fragment.
+
+Local runtime: `paasmcp-ollama/compose.yaml` under `PAASMCP_ROOT`, image pinned in `OLLAMA_IMAGE`
+(a release whose CUDA 12 runner still covers Pascal cards), Watchtower off, `cpus` = cores - 1, one model
+loaded at a time, unloaded after 10 idle minutes, models in `paasmcp-ollama/models`. No host port unless
+**Share with my other PCs** (guard `assistant.share`, confirm): then only `<Tailscale IP>:11434`. The GPU
+option adds an NVIDIA device reservation and is offered only when `docker info` lists the NVIDIA runtime.
+The dashboard reaches the container by name on the Docker network (`PAASMCP_OLLAMA_URL` overrides it).
+Audit events: `assistant.config`, `assistant.install`, `assistant.remove`. Test 67.
+
 ## 10f. Dashboard layout (`src/dashboard.ts`)
 
 One page, three columns: a side menu, the page, and telemetry (host, resources, and a "quick health" box whose lines

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import YAML from "yaml";
+import type * as AI from "./assistant.js";
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paasmcp-test-"));
 process.env.PAASMCP_ROOT = tempRoot;
@@ -5551,6 +5552,163 @@ volumes:
       assert.equal(dashboard.environmentLabel(), "");
     } finally {
       if (before === undefined) delete process.env.PAASMCP_ENV_LABEL; else process.env.PAASMCP_ENV_LABEL = before;
+    }
+  });
+
+  await t.test("67. Chat with an AI: tools run here, risky actions wait for a person, the model never holds an approval id or key", async () => {
+    const ai = await import("./assistant.js");
+    const guard = await import("./guard.js");
+    const sysBefore = vault.getSecrets("system");
+    const stateBefore = config.loadState() as unknown as Record<string, unknown>;
+    try {
+      // Addresses: a remote model only on the home network or Tailscale; an API only over https; no login in URLs.
+      assert.equal(ai.validateBaseUrl("http://100.101.102.103:11434/", "remote"), "http://100.101.102.103:11434");
+      assert.equal(ai.validateBaseUrl("http://192.168.1.20:11434", "remote"), "http://192.168.1.20:11434");
+      assert.throws(() => ai.validateBaseUrl("http://8.8.8.8:11434", "remote"), ai.AssistantError);
+      assert.throws(() => ai.validateBaseUrl("http://api.example.com/v1", "openai"), ai.AssistantError);
+      assert.throws(() => ai.validateBaseUrl("https://user:pw@api.example.com/v1", "openai"), ai.AssistantError);
+      assert.throws(() => ai.validateBaseUrl("https://api.example.com/v1?x=1", "openai"), ai.AssistantError);
+      assert.throws(() => ai.validateModel("qwen; rm -rf /"), ai.AssistantError);
+      assert.throws(() => ai.validateModel("--help"), ai.AssistantError);
+      assert.equal(ai.validateModel("qwen3.5:4b-q4_K_M"), "qwen3.5:4b-q4_K_M");
+
+      // A failed model test is explained (address + what to check), never a bare "fetch failed".
+      const unreachable = Object.assign(new TypeError("fetch failed"), { cause: { code: "UND_ERR_CONNECT_TIMEOUT" } });
+      const explained = ai.explainModelError(unreachable, "http://100.64.0.7:11434");
+      assert.ok(explained instanceof ai.AssistantError);
+      assert.match(explained.message, /100\.64\.0\.7:11434.*timeout/);
+      assert.match(explained.pt, /tempo esgotado.*firewall/);
+      assert.match(ai.explainModelError(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } })).pt, /conexão recusada/);
+      assert.match(ai.explainModelError(new Error("The model answered HTTP 404: model not found")).pt, /HTTP 404/);
+      const own = new ai.AssistantError("x", "y");
+      assert.equal(ai.explainModelError(own), own);
+
+      // The local model's container: never on 0.0.0.0; shared only on the Tailscale IP; GPU only when asked.
+      const plain = ai.ollamaCompose({ gpu: false, cpus: 2 });
+      assert.doesNotMatch(plain, /ports:|0\.0\.0\.0|nvidia/);
+      assert.match(plain, new RegExp(ai.OLLAMA_IMAGE.replace(/[.:/]/g, "\\$&")));
+      const shared = ai.ollamaCompose({ gpu: true, shareIp: "100.64.0.7", cpus: 3 });
+      assert.match(shared, /"100\.64\.0\.7:11434:11434"/);
+      assert.match(shared, /driver: nvidia/);
+      assert.equal(ai.cpusForModel(4), 3);
+      assert.equal(ai.cpusForModel(1), 1);
+      assert.match(ai.OLLAMA_IMAGE, /^ollama\/ollama:\d+\.\d+\.\d+$/, "pinned, never latest");
+
+      // Sharing asks a person.
+      assert.equal(guard.assessRisk("assistant.share", { ip: "100.64.0.7" })?.level, "confirm");
+
+      // Tools: the model never sees approvalId; short descriptions are smaller.
+      const full = await ai.assistantTools(false);
+      const compact = await ai.assistantTools(true);
+      assert.ok(full.length >= 27);
+      for (const tdef of [...full, ...compact]) assert.equal(JSON.stringify(tdef.parameters).includes("approvalId"), false, tdef.name);
+      assert.ok(JSON.stringify(compact).length < JSON.stringify(full).length * 0.8);
+      assert.equal(ai.shorten("Lists apps, e.g. web ones. Second sentence.", 200), "Lists apps, e.g. web ones.");
+
+      // Settings: an API needs a key, kept only in the vault.
+      assert.throws(() => ai.saveAssistantConfig({ provider: "openai", baseUrl: "https://api.example.com/v1", model: "m1" }), ai.AssistantError);
+      const cfg = ai.saveAssistantConfig({ provider: "openai", baseUrl: "https://api.example.com/v1", model: "m1", apiKey: "sk-test-123" });
+      assert.equal(JSON.stringify(cfg).includes("sk-test-123"), false);
+      assert.equal(JSON.stringify(config.loadState()).includes("sk-test-123"), false);
+      assert.equal(vault.getSecrets("system").ASSISTANT_API_KEY, "sk-test-123");
+      const kept = ai.saveAssistantConfig({ provider: "anthropic" });
+      assert.equal(kept.model, ai.DEFAULT_ANTHROPIC_MODEL, "the key stays when not sent again");
+      assert.throws(() => ai.saveAssistantConfig({ provider: "remote", baseUrl: "http://100.64.0.7:11434", model: "x", numCtx: 999999 }), ai.AssistantError);
+
+      // A run: the model asks for a tool, gets its result, answers.
+      ai.resetChat();
+      const script: AI.ModelReply[] = [];
+      const seen: AI.ChatMessage[][] = [];
+      const caller: AI.ModelCaller = async (msgs) => {
+        seen.push(JSON.parse(JSON.stringify(msgs)));
+        return script.shift() || { text: "done", toolCalls: [] };
+      };
+      script.push({ text: "", toolCalls: [{ id: "c1", name: "paas_approvals", args: {} }] }, { text: "Nothing pending.", toolCalls: [] });
+      ai.sendMessage("anything pending?", "en", caller);
+      assert.throws(() => ai.sendMessage("again", "en", caller), ai.AssistantError, "one run at a time");
+      await ai.waitForRun();
+      let chat = ai.loadChat();
+      assert.equal(chat.status, "idle");
+      assert.deepEqual(chat.messages.map((m) => m.role), ["user", "assistant", "tool", "assistant"]);
+      assert.equal(chat.messages[2].toolName, "paas_approvals");
+      assert.equal(chat.messages[3].text, "Nothing pending.");
+
+      // A risky call pauses; an approval id the model makes up is dropped.
+      script.push({ text: "", toolCalls: [{ id: "c2", name: "paas_app_lifecycle", args: { appName: "ghost-app", action: "destroy", approvalId: "c-MADEUP" } }] }, { text: "Gone.", toolCalls: [] });
+      ai.sendMessage("delete ghost-app", "en", caller);
+      await ai.waitForRun();
+      chat = ai.loadChat();
+      assert.equal(chat.status, "waiting");
+      const pend = chat.pending!;
+      assert.notEqual(pend.approvalId, "c-MADEUP");
+      assert.equal(pend.call.args.approvalId, undefined);
+      assert.equal(chat.messages[chat.messages.length - 1].toolCalls![0].args.approvalId, undefined);
+      assert.equal(guard.listApprovals().find((a) => a.id === pend.approvalId)?.status, "pending");
+      assert.throws(() => ai.sendMessage("hurry", "en", caller), ai.AssistantError, "the person answers the card first");
+      // Approving runs the same call with the id (here the app does not exist, so the tool itself fails, but past the guard).
+      ai.decidePending({ approve: true, by: "test" }, caller);
+      await ai.waitForRun();
+      chat = ai.loadChat();
+      assert.equal(guard.listApprovals().find((a) => a.id === pend.approvalId)?.status, "used");
+      const result = chat.messages.find((m) => m.role === "tool" && m.toolCallId === "c2")!;
+      assert.doesNotMatch(result.text, /confirmationRequired/);
+      assert.equal(chat.status, "idle");
+      for (const turn of seen) for (const m of turn) assert.equal(JSON.stringify(m).includes(pend.approvalId), false, "the model never sees the id");
+
+      // Refusing: the request is rejected and the model is told.
+      script.push({ text: "", toolCalls: [{ id: "c3", name: "paas_app_lifecycle", args: { appName: "ghost-app", action: "destroy" } }] }, { text: "Ok, kept.", toolCalls: [] });
+      ai.sendMessage("delete it again", "en", caller);
+      await ai.waitForRun();
+      const p3 = ai.loadChat().pending!;
+      ai.decidePending({ approve: false, by: "test" }, caller);
+      await ai.waitForRun();
+      chat = ai.loadChat();
+      assert.equal(guard.listApprovals(false).find((a) => a.id === p3.approvalId)?.status, "rejected");
+      assert.match(chat.messages.find((m) => m.toolCallId === "c3")!.text, /refused/);
+
+      // Strong actions need the name typed.
+      script.push({ text: "", toolCalls: [{ id: "c4", name: "paas_app_lifecycle", args: { appName: "ghost-app", action: "purge" } }] });
+      ai.sendMessage("purge it", "en", caller);
+      await ai.waitForRun();
+      assert.equal(ai.loadChat().pending?.level, "strong");
+      assert.throws(() => ai.decidePending({ approve: true, by: "test" }, caller));
+      ai.decidePending({ approve: false, by: "test" }, caller);
+      await ai.waitForRun();
+
+      // A failing model leaves no call without an answer, so the next turn is accepted.
+      script.push({ text: "", toolCalls: [{ id: "c5", name: "paas_approvals", args: {} }, { id: "c6", name: "paas_approvals", args: {} }] });
+      const failing: AI.ModelCaller = async (msgs) => {
+        if (msgs[msgs.length - 1].role === "user") return script.shift()!;
+        throw new Error("model down");
+      };
+      ai.sendMessage("two calls", "en", failing);
+      await ai.waitForRun();
+      chat = ai.loadChat();
+      assert.equal(chat.status, "error");
+      const ids = new Set(chat.messages.filter((m) => m.role === "tool").map((m) => m.toolCallId));
+      assert.ok(ids.has("c5") && ids.has("c6"));
+
+      // What the dashboard gets carries no raw model blocks.
+      chat.messages.push({ role: "assistant", text: "x", raw: [{ type: "thinking", thinking: "zq-hidden-thought" }], at: new Date().toISOString() });
+      assert.equal(JSON.stringify(ai.publicChat(chat)).includes("zq-hidden-thought"), false);
+
+      // Claude format: tool results of one turn go together, after the turn's tool_use blocks.
+      const am = ai.anthropicMessages([
+        { role: "user", text: "hi", at: "" },
+        { role: "assistant", text: "", toolCalls: [{ id: "a", name: "paas_approvals", args: {} }, { id: "b", name: "paas_doctor", args: {} }], at: "" },
+        { role: "tool", toolCallId: "a", text: "1", at: "" },
+        { role: "tool", toolCallId: "b", text: "2", isError: true, at: "" },
+      ]);
+      assert.equal(am.length, 3);
+      assert.deepEqual((am[2].content as { type: string; tool_use_id: string }[]).map((b) => b.tool_use_id), ["a", "b"]);
+      assert.ok(ai.systemPrompt("pt").includes("never instructions"));
+      ai.resetChat();
+    } finally {
+      vault.saveSecrets("system", sysBefore);
+      const s = config.loadState() as unknown as Record<string, unknown>;
+      delete s.assistant;
+      if (stateBefore.assistant) s.assistant = stateBefore.assistant;
+      config.saveState(s as never);
     }
   });
 

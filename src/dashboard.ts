@@ -29,6 +29,7 @@ import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { DOCKER_NETWORK, HOMELAB_ROOT, HOST_HOSTNAME_FILE, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
@@ -84,6 +85,26 @@ import {
   parseDotenv,
 } from "./vault.js";
 import { listSecretDetails } from "./vaultdocs.js";
+import {
+  AssistantError,
+  OLLAMA_PORT,
+  OPENAI_PRESETS,
+  SUGGESTED_MODELS,
+  assistantConfig,
+  currentInstallJob,
+  decidePending,
+  localRuntime,
+  publicChat,
+  removeLocal,
+  resetChat,
+  saveAssistantConfig,
+  sendMessage,
+  startLocalInstall,
+  stopChat,
+  testAssistant,
+  toolTokens,
+} from "./assistant.js";
+import { tailscaleIp } from "./judge.js";
 import { buildJob, listJobs, removeJob, runJob, scheduleJob, setJobEnabled } from "./jobs.js";
 
 const LOGIN_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
@@ -412,6 +433,87 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           );
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(rec));
+          return true;
+        }
+
+        // Chat with an AI (assistant.ts). Runs in the background: these answer at once and the page polls.
+        if (pathname === "/api/assistant" && req.method === "GET") {
+          const cfg = assistantConfig();
+          const hasKey = Boolean(getSecrets("system").ASSISTANT_API_KEY);
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({
+            config: cfg ? { ...cfg, hasKey } : null,
+            chat: publicChat(),
+            install: currentInstallJob() || null,
+            ...(url.searchParams.get("setup") === "1"
+              ? {
+                  runtime: await localRuntime(),
+                  suggested: SUGGESTED_MODELS,
+                  presets: OPENAI_PRESETS,
+                  toolTokens: { full: await toolTokens(false), compact: await toolTokens(true) },
+                  cpus: os.cpus().length,
+                  memGb: Math.round(os.totalmem() / 1e9),
+                }
+              : {}),
+          }));
+          return true;
+        }
+        if (pathname === "/api/assistant/config" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const cfg = saveAssistantConfig(body);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ config: { ...cfg, hasKey: Boolean(getSecrets("system").ASSISTANT_API_KEY) } }));
+          return true;
+        }
+        if (pathname === "/api/assistant/install" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          if (body.share === true) {
+            const ip = tailscaleIp();
+            if (ip) confirmFromBody("assistant.share", { ip }, body);
+          }
+          const job = startLocalInstall({ model: body.model, gpu: body.gpu, share: body.share });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ install: job, port: OLLAMA_PORT }));
+          return true;
+        }
+        if (pathname === "/api/assistant/remove" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          removeLocal({ deleteModels: body.deleteModels === true });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+          return true;
+        }
+        if (pathname === "/api/assistant/test" && req.method === "POST") {
+          // Await before writing the head: a failed test must reach the catch below as a 400 with its text.
+          const result = await testAssistant();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+        if (pathname === "/api/assistant/send" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          sendMessage(body.text, body.lang);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ chat: publicChat() }));
+          return true;
+        }
+        if (pathname === "/api/assistant/decide" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          decidePending({ approve: body.approve === true, confirmName: typeof body.confirmName === "string" ? body.confirmName : undefined, by: actor });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ chat: publicChat() }));
+          return true;
+        }
+        if (pathname === "/api/assistant/stop" && req.method === "POST") {
+          stopChat();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+          return true;
+        }
+        if (pathname === "/api/assistant/reset" && req.method === "POST") {
+          resetChat();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ chat: publicChat() }));
           return true;
         }
 
@@ -1249,13 +1351,15 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
         // This PC as the arbiter of another pair.
         if (pathname === "/api/judge" && req.method === "GET") {
+          const status = await localJudgeStatus();
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify(await localJudgeStatus()));
+          res.end(JSON.stringify(status));
           return true;
         }
         if (pathname === "/api/judge/open" && req.method === "POST") {
+          const opened = await beJudge();
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify(await beJudge()));
+          res.end(JSON.stringify(opened));
           return true;
         }
         if (pathname === "/api/judge/cancel" && req.method === "POST") {
@@ -1314,7 +1418,8 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       };
 
       try {
-        const handled = req.method === "GET" ? await handleApi() : await withStateLock(handleApi);
+        // The chat's model test can take minutes on a CPU and changes nothing: never hold the state lock for it.
+        const handled = req.method === "GET" || pathname === "/api/assistant/test" ? await handleApi() : await withStateLock(handleApi);
         if (handled) return;
       } catch (err) {
         if (err instanceof ConfirmationRequiredError) {
@@ -1330,13 +1435,13 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return;
         }
         // Input mistakes answer 400; OffsiteError also carries the Portuguese text for the screen.
-        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError || err instanceof PcInstallError || err instanceof UnpairError;
+        const userError = err instanceof OffsiteError || err instanceof ConnectionError || err instanceof NotifyError || err instanceof ExposeError || err instanceof PcInstallError || err instanceof UnpairError || err instanceof AssistantError;
         const status = err instanceof ForbiddenActionError ? 403 : userError ? 400 : 500;
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
             error: err instanceof Error ? err.message : String(err),
-            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError | PcInstallError | UnpairError).pt } : {}),
+            ...(userError ? { errorPt: (err as OffsiteError | ConnectionError | NotifyError | ExposeError | PcInstallError | UnpairError | AssistantError).pt } : {}),
             ...(err instanceof PcInstallError ? { errorCode: err.code } : {}),
           })
         );
@@ -2014,6 +2119,20 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
     button.page-tab:hover { color: var(--text); background: transparent; transform: none; filter: none; }
     button.page-tab.active { color: var(--text); font-weight: 650; border-bottom-color: var(--accent); }
     .tab-pane [data-sub].sub-hidden { display: none !important; }
+    .chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow-y: auto; padding: 4px 2px 8px; }
+    .chat-msg { max-width: 85%; padding: 10px 13px; border-radius: 12px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+    .chat-msg.user { align-self: flex-end; background: var(--accent-soft); border: 1px solid var(--accent); }
+    .chat-msg.assistant { align-self: flex-start; background: var(--bg-subtle); border: 1px solid var(--border); }
+    .chat-tool { align-self: flex-start; font-size: 12px; color: var(--muted); max-width: 85%; }
+    .chat-tool summary { cursor: pointer; }
+    .chat-tool pre { max-height: 220px; overflow: auto; font-size: 11.5px; margin-top: 6px; white-space: pre-wrap; }
+    .chat-tool.err summary { color: var(--danger); }
+    .chat-input { display: flex; gap: 8px; align-items: flex-end; margin-top: 10px; }
+    .chat-input textarea { flex: 1; min-height: 44px; resize: vertical; }
+    .chat-pending { border: 1px solid var(--warning); background: var(--warning-soft); border-radius: 10px; padding: 12px 14px; margin-top: 10px; font-size: 13px; }
+    .chat-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .chat-chips button { font-size: 12px; padding: 5px 10px; white-space: normal; text-align: left; max-width: 100%; }
+    @media (max-width: 640px) { .chat-msg, .chat-tool { max-width: 100%; } .chat-input { flex-direction: column; align-items: stretch; } }
 
     /* Three-column workspace: navigation | page | telemetry */
     /* Fills the screen up to 2400 px; the side columns grow on big screens. */
@@ -2522,6 +2641,11 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
         <span class="nav-label"></span>
       </button>
       <div class="nav-subs" data-subs-for="home"></div>
+      <button class="nav-item nav-btn" onclick="goTo('chat')" id="navChat">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+        <span class="nav-label"></span>
+      </button>
+      <div class="nav-subs" data-subs-for="chat"></div>
       <button class="nav-section" data-section="apps" aria-expanded="true" aria-controls="navGroup-apps" onclick="toggleNavSection('apps')"><svg class="nav-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"></path></svg><span data-i18n="navSecApps"></span></button>
       <div class="nav-group" id="navGroup-apps"><div class="nav-group-inner">
         <button class="nav-item nav-btn" onclick="goTo('overview')" id="navOverview">
@@ -3533,6 +3657,81 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         </div>
 
         <!-- TAB 6: AI AGENT STUDIO & ARCHITECTURE -->
+        <div class="tab-pane" id="tab-chat">
+          <div class="card" data-sub="talk">
+            <div class="card-header"><h2 data-i18n="chatTitle"></h2><p class="card-desc" id="chatWhere"></p></div>
+            <div id="chatNotSet" style="display:none;">
+              <p class="card-desc" data-i18n="chatNotSet"></p>
+              <button onclick="goTo('chat','setup')" data-i18n="chatGoSetup"></button>
+            </div>
+            <div id="chatBox">
+              <div id="chatLog" class="chat-log" aria-live="polite"></div>
+              <div id="chatPending"></div>
+              <p class="card-desc" id="chatStatus" style="margin-top:8px;"></p>
+              <div class="chat-input">
+                <label for="chatText" class="field-label" style="position:absolute;left:-9999px;" data-i18n="chatPlaceholder"></label>
+                <textarea id="chatText" rows="2" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();chatSend();}"></textarea>
+                <button id="chatSendBtn" onclick="chatSend()" data-i18n="chatSend"></button>
+                <button id="chatStopBtn" class="secondary" onclick="chatStop()" style="display:none;" data-i18n="chatStop"></button>
+              </div>
+              <div class="chat-chips" id="chatChips"></div>
+              <div style="margin-top:10px;"><button class="secondary" onclick="chatReset()" data-i18n="chatNew"></button></div>
+            </div>
+          </div>
+          <div class="card" data-sub="setup">
+            <div class="card-header"><h2 data-i18n="aisTitle"></h2><p class="card-desc" data-i18n="aisDesc"></p></div>
+            <div class="grid-2" id="aisProviders" style="margin-bottom:14px;"></div>
+            <div id="aisLocal" class="ais-part">
+              <div id="aisRuntime" style="margin-bottom:10px;"></div>
+              <label class="field-label" for="aisLocalModel" data-i18n="aisModel"></label>
+              <select id="aisLocalModel" onchange="aisModelChanged()"></select>
+              <input id="aisLocalModelCustom" style="display:none;margin-top:6px;" placeholder="qwen3.5:4b-q4_K_M" />
+              <p class="card-desc" id="aisModelHint" style="margin-top:6px;"></p>
+              <label style="display:flex;gap:6px;align-items:flex-start;margin-top:10px;cursor:pointer;"><input type="checkbox" id="aisGpu" style="width:auto;" /> <span><span data-i18n="aisGpu"></span><br><span class="card-desc" id="aisGpuHint"></span></span></label>
+              <label style="display:flex;gap:6px;align-items:flex-start;margin-top:10px;cursor:pointer;"><input type="checkbox" id="aisShare" style="width:auto;" /> <span><span data-i18n="aisShare"></span><br><span class="card-desc" data-i18n="aisShareHint"></span></span></label>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+                <button id="aisInstallBtn" onclick="aisInstall()" data-i18n="aisInstall"></button>
+                <button id="aisRemoveBtn" class="secondary" onclick="aisRemove()" data-i18n="aisRemove" style="display:none;"></button>
+              </div>
+              <div id="aisInstallJob" style="margin-top:10px;"></div>
+            </div>
+            <div id="aisRemote" class="ais-part">
+              <label class="field-label" for="aisRemoteUrl" data-i18n="aisRemoteUrl"></label>
+              <input id="aisRemoteUrl" placeholder="http://100.64.0.10:11434" />
+              <p class="card-desc" data-i18n="aisRemoteHint" style="margin-top:6px;"></p>
+              <label class="field-label" for="aisRemoteModel" data-i18n="aisModel"></label>
+              <input id="aisRemoteModel" placeholder="qwen3.5:4b-q4_K_M" />
+            </div>
+            <div id="aisApi" class="ais-part">
+              <div id="aisOpenaiOnly">
+                <label class="field-label" for="aisPreset" data-i18n="aisService"></label>
+                <select id="aisPreset" onchange="aisPresetChanged()"></select>
+                <label class="field-label" for="aisBaseUrl" data-i18n="aisBaseUrl"></label>
+                <input id="aisBaseUrl" placeholder="https://…/v1" />
+              </div>
+              <label class="field-label" for="aisApiModel" data-i18n="aisModel"></label>
+              <input id="aisApiModel" />
+              <p class="card-desc" id="aisApiModelHint" style="margin-top:6px;"></p>
+              <label class="field-label" for="aisKey" data-i18n="aisKey"></label>
+              <input id="aisKey" type="password" autocomplete="off" />
+              <p class="card-desc" id="aisKeyHint" style="margin-top:6px;"></p>
+            </div>
+            <div id="aisAdvanced" style="margin-top:12px;">
+              <label style="display:flex;gap:6px;align-items:flex-start;cursor:pointer;"><input type="checkbox" id="aisCompact" style="width:auto;" /> <span><span data-i18n="aisCompact"></span><br><span class="card-desc" id="aisCompactHint"></span></span></label>
+              <div id="aisCtxRow" style="margin-top:10px;">
+                <label class="field-label" for="aisCtx" data-i18n="aisCtx"></label>
+                <select id="aisCtx"><option value="8192">8192</option><option value="16384">16384</option><option value="32768">32768</option></select>
+                <p class="card-desc" data-i18n="aisCtxHint" style="margin-top:6px;"></p>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;">
+              <button onclick="aisSave()" data-i18n="aisSave"></button>
+              <button class="secondary" onclick="aisTest()" data-i18n="aisTest"></button>
+            </div>
+            <p class="card-desc" id="aisTestOut" style="margin-top:8px;"></p>
+          </div>
+        </div>
+
         <div class="tab-pane" id="tab-agents">
           <div class="card" data-sub="connect">
             <div class="card-header">
@@ -5523,6 +5722,173 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsDisabledToast": "Schedule updated."
     });
 
+    Object.assign(I18N.pt, {
+          "navChat": "Conversar",
+          "lead_chat": "Peça em palavras: publicar um app, ver por que caiu, fazer backup. O assistente usa as mesmas ferramentas do MCP e as ações arriscadas esperam você aprovar aqui.",
+          "sub_chat_talk": "Conversa",
+          "sub_chat_setup": "Modelo",
+          "chatTitle": "Conversar com o servidor",
+          "chatNotSet": "Escolha antes onde o modelo de IA roda: neste PC, em outro PC seu ou numa API.",
+          "chatGoSetup": "Escolher o modelo",
+          "chatPlaceholder": "Ex.: publique o repositório usuario/meu-app em app.meudominio.com",
+          "chatSend": "Enviar",
+          "chatStop": "Parar",
+          "chatNew": "Nova conversa",
+          "chatWhere": "Modelo: {p} · {m}",
+          "chatEmpty": "Nenhuma mensagem ainda.",
+          "chatUsed": "Usou",
+          "chatApproveTitle": "O assistente quer fazer uma ação que precisa da sua aprovação:",
+          "chatTypeName": "Para aprovar, digite {n}",
+          "chatApprove": "Aprovar",
+          "chatRefuse": "Recusar",
+          "chatRunning": "Usando {t}…",
+          "chatThinking": "Pensando…",
+          "chatFailed": "Não deu certo.",
+          "chatEx1": "Como está o servidor? Algum app com problema?",
+          "chatEx2": "Publique o repositório usuario/meu-app com Postgres em app.meudominio.com",
+          "chatEx3": "Faça um backup do banco de todos os apps",
+          "aisTitle": "Onde o modelo roda",
+          "aisDesc": "As ferramentas sempre rodam neste servidor. Aqui você escolhe só quem pensa nas respostas.",
+          "aisP_local": "Neste PC",
+          "aisP_remote": "Em outro PC meu",
+          "aisP_openai": "API compatível com OpenAI",
+          "aisP_anthropic": "API da Anthropic (Claude)",
+          "aisPd_local": "Grátis e privado. Instala o Ollama num contêiner e baixa o modelo. Sem GPU fica lento.",
+          "aisPd_remote": "Usa o modelo de outro PC com PaaSMCP que compartilha o dele (por exemplo, um com placa de vídeo).",
+          "aisPd_openai": "Gemini, OpenRouter, Groq, OpenAI... Alguns têm plano grátis. Precisa de chave. O que as ferramentas mostram (como logs) vai para esse serviço.",
+          "aisPd_anthropic": "Os modelos Claude. Pago por uso, precisa de chave. O que as ferramentas mostram (como logs) vai para a Anthropic.",
+          "aisModel": "Modelo",
+          "aisOtherModel": "Outro (digitar o nome)",
+          "aisModelNote_cpu": "Cabe numa placa de 6 GB e roda em CPU com uns {r} GB de RAM livres. Bom para pedidos diretos.",
+          "aisModelNote_gpu8": "Responde melhor, mas precisa de uns {r} GB de RAM ou de uma placa com 8 GB ou mais.",
+          "aisGpu": "Usar a placa de vídeo NVIDIA",
+          "aisGpuReady": "O Docker já enxerga a GPU.",
+          "aisGpuMissing": "Para liberar: instale o driver da NVIDIA (para GTX 10xx, a série 570 ou 580: a 590 não suporta mais essas placas) e o NVIDIA Container Toolkit, rode sudo nvidia-ctk runtime configure --runtime=docker e reinicie o Docker.",
+          "aisShare": "Compartilhar com meus outros PCs",
+          "aisShareHint": "O modelo responde no IP da Tailscale deste PC, sem senha, só para aparelhos da sua Tailscale. Nos outros PCs, escolha \\"Em outro PC meu\\".",
+          "aisInstall": "Instalar e baixar o modelo",
+          "aisReinstall": "Aplicar e baixar o modelo",
+          "aisRemove": "Desligar o modelo local",
+          "aisRemoveConfirm": "Desligar o modelo local deste PC? Outros PCs que usam ele param de conversar.",
+          "aisRemoveModels": "Apagar também os modelos baixados (liberam espaço, mas precisam ser baixados de novo)?",
+          "aisRemoved": "Modelo local desligado.",
+          "aisRunning": "Rodando",
+          "aisStopped": "Parado",
+          "aisSharedAt": "Outros PCs usam:",
+          "aisNotInstalled": "Ainda não instalado. Este PC tem {c} núcleos e {m} GB de RAM.",
+          "aisJob_starting": "Preparando…",
+          "aisJob_image": "Baixando e ligando o Ollama (pode levar uns minutos)…",
+          "aisJob_model": "Baixando {m}…",
+          "aisJobDone": "{m} pronto.",
+          "aisJobFailed": "A instalação falhou:",
+          "aisRemoteUrl": "Endereço do outro PC",
+          "aisRemoteHint": "Aparece na tela Modelo do outro PC, em \\"Outros PCs usam\\".",
+          "aisService": "Serviço",
+          "aisPre_gemini": "Google Gemini",
+          "aisPre_openrouter": "OpenRouter",
+          "aisPre_groq": "Groq",
+          "aisPre_openai": "OpenAI",
+          "aisPre_other": "Outro (digitar o endereço)",
+          "aisBaseUrl": "Endereço da API",
+          "aisKey": "Chave da API",
+          "aisKeySaved": "Chave guardada (deixe vazio para manter)",
+          "aisKeyHint": "Fica criptografada no cofre do servidor e nunca volta para esta tela.",
+          "aisAnthropicHint": "O nome exato do modelo, como aparece na documentação do serviço.",
+          "aisOpenaiHint": "O nome exato do modelo, como aparece na documentação do serviço. Escolha um que aceite ferramentas (tool calling).",
+          "aisCompact": "Descrições curtas das ferramentas",
+          "aisCompactHint": "Cerca de {c} tokens em vez de {f}. Deixa modelos pequenos bem mais rápidos; modelos grandes entendem melhor as descrições completas.",
+          "aisCtx": "Memória da conversa (contexto)",
+          "aisCtxHint": "Mais contexto aguenta conversas longas, mas usa mais RAM ou memória da placa.",
+          "aisSave": "Salvar",
+          "aisSaved": "Salvo.",
+          "aisTest": "Testar",
+          "aisTesting": "Perguntando ao modelo…",
+          "aisTestOk": "{m} respondeu em {s} s."
+    });
+    Object.assign(I18N.en, {
+          "navChat": "Chat",
+          "lead_chat": "Ask in plain words: publish an app, find out why it went down, back it up. The assistant uses the same MCP tools, and risky actions wait for your approval here.",
+          "sub_chat_talk": "Chat",
+          "sub_chat_setup": "Model",
+          "chatTitle": "Talk to the server",
+          "chatNotSet": "First choose where the AI model runs: on this PC, on another PC of yours or through an API.",
+          "chatGoSetup": "Choose the model",
+          "chatPlaceholder": "E.g.: publish the repository user/my-app at app.mydomain.com",
+          "chatSend": "Send",
+          "chatStop": "Stop",
+          "chatNew": "New chat",
+          "chatWhere": "Model: {p} · {m}",
+          "chatEmpty": "No messages yet.",
+          "chatUsed": "Used",
+          "chatApproveTitle": "The assistant wants to do something that needs your approval:",
+          "chatTypeName": "To approve, type {n}",
+          "chatApprove": "Approve",
+          "chatRefuse": "Refuse",
+          "chatRunning": "Using {t}…",
+          "chatThinking": "Thinking…",
+          "chatFailed": "That did not work.",
+          "chatEx1": "How is the server? Any app in trouble?",
+          "chatEx2": "Publish the repository user/my-app with Postgres at app.mydomain.com",
+          "chatEx3": "Back up every app's database",
+          "aisTitle": "Where the model runs",
+          "aisDesc": "The tools always run on this server. Here you only choose who thinks up the answers.",
+          "aisP_local": "On this PC",
+          "aisP_remote": "On another PC of mine",
+          "aisP_openai": "OpenAI-compatible API",
+          "aisP_anthropic": "Anthropic API (Claude)",
+          "aisPd_local": "Free and private. Installs Ollama in a container and downloads the model. Slow without a GPU.",
+          "aisPd_remote": "Uses the model of another PC with PaaSMCP that shares its own (for example, one with a graphics card).",
+          "aisPd_openai": "Gemini, OpenRouter, Groq, OpenAI... Some have a free tier. Needs a key. What the tools show (such as logs) goes to that service.",
+          "aisPd_anthropic": "The Claude models. Pay per use, needs a key. What the tools show (such as logs) goes to Anthropic.",
+          "aisModel": "Model",
+          "aisOtherModel": "Other (type the name)",
+          "aisModelNote_cpu": "Fits a 6 GB card and runs on CPU with about {r} GB of free RAM. Good for direct requests.",
+          "aisModelNote_gpu8": "Answers better, but needs about {r} GB of RAM or a card with 8 GB or more.",
+          "aisGpu": "Use the NVIDIA graphics card",
+          "aisGpuReady": "Docker already sees the GPU.",
+          "aisGpuMissing": "To enable it: install the NVIDIA driver (for GTX 10xx, the 570 or 580 series: 590 dropped those cards) and the NVIDIA Container Toolkit, run sudo nvidia-ctk runtime configure --runtime=docker, then restart Docker.",
+          "aisShare": "Share with my other PCs",
+          "aisShareHint": "The model answers on this PC's Tailscale IP, without a password, only to devices in your Tailscale. On the other PCs, choose \\"On another PC of mine\\".",
+          "aisInstall": "Install and download the model",
+          "aisReinstall": "Apply and download the model",
+          "aisRemove": "Turn the local model off",
+          "aisRemoveConfirm": "Turn this PC's local model off? Other PCs that use it stop chatting.",
+          "aisRemoveModels": "Also delete the downloaded models (frees space, but they must be downloaded again)?",
+          "aisRemoved": "Local model turned off.",
+          "aisRunning": "Running",
+          "aisStopped": "Stopped",
+          "aisSharedAt": "Other PCs use:",
+          "aisNotInstalled": "Not installed yet. This PC has {c} cores and {m} GB of RAM.",
+          "aisJob_starting": "Preparing…",
+          "aisJob_image": "Downloading and starting Ollama (may take a few minutes)…",
+          "aisJob_model": "Downloading {m}…",
+          "aisJobDone": "{m} ready.",
+          "aisJobFailed": "The install failed:",
+          "aisRemoteUrl": "Other PC's address",
+          "aisRemoteHint": "Shown on the other PC's Model screen, under \\"Other PCs use\\".",
+          "aisService": "Service",
+          "aisPre_gemini": "Google Gemini",
+          "aisPre_openrouter": "OpenRouter",
+          "aisPre_groq": "Groq",
+          "aisPre_openai": "OpenAI",
+          "aisPre_other": "Other (type the address)",
+          "aisBaseUrl": "API address",
+          "aisKey": "API key",
+          "aisKeySaved": "Key saved (leave empty to keep it)",
+          "aisKeyHint": "Kept encrypted in the server's vault and never shown on this screen again.",
+          "aisAnthropicHint": "The model's exact name, as in the service's documentation.",
+          "aisOpenaiHint": "The model's exact name, as in the service's documentation. Pick one that supports tools (tool calling).",
+          "aisCompact": "Short tool descriptions",
+          "aisCompactHint": "About {c} tokens instead of {f}. Makes small models much faster; large models understand the full descriptions better.",
+          "aisCtx": "Conversation memory (context)",
+          "aisCtxHint": "More context holds longer chats but uses more RAM or graphics memory.",
+          "aisSave": "Save",
+          "aisSaved": "Saved.",
+          "aisTest": "Test",
+          "aisTesting": "Asking the model…",
+          "aisTestOk": "{m} answered in {s} s."
+    });
+
     function t(key) {
       const dict = I18N[currentLang] || I18N.pt;
       return dict[key] !== undefined ? dict[key] : (I18N.pt[key] !== undefined ? I18N.pt[key] : key);
@@ -5533,7 +5899,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'setupGithubDocsLink',
       'setupLocalDesc',
       'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'navJobs', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'navJobs', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect', 'navChat',
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -6932,6 +7298,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       mirror: ['connect', 'copy', 'judge', 'auto', 'aa', 'back'],
       pool: ['list', 'add', 'how'],
       agents: ['connect', 'examples'],
+      chat: ['talk', 'setup'],
       connect: ['cloudflare', 'github', 'alerts', 'pcs'],
     };
     let activeSubs = {};
@@ -7051,6 +7418,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tab === 'guide') { if (sub) currentGuide = sub; renderGuide(); }
       if (tab === 'overview' && currentSub('overview') === 'webhook' && (moved || mode === 'init')) loadHooks();
       if (tab === 'connect' && currentSub('connect') === 'pcs' && (moved || mode === 'init')) { loadPaired(); loadPcs(); }
+      if (tab === 'chat' && (moved || mode === 'init')) loadAssistant();
       const hash = '#' + tab + (subs ? '/' + currentSub(tab) : tab === 'guide' && currentGuide ? '/' + currentGuide : '');
       if (mode !== 'hash' && location.hash !== hash) {
         try {
@@ -7168,6 +7536,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'doctor') runDoctor();
       if (tabName === 'email') loadEmail();
       if (tabName === 'agents') { renderAi(); loadAiTokens(); }
+      if (tabName === 'chat') loadAssistant();
       if (tabName === 'connect') loadConnections();
       if (tabName === 'home') loadTutorialExtra();
       if (tabName === 'mirror') loadMirror();
@@ -7231,6 +7600,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const search = document.getElementById('appSearchInput');
       if (search) search.placeholder = t('appSearch');
       renderAi();
+      if (aiState) { renderChat(); if (currentSub('chat') === 'setup') renderAis(); }
       for (const k of I18N_KEYS) {
         const el = document.getElementById(k);
         if (el) {
@@ -8095,6 +8465,226 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { if (!data.confirmationRequired) alert(data.error || ('HTTP ' + res.status)); return null; }
       return data;
+    }
+
+    // ---- Chat with an AI (Conversar) ----
+    var aiState = null;
+    let aiPoll = null;
+    let aiProvider = '';
+    function aiProviderLabel(p) { return t('aisP_' + p); }
+    async function loadAssistant() {
+      const setup = currentSub('chat') === 'setup';
+      try {
+        const r = await fetch('/api/assistant' + (setup ? '?setup=1' : ''));
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!setup && aiState && aiState.runtime) { data.runtime = aiState.runtime; data.suggested = aiState.suggested; data.presets = aiState.presets; data.toolTokens = aiState.toolTokens; data.cpus = aiState.cpus; data.memGb = aiState.memGb; }
+        aiState = data;
+      } catch { return; }
+      renderChat();
+      if (setup) renderAis();
+      const busy = (aiState.chat && aiState.chat.status === 'thinking') || (aiState.install && ['starting', 'image', 'model'].indexOf(aiState.install.phase) !== -1);
+      clearTimeout(aiPoll);
+      if (busy && currentTab === 'chat') aiPoll = setTimeout(loadAssistant, 1500);
+    }
+    function chatText(s) { return esc(s); }
+    function renderChat() {
+      const st = aiState || {};
+      const cfg = st.config;
+      document.getElementById('chatNotSet').style.display = cfg ? 'none' : '';
+      document.getElementById('chatBox').style.display = cfg ? '' : 'none';
+      document.getElementById('chatWhere').textContent = cfg ? t('chatWhere').replace('{p}', aiProviderLabel(cfg.provider)).replace('{m}', cfg.model) : '';
+      const chat = st.chat || { messages: [], status: 'idle' };
+      const log = document.getElementById('chatLog');
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      let html = '';
+      if (!chat.messages.length) html = '<p class="card-desc">' + esc(t('chatEmpty')) + '</p>';
+      for (const m of chat.messages) {
+        if (m.role === 'user') html += '<div class="chat-msg user">' + chatText(m.text) + '</div>';
+        else if (m.role === 'assistant') {
+          if (m.text) html += '<div class="chat-msg assistant">' + chatText(m.text) + '</div>';
+        } else {
+          const body = String(m.text || '');
+          html += '<details class="chat-tool' + (m.isError ? ' err' : '') + '"><summary>' + esc((m.isError ? '⚠ ' : '🔧 ') + t('chatUsed') + ' ' + (m.toolName || '')) + '</summary><pre>' + esc(body.length > 3000 ? body.slice(0, 3000) + '…' : body) + '</pre></details>';
+        }
+      }
+      log.innerHTML = html;
+      if (atBottom || chat.status === 'thinking') log.scrollTop = log.scrollHeight;
+      const pend = document.getElementById('chatPending');
+      if (chat.status === 'waiting' && chat.pending) {
+        const p = chat.pending;
+        const warn = (p.warning && (currentLang === 'pt' ? p.warning.pt : p.warning.en)) || '';
+        pend.innerHTML = '<div class="chat-pending"><strong>' + esc(t('chatApproveTitle')) + '</strong> <code>' + esc(p.call.name) + '</code><p style="margin:6px 0;">' + esc(warn) + '</p>' +
+          (p.level === 'strong' ? '<label class="field-label" for="chatConfirmName">' + esc(t('chatTypeName').replace('{n}', p.subject)) + '</label><input id="chatConfirmName" autocomplete="off" />' : '') +
+          '<div style="display:flex;gap:8px;margin-top:8px;"><button onclick="chatDecide(true)">' + esc(t('chatApprove')) + '</button><button class="secondary" onclick="chatDecide(false)">' + esc(t('chatRefuse')) + '</button></div></div>';
+      } else pend.innerHTML = '';
+      const thinking = chat.status === 'thinking';
+      const status = document.getElementById('chatStatus');
+      if (thinking) {
+        const secs = chat.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(chat.startedAt)) / 1000)) : 0;
+        status.textContent = (chat.step ? t('chatRunning').replace('{t}', chat.step) : t('chatThinking')) + ' · ' + secs + ' s';
+      } else if (chat.status === 'error') status.textContent = '⚠ ' + t('chatFailed') + ' ' + (chat.error || '');
+      else status.textContent = '';
+      document.getElementById('chatSendBtn').disabled = thinking || chat.status === 'waiting';
+      document.getElementById('chatStopBtn').style.display = thinking ? '' : 'none';
+      const chips = document.getElementById('chatChips');
+      if (!chips.dataset.lang || chips.dataset.lang !== currentLang) {
+        chips.dataset.lang = currentLang;
+        chips.innerHTML = ['chatEx1', 'chatEx2', 'chatEx3'].map(function (k) { return '<button class="secondary" type="button" data-chat-ex="' + k + '">' + esc(t(k)) + '</button>'; }).join('');
+      }
+      document.getElementById('chatText').placeholder = t('chatPlaceholder');
+    }
+    document.addEventListener('click', function (e) {
+      const b = e.target.closest ? e.target.closest('[data-chat-ex]') : null;
+      if (b) { const ta = document.getElementById('chatText'); ta.value = t(b.getAttribute('data-chat-ex')); ta.focus(); }
+    });
+    async function chatSend() {
+      const ta = document.getElementById('chatText');
+      const text = ta.value.trim();
+      if (!text) return;
+      const r = await postJson('/api/assistant/send', { text: text, lang: currentLang });
+      if (r) { ta.value = ''; aiState = Object.assign(aiState || {}, { chat: r.chat }); renderChat(); loadAssistant(); }
+    }
+    async function chatDecide(approve) {
+      const nameEl = document.getElementById('chatConfirmName');
+      const r = await postJson('/api/assistant/decide', { approve: approve, confirmName: nameEl ? nameEl.value : undefined });
+      if (r) { aiState = Object.assign(aiState || {}, { chat: r.chat }); renderChat(); loadAssistant(); }
+    }
+    async function chatStop() { await postJson('/api/assistant/stop', {}); setTimeout(loadAssistant, 400); }
+    async function chatReset() {
+      const r = await postJson('/api/assistant/reset', {});
+      if (r) { aiState = Object.assign(aiState || {}, { chat: r.chat }); renderChat(); }
+    }
+
+    function renderAis() {
+      const st = aiState || {};
+      const cfg = st.config || null;
+      if (!aiProvider) aiProvider = cfg ? cfg.provider : 'local';
+      const provs = ['local', 'remote', 'openai', 'anthropic'];
+      document.getElementById('aisProviders').innerHTML = provs.map(function (p) {
+        return '<label class="arch-box" style="cursor:pointer;"><input type="radio" name="aisProv" value="' + p + '"' + (p === aiProvider ? ' checked' : '') + ' onchange="aiProvider=this.value;renderAis()" style="width:auto;" /> <strong>' + esc(aiProviderLabel(p)) + '</strong><p>' + esc(t('aisPd_' + p)) + '</p></label>';
+      }).join('');
+      document.getElementById('aisLocal').style.display = aiProvider === 'local' ? '' : 'none';
+      document.getElementById('aisRemote').style.display = aiProvider === 'remote' ? '' : 'none';
+      document.getElementById('aisApi').style.display = aiProvider === 'openai' || aiProvider === 'anthropic' ? '' : 'none';
+      document.getElementById('aisOpenaiOnly').style.display = aiProvider === 'openai' ? '' : 'none';
+      document.getElementById('aisCtxRow').style.display = aiProvider === 'local' || aiProvider === 'remote' ? '' : 'none';
+      const rt = st.runtime || { installed: false, running: false, models: [], gpuReady: false };
+      // Local runtime
+      const sel = document.getElementById('aisLocalModel');
+      const sug = st.suggested || [];
+      const names = [];
+      (rt.models || []).forEach(function (m) { if (names.indexOf(m.name) === -1) names.push(m.name); });
+      sug.forEach(function (m) { if (names.indexOf(m.id) === -1) names.push(m.id); });
+      const want = cfg && cfg.provider === 'local' ? cfg.model : (sug[0] ? sug[0].id : '');
+      const prevSel = sel.value;
+      sel.innerHTML = names.map(function (n) {
+        const s = sug.find(function (x) { return x.id === n; });
+        const have = (rt.models || []).find(function (x) { return x.name === n; });
+        const extra = s ? ' · ' + s.sizeGb + ' GB' : have ? ' · ' + have.sizeGb + ' GB' : '';
+        return '<option value="' + esc(n) + '">' + esc(n + extra + (have ? ' ✓' : '')) + '</option>';
+      }).join('') + '<option value="__other">' + esc(t('aisOtherModel')) + '</option>';
+      sel.value = prevSel && names.indexOf(prevSel) !== -1 ? prevSel : (names.indexOf(want) !== -1 ? want : names[0] || '__other');
+      aisModelChanged();
+      document.getElementById('aisRuntime').innerHTML = rt.installed
+        ? (rt.running ? badge('success', t('aisRunning')) : badge('warning', t('aisStopped'))) + (cfg && cfg.local && cfg.local.gpu ? ' ' + badge('success', 'GPU') : '') +
+          (rt.shareUrl ? '<p class="card-desc" style="margin-top:6px;">' + esc(t('aisSharedAt')) + ' <code>' + esc(rt.shareUrl) + '</code></p>' : '')
+        : '<p class="card-desc">' + esc(t('aisNotInstalled').replace('{c}', String(st.cpus || '?')).replace('{m}', String(st.memGb || '?'))) + '</p>';
+      const gpu = document.getElementById('aisGpu');
+      gpu.disabled = !rt.gpuReady;
+      if (!rt.gpuReady) gpu.checked = false; else if (cfg && cfg.local) gpu.checked = cfg.local.gpu;
+      document.getElementById('aisGpuHint').textContent = rt.gpuReady ? t('aisGpuReady') : t('aisGpuMissing');
+      const share = document.getElementById('aisShare');
+      if (cfg && cfg.local) share.checked = cfg.local.share;
+      document.getElementById('aisRemoveBtn').style.display = rt.installed ? '' : 'none';
+      document.getElementById('aisInstallBtn').textContent = rt.installed ? t('aisReinstall') : t('aisInstall');
+      const job = st.install;
+      const jobEl = document.getElementById('aisInstallJob');
+      if (job) {
+        const pct = job.total ? Math.round((job.completed || 0) * 100 / job.total) : 0;
+        jobEl.innerHTML = job.phase === 'failed' ? '<p class="card-desc" style="color:var(--danger);">' + esc(t('aisJobFailed') + ' ' + (job.error || '')) + '</p>'
+          : job.phase === 'done' ? '<p class="card-desc">' + esc(t('aisJobDone').replace('{m}', job.model)) + '</p>'
+          : '<p class="card-desc">' + esc(t('aisJob_' + job.phase).replace('{m}', job.model) + (job.phase === 'model' && job.total ? ' ' + pct + '% (' + (Math.round(job.total / 1e8) / 10) + ' GB)' : '')) + '</p>';
+      } else jobEl.innerHTML = '';
+      // Remote / API
+      if (cfg && cfg.provider === 'remote') { document.getElementById('aisRemoteUrl').value = document.getElementById('aisRemoteUrl').value || cfg.baseUrl || ''; document.getElementById('aisRemoteModel').value = document.getElementById('aisRemoteModel').value || cfg.model; }
+      const preset = document.getElementById('aisPreset');
+      const presets = st.presets || {};
+      if (!preset.options.length) {
+        preset.innerHTML = Object.keys(presets).map(function (k) { return '<option value="' + k + '">' + esc(t('aisPre_' + k)) + '</option>'; }).join('') + '<option value="other">' + esc(t('aisPre_other')) + '</option>';
+        if (cfg && cfg.provider === 'openai') {
+          const k = Object.keys(presets).find(function (x) { return presets[x] === cfg.baseUrl; });
+          preset.value = k || 'other';
+          document.getElementById('aisBaseUrl').value = cfg.baseUrl || '';
+        } else { preset.value = 'gemini'; aisPresetChanged(); }
+      }
+      const apiModel = document.getElementById('aisApiModel');
+      if (cfg && cfg.provider === aiProvider && (aiProvider === 'openai' || aiProvider === 'anthropic')) apiModel.value = apiModel.value || cfg.model;
+      if (aiProvider === 'anthropic' && !apiModel.value) apiModel.value = 'claude-opus-5-5';
+      document.getElementById('aisApiModelHint').textContent = aiProvider === 'anthropic' ? t('aisAnthropicHint') : t('aisOpenaiHint');
+      document.getElementById('aisKey').placeholder = cfg && cfg.hasKey ? t('aisKeySaved') : '';
+      document.getElementById('aisKeyHint').textContent = t('aisKeyHint');
+      const tt = st.toolTokens || {};
+      document.getElementById('aisCompact').checked = cfg && cfg.provider === aiProvider ? cfg.compactTools !== false : (aiProvider === 'local' || aiProvider === 'remote');
+      document.getElementById('aisCompactHint').textContent = t('aisCompactHint').replace('{c}', String(tt.compact || '?')).replace('{f}', String(tt.full || '?'));
+      if (cfg && cfg.numCtx) document.getElementById('aisCtx').value = String(cfg.numCtx); else document.getElementById('aisCtx').value = '16384';
+    }
+    function aisModelChanged() {
+      const sel = document.getElementById('aisLocalModel');
+      document.getElementById('aisLocalModelCustom').style.display = sel.value === '__other' ? '' : 'none';
+      const s = ((aiState && aiState.suggested) || []).find(function (x) { return x.id === sel.value; });
+      document.getElementById('aisModelHint').textContent = s ? t('aisModelNote_' + s.note).replace('{r}', String(s.ramGb)) : '';
+    }
+    function aisPresetChanged() {
+      const k = document.getElementById('aisPreset').value;
+      const presets = (aiState && aiState.presets) || {};
+      document.getElementById('aisBaseUrl').value = presets[k] || '';
+    }
+    function aisLocalModel() {
+      const sel = document.getElementById('aisLocalModel');
+      return sel.value === '__other' ? document.getElementById('aisLocalModelCustom').value.trim() : sel.value;
+    }
+    async function aisInstall() {
+      const body = { model: aisLocalModel(), gpu: document.getElementById('aisGpu').checked, share: document.getElementById('aisShare').checked };
+      let res = await fetch('/api/assistant/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      let data = await res.json().catch(function () { return {}; });
+      if (res.status === 409 && data.confirmationRequired) {
+        if (!confirm((currentLang === 'pt' ? data.warning.pt : data.warning.en))) return;
+        body.confirmed = true;
+        res = await fetch('/api/assistant/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        data = await res.json().catch(function () { return {}; });
+      }
+      if (!res.ok) { alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
+      loadAssistant();
+    }
+    async function aisRemove() {
+      if (!confirm(t('aisRemoveConfirm'))) return;
+      const r = await postJson('/api/assistant/remove', { deleteModels: confirm(t('aisRemoveModels')) });
+      if (r) { showToast(t('aisRemoved')); loadAssistant(); }
+    }
+    function aisBody() {
+      const p = aiProvider;
+      const body = { provider: p, compactTools: document.getElementById('aisCompact').checked, numCtx: Number(document.getElementById('aisCtx').value) };
+      if (p === 'local') body.model = aisLocalModel();
+      if (p === 'remote') { body.baseUrl = document.getElementById('aisRemoteUrl').value.trim(); body.model = document.getElementById('aisRemoteModel').value.trim(); }
+      if (p === 'openai') body.baseUrl = document.getElementById('aisBaseUrl').value.trim();
+      if (p === 'openai' || p === 'anthropic') { body.model = document.getElementById('aisApiModel').value.trim(); const k = document.getElementById('aisKey').value.trim(); if (k) body.apiKey = k; }
+      return body;
+    }
+    async function aisSave() {
+      const res = await fetch('/api/assistant/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(aisBody()) });
+      const data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { alert((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status)); return; }
+      document.getElementById('aisKey').value = '';
+      showToast(t('aisSaved'));
+      loadAssistant();
+    }
+    async function aisTest() {
+      const out = document.getElementById('aisTestOut');
+      out.textContent = t('aisTesting');
+      const res = await fetch('/api/assistant/test', { method: 'POST' });
+      const data = await res.json().catch(function () { return {}; });
+      out.textContent = res.ok ? t('aisTestOk').replace('{m}', data.model).replace('{s}', String(Math.round(data.ms / 100) / 10)) : '⚠ ' + ((currentLang === 'pt' && data.errorPt) || data.error || ('HTTP ' + res.status));
     }
 
     function renderHome() {

@@ -4,6 +4,8 @@ O **PaaSMCP** é um Micro-PaaS open-source *"Agent-First & Security-First"* (fei
 
 Ele transforma qualquer servidor Linux ou Homelab em uma plataforma de nuvem pessoal automatizada, com **0 MB de consumo ocioso de RAM** quando usado só pelo MCP e pela linha de comando. O painel web e o webhook do GitHub, se ligados, são um serviço sempre ativo (pequeno, mas não zero).
 
+E dá para **conversar com o servidor** no próprio painel, com uma **LLM local e gratuita** (Ollama no servidor ou em outro PC seu, na placa de vídeo NVIDIA se houver) ou uma **LLM externa** pela sua chave de API (Gemini, OpenRouter, Groq, OpenAI ou qualquer serviço compatível, ou o Claude). Veja [Conversar com o servidor no painel](#conversar-com-o-servidor-no-painel).
+
 
 ## 🧭 Três jeitos de usar
 
@@ -133,6 +135,26 @@ Na linha de comando, a pergunta aparece na tela; `--yes` serve para scripts nas 
 Quase tudo o que o painel faz também tem ferramenta MCP, com os mesmos níveis de token e as mesmas confirmações: publicar de novo com o que o app já tem (`paas_app_lifecycle redeploy`, o jeito de as variáveis novas valerem), tirar um endereço do ar, ligar ou desligar a publicação automática, apps prontos (`paas_app_templates`), Conexões (`paas_connections`: estado, repositórios do GitHub, webhook automático, avisos no Discord/Slack/ntfy), tamanho dos bancos e o crescimento deles (`paas_usage`), juiz e troca automática (`paas_mirror`), a lista de PCs da Tailscale (`paas_pcs`), o relay de e-mail (`paas_email_provision status|test`) e as cópias externas (`paas_db_backup offsite_status|offsite_test|grant_revoke`).
 
 Ficam só no painel e na linha de comando, porque levam senha, token ou chave pelo chat da IA: instalar o PaaSMCP em outro PC (entra nele por SSH), ligar a Cloudflare (token e túnel), escolher o destino das cópias externas e gerar chave para outro computador, o comando de instalação do juiz e o pareamento do espelho.
+
+### Conversar com o servidor no painel
+
+A página **Conversar** do painel recebe pedidos em palavras ("publique usuario/meu-app em app.meudominio.com", "por que o blog caiu?") e responde usando as mesmas ferramentas do MCP, rodando no próprio servidor. As ações arriscadas param no pedido de aprovação de sempre e aparecem no chat com **Aprovar** e **Recusar** (as mais perigosas pedem o nome digitado). Quem guarda a ação pausada é o servidor, então o modelo nunca vê nem manda o número da aprovação.
+
+Em **Conversar → Modelo** você escolhe quem pensa nas respostas:
+
+- **Neste PC**: grátis e privado. O painel liga o Ollama num contêiner com versão fixa (`paasmcp-ollama`, sem porta no servidor, deixando um núcleo para os apps) e baixa o modelo. Com o NVIDIA Container Toolkit, usa a placa de vídeo (uma GTX 1060 de 6 GB já roda o `qwen3.5:4b` inteiro na placa; GTX 10xx pede driver da série 570 ou 580).
+- **Em outro PC meu**: um PC que marcou *Compartilhar com meus outros PCs* responde no IP da Tailscale dele (sem senha, por isso pede confirmação). Assim um servidor sem GPU usa a placa de outro.
+- **API**: qualquer serviço compatível com OpenAI (Gemini, OpenRouter e Groq têm plano grátis) ou a API da Anthropic, com a sua chave. A chave fica no cofre `system` e nunca volta para a tela.
+
+Números reais: numa GTX 1060 de 6 GB, o `qwen3.5:4b-q4_K_M` roda inteiro na placa (cerca de 3,7 GB de memória de vídeo), a uns 32 tokens por segundo.
+
+**Ligar a placa NVIDIA** (uma vez, no servidor; precisa de root e de reinício, por isso não é um botão do painel):
+
+1. Instale o driver da NVIDIA. Para placas GTX 10xx (Pascal), use a série **570 ou 580** e trave a versão (`apt-mark hold`): a série 590 deixou de suportar essas placas, então não use `ubuntu-drivers autoinstall`. Reinicie e confira com `nvidia-smi`.
+2. Instale o [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), rode `sudo nvidia-ctk runtime configure --runtime=docker` e `sudo systemctl restart docker` (todos os contêineres reiniciam por um instante).
+3. Confira com `docker run --rm --gpus all ubuntu:24.04 nvidia-smi`. Depois disso, **Conversar → Modelo** oferece *Usar a placa de vídeo NVIDIA*.
+
+Limite honesto: sem placa de vídeo (por exemplo numa VM ARM de 3 núcleos) cada resposta leva de dezenas de segundos a alguns minutos, e manutenção com vários passos falha com frequência. Pela linha de comando: `paasmcp assistant status|install|remove|test`.
 
 ### IA em outra máquina (MCP pela rede) e dois fatores no painel
 
