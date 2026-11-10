@@ -31,7 +31,7 @@
 set -euo pipefail
 
 BOX="staging-paasmcp"            # never "paasmcp-*": that prefix belongs to the official install's containers
-IMAGE="staging-paasmcp-box:1"
+IMAGE="staging-paasmcp-box:2"        # bump when the box Dockerfile below changes: "up" recreates the box
 BRANCH="${STAGING_BRANCH:-staging}"
 REPO="${STAGING_REPO:-https://github.com/CodeVanzi/paasmcp.git}"
 PORT="${STAGING_PORT:-4199}"
@@ -66,7 +66,10 @@ RUN apk add --no-cache nodejs npm git openssh-client socat bash
 ENV PAASMCP_ROOT=/opt/homelab
 # The inner engine listens only on its unix socket. (The image's default entrypoint would also open
 # tcp 0.0.0.0:2375 without a password, which any container on the same network could use as root.)
+# A restart of the box (server reboot, Docker restart) keeps /var/run/docker.pid holding "1"; the new
+# dockerd is PID 1 too, sees it "running" and exits in a loop. Same cleanup as the image's own entrypoint.
 RUN printf '%s\n' '#!/bin/sh' \
+  'find /run /var/run -iname "docker*.pid" -delete 2>/dev/null || true' \
   'socat TCP-LISTEN:4199,fork,reuseaddr TCP:127.0.0.1:4099 &' \
   'exec dind dockerd --host=unix:///var/run/docker.sock' > /usr/local/bin/staging-entry && chmod +x /usr/local/bin/staging-entry
 ENTRYPOINT ["staging-entry"]
@@ -81,6 +84,10 @@ wait_docker() {
 
 cmd_up() {
   build_image
+  if exists && [ "$(docker container inspect -f '{{.Config.Image}}' "$BOX")" != "$IMAGE" ]; then
+    say "Recreating the box with the new image $IMAGE (data volumes kept)..."
+    docker rm -f "$BOX" >/dev/null
+  fi
   if exists; then
     running || { say "Starting the box..."; docker start "$BOX" >/dev/null; }
   else
