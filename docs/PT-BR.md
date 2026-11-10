@@ -142,11 +142,9 @@ A página **Conversar** do painel recebe pedidos em palavras ("publique usuario/
 
 Em **Conversar → Modelo** você escolhe quem pensa nas respostas:
 
-- **Neste PC**: grátis e privado. O painel liga o Ollama num contêiner com versão fixa (`paasmcp-ollama`, sem porta no servidor, deixando um núcleo para os apps) e baixa o modelo. Com o NVIDIA Container Toolkit, usa a placa de vídeo (uma GTX 1060 de 6 GB já roda o `qwen3.5:4b` inteiro na placa; GTX 10xx pede driver da série 570 ou 580).
+- **Neste PC**: grátis e privado. O painel liga o Ollama num contêiner com versão fixa (`paasmcp-ollama`, sem porta no servidor, deixando um núcleo para os apps) e baixa o modelo. Com o NVIDIA Container Toolkit, usa a placa de vídeo (uma placa de 6 GB já roda o `qwen3.5:4b` inteiro na memória de vídeo; placas GTX 10xx pedem driver da série 570 ou 580).
 - **Em outro PC meu**: um PC que marcou *Compartilhar com meus outros PCs* responde no IP da Tailscale dele (sem senha, por isso pede confirmação). Assim um servidor sem GPU usa a placa de outro.
 - **API**: qualquer serviço compatível com OpenAI (Gemini, OpenRouter e Groq têm plano grátis) ou a API da Anthropic, com a sua chave. A chave fica no cofre `system` e nunca volta para a tela.
-
-Números reais: numa GTX 1060 de 6 GB, o `qwen3.5:4b-q4_K_M` roda inteiro na placa (cerca de 3,7 GB de memória de vídeo), a uns 32 tokens por segundo.
 
 **Ligar a placa NVIDIA** (uma vez, no servidor; precisa de root e de reinício, por isso não é um botão do painel):
 
@@ -154,7 +152,7 @@ Números reais: numa GTX 1060 de 6 GB, o `qwen3.5:4b-q4_K_M` roda inteiro na pla
 2. Instale o [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), rode `sudo nvidia-ctk runtime configure --runtime=docker` e `sudo systemctl restart docker` (todos os contêineres reiniciam por um instante).
 3. Confira com `docker run --rm --gpus all ubuntu:24.04 nvidia-smi`. Depois disso, **Conversar → Modelo** oferece *Usar a placa de vídeo NVIDIA*.
 
-Limite honesto: sem placa de vídeo (por exemplo numa VM ARM de 3 núcleos) cada resposta leva de dezenas de segundos a alguns minutos, e manutenção com vários passos falha com frequência. Pela linha de comando: `paasmcp assistant status|install|remove|test`.
+Limite honesto: sem placa de vídeo (por exemplo num servidor pequeno só com processador) cada resposta leva de dezenas de segundos a alguns minutos, e manutenção com vários passos falha com frequência. Pela linha de comando: `paasmcp assistant status|install|remove|test`.
 
 ### IA em outra máquina (MCP pela rede) e dois fatores no painel
 
