@@ -847,8 +847,30 @@ export async function testAssistant(): Promise<{ ok: true; model: string; ms: nu
   const cfg = assistantConfig();
   const started = Date.now();
   const caller = callerFor(cfg);
-  await caller([{ role: "user", text: "Reply with: ok", at: new Date().toISOString() }], [], AbortSignal.timeout(MODEL_TIMEOUT_MS), "en");
+  try {
+    await caller([{ role: "user", text: "Reply with: ok", at: new Date().toISOString() }], [], AbortSignal.timeout(MODEL_TIMEOUT_MS), "en");
+  } catch (err) {
+    throw explainModelError(err, cfg!.provider === "local" ? localOllamaUrl() : cfg!.baseUrl);
+  }
   return { ok: true, model: cfg!.model, ms: Date.now() - started };
+}
+
+/** A failed model call in words for the screen: who could not be reached and what to check. */
+export function explainModelError(err: unknown, url?: string): AssistantError {
+  if (err instanceof AssistantError) return err;
+  const cause = (err as { cause?: { code?: unknown } })?.cause;
+  const code = typeof cause?.code === "string" ? cause.code : "";
+  const where = url ? ` ${url}` : "";
+  if (code || (err instanceof TypeError && /fetch failed/i.test(err.message))) {
+    const why = code === "ECONNREFUSED" ? "connection refused" : /TIMEOUT|ETIMEDOUT/.test(code) ? "timeout" : code || "network error";
+    const whyPt = code === "ECONNREFUSED" ? "conexão recusada" : /TIMEOUT|ETIMEDOUT/.test(code) ? "tempo esgotado" : code || "erro de rede";
+    return fail(
+      `Could not reach the model at${where} (${why}). Check the address, that the other PC is on and that its firewall lets this server in.`,
+      `Não consegui falar com o modelo em${where} (${whyPt}). Confira o endereço, se o outro PC está ligado e se o firewall dele deixa este servidor entrar.`
+    );
+  }
+  const msg = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+  return fail(`The model test failed: ${msg}`, `O teste do modelo falhou: ${msg}`);
 }
 
 /** Rough size of the tool list in tokens (about 3.5 characters each). */

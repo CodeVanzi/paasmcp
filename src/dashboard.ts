@@ -484,8 +484,10 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         }
         if (pathname === "/api/assistant/test" && req.method === "POST") {
+          // Await before writing the head: a failed test must reach the catch below as a 400 with its text.
+          const result = await testAssistant();
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(await testAssistant()));
+          res.end(JSON.stringify(result));
           return true;
         }
         if (pathname === "/api/assistant/send" && req.method === "POST") {
@@ -1349,13 +1351,15 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
         // This PC as the arbiter of another pair.
         if (pathname === "/api/judge" && req.method === "GET") {
+          const status = await localJudgeStatus();
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify(await localJudgeStatus()));
+          res.end(JSON.stringify(status));
           return true;
         }
         if (pathname === "/api/judge/open" && req.method === "POST") {
+          const opened = await beJudge();
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify(await beJudge()));
+          res.end(JSON.stringify(opened));
           return true;
         }
         if (pathname === "/api/judge/cancel" && req.method === "POST") {
