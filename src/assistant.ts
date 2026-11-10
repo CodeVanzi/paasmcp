@@ -59,7 +59,7 @@ const fail = (en: string, pt: string) => new AssistantError(en, pt);
 
 const OFFLINE = () => process.env.PAASMCP_OFFLINE_TEST === "1";
 
-/** Ollama release with the CUDA 12 runner, so Pascal cards (GTX 10xx, driver 570+) still work. Multi-arch. */
+/** Ollama release with the CUDA 12 runner, so Pascal cards (GTX 10xx, driver 570/580; 590+ dropped them) still work. Multi-arch. */
 export const OLLAMA_IMAGE = "ollama/ollama:0.40.11";
 export const OLLAMA_CONTAINER = "paasmcp-ollama";
 export const OLLAMA_PORT = 11434;
