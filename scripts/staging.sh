@@ -10,6 +10,10 @@
 #   sudo scripts/staging.sh status    Is it running, which branch and commit, how to open it
 #   sudo scripts/staging.sh token     Login token of the test dashboard
 #   sudo scripts/staging.sh update    Check the followed branch now (instead of waiting ~2 min)
+#   sudo scripts/staging.sh domain <subdomain>
+#                                     Publish the test dashboard at https://<subdomain>.<your domain>,
+#                                     behind Cloudflare Access. First connect Cloudflare in the TEST
+#                                     dashboard (Connections > Domain, "Create a new tunnel", your e-mail).
 #   sudo scripts/staging.sh logs      Logs of the test dashboard
 #   sudo scripts/staging.sh shell     A shell inside the box (paasmcp CLI of the test copy)
 #   sudo scripts/staging.sh stop      Stop the box (data kept)
@@ -119,6 +123,28 @@ cmd_status() {
   cli dashboard follow status 2>/dev/null | grep -E '"(branch|current|failedCommit|lastError)"' | sed 's/^ */  /' || true
 }
 
+cmd_domain() {
+  local sub="${1:-}"
+  [[ "$sub" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || die "Usage: $0 domain <subdomain>   (only the first part, e.g. testepaasmcp for testepaasmcp.yourdomain.com)"
+  running || die "The box is not running. Start it with: sudo $0 up"
+  # What is missing in the test copy's Cloudflare settings: tunnel, domain, e-mail for Access.
+  local missing
+  missing=$(cli config 2>/dev/null | inbox node -e '
+    let d = ""; process.stdin.on("data", (c) => (d += c)).on("end", () => {
+      const cf = JSON.parse(d).cloudflare || {};
+      const m = [];
+      if (!cf.tunnelId) m.push("tunnel");
+      if (!cf.baseDomain || cf.baseDomain === "example.com") m.push("domain");
+      if (!(cf.zeroTrustEmails || []).length) m.push("e-mail");
+      console.log(m.join(", "));
+    });') || die "Could not read the test copy's settings."
+  [ -z "$missing" ] || die "Missing in the TEST dashboard: $missing. Open it, go to Connections > Domain, paste the Cloudflare token, pick the domain, choose \"Create a new tunnel\" and fill in your e-mail (only it gets in). Then run this again."
+  say "Publishing the test dashboard at ${sub}.<domain> (own tunnel of the test copy, Cloudflare Access)..."
+  cli dashboard start --expose zero-trust --subdomain "$sub" --yes \
+    | grep -E '"(url|details)"' | sed 's/^ */  /' || true
+}
+
 cmd_destroy() {
   exists || docker volume inspect staging-paasmcp-data >/dev/null 2>&1 || { echo "Nothing to delete."; return; }
   echo "This deletes the test box and ALL its data (apps, databases, settings of the test copy)."
@@ -135,9 +161,10 @@ case "${1:-status}" in
   status)   cmd_status ;;
   token)    running || die "The box is not running."; cli dashboard token ;;
   update)   running || die "The box is not running."; cli dashboard update --force ;;
+  domain)   cmd_domain "${2:-}" ;;
   logs)     running || die "The box is not running."; inbox docker logs --tail "${2:-200}" paasmcp-dashboard ;;
   shell)    running || die "The box is not running."; docker exec -it -w "$SRC" "$BOX" bash ;;
   stop)     exists && docker stop "$BOX" >/dev/null; echo "Stopped (data kept). Start again with: sudo $0 up" ;;
   destroy)  cmd_destroy ;;
-  *) sed -n '2,24p' "$0"; exit 1 ;;
+  *) sed -n '2,28p' "$0"; exit 1 ;;
 esac
