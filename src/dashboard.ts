@@ -1407,7 +1407,7 @@ export function environmentStrip(label: string, branch?: string): string {
   return `<div class="env-strip" role="note">${escapeHtmlServer(label)}${where} · <span>Separado da versão oficial: o que você fizer aqui não muda os apps de lá.</span></div>`;
 }
 
-function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = false): string {
+export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = false): string {
   const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
   const envLabel = environmentLabel();
   const envStrip = environmentStrip(envLabel, envLabel ? readFollow()?.branch : undefined);
@@ -1744,7 +1744,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
     <div class="err" id="err"></div>
     <div class="help-box">
       <strong id="helpTitle"></strong><br/>
-      <code>paasmcp dashboard token</code>
+      <code>${envLabel ? "sudo scripts/staging.sh token" : "paasmcp dashboard token"}</code>
     </div>
   </div>
   <script>
