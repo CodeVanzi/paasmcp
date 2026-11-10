@@ -785,6 +785,47 @@ async function runCli() {
       break;
     }
 
+    case "assistant": {
+      // Chat with an AI in the dashboard (assistant.ts): where its model runs. Chatting itself is in the dashboard.
+      const ai = await import("./assistant.js");
+      const sub = rest[0] || "status";
+      if (sub === "status") {
+        const cfg = ai.assistantConfig();
+        console.log(JSON.stringify({ config: cfg || null, local: await ai.localRuntime(), toolTokens: { full: await ai.toolTokens(false), compact: await ai.toolTokens(true) } }, null, 2));
+      } else if (sub === "install") {
+        const share = rest.includes("--share");
+        if (share) {
+          const { tailscaleIp } = await import("./judge.js");
+          const ip = tailscaleIp();
+          if (ip) await confirmInCli("assistant.share", { ip }, rest);
+        }
+        const model = getFlagValue(rest, "--model") || ai.DEFAULT_LOCAL_MODEL;
+        ai.startLocalInstall({ model, gpu: rest.includes("--gpu"), share });
+        console.error(`Starting Ollama (${ai.OLLAMA_IMAGE}) and downloading ${model}...`);
+        let last = "";
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const job = ai.currentInstallJob()!;
+          const line = job.phase === "model" && job.total ? `model ${Math.round(((job.completed || 0) * 100) / job.total)}%` : job.phase;
+          if (line !== last) console.error(line);
+          last = line;
+          if (job.phase === "done" || job.phase === "failed") {
+            console.log(JSON.stringify(job, null, 2));
+            if (job.phase === "failed") process.exitCode = 1;
+            break;
+          }
+        }
+      } else if (sub === "remove") {
+        ai.removeLocal({ deleteModels: rest.includes("--delete-models") });
+        console.log(JSON.stringify({ ok: true }, null, 2));
+      } else if (sub === "test") {
+        console.log(JSON.stringify(await ai.testAssistant(), null, 2));
+      } else {
+        throw new Error("Usage: paasmcp assistant status | install [--model qwen3.5:4b-q4_K_M] [--gpu] [--share [--yes]] | remove [--delete-models] | test. Choose where the model runs and chat in the dashboard (Chat).");
+      }
+      break;
+    }
+
     case "pcs": {
       // The devices of the Tailscale network, with and without PaaSMCP (installing is done from the dashboard).
       const { listTailnetPcs } = await import("./pcinstall.js");
@@ -1256,6 +1297,7 @@ Commands:
                                                     Live Postgres copy between two servers, failover, failback
   paasmcp pcs [--no-probe]                           Devices of your Tailscale, with and without PaaSMCP (install them in the dashboard: Connections > PCs)
   paasmcp wake [list|add <name> --mac <mac>|remove <name>|<name>]  Turn on a PC of this network by Wake-on-LAN
+  paasmcp assistant status|install [--model M] [--gpu] [--share]|remove|test  The dashboard chat AI model (local Ollama, another PC or an API)
   paasmcp arbiter <key|serve|install-service|pair|be-judge|pair-with|add-key|remove-key|clusters|check>
                                                     Third vote for automatic failover (one device can serve several clusters)
   paasmcp active <status|check|on|off|sync> [app]   Run an app on both servers at once (needs the mirror)

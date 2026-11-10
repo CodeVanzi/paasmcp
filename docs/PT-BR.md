@@ -134,6 +134,18 @@ Quase tudo o que o painel faz também tem ferramenta MCP, com os mesmos níveis 
 
 Ficam só no painel e na linha de comando, porque levam senha, token ou chave pelo chat da IA: instalar o PaaSMCP em outro PC (entra nele por SSH), ligar a Cloudflare (token e túnel), escolher o destino das cópias externas e gerar chave para outro computador, o comando de instalação do juiz e o pareamento do espelho.
 
+### Conversar com o servidor no painel
+
+A página **Conversar** do painel recebe pedidos em palavras ("publique usuario/meu-app em app.meudominio.com", "por que o blog caiu?") e responde usando as mesmas ferramentas do MCP, rodando no próprio servidor. As ações arriscadas param no pedido de aprovação de sempre e aparecem no chat com **Aprovar** e **Recusar** (as mais perigosas pedem o nome digitado). Quem guarda a ação pausada é o servidor, então o modelo nunca vê nem manda o número da aprovação.
+
+Em **Conversar → Modelo** você escolhe quem pensa nas respostas:
+
+- **Neste PC**: grátis e privado. O painel liga o Ollama num contêiner com versão fixa (`paasmcp-ollama`, sem porta no servidor, deixando um núcleo para os apps) e baixa o modelo. Com o NVIDIA Container Toolkit, usa a placa de vídeo (uma GTX 1060 de 6 GB já roda o `qwen3.5:4b` inteiro na placa; GTX 10xx pede driver 570 ou mais novo).
+- **Em outro PC meu**: um PC que marcou *Compartilhar com meus outros PCs* responde no IP da Tailscale dele (sem senha, por isso pede confirmação). Assim um servidor sem GPU usa a placa de outro.
+- **API**: qualquer serviço compatível com OpenAI (Gemini, OpenRouter e Groq têm plano grátis) ou a API da Anthropic, com a sua chave. A chave fica no cofre `system` e nunca volta para a tela.
+
+Limite honesto: sem placa de vídeo (por exemplo numa VM ARM de 3 núcleos) cada resposta leva de dezenas de segundos a alguns minutos, e manutenção com vários passos falha com frequência. Pela linha de comando: `paasmcp assistant status|install|remove|test`.
+
 ### IA em outra máquina (MCP pela rede) e dois fatores no painel
 
 ```bash
