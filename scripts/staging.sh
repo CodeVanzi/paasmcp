@@ -5,11 +5,17 @@
 # own dashboard. Nothing in it can see or touch the official apps, containers, network or state
 # (/opt/homelab). The dashboard inside follows a branch (default: staging) and updates itself after
 # each merge, with the same build + tests + rollback as the official one.
+# Every command below also works as "sudo paasmcp staging <command>".
 #
 #   sudo scripts/staging.sh up        Create the box, or start it again (first time: ~5-10 min)
 #   sudo scripts/staging.sh status    Is it running, which branch and commit, how to open it
 #   sudo scripts/staging.sh token     Login token of the test dashboard
 #   sudo scripts/staging.sh update    Check the followed branch now (instead of waiting ~2 min)
+#   sudo scripts/staging.sh domain <subdomain> [e-mail]
+#                                     Publish the test dashboard at https://<subdomain>.<your domain>,
+#                                     behind Cloudflare Access. First connect Cloudflare in the TEST
+#                                     dashboard (Connections > Domain, "Create a new tunnel"). The e-mail
+#                                     given here (or saved there) is the only one let in.
 #   sudo scripts/staging.sh logs      Logs of the test dashboard
 #   sudo scripts/staging.sh shell     A shell inside the box (paasmcp CLI of the test copy)
 #   sudo scripts/staging.sh stop      Stop the box (data kept)
@@ -35,6 +41,8 @@ INNER_PORT=4199                  # socat inside the box -> the test dashboard (1
 SRC=/srv/paasmcp                 # code used to install; afterwards the dashboard runs the followed release
 
 die() { echo "❌ $*" >&2; exit 1; }
+# How to call this again in messages: "paasmcp staging" when started by the CLI, else this script.
+ME="${PAASMCP_STAGING_CMD:-$0}"
 say() { echo "▶ $*"; }
 
 [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ && "$BRANCH" != -* ]] || die "Invalid branch name: $BRANCH"
@@ -92,6 +100,8 @@ cmd_up() {
     docker network connect "$NETWORK" "$BOX" 2>/dev/null || true
   fi
   wait_docker
+  # The strip on the test dashboard: kept in its data, so every new version of the dashboard shows it.
+  inbox sh -c 'mkdir -p /opt/homelab/paasmcp && printf "%s" "$PAASMCP_ENV_LABEL" > /opt/homelab/paasmcp/environment-label'
 
   if ! inbox test -f "$SRC/dist/cli.js"; then
     say "Installing PaaSMCP ($BRANCH) inside the box..."
@@ -102,21 +112,51 @@ cmd_up() {
     cli init --dashboard >/dev/null
     say "Making the test dashboard follow '$BRANCH' (build + tests, a few minutes)..."
     cli dashboard follow --repo "$REPO" --branch "$BRANCH" --yes >/dev/null \
-      || echo "⚠️  The first build of '$BRANCH' failed; the dashboard keeps running the installed code. See: $0 status"
+      || echo "⚠️  The first build of '$BRANCH' failed; the dashboard keeps running the installed code. See: sudo $ME status"
   fi
   cmd_status
 }
 
 cmd_status() {
-  exists || { echo "No test environment yet. Create it with: sudo $0 up"; return; }
-  if ! running; then echo "The box $BOX exists but is stopped. Start it with: sudo $0 up"; return; fi
+  exists || { echo "No test environment yet. Create it with: sudo $ME up"; return; }
+  if ! running; then echo "The box $BOX exists but is stopped. Start it with: sudo $ME up"; return; fi
   echo "Test environment: running"
   echo "  Dashboard:  http://127.0.0.1:${PORT}  (only on this server)"
   if docker network inspect "$NETWORK" >/dev/null 2>&1; then
     echo "  For a public hostname in your Cloudflare tunnel, use the service: http://${BOX}:${INNER_PORT}"
   fi
-  echo "  Login:      sudo $0 token"
+  echo "  Login:      sudo $ME token"
   cli dashboard follow status 2>/dev/null | grep -E '"(branch|current|failedCommit|lastError)"' | sed 's/^ */  /' || true
+}
+
+cmd_domain() {
+  local sub="${1:-}"
+  [[ "$sub" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
+    || die "Usage: $ME domain <subdomain>   (only the first part, e.g. testepaasmcp for testepaasmcp.yourdomain.com)"
+  running || die "The box is not running. Start it with: sudo $ME up"
+  local email="${2:-}"
+  if [ -n "$email" ]; then
+    [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "Invalid e-mail: $email"
+    cli config --zero-trust-emails "$email" >/dev/null || die "Could not save the e-mail in the test copy."
+  fi
+  # What is missing in the test copy's Cloudflare settings: tunnel, domain, e-mail for Access.
+  local missing
+  missing=$(cli config 2>/dev/null | inbox node -e '
+    let d = ""; process.stdin.on("data", (c) => (d += c)).on("end", () => {
+      const cf = JSON.parse(d).cloudflare || {};
+      const m = [];
+      if (!cf.tunnelId) m.push("tunnel");
+      if (!cf.baseDomain || cf.baseDomain === "example.com") m.push("domain");
+      if (!(cf.zeroTrustEmails || []).length) m.push("e-mail");
+      console.log(m.join(", "));
+    });') || die "Could not read the test copy's settings."
+  if [ "$missing" = "e-mail" ]; then
+    die "Missing the e-mail allowed in (Cloudflare Access). Run: sudo $ME domain $sub you@example.com"
+  fi
+  [ -z "$missing" ] || die "Missing in the TEST dashboard: $missing. Open it, go to Connections > Domain, paste the Cloudflare token, pick the domain and choose \"Create a new tunnel\". Then run: sudo $ME domain $sub you@example.com"
+  say "Publishing the test dashboard at ${sub}.<domain> (own tunnel of the test copy, Cloudflare Access)..."
+  cli dashboard start --expose zero-trust --subdomain "$sub" --yes \
+    | grep -E '"(url|details)"' | sed 's/^ */  /' || true
 }
 
 cmd_destroy() {
@@ -135,9 +175,10 @@ case "${1:-status}" in
   status)   cmd_status ;;
   token)    running || die "The box is not running."; cli dashboard token ;;
   update)   running || die "The box is not running."; cli dashboard update --force ;;
+  domain)   cmd_domain "${2:-}" "${3:-}" ;;
   logs)     running || die "The box is not running."; inbox docker logs --tail "${2:-200}" paasmcp-dashboard ;;
   shell)    running || die "The box is not running."; docker exec -it -w "$SRC" "$BOX" bash ;;
-  stop)     exists && docker stop "$BOX" >/dev/null; echo "Stopped (data kept). Start again with: sudo $0 up" ;;
+  stop)     exists && docker stop "$BOX" >/dev/null; echo "Stopped (data kept). Start again with: sudo $ME up" ;;
   destroy)  cmd_destroy ;;
-  *) sed -n '2,24p' "$0"; exit 1 ;;
+  *) sed -n '2,29p' "$0"; exit 1 ;;
 esac

@@ -186,17 +186,18 @@ O PaaSMCP convive com o resto do servidor. Depois de instalar, rode `paasmcp doc
 
 ### Ambiente de testes no mesmo servidor
 
-Para experimentar uma versão nova sem arriscar a oficial, `scripts/staging.sh` sobe uma cópia de testes do PaaSMCP numa "caixa": um contêiner com Docker próprio, dados próprios e painel próprio. A cópia não enxerga nem mexe nos apps, contêineres, redes ou no estado (`/opt/homelab`) da versão oficial. O painel dela segue um branch (padrão `staging`) e se atualiza sozinho a cada merge, com a mesma compilação, testes e volta automática da versão oficial. Todas as páginas mostram uma faixa laranja **AMBIENTE DE TESTES** e o título da aba começa com `[AMBIENTE DE TESTES]`.
+Para experimentar uma versão nova sem arriscar a oficial, `sudo paasmcp staging up` (o mesmo que `sudo scripts/staging.sh up`) sobe uma cópia de testes do PaaSMCP numa "caixa": um contêiner com Docker próprio, dados próprios e painel próprio. A cópia não enxerga nem mexe nos apps, contêineres, redes ou no estado (`/opt/homelab`) da versão oficial. O painel dela segue um branch (padrão `staging`) e se atualiza sozinho a cada merge, com a mesma compilação, testes e volta automática da versão oficial. Todas as páginas mostram uma faixa laranja **AMBIENTE DE TESTES** e o título da aba começa com `[AMBIENTE DE TESTES]`.
 
 ```bash
-sudo scripts/staging.sh up       # cria a caixa (primeira vez: 5 a 10 min) e mostra como abrir
-sudo scripts/staging.sh token    # token para entrar no painel de testes
-sudo scripts/staging.sh status   # branch, versão em uso e a última falha, se houver
-sudo scripts/staging.sh update   # confere o branch agora, sem esperar os ~2 min
-sudo scripts/staging.sh destroy  # apaga a caixa e todos os dados de teste (pede para digitar o nome)
+sudo paasmcp staging up       # cria a caixa (primeira vez: 5 a 10 min) e mostra como abrir
+sudo paasmcp staging token    # token para entrar no painel de testes
+sudo paasmcp staging status   # branch, versão em uso e a última falha, se houver
+sudo paasmcp staging update   # confere o branch agora, sem esperar os ~2 min
+sudo paasmcp staging domain testepaasmcp voce@exemplo.com  # publica em https://testepaasmcp.<seu domínio>, com Access
+sudo paasmcp staging destroy  # apaga a caixa e todos os dados de teste (pede para digitar o nome)
 ```
 
-- **Endereço:** o painel de testes fica em `http://127.0.0.1:4199` neste servidor. Para um domínio só de testes, crie no seu túnel da Cloudflare um *public hostname* (ex.: `teste.seudominio.com`) apontando para `http://staging-paasmcp:4199`; a caixa entra sozinha na rede `homelab-network` do seu `cloudflared`. Proteja esse endereço com Cloudflare Access (só o seu e-mail), como o painel oficial. Outra opção é só pela Tailscale: `tailscale serve --bg --https=8461 http://127.0.0.1:4199`.
+- **Endereço:** o painel de testes fica em `http://127.0.0.1:4199` neste servidor. Para um domínio só de testes, abra o painel de testes, vá em **Conexões → Domínio**, cole o token da Cloudflare, escolha o domínio, marque “Criar um túnel novo”. Depois, um comando publica o painel de testes atrás do Cloudflare Access (só o e-mail informado entra), com um túnel próprio da cópia de testes, sem mexer no túnel oficial: `sudo paasmcp staging domain testepaasmcp voce@exemplo.com` (vira `https://testepaasmcp.<seu domínio>`). Outra opção é só pela Tailscale: `tailscale serve --bg --https=8461 http://127.0.0.1:4199`.
 - **Fluxo:** os PRs entram em `staging`; a cópia de testes se atualiza; depois de aprovado, um PR `staging → main` leva tudo para a versão oficial, que segue a `main`.
 - **Credenciais:** use tokens próprios de teste (GitHub e Cloudflare), nunca os da versão oficial. Um token da Cloudflare restrito a outro domínio, ou a outro túnel, evita que um teste mexa nos endereços de verdade.
 - **Configurar:** `STAGING_BRANCH`, `STAGING_PORT`, `STAGING_LABEL`, `STAGING_REPO` e `STAGING_NETWORK` mudam o branch, a porta, o texto da faixa, o repositório e a rede do túnel.

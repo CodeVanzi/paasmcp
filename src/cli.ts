@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
@@ -218,6 +219,15 @@ async function runCli() {
   switch (cmd) {
     case "status": {
       console.log(JSON.stringify(getSystemStatusSummary(), null, 2));
+      break;
+    }
+
+    case "staging": {
+      // The test copy of PaaSMCP (scripts/staging.sh): its own box, data and dashboard, never this install.
+      const script = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "scripts", "staging.sh");
+      if (!fs.existsSync(script)) throw new Error(`scripts/staging.sh not found next to this installation (${script}).`);
+      const r = spawnSync("bash", [script, ...rest], { stdio: "inherit", env: { ...process.env, PAASMCP_STAGING_CMD: "paasmcp staging" } });
+      process.exitCode = r.status ?? 1;
       break;
     }
 
@@ -1278,6 +1288,7 @@ Commands:
   paasmcp trash purge-expired                        Delete apps trashed more than 30 days ago (cron)
   paasmcp dashboard follow [--repo URL] [--branch main] [--off] | follow status  Dashboard updates itself from a branch (build + tests first, rollback)
   paasmcp dashboard update [--force]                 Check the followed branch now
+  sudo paasmcp staging <up|status|token|update|domain|logs|shell|stop|destroy>  Test copy of PaaSMCP in its own box (see docs/PT-BR.md)
   paasmcp dashboard 2fa <enable|disable|status>      Two-factor login for the dashboard (needed to publish it openly)
   paasmcp mcp serve [--port 4098] [--host tailscale] MCP over HTTP for remote AI clients (token required)
   paasmcp token <create|list|revoke> ...             Personal MCP tokens (levels: read, deploy, destroy)
@@ -1337,7 +1348,7 @@ async function runActiveSyncWithFiles() {
 }
 
 // Read-only commands and the long-running dashboard server skip the state lock.
-const LOCK_FREE_COMMANDS = new Set(["status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", "mcp", "token", undefined]);
+const LOCK_FREE_COMMANDS = new Set(["staging", "status", "doctor", "logs", "approvals", "approve", "reject", "dashboard", "mcp", "token", undefined]);
 const command = process.argv[2];
 // Long-running loops take the lock per round instead of holding it.
 // Scale rounds measure without the lock (they keep their own files), so a long deploy never pauses the

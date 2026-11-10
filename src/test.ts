@@ -5536,10 +5536,19 @@ volumes:
       const strip = dashboard.environmentStrip(dashboard.environmentLabel(), "staging");
       assert.match(strip, /AMBIENTE DE TESTES/);
       assert.match(strip, /<code>staging<\/code>/);
+      assert.match(dashboard.renderDashboardHtml(false), /sudo paasmcp staging token/, "the test login points to the test token, not the official one");
       process.env.PAASMCP_ENV_LABEL = 'TESTE <script>x</script> ${HOME} "a"\nb';
       const label = dashboard.environmentLabel();
       assert.doesNotMatch(label, /[<>$"{}\n]/, "only plain characters reach the page and the compose file");
       assert.doesNotMatch(dashboard.environmentStrip(label, "<b>"), /<b>|<script>/);
+      // Kept in the data folder too: a new dashboard version started without the variable still shows it.
+      delete process.env.PAASMCP_ENV_LABEL;
+      const labelFile = path.join(config.PAAS_DATA_DIR, "environment-label");
+      fs.mkdirSync(config.PAAS_DATA_DIR, { recursive: true });
+      fs.writeFileSync(labelFile, "AMBIENTE DE TESTES");
+      assert.equal(dashboard.environmentLabel(), "AMBIENTE DE TESTES");
+      fs.rmSync(labelFile);
+      assert.equal(dashboard.environmentLabel(), "");
     } finally {
       if (before === undefined) delete process.env.PAASMCP_ENV_LABEL; else process.env.PAASMCP_ENV_LABEL = before;
     }
