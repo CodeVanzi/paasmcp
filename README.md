@@ -66,7 +66,7 @@ Open **Chat** in the dashboard and ask in plain words: "publish user/my-app at a
 | **On another PC of yours** (local LLM) | Free and private | A PC with PaaSMCP that ticked *Share with my other PCs*: its model answers on its Tailscale IP only. A server without a GPU can use the card of a PC at home. |
 | **An API** (external LLM) | Your plan with the provider | A key for any OpenAI-compatible service (Gemini, OpenRouter and Groq have free tiers; OpenAI) or for the Claude API. The key stays in the encrypted vault and never comes back to the screen. |
 
-**Real numbers.** On a GTX 1060 with 6 GB, `qwen3.5:4b-q4_K_M` runs entirely on the card (about 3.7 GB of video memory) at about 32 tokens per second. Without a GPU, for example on a 3-core ARM VM, each answer takes from tens of seconds to minutes and multi-step maintenance often fails: use another PC's GPU or an API there.
+**What to expect.** A 6 GB NVIDIA card holds a 4B model such as `qwen3.5:4b-q4_K_M` entirely in video memory, fast enough for a normal chat. Without a GPU, on a small CPU-only server, each answer takes from tens of seconds to minutes and multi-step maintenance often fails: use another PC's GPU or an API there.
 
 **Turning on an NVIDIA GPU** (once, on the host, needs root and a reboot, so it is not a dashboard button):
 
