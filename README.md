@@ -48,6 +48,7 @@ What you can do there, without a terminal:
 - **Notices** on your phone (ntfy, Discord, Slack) when an app stops or a deploy fails.
 - **Second server, judge and helpers**: pair a second server for a live copy and automatic takeover, pick a judge (arbiter) by a 6-digit code, list the PCs of your Tailscale network and **install PaaSMCP on them from the dashboard**, wake sleeping PCs (Wake-on-LAN), scale apps onto them.
 - **Connect your AI**: create MCP tokens with a level and copy the ready config for Claude Code, Codex, Cursor, VS Code or Gemini CLI. Approve what the agent asked for.
+- **Chat with the server**: ask in plain words ("publish user/my-app at app.mydomain.com", "why is the blog down?"). The assistant uses the same tools as MCP, and risky actions show an Approve / Refuse card in the chat. The model can run free on the server itself (Ollama in a pinned container, on an NVIDIA GPU if there is one), on another PC of yours that shares its model over Tailscale, or through an API with your key (OpenAI-compatible such as Gemini, OpenRouter or Groq, or Claude).
 
 ---
 
@@ -368,6 +369,11 @@ paasmcp approve c-7F3K2A
 paasmcp token create laptop --level deploy
 paasmcp mcp serve --host tailscale
 paasmcp dashboard 2fa enable
+
+# The dashboard's chat (Chat): a free local model on this PC (add --gpu with the NVIDIA Container Toolkit,
+# --share to let your other PCs use it over Tailscale), or pick another PC / an API on the Chat → Model screen
+paasmcp assistant install --model qwen3.5:4b-q4_K_M
+paasmcp assistant status
 
 # Trash: destroy is reversible for 30 days
 paasmcp destroy my-saas

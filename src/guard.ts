@@ -266,6 +266,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `https://${String(params.hostname)} stops answering.${params.users ? ` These keys stop working from outside Tailscale: ${String(params.users)}.` : ""} Nothing stored is deleted.`,
         `https://${String(params.hostname)} para de responder.${params.users ? ` Estas chaves param de funcionar fora da Tailscale: ${String(params.users)}.` : ""} Nada do que está guardado é apagado.`,
         params);
+    case "assistant.share":
+      return risk(action, "assistant", "confirm",
+        `The local AI model answers on this PC's Tailscale address (${String(params.ip)}:11434) without a password: any device in your Tailscale network that can reach this PC can use it (it only generates text; it cannot run anything here).`,
+        `O modelo de IA local passa a responder no endereço da Tailscale deste PC (${String(params.ip)}:11434), sem senha: qualquer aparelho da sua rede Tailscale que alcance este PC pode usá-lo (ele só gera texto; não consegue rodar nada aqui).`,
+        params);
     case "connect.cloudflare":
       // Free the first time; replacing a working domain or tunnel is confirmed.
       return risk(action, "cloudflare", "confirm",
