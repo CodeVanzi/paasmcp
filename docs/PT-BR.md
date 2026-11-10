@@ -184,6 +184,24 @@ O PaaSMCP convive com o resto do servidor. Depois de instalar, rode `paasmcp doc
 - **Seu próprio contêiner do Cloudflare Tunnel.** O PaaSMCP manda os endereços públicos para os apps pelo nome do contêiner na rede Docker `homelab-network`, então o contêiner `cloudflared` precisa estar nela.
 - **Servidor no cabo.** O ativo-ativo e o juiz julgam um servidor por ele responder; Wi-Fi instável gera falsos alarmes.
 
+### Ambiente de testes no mesmo servidor
+
+Para experimentar uma versão nova sem arriscar a oficial, `scripts/staging.sh` sobe uma cópia de testes do PaaSMCP numa "caixa": um contêiner com Docker próprio, dados próprios e painel próprio. A cópia não enxerga nem mexe nos apps, contêineres, redes ou no estado (`/opt/homelab`) da versão oficial. O painel dela segue um branch (padrão `staging`) e se atualiza sozinho a cada merge, com a mesma compilação, testes e volta automática da versão oficial. Todas as páginas mostram uma faixa laranja **AMBIENTE DE TESTES** e o título da aba começa com `[AMBIENTE DE TESTES]`.
+
+```bash
+sudo scripts/staging.sh up       # cria a caixa (primeira vez: 5 a 10 min) e mostra como abrir
+sudo scripts/staging.sh token    # token para entrar no painel de testes
+sudo scripts/staging.sh status   # branch, versão em uso e a última falha, se houver
+sudo scripts/staging.sh update   # confere o branch agora, sem esperar os ~2 min
+sudo scripts/staging.sh destroy  # apaga a caixa e todos os dados de teste (pede para digitar o nome)
+```
+
+- **Endereço:** o painel de testes fica em `http://127.0.0.1:4199` neste servidor. Para um domínio só de testes, crie no seu túnel da Cloudflare um *public hostname* (ex.: `teste.seudominio.com`) apontando para `http://staging-paasmcp:4199`; a caixa entra sozinha na rede `homelab-network` do seu `cloudflared`. Proteja esse endereço com Cloudflare Access (só o seu e-mail), como o painel oficial. Outra opção é só pela Tailscale: `tailscale serve --bg --https=8461 http://127.0.0.1:4199`.
+- **Fluxo:** os PRs entram em `staging`; a cópia de testes se atualiza; depois de aprovado, um PR `staging → main` leva tudo para a versão oficial, que segue a `main`.
+- **Credenciais:** use tokens próprios de teste (GitHub e Cloudflare), nunca os da versão oficial. Um token da Cloudflare restrito a outro domínio, ou a outro túnel, evita que um teste mexa nos endereços de verdade.
+- **Configurar:** `STAGING_BRANCH`, `STAGING_PORT`, `STAGING_LABEL`, `STAGING_REPO` e `STAGING_NETWORK` mudam o branch, a porta, o texto da faixa, o repositório e a rede do túnel.
+- **Segurança:** a caixa roda como contêiner privilegiado, que é o que um Docker dentro de contêiner precisa (é a mesma confiança que o painel oficial já tem, com o socket do Docker do servidor). O Docker de dentro escuta só no próprio socket, nunca na rede, e a caixa leva o rótulo que o Watchtower respeita.
+
 ### Primeira configuração e credenciais
 
 Em **Senhas e chaves**, escolha o app numa lista, cole um `.env` inteiro se quiser (aspas, `export` e comentários funcionam) e use **Publicar de novo** para o app passar a usar as variáveis novas: reiniciar não basta, porque elas são gravadas na hora de publicar. No painel, **Início → Tutorial** mostra o que já foi feito e o que ainda dá para fazer (os itens se marcam sozinhos), com guias passo a passo em páginas próprias (`#guide/firstapp`, `address`, `offsite`, `autoupdate`, `email`, `github`). As integrações externas são opcionais. Bootstrap, deploy de pastas locais, repositórios públicos, bancos locais e uso do painel não precisam de token Cloudflare ou GitHub. Guarde credenciais em **Cofre → escopo `system`**; segredos usados pelo código de uma aplicação ficam no escopo do slug dela. O painel mostra valores mascarados depois de salvar. Cada chave pode ter uma descrição curta (para que serve) e mostra quando foi criada e alterada pela última vez; as chaves que o próprio PaaSMCP cria já vêm com uma explicação padrão, que dá para trocar. Chaves salvas antes desta versão aparecem com data desconhecida. Pela linha de comando: `paasmcp secret describe <escopo> <CHAVE> "texto"`.

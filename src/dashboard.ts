@@ -68,7 +68,7 @@ import {
   verifyGitHubWebhookSignature,
 } from "./federation.js";
 import { getSystemStatusSummary, resourceSnapshot } from "./mcp-server.js";
-import { followedCode, followStatus, originOf, setFollow } from "./selfupdate.js";
+import { followedCode, followStatus, originOf, readFollow, setFollow } from "./selfupdate.js";
 import { startPollLoop } from "./pollloop.js";
 import { startMirrorWatchLoop } from "./mirrorwatchloop.js";
 import { startAppWatch } from "./appwatch.js";
@@ -1385,8 +1385,25 @@ function tellPeerAboutArbiter(): void {
     });
 }
 
+/**
+ * Name of this installation's environment when it is not the official one (e.g. "AMBIENTE DE TESTES").
+ * Set by scripts/staging.sh; empty on a normal install. Shown as a strip on every page and in the tab title.
+ */
+export function environmentLabel(): string {
+  return (process.env.PAASMCP_ENV_LABEL || "").replace(/[^\p{L}\p{N} ._:()·!-]+/gu, " ").replace(/ {2,}/g, " ").trim().slice(0, 60);
+}
+
+export function environmentStrip(label: string, branch?: string): string {
+  if (!label) return "";
+  const where = branch ? ` · branch <code>${escapeHtmlServer(branch)}</code>` : "";
+  return `<div class="env-strip" role="note">${escapeHtmlServer(label)}${where} · <span>Separado da versão oficial: o que você fizer aqui não muda os apps de lá.</span></div>`;
+}
+
 function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = false): string {
   const safeCfEmail = cfEmail ? escapeHtmlServer(cfEmail) : "";
+  const envLabel = environmentLabel();
+  const envStrip = environmentStrip(envLabel, envLabel ? readFollow()?.branch : undefined);
+  const titlePrefix = envLabel ? `[${escapeHtmlServer(envLabel)}] ` : "";
   const sharedCss = `
     :root, [data-theme="dark"] {
       --bg: #121720;
@@ -1641,6 +1658,18 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
       z-index: 9999;
       display: none;
     }
+    .env-strip {
+      background: #f59e0b;
+      color: #1c1206;
+      font-size: 12.5px;
+      font-weight: 700;
+      text-align: center;
+      padding: 6px 16px;
+      letter-spacing: 0.02em;
+      line-height: 1.4;
+    }
+    .env-strip span { font-weight: 500; }
+    .env-strip code { background: rgba(0,0,0,0.12); padding: 0 4px; border-radius: 4px; }
   `;
 
   if (!authed) {
@@ -1649,10 +1678,11 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PaaSMCP — Control Plane Login</title>
+  <title>${titlePrefix}PaaSMCP — Control Plane Login</title>
   <style>
     ${sharedCss}
     body { display: flex; min-height: 100vh; align-items: center; justify-content: center; padding: 20px; background: radial-gradient(circle at 50% 0%, rgba(99,102,241,0.14), transparent 55%), var(--bg); }
+    .env-strip { position: fixed; top: 0; left: 0; right: 0; z-index: 10; }
     .login-card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -1679,6 +1709,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   </style>
 </head>
 <body>
+  ${envStrip}
   <div class="login-card">
     <div class="login-top">
       <span class="badge">Agent-First Micro-PaaS</span>
@@ -1762,7 +1793,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PaaSMCP — Workspace & Control Plane</title>
+  <title>${titlePrefix}PaaSMCP — Workspace & Control Plane</title>
   <style>
     ${sharedCss}
     /* Top Console Header */
@@ -2427,6 +2458,7 @@ function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor = fals
   </style>
 </head>
 <body>
+  ${envStrip}
   <!-- Top Console Header -->
   <header class="console-header">
     <div class="console-header-left">
@@ -10679,7 +10711,7 @@ ${WATCHTOWER_OFF_COMPOSE}    working_dir: /app
     command: ["node", "dist/cli.js", "dashboard", "serve", "--port", "${port}", "--host", "0.0.0.0"]
     environment:
       PAASMCP_ROOT: "${HOMELAB_ROOT}"
-      PAASMCP_IN_DASHBOARD: "1"
+      PAASMCP_IN_DASHBOARD: "1"${environmentLabel() ? `\n      PAASMCP_ENV_LABEL: ${JSON.stringify(environmentLabel())}` : ""}
     ports:
       - "127.0.0.1:${port}:${port}"
     volumes:

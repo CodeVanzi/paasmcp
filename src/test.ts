@@ -5524,5 +5524,26 @@ volumes:
     }
   });
 
+  await t.test("66. Test environment: the dashboard says it is not the official one, and the label cannot inject markup or compose variables", async () => {
+    const dashboard = await import("./dashboard.js");
+    const before = process.env.PAASMCP_ENV_LABEL;
+    try {
+      delete process.env.PAASMCP_ENV_LABEL;
+      assert.equal(dashboard.environmentLabel(), "");
+      assert.equal(dashboard.environmentStrip(""), "", "a normal install shows no strip");
+      process.env.PAASMCP_ENV_LABEL = "AMBIENTE DE TESTES";
+      assert.equal(dashboard.environmentLabel(), "AMBIENTE DE TESTES");
+      const strip = dashboard.environmentStrip(dashboard.environmentLabel(), "staging");
+      assert.match(strip, /AMBIENTE DE TESTES/);
+      assert.match(strip, /<code>staging<\/code>/);
+      process.env.PAASMCP_ENV_LABEL = 'TESTE <script>x</script> ${HOME} "a"\nb';
+      const label = dashboard.environmentLabel();
+      assert.doesNotMatch(label, /[<>$"{}\n]/, "only plain characters reach the page and the compose file");
+      assert.doesNotMatch(dashboard.environmentStrip(label, "<b>"), /<b>|<script>/);
+    } finally {
+      if (before === undefined) delete process.env.PAASMCP_ENV_LABEL; else process.env.PAASMCP_ENV_LABEL = before;
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
