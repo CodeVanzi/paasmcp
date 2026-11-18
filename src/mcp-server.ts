@@ -60,7 +60,7 @@ import {
   readDockerStats,
   runPaaSDoctor,
 } from "./deployer.js";
-import { exposeApplication, releaseAddresses, removeAppAddress } from "./exposure.js";
+import { addressInUse, exposeApplication, releaseAddresses, removeAppAddress } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -672,7 +672,7 @@ function toolCatalog() {
             },
             subdomain: {
               type: "string",
-              description: "Subdomain under configured baseDomain (defaults to appName).",
+              description: "Subdomain under configured baseDomain (defaults to appName). \"@\" (or the domain itself) uses the domain alone. An address that already points elsewhere asks for a strong approval before it is replaced.",
             },
             mode: {
               type: "string",
@@ -1466,11 +1466,14 @@ async function callTool(name: string, args: Record<string, unknown>, level: Toke
       }
 
       case "paas_app_expose": {
-        authorize("app.expose", { appName: String(args.appName), mode: String(args.mode) });
+        const subdomain = args.subdomain ? String(args.subdomain) : undefined;
+        const inUse = args.mode === "tailscale" ? { hostname: "", foreign: [] as string[] } : await addressInUse(String(args.appName), subdomain);
+        authorize("app.expose", { appName: String(args.appName), mode: String(args.mode), ...(inUse.foreign.length ? { hostname: inUse.hostname, replaces: inUse.foreign.join(", ") } : {}) });
         const result = await exposeApplication({
           appName: String(args.appName),
-          subdomain: args.subdomain ? String(args.subdomain) : undefined,
+          subdomain,
           mode: args.mode as "public" | "zero-trust" | "tailscale",
+          replaceDns: inUse.foreign.length > 0,
         });
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

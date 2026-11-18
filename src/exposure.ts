@@ -37,6 +37,46 @@ export interface ExposeOptions {
   subdomain?: string;
   mode: "public" | "zero-trust" | "tailscale";
   tailscalePort?: number;
+  /** The hostname already points somewhere else (A/AAAA, or a CNAME that is not a tunnel): replace it. */
+  replaceDns?: boolean;
+}
+
+/**
+ * The full hostname for an app's address on the domain. "@" or the domain itself is the domain alone
+ * (example.com, no prefix), for an app that moves in from another host and already lives there.
+ */
+export function appHostname(baseDomain: string, subdomain: string | undefined, appSlug: string): string {
+  const raw = String(subdomain || "").trim().toLowerCase().replace(/\.$/, "");
+  if (raw === "@" || raw === baseDomain.toLowerCase()) return baseDomain;
+  const sub = sanitizeSlug(raw.endsWith(`.${baseDomain}`) ? raw.slice(0, -baseDomain.length - 1) : raw || appSlug);
+  return `${sub}.${baseDomain}`;
+}
+
+type DnsRecord = { id: string; type: string; content: string };
+
+/** A/AAAA/CNAME records of a hostname; a CNAME to a Cloudflare tunnel is a PaaSMCP address (this server or its pair). */
+async function addressRecords(hostname: string, headers: Record<string, string>, baseDomain: string): Promise<{ zoneId: string; records: DnsRecord[]; foreign: string[] }> {
+  const zoneRes = await fetch(`${cfApi()}/zones?name=${encodeURIComponent(baseDomain)}`, { headers });
+  const zoneData = (await zoneRes.json().catch(() => ({}))) as { result?: Array<{ id: string }> };
+  const zoneId = zoneData.result?.[0]?.id;
+  if (!zoneId) throw new Error(`Could not find Cloudflare Zone ID for domain '${baseDomain}'.`);
+  const res = await fetch(`${cfApi()}/zones/${zoneId}/dns_records?name=${encodeURIComponent(hostname)}`, { headers });
+  const data = (await res.json().catch(() => ({}))) as { result?: DnsRecord[] };
+  const records = (data.result || []).filter((r) => r.type === "A" || r.type === "AAAA" || r.type === "CNAME");
+  const foreign = records
+    .filter((r) => !(r.type === "CNAME" && /\.cfargotunnel\.com\.?$/i.test(r.content)))
+    .map((r) => `${r.type} ${String(r.content).slice(0, 100)}`);
+  return { zoneId, records, foreign };
+}
+
+/** What a hostname points at today when that is not a PaaSMCP tunnel (empty: free, or already ours). */
+export async function addressInUse(appName: string, subdomain?: string): Promise<{ hostname: string; foreign: string[] }> {
+  const { baseDomain } = loadState().cloudflare;
+  const token = getSecrets("system").CF_API_TOKEN || process.env.CF_API_TOKEN;
+  if (!baseDomain || baseDomain === "example.com" || !token) return { hostname: "", foreign: [] };
+  const hostname = appHostname(baseDomain, subdomain, sanitizeSlug(appName));
+  const { foreign } = await addressRecords(hostname, { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, baseDomain);
+  return { hostname, foreign };
 }
 
 function detectTailscaleDomain(configured?: string): string {
@@ -105,10 +145,7 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
     );
   }
 
-  const subdomain = sanitizeSlug(opts.subdomain || slug);
-  const fullHostname = subdomain.endsWith(baseDomain)
-    ? subdomain
-    : `${subdomain}.${baseDomain}`;
+  const fullHostname = appHostname(baseDomain, opts.subdomain, slug);
   // With copies on helpers, visits go through the pool balancer here (pool.ts).
   const internalServiceUrl = appServiceUrl(app);
 
@@ -125,9 +162,19 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
     "Content-Type": "application/json",
   };
 
+  // Before touching the tunnel: a hostname that points elsewhere (another host, an old provider) is
+  // only taken over when the person said so, since its visitors move here at once.
+  const dns = await addressRecords(fullHostname, headers, baseDomain);
+  if (dns.foreign.length && !opts.replaceDns) {
+    throw new ExposeError(
+      `${fullHostname} already points somewhere else (${dns.foreign.join(", ")}). Publishing moves its visitors to this server; confirm replacing it.`,
+      `${fullHostname} hoje aponta para outro lugar (${dns.foreign.join(", ")}). Publicar aqui leva quem abre esse endereço para este servidor; confirme a troca.`
+    );
+  }
+
   // 1. Fetch current Cloudflare Tunnel configuration
   const getCfgRes = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`,
+    `${cfApi()}/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`,
     { headers }
   );
   if (!getCfgRes.ok) {
@@ -166,7 +213,7 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
   const updatedIngress = [...hostRules, catchAll];
 
   const putCfgRes = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`,
+    `${cfApi()}/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`,
     {
       method: "PUT",
       headers,
@@ -183,55 +230,26 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
     );
   }
 
-  // 2. Ensure CNAME DNS record exists in the Cloudflare Zone for baseDomain
-  const zoneRes = await fetch(
-    `https://api.cloudflare.com/client/v4/zones?name=${encodeURIComponent(baseDomain)}`,
-    { headers }
-  );
-  const zoneData = (await zoneRes.json()) as { result?: Array<{ id: string }> };
-  const zoneId = zoneData.result?.[0]?.id;
-  if (!zoneId) {
-    throw new Error(`Could not find Cloudflare Zone ID for domain '${baseDomain}'.`);
-  }
-
-  const existingDnsRes = await fetch(
-    `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?name=${encodeURIComponent(fullHostname)}`,
-    { headers }
-  );
-  const existingDnsData = (await existingDnsRes.json()) as {
-    result?: Array<{ id: string }>;
-  };
-
+  // 2. The proxied CNAME to the tunnel. A CNAME already there (ours, or the pair's) is updated in place;
+  // A/AAAA records of a replaced address go first, since a CNAME cannot sit next to them. Other record
+  // types (MX, TXT for e-mail) are never touched.
+  const zoneId = dns.zoneId;
   // A hostname already served by the tunnel for apps on both servers stays on it (activetunnel.ts).
   const onSecond = app.activeActive && state.activeTunnel?.routes[fullHostname] ? state.activeTunnel.tunnelId : undefined;
   const cnameTarget = `${onSecond || tunnelId}.cfargotunnel.com`;
-  if (existingDnsData.result && existingDnsData.result.length > 0) {
-    const recordId = existingDnsData.result[0].id;
-    await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${recordId}`,
-      {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({
-          type: "CNAME",
-          name: fullHostname,
-          content: cnameTarget,
-          proxied: true,
-        }),
-      }
-    );
+  const record = { type: "CNAME", name: fullHostname, content: cnameTarget, proxied: true };
+  const dnsCall = async (method: string, route: string, body?: unknown) => {
+    const r = await fetch(`${cfApi()}/zones/${zoneId}/dns_records${route}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    if (!r.ok) throw new Error(`Cloudflare DNS ${method} for ${fullHostname}: HTTP ${r.status} ${(await r.text()).slice(0, 300)}`);
+  };
+  const cname = dns.records.find((r) => r.type === "CNAME");
+  if (cname) {
+    await dnsCall("PUT", `/${cname.id}`, record);
   } else {
-    await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        type: "CNAME",
-        name: fullHostname,
-        content: cnameTarget,
-        proxied: true,
-      }),
-    });
+    for (const r of dns.records) await dnsCall("DELETE", `/${r.id}`);
+    await dnsCall("POST", "", record);
   }
+  if (dns.foreign.length) audit({ event: "app.expose.replace_dns", app: slug, hostname: fullHostname, was: dns.foreign.join(", ") });
 
   // 3. Optional Zero Trust Access protection
   let zeroTrustStatus = "Public access enabled (no Zero Trust gate).";
@@ -242,7 +260,7 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
         "Tunnel & DNS configured. Warning: No zeroTrustEmails configured in state; configure emails via paas_configure to attach an email OTP Access policy.";
     } else {
       const appsRes = await fetch(
-        `https://api.cloudflare.com/client/v4/accounts/${accountId}/access/apps`,
+        `${cfApi()}/accounts/${accountId}/access/apps`,
         { headers }
       );
       if (appsRes.ok) {
@@ -252,7 +270,7 @@ export async function exposeApplication(opts: ExposeOptions): Promise<{
         const alreadyExists = appsData.result?.some((a) => a.domain === fullHostname);
         if (!alreadyExists) {
           const createAppRes = await fetch(
-            `https://api.cloudflare.com/client/v4/accounts/${accountId}/access/apps`,
+            `${cfApi()}/accounts/${accountId}/access/apps`,
             {
               method: "POST",
               headers,

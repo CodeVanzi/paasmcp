@@ -328,6 +328,15 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
           `O painel controla o servidor inteiro. Ele ficará acessível ${mode === "tailscale" ? "pela sua Tailnet" : "pelo Cloudflare Zero Trust (login por e-mail)"}.`,
           params);
       }
+      // The address already points somewhere else (another host, an old provider): its visitors move here.
+      if (params.replaces && mode !== "tailscale") {
+        const host = String(params.hostname || "");
+        const was = String(params.replaces);
+        return risk(action, subject, "strong",
+          `${host} points somewhere else today (${was}). It will point to '${subject}' on this server: whoever opens ${host} lands here at once, and the old destination stops getting visits through it.${mode === "public" ? " The app will be open to anyone on the internet." : ""}`,
+          `${host} hoje aponta para outro lugar (${was}). Ele vai passar a apontar para '${subject}' neste servidor: quem abrir ${host} cai aqui na hora, e o destino antigo deixa de receber visitas por esse endereço.${mode === "public" ? " O app ficará aberto para qualquer pessoa na internet." : ""}`,
+          params);
+      }
       if (mode === "public") {
         return risk(action, subject, "confirm",
           `App '${subject}' will be open to anyone on the internet. Only do this for apps with their own login or public content.`,
