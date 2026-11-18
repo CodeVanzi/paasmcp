@@ -115,6 +115,19 @@ function writeEncryptedJson(filePath: string, data: unknown): void {
   writeFileAtomic(filePath, JSON.stringify(payload, null, 2));
 }
 
+/** Scopes that hold variables, published or not (a first deploy that failed still has its variables). */
+export function listSecretScopes(): string[] {
+  try {
+    return fs
+      .readdirSync(PAAS_VAULT_DIR)
+      .map((f) => f.match(/^([a-z0-9][a-z0-9-]*)\.enc\.json$/)?.[1])
+      .filter((n): n is string => Boolean(n))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 export function getSecrets(scope: string, kind: "" | ".deleted" = ""): Record<string, string> {
   return readEncryptedJson<Record<string, string>>(getVaultFilePath(scope, kind), {});
 }

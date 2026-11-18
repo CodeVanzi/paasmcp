@@ -56,6 +56,7 @@ import {
   syncOffsite,
   testRestore,
 } from "./backup.js";
+import { importExternalPostgres, parsePostgresUrl } from "./dbimport.js";
 import { assessRisk, authorizeHuman, DASHBOARD_APP_NAME, decideApproval, listApprovals } from "./guard.js";
 import { addHelper, createInvite, disablePool, pauseHelper, poolAcl, poolAfterLifecycle, poolReadiness, poolStatus, removeHelper, setCopies, setCourtesy } from "./pool.js";
 import { joinPool, leavePool, previewJoin, setupWake, undoWakeSetup, updateWorker } from "./pooljoin.js";
@@ -424,6 +425,17 @@ async function runCli() {
       if (!appName) throw new Error("Usage: paasmcp db <appName> [postgres|redis]");
       const engine = (engineArg as "postgres" | "redis") || "postgres";
       console.log(JSON.stringify(provisionDatabase(appName, engine), null, 2));
+      break;
+    }
+
+    case "db-import": {
+      // The source address carries a password: typed without echo, or piped in; never an argument.
+      const [appName] = rest;
+      if (!appName) throw new Error("Usage: paasmcp db-import <appName> [--yes]   (then type or pipe the postgres://... address of the source)");
+      const sourceUrl = process.env.PAASMCP_IMPORT_URL || (await readSecret("Address of the source database (postgres://...): "));
+      parsePostgresUrl(sourceUrl);
+      await confirmInCli("db.import", { appName: sanitizeSlug(appName) }, rest);
+      console.log(JSON.stringify(await importExternalPostgres(appName, sourceUrl), null, 2));
       break;
     }
 
@@ -1292,6 +1304,7 @@ Commands:
   paasmcp secret list <scope>                        List masked secrets in scope, with description and dates
   paasmcp secret describe <scope> <KEY> "text"       Say what a key is for (empty text clears it)
   paasmcp db <appName> [postgres|redis]              Provision isolated DB & bind DATABASE_URL
+  paasmcp db-import <app> [--yes]                    Copy an outside PostgreSQL (Render, Neon, Supabase…) into the app's database here
   paasmcp db-backup <create|list|restore> ...        Encrypted AES-256-GCM database/volume snapshots & restore
   paasmcp mirror <offer|accept|status|promote|handback|auto|watch|install-watch>
                                                     Live Postgres copy between two servers, failover, failback

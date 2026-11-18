@@ -5712,5 +5712,88 @@ volumes:
     }
   });
 
+  await t.test("68. Moving an app in: .env on the publish form, database addresses kept, importing an outside database", async () => {
+    const imp = await import("./dbimport.js");
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const vm = await import("node:vm");
+    const { Readable } = await import("node:stream");
+
+    // The source address: read into PG* variables, refused in plain words without being repeated.
+    const src = imp.parsePostgresUrl("postgresql://app%40x:p%3Ass@db.example.com:6543/guar?sslmode=require");
+    assert.deepEqual(src, { host: "db.example.com", port: "6543", user: "app@x", password: "p:ss", database: "guar", sslmode: "require" });
+    assert.equal(imp.parsePostgresUrl("postgres://u:p@h/d").sslmode, "prefer");
+    assert.equal(imp.pgEnv(src).PGPASSWORD, "p:ss");
+    for (const bad of ["", "mysql://u:p@h/d", "postgres://u:p@h/", "postgres://h/d", "postgres://u:p@h/d x", "postgres://u:p@h/d?sslmode=nope"]) {
+      assert.throws(() => imp.parsePostgresUrl(bad), (e: Error) => !e.message.includes("u:p@"), bad);
+    }
+    // pg_dump at least as new as the source.
+    assert.match(imp.dumpImageFor(150004), /^postgres:16\./);
+    assert.equal(imp.dumpImageFor(170002), "postgres:17-alpine");
+    assert.throws(() => imp.dumpImageFor(190000));
+    assert.throws(() => imp.dumpImageFor(90600));
+    // Lines the app's user (or a 16 server) cannot run are dropped, even split across chunks.
+    const chunks = ["SET statement_timeout = 0;\nSET transaction_time", "out = 0;\nCOMMENT ON SCHEMA public IS 'x';\nCREATE TABLE a (id int);\nDROP SCHEMA IF EXISTS public;\nSELECT 1;"];
+    let out = "";
+    for await (const c of Readable.from(chunks).pipe(imp.dumpFilter())) out += c.toString();
+    assert.equal(out, "SET statement_timeout = 0;\nCREATE TABLE a (id int);\nSELECT 1;");
+
+    // The app's own database addresses stay when a copied .env is pasted.
+    const st = config.loadState();
+    st.databases["move-test-postgres"] = { name: "move-test-postgres", engine: "postgres", mode: "shared", appName: "move-test", dbName: "db_move_test", dbUser: "user_move_test", host: "paasmcp-postgres", port: 5432, localPort: 5432, createdAt: new Date().toISOString() };
+    config.saveState(st);
+    assert.deepEqual(database.managedDbKeys("move-test"), ["DATABASE_URL", "POSTGRES_URL", "LOCAL_DATABASE_URL"]);
+    assert.deepEqual(database.managedDbKeys("nothing-here"), []);
+    vault.setSecretEntries("move-test", { DATABASE_URL: "postgresql://local/db" });
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const baseUrl = `http://127.0.0.1:${(dsrv.address() as { port: number }).port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "test-68" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+      const r = await (await post("/api/secrets", { scope: "move-test", dotenv: "SECRET_KEY=abc\nDATABASE_URL=postgres://render/old\nPOSTGRES_URL=x" })).json();
+      assert.ok(Array.isArray(r.saved), JSON.stringify(r));
+      assert.deepEqual(r.saved.sort(), ["POSTGRES_URL", "SECRET_KEY"], "a key PaaSMCP never set is saved as pasted");
+      assert.deepEqual(r.keptDb, ["DATABASE_URL"]);
+      assert.equal(vault.getSecrets("move-test").DATABASE_URL, "postgresql://local/db");
+      // Same value pasted again: nothing to report.
+      const same = await (await post("/api/secrets", { scope: "move-test", dotenv: "DATABASE_URL=postgresql://local/db" })).json();
+      assert.deepEqual(same.keptDb, []);
+      // One key on purpose still changes it.
+      await post("/api/secrets", { scope: "move-test", key: "DATABASE_URL", value: "postgres://outside/db" });
+      assert.equal(vault.getSecrets("move-test").DATABASE_URL, "postgres://outside/db");
+
+      // Variables of an app never published show up in Secrets & keys (a first publish that failed).
+      vault.setSecretEntries("never-published", { SECRET_KEY: "k" });
+      const stRes = await fetch(`${baseUrl}/api/status`, { headers: { cookie } });
+      const status = await stRes.json();
+      assert.ok(Array.isArray(status.vaultScopes), `status ${stRes.status}: ${JSON.stringify(status).slice(0, 300)}`);
+      assert.ok(status.vaultScopes.includes("never-published") && !status.vaultScopes.some((n: string) => n.includes(".")));
+
+      // Import: a wrong address is refused before anything, a right one asks for confirmation.
+      const bad = await post("/api/db/import", { appName: "move-test", sourceUrl: "mysql://u:secretpw@h/d" });
+      assert.equal(bad.status, 500);
+      assert.ok(!(await bad.text()).includes("secretpw"));
+      const ask = await post("/api/db/import", { appName: "move-test", sourceUrl: "postgres://u:secretpw@h/d" });
+      assert.equal(ask.status, 409);
+      const askBody = await ask.text();
+      assert.ok(askBody.includes("confirmationRequired") && !askBody.includes("secretpw"));
+      await assert.rejects(imp.importExternalPostgres("no-db-app", "postgres://u:p@h/d"), /no PostgreSQL database here yet/);
+
+      const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(page.includes('id="depEnv"') && page.includes('id="dbImpUrl" type="password"') && page.includes("importDbUi("));
+    } finally {
+      dsrv.close();
+      const s2 = config.loadState();
+      delete s2.databases["move-test-postgres"];
+      config.saveState(s2);
+      for (const k of ["SECRET_KEY", "DATABASE_URL", "POSTGRES_URL"]) vault.deleteSecretKey("move-test", k);
+      vault.deleteSecretKey("never-published", "SECRET_KEY");
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
