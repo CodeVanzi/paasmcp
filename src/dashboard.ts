@@ -59,7 +59,7 @@ import {
   runPaaSDoctor,
   syncHomepageDashboard,
 } from "./deployer.js";
-import { exposeApplication, ExposeError, releaseAddresses, removeAppAddress } from "./exposure.js";
+import { addressInUse, exposeApplication, ExposeError, releaseAddresses, removeAppAddress } from "./exposure.js";
 import { trashDeleteDate } from "./trashclean.js";
 import {
   applyEncryptedFederationSyncBundle,
@@ -875,11 +875,15 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
         if (pathname === "/api/expose" && req.method === "POST") {
           const body = await readJsonBody(req);
-          confirmFromBody("app.expose", { appName: String(body.appName), mode: String(body.mode) }, body);
+          const subdomain = body.subdomain ? String(body.subdomain) : undefined;
+          // An address that points elsewhere today (e.g. the domain alone, still on the old host) is said in the warning.
+          const inUse = body.mode === "tailscale" ? { hostname: "", foreign: [] as string[] } : await addressInUse(String(body.appName), subdomain);
+          confirmFromBody("app.expose", { appName: String(body.appName), mode: String(body.mode), ...(inUse.foreign.length ? { hostname: inUse.hostname, replaces: inUse.foreign.join(", ") } : {}) }, body);
           const result = await exposeApplication({
             appName: String(body.appName),
             mode: body.mode as "public" | "zero-trust" | "tailscale",
-            subdomain: body.subdomain ? String(body.subdomain) : undefined,
+            subdomain,
+            replaceDns: inUse.foreign.length > 0,
           });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
@@ -2944,6 +2948,10 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
                 <div id="expSubBox">
                   <label class="field-label" id="lblExpSub">Subdomínio</label>
                   <input id="expSub" placeholder="ex: loja" oninput="renderExposeHint()" />
+                  <label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12.5px;cursor:pointer;">
+                    <input type="checkbox" id="expApex" style="width:auto;" onchange="renderExposeHint()" />
+                    <span data-i18n="expApex"></span>
+                  </label>
                 </div>
               </div>
               <p class="ofs-note" id="expPreviewLine" style="margin:-4px 0 10px;"></p>
@@ -6474,6 +6482,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "expHint_zero-trust": "A pessoa digita o e-mail e recebe um código. Só entra quem está na lista de Conexões → Domínio. Bom para painéis e ferramentas internas.",
       "expHint_tailscale": "Só abre em aparelhos com o Tailscale ligado na sua conta. Não precisa de domínio.",
       "expPreview": "Vai ficar:",
+      "expApex": "Usar só o domínio, sem nada antes",
+      "expApexNote": "se esse endereço hoje aponta para outro lugar (outro servidor, Render, Vercel), o painel mostra para onde e pede para digitar o nome do app antes de trocar.",
       "whLblUrl": "Endereço para colar no GitHub (Settings → Webhooks → Add webhook, campo Payload URL; Content type: application/json; evento: Just the push event)",
       "whLblSecret": "Segredo (campo Secret do mesmo formulário)",
       "btnRevealWhSecret": "👁️ Mostrar e copiar",
@@ -6561,6 +6571,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "expHint_zero-trust": "The person types their email and gets a code. Only people on the list in Connections → Domain get in. Good for admin panels and internal tools.",
       "expHint_tailscale": "Only opens on devices with Tailscale on, in your account. No domain needed.",
       "expPreview": "It will be:",
+      "expApex": "Use the domain alone, nothing before it",
+      "expApexNote": "if that address points somewhere else today (another server, Render, Vercel), the dashboard shows where and asks you to type the app's name before replacing it.",
       "whLblUrl": "Address to paste on GitHub (Settings → Webhooks → Add webhook, Payload URL field; Content type: application/json; event: Just the push event)",
       "whLblSecret": "Secret (the Secret field on the same form)",
       "btnRevealWhSecret": "👁️ Show and copy",
@@ -9409,8 +9421,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const hint = document.getElementById('expModeHint');
       if (hint) hint.textContent = t('expHint_' + mode);
       const line = document.getElementById('expPreviewLine');
-      const sub = ((document.getElementById('expSub') || {}).value || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
-      if (line) line.textContent = sub && mode !== 'tailscale' && c.baseDomain && c.baseDomain !== 'example.com' ? t('expPreview') + ' https://' + sub + '.' + c.baseDomain : '';
+      const apex = Boolean((document.getElementById('expApex') || {}).checked);
+      const subEl = document.getElementById('expSub');
+      if (subEl) subEl.disabled = apex;
+      const sub = ((subEl || {}).value || '').trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+      const host = apex ? c.baseDomain : (sub ? sub + '.' + c.baseDomain : '');
+      if (line) line.textContent = host && mode !== 'tailscale' && c.baseDomain && c.baseDomain !== 'example.com' ? t('expPreview') + ' https://' + host + (apex ? ' · ' + t('expApexNote') : '') : '';
       const subBox = document.getElementById('expSubBox');
       if (subBox) subBox.style.display = mode === 'tailscale' ? 'none' : '';
       renderAddresses();
@@ -11344,7 +11360,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function exposeApp() {
       const appName = document.getElementById('expApp').value.trim();
       const mode = document.getElementById('expMode').value;
-      const subdomain = document.getElementById('expSub').value.trim() || undefined;
+      const subdomain = document.getElementById('expApex').checked ? '@' : (document.getElementById('expSub').value.trim() || undefined);
       if (!appName) return;
       const res = await fetch('/api/expose', {
         method: 'POST',
