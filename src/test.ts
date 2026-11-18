@@ -5796,5 +5796,92 @@ volumes:
     }
   });
 
+  await t.test("69. An address on the domain alone, and an address that points elsewhere is only taken over when confirmed", async () => {
+    const exp = await import("./exposure.js");
+    const guard = await import("./guard.js");
+    const http = await import("node:http");
+    assert.equal(exp.appHostname("loja.dev", "@", "shop"), "loja.dev");
+    assert.equal(exp.appHostname("loja.dev", "loja.dev", "shop"), "loja.dev");
+    assert.equal(exp.appHostname("loja.dev", "LOJA.DEV.", "shop"), "loja.dev");
+    assert.equal(exp.appHostname("loja.dev", "", "shop"), "shop.loja.dev");
+    assert.equal(exp.appHostname("loja.dev", "novo", "shop"), "novo.loja.dev");
+    assert.equal(exp.appHostname("loja.dev", "novo.loja.dev", "shop"), "novo.loja.dev", "a full hostname on the domain keeps its start");
+    assert.equal(exp.appHostname("loja.dev", "a.b", "shop"), "a-b.loja.dev");
+    // Replacing an address that points elsewhere needs the app's name typed.
+    const r = guard.assessRisk("app.expose", { appName: "shop", mode: "public", hostname: "loja.dev", replaces: "A 216.24.57.1" });
+    assert.equal(r?.level, "strong");
+    assert.match(r!.warning.pt, /loja\.dev hoje aponta para outro lugar \(A 216\.24\.57\.1\)/);
+    assert.equal(guard.assessRisk("app.expose", { appName: "shop", mode: "public" })?.level, "confirm");
+
+    let dns: Array<{ id: string; type: string; name: string; content: string }> = [];
+    let ingress: unknown[] = [];
+    const calls: string[] = [];
+    const srv = http.createServer((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const u = new URL(req.url || "/", "http://x");
+        const p = u.pathname;
+        const body = raw ? JSON.parse(raw) : {};
+        const ok = (result: unknown) => res.writeHead(200).end(JSON.stringify({ success: true, result }));
+        calls.push(`${req.method} ${p}`);
+        if (p === "/accounts/acc1/cfd_tunnel/tun1/configurations") {
+          if (req.method === "PUT") ingress = body.config.ingress;
+          return ok({ config: { ingress } });
+        }
+        if (req.method === "GET" && p === "/zones") return ok([{ id: "z1" }]);
+        if (req.method === "GET" && p === "/zones/z1/dns_records") return ok(dns.filter((d) => d.name === u.searchParams.get("name")));
+        if (req.method === "DELETE" && p.startsWith("/zones/z1/dns_records/")) { dns = dns.filter((d) => d.id !== p.split("/").pop()); return ok({}); }
+        if (req.method === "POST" && p === "/zones/z1/dns_records") { dns.push({ id: "new" + dns.length, ...body }); return ok({}); }
+        if (req.method === "PUT" && p.startsWith("/zones/z1/dns_records/")) { const d = dns.find((x) => x.id === p.split("/").pop())!; Object.assign(d, body); return ok({}); }
+        res.writeHead(404).end("{}");
+      });
+    });
+    await new Promise<void>((r2) => srv.listen(0, "127.0.0.1", r2));
+    process.env.PAASMCP_CF_API_URL = `http://127.0.0.1:${(srv.address() as { port: number }).port}`;
+    const before = config.loadState();
+    const sysBefore = vault.getSecrets("system").CF_API_TOKEN;
+    try {
+      const st = config.loadState();
+      st.cloudflare = { ...st.cloudflare, accountId: "acc1", tunnelId: "tun1", baseDomain: "loja.dev" };
+      st.apps["apex-shop"] = { name: "apex-shop", repoUrl: "acme/x", branch: "main", internalPort: 8000, localPort: 4321, containerName: "paasmcp-apex-shop", appDir: "/x", runtimeType: "python", databases: [], domains: [], createdAt: "x", updatedAt: "x" } as never;
+      config.saveState(st);
+      vault.setSecretEntries("system", { CF_API_TOKEN: "cf-test-token" });
+      // The domain alone still on the old host (A + AAAA), plus e-mail records that must stay.
+      dns = [
+        { id: "a1", type: "A", name: "loja.dev", content: "216.24.57.1" },
+        { id: "a2", type: "AAAA", name: "loja.dev", content: "2001:db8::1" },
+        { id: "mx", type: "MX", name: "loja.dev", content: "mx.mail.dev" },
+        { id: "tx", type: "TXT", name: "loja.dev", content: "v=spf1 -all" },
+      ];
+      const inUse = await exp.addressInUse("apex-shop", "@");
+      assert.deepEqual(inUse, { hostname: "loja.dev", foreign: ["A 216.24.57.1", "AAAA 2001:db8::1"] });
+      await assert.rejects(exp.exposeApplication({ appName: "apex-shop", mode: "public", subdomain: "@" }), (e: Error) => /already points somewhere else/.test(e.message));
+      assert.ok(!calls.some((c) => c.startsWith("PUT /accounts")), "nothing changes before the person confirms");
+      const done = await exp.exposeApplication({ appName: "apex-shop", mode: "public", subdomain: "@", replaceDns: true });
+      assert.equal(done.url, "https://loja.dev");
+      assert.deepEqual(dns.map((d) => d.type).sort(), ["CNAME", "MX", "TXT"], "A/AAAA replaced, e-mail records kept");
+      assert.equal(dns.find((d) => d.type === "CNAME")!.content, "tun1.cfargotunnel.com");
+      assert.ok((ingress as Array<{ hostname?: string }>).some((i) => i.hostname === "loja.dev"));
+      // Already a tunnel CNAME (this server or its pair): not "elsewhere", updated in place.
+      assert.deepEqual((await exp.addressInUse("apex-shop", "@")).foreign, []);
+      calls.length = 0;
+      await exp.exposeApplication({ appName: "apex-shop", mode: "public", subdomain: "loja.dev" });
+      assert.ok(calls.some((c) => c.startsWith("PUT /zones/z1/dns_records/")) && !calls.some((c) => c.startsWith("DELETE")));
+      // A subdomain with a CNAME to another provider is refused the same way.
+      dns.push({ id: "c9", type: "CNAME", name: "novo.loja.dev", content: "app.onrender.com" });
+      assert.deepEqual((await exp.addressInUse("apex-shop", "novo")).foreign, ["CNAME app.onrender.com"]);
+      await assert.rejects(exp.exposeApplication({ appName: "apex-shop", mode: "public", subdomain: "novo" }), /already points somewhere else/);
+    } finally {
+      srv.close();
+      delete process.env.PAASMCP_CF_API_URL;
+      const s2 = config.loadState();
+      delete s2.apps["apex-shop"];
+      s2.cloudflare = before.cloudflare;
+      config.saveState(s2);
+      if (sysBefore) vault.setSecretEntries("system", { CF_API_TOKEN: sysBefore }); else vault.deleteSecretKey("system", "CF_API_TOKEN");
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });

@@ -85,7 +85,7 @@ import {
   purgeExpiredTrash,
   runPaaSDoctor,
 } from "./deployer.js";
-import { exposeApplication, releaseAddresses } from "./exposure.js";
+import { addressInUse, exposeApplication, releaseAddresses } from "./exposure.js";
 import {
   applyEncryptedFederationSyncBundle,
   buildEncryptedFederationSyncBundle,
@@ -1194,14 +1194,17 @@ async function runCli() {
       const [appName, modeArg, subdomain] = rest;
       if (!appName || !modeArg) {
         throw new Error(
-          "Usage: paasmcp expose <appName> <public|zero-trust|tailscale> [subdomain]"
+          "Usage: paasmcp expose <appName> <public|zero-trust|tailscale> [subdomain | @ for the domain alone]"
         );
       }
-      await confirmInCli("app.expose", { appName, mode: modeArg }, rest);
+      const sub = subdomain?.startsWith("--") ? undefined : subdomain;
+      const inUse = modeArg === "tailscale" ? { hostname: "", foreign: [] as string[] } : await addressInUse(appName, sub);
+      await confirmInCli("app.expose", { appName, mode: modeArg, ...(inUse.foreign.length ? { hostname: inUse.hostname, replaces: inUse.foreign.join(", ") } : {}) }, rest);
       const res = await exposeApplication({
         appName,
         mode: modeArg as "public" | "zero-trust" | "tailscale",
-        subdomain: subdomain?.startsWith("--") ? undefined : subdomain,
+        subdomain: sub,
+        replaceDns: inUse.foreign.length > 0,
       });
       console.log(JSON.stringify(res, null, 2));
       break;
