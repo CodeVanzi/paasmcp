@@ -46,9 +46,12 @@ import {
   backupDatabase,
   ensureDockerNetwork,
   listDatabaseBackups,
+  managedDbKeys,
   provisionDatabase,
   restoreDatabase,
+  withoutManagedDbKeys,
 } from "./database.js";
+import { importExternalPostgres, parsePostgresUrl } from "./dbimport.js";
 import {
   AppLifecycleAction,
   deployApp,
@@ -83,6 +86,7 @@ import {
   setSecretEntries,
   timingSafeCompare,
   parseDotenv,
+  listSecretScopes,
 } from "./vault.js";
 import { listSecretDetails } from "./vaultdocs.js";
 import {
@@ -518,7 +522,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
 
         if (pathname === "/api/status" && req.method === "GET") {
-          const status = { ...getSystemStatusSummary(true), controlPlane: followStatus() };
+          const status = { ...getSystemStatusSummary(true), controlPlane: followStatus(), vaultScopes: listSecretScopes() };
           // Trashed apps: the day the trash deletes them for good (trashclean.ts).
           const statusApps = (status as { apps?: Record<string, { trashedAt?: string }> }).apps;
           if (statusApps && process.env.PAASMCP_TRASH_AUTO !== "0") {
@@ -615,10 +619,16 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             const keys = Object.keys(entries);
             if (!keys.length) throw new Error("No KEY=value line found in the pasted text.");
             if (keys.length > 300) throw new Error("Too many variables at once (300 at most).");
-            const saved = setSecretEntries(scope, entries);
+            // The app's own database addresses stay as PaaSMCP set them (a copied .env points elsewhere).
+            const current = getSecrets(scope);
+            const split = scope === "system" ? { entries, kept: [] as string[] } : withoutManagedDbKeys(entries, managedDbKeys(scope));
+            const keptDb = split.kept.filter((k) => current[k] !== undefined && current[k] !== entries[k]);
+            for (const k of split.kept) if (!keptDb.includes(k)) split.entries[k] = entries[k];
+            if (!Object.keys(split.entries).length && !keptDb.length) throw new Error("No KEY=value line found in the pasted text.");
+            const saved = Object.keys(split.entries).length ? setSecretEntries(scope, split.entries) : [];
             audit({ event: "secret.import", scope: sanitizeSlug(scope), keys: saved.length, by: actor });
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ scope, saved, skipped, secrets: listMaskedSecrets(scope) }));
+            res.end(JSON.stringify({ scope, saved, skipped, keptDb, secrets: listMaskedSecrets(scope) }));
             return true;
           }
           const key = String(body.key || "").trim();
@@ -659,6 +669,21 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const appName = String(body.appName || "");
           const engine = (body.engine as "postgres" | "redis") || "postgres";
           const result = provisionDatabase(appName, engine);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return true;
+        }
+
+        // Copy a database that lives elsewhere (Render, Neon, Supabase…) into the app's database here.
+        // The address carries a password: it is used once and never stored, logged or audited.
+        if (pathname === "/api/db/import" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          const appName = sanitizeSlug(String(body.appName || ""));
+          const sourceUrl = String(body.sourceUrl || "");
+          parsePostgresUrl(sourceUrl); // a wrong address is refused before the confirmation
+          confirmFromBody("db.import", { appName }, body);
+          const result = await importExternalPostgres(appName, sourceUrl);
+          audit({ event: "db.import", app: appName, tables: result.tables, sourceVersion: result.sourceVersion, by: actor });
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(result));
           return true;
@@ -756,9 +781,32 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           if (trusted && !loadState().apps[sanitizeSlug(String(body.appName))]?.trusted) {
             confirmFromBody("app.trust", { appName: sanitizeSlug(String(body.appName)) }, body);
           }
+          // Variables pasted on the publish form (a whole .env): saved before the build, so the very
+          // first start already has SECRET_KEY & co. Database addresses PaaSMCP creates win over pasted ones.
+          let env: Record<string, string> | undefined;
+          let envInfo: { saved: number; skipped: number[]; keptDb: string[] } | undefined;
+          if (typeof body.dotenv === "string" && body.dotenv.trim()) {
+            if (body.dotenv.length > 256 * 1024) throw new Error("The pasted text is too long (256 KB at most).");
+            const slug = sanitizeSlug(String(body.appName));
+            const { entries, skipped } = parseDotenv(body.dotenv);
+            if (Object.keys(entries).length > 300) throw new Error("Too many variables at once (300 at most).");
+            const managed = [...managedDbKeys(slug)];
+            if (body.withPostgres) managed.push("DATABASE_URL", "POSTGRES_URL", "LOCAL_DATABASE_URL");
+            if (body.withRedis) managed.push("REDIS_URL", "LOCAL_REDIS_URL");
+            const split = withoutManagedDbKeys(entries, managed);
+            env = split.entries;
+            envInfo = { saved: Object.keys(split.entries).length, skipped, keptDb: split.kept };
+            if (envInfo.saved) audit({ event: "secret.import", scope: slug, keys: envInfo.saved, by: actor });
+          }
+          const deployFailedWithEnv = (err: unknown) => {
+            res.writeHead(422, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err), failure: explainDeployError(err), env: envInfo }));
+            return true;
+          };
           let result;
           try {
             result = await deployApp({
+            env,
             trigger: "dashboard",
             trusted,
             healthcheckPath: body.healthcheckPath ? String(body.healthcheckPath) : undefined,
@@ -774,10 +822,10 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
             cpuLimit: body.cpuLimit ? String(body.cpuLimit) : undefined,
             });
           } catch (err) {
-            return deployFailed(err);
+            return deployFailedWithEnv(err);
           }
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(result));
+          res.end(JSON.stringify({ ...result, env: envInfo }));
           return true;
         }
 
@@ -2848,6 +2896,11 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
                   <span data-i18n="lblDepNoHealth"></span>
                 </label>
               </details>
+              <details class="dep-more dep-env" id="depEnvBox">
+                <summary data-i18n="depEnvTitle"></summary>
+                <p class="ofs-note" data-i18n="depEnvDesc" style="margin-top:8px;"></p>
+                <textarea id="depEnv" rows="6" spellcheck="false" autocomplete="off" placeholder="SECRET_KEY=...&#10;ALLOWED_HOSTS=app.example.com&#10;# comentários são ignorados"></textarea>
+              </details>
               <div id="depStoBox" style="display:none;margin:-4px 0 14px;padding:12px 14px;border-radius:10px;background:var(--bg-subtle);border:1px solid var(--border);">
                 <p class="ofs-note" data-i18n="stoWhere"></p>
                 <div id="depProviders" class="ofs-chips"></div>
@@ -3200,6 +3253,26 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
               <button onclick="createDb()" id="btnCreateDb" style="margin-bottom:16px;">+ Provisionar Banco</button>
               <div id="dbResult"></div>
               <div id="dbList"></div>
+            </div>
+
+            <div class="card" data-sub="dbs">
+              <div class="card-header">
+                <h2 data-i18n="dbImpTitle"></h2>
+                <p class="card-desc" data-i18n="dbImpDesc"></p>
+              </div>
+              <div class="form-grid">
+                <div>
+                  <label class="field-label" for="dbImpApp" data-i18n="dbImpApp"></label>
+                  <select id="dbImpApp"></select>
+                </div>
+                <div>
+                  <label class="field-label" for="dbImpUrl" data-i18n="dbImpUrl"></label>
+                  <input id="dbImpUrl" type="password" autocomplete="off" spellcheck="false" placeholder="postgres://usuario:senha@servidor:5432/banco" />
+                </div>
+              </div>
+              <p class="ofs-note" data-i18n="dbImpNote"></p>
+              <button onclick="importDbUi()" id="btnDbImp" data-i18n="dbImpBtn" style="margin-top:8px;"></button>
+              <div class="ofs-msg" id="dbImpMsg" role="status" aria-live="polite"></div>
             </div>
 
             <div class="card" data-sub="backups">
@@ -6111,7 +6184,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_firstapp_s4": "Clique em Publicar e acompanhe",
       "guide_firstapp_s4Desc": "A linha do app mostra cada fase: baixando, montando, testando, no ar. Se algo falhar, o painel mostra o motivo, e uma versão que já estava no ar continua funcionando.",
       "guide_firstapp_s5": "Senhas do app ficam em Senhas e chaves",
-      "guide_firstapp_s5Desc": "Chaves como a da Stripe vão em Senhas e chaves, com o nome do app. Depois publique de novo para o app usar.",
+      "guide_firstapp_s5Desc": "Chaves como a da Stripe vão em Senhas e chaves, com o nome do app. Depois publique de novo para o app usar. Vindo do Render ou do Railway? Cole o .env inteiro em Variáveis do app, na própria tela de publicar, e traga os dados em Bancos → Trazer dados de outro banco.",
       "guide_address": "Dar um endereço ao app",
       "guide_address_lead": "Escolha quem pode abrir o app. Não precisa abrir porta no roteador.",
       "guide_address_s1": "Decida quem vai usar",
@@ -6215,7 +6288,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "guide_firstapp_s4": "Click Publish and follow along",
       "guide_firstapp_s4Desc": "The app's row shows each phase: fetching, building, testing, live. If something fails, the dashboard shows why, and a version already live keeps working.",
       "guide_firstapp_s5": "App passwords live in Secrets & keys",
-      "guide_firstapp_s5Desc": "Keys such as Stripe's go in Secrets & keys, under the app's name. Then publish again so the app uses them.",
+      "guide_firstapp_s5Desc": "Keys such as Stripe's go in Secrets & keys, under the app's name. Then publish again so the app uses them. Coming from Render or Railway? Paste the whole .env under App variables on the publish form, and bring the data with Databases → Bring data from another database.",
       "guide_address": "Give the app an address",
       "guide_address_lead": "Choose who can open the app. No router port needs opening.",
       "guide_address_s1": "Decide who will use it",
@@ -6293,6 +6366,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "secPasteBtn": "Salvar todas",
       "secPasteOk": "{n} variáveis salvas.",
       "secPasteSkipped": "Ficaram de fora (não pareciam NOME=valor): linha {lines}.",
+      "secPasteKeptDb": "{keys} continua apontando para o banco deste servidor (o .env colado trazia outro endereço). Para usar o banco de fora, troque essa variável sozinha acima.",
+      "depEnvTitle": "Variáveis do app (colar o .env)",
+      "depEnvDesc": "Opcional. Cole o .env do app (do Render, Railway ou do seu PC) para ele já subir com as chaves na primeira vez. Ficam guardadas em Senhas e chaves, criptografadas. Se marcar PostgreSQL ou Redis acima, o endereço do banco novo vale no lugar do DATABASE_URL ou REDIS_URL colado.",
+      "depEnvSaved": "{n} variáveis salvas em Senhas e chaves.",
+      "depEnvSavedFail": "As {n} variáveis coladas já estão salvas em Senhas e chaves: corrija lá o que faltar e publique de novo.",
+      "depEnvKeptDb": "{keys} ficou com o banco criado aqui, não com o endereço colado.",
+      "dbImpTitle": "Trazer dados de outro banco",
+      "dbImpDesc": "Copia as tabelas de um PostgreSQL que está em outro lugar (Render, Neon, Supabase, Railway…) para o banco do app aqui. Use ao mudar um app de serviço.",
+      "dbImpApp": "Banco de qual app",
+      "dbImpUrl": "Endereço do banco de origem",
+      "dbImpNote": "Copia só o esquema public, onde ficam as tabelas do Django, Rails, Prisma e da maioria dos apps. As tabelas daqui são trocadas pelas de lá, em um passo só: se der erro, nada muda. Antes, o painel faz um backup do banco daqui. O endereço é usado uma vez e não fica salvo. Faça antes de abrir o app para o público, porque o que for gravado na origem depois não vem junto.",
+      "dbImpBtn": "Copiar os dados",
+      "dbImpRunning": "Copiando… pode levar alguns minutos.",
+      "dbImpDone": "Pronto: {n} tabelas vieram do PostgreSQL {v} em {s} s. Backup de antes: {b}.",
+      "dbImpNone": "Nenhum app tem banco PostgreSQL aqui ainda. Publique o app marcando PostgreSQL (ou crie o banco acima) e depois volte aqui.",
       "actionRedeploy": "Publicar de novo",
       "redeployTitle": "Monta e publica de novo o mesmo repositório e branch, com as variáveis atuais. A versão no ar continua até a nova passar no teste.",
       "redeployConfirm": "Publicar {app} de novo com as variáveis atuais? A versão no ar continua funcionando até a nova passar no teste."
@@ -6325,6 +6413,21 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "secPasteBtn": "Save all",
       "secPasteOk": "{n} variables saved.",
       "secPasteSkipped": "Left out (not NAME=value): line {lines}.",
+      "secPasteKeptDb": "{keys} still points at this server's database (the pasted .env had another address). To use the outside database, change that variable on its own above.",
+      "depEnvTitle": "App variables (paste the .env)",
+      "depEnvDesc": "Optional. Paste the app's .env (from Render, Railway or your PC) so it starts with its keys the very first time. They are kept in Secrets & keys, encrypted. If you tick PostgreSQL or Redis above, the new database's address is used instead of the pasted DATABASE_URL or REDIS_URL.",
+      "depEnvSaved": "{n} variables saved in Secrets & keys.",
+      "depEnvSavedFail": "The {n} pasted variables are already saved in Secrets & keys: fix what is missing there and publish again.",
+      "depEnvKeptDb": "{keys} kept the database created here, not the pasted address.",
+      "dbImpTitle": "Bring data from another database",
+      "dbImpDesc": "Copies the tables of a PostgreSQL that lives elsewhere (Render, Neon, Supabase, Railway…) into the app's database here. Use it when moving an app from another service.",
+      "dbImpApp": "Database of which app",
+      "dbImpUrl": "Address of the source database",
+      "dbImpNote": "Only the public schema is copied, where Django, Rails, Prisma and most apps keep their tables. The tables here are replaced by those over there in a single step: if anything fails, nothing changes. A backup of the database here is taken first. The address is used once and not saved. Do it before opening the app to the public, since what is written at the source afterwards does not come along.",
+      "dbImpBtn": "Copy the data",
+      "dbImpRunning": "Copying… this can take a few minutes.",
+      "dbImpDone": "Done: {n} tables came from PostgreSQL {v} in {s} s. Backup from before: {b}.",
+      "dbImpNone": "No app has a PostgreSQL database here yet. Publish the app with PostgreSQL ticked (or create the database above), then come back.",
       "actionRedeploy": "Publish again",
       "redeployTitle": "Builds and publishes the same repository and branch again, with the current variables. The live version stays until the new one passes the test.",
       "redeployConfirm": "Publish {app} again with the current variables? The live version keeps working until the new one passes the test."
@@ -8226,6 +8329,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
       document.getElementById('hostedAppsList').innerHTML = apps.map(a => \`<option value="\${esc(a.name)}"></option>\`).join('');
       fillScopeSelect(apps);
+      fillDbImport();
       renderAddresses();
 
       const deploys = deployState || s.deploys || {};
@@ -10771,7 +10875,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const sel = document.getElementById('secScope');
       if (!sel) return;
       const cur = sel.value || 'system';
-      const names = apps.map(function (a) { return a.name; }).sort();
+      // Apps plus scopes that already hold variables (a first publish that failed keeps its pasted .env).
+      const names = apps.map(function (a) { return a.name; });
+      ((lastStatus && lastStatus.vaultScopes) || []).forEach(function (n) { if (n !== 'system' && names.indexOf(n) === -1) names.push(n); });
+      names.sort();
       sel.innerHTML = names.map(function (n) { return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('') +
         '<option value="system">' + esc(t('secSystemScope')) + '</option>';
       sel.value = names.indexOf(cur) !== -1 || cur === 'system' ? cur : (names[0] || 'system');
@@ -10891,8 +10998,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const r = await ofsPost('/api/secrets', { scope: scope, dotenv: box.value }, 'secPasteMsg');
       if (!r) return;
       box.value = '';
+      const keptDb = r.keptDb || [];
       ofsMsg('secPasteMsg', t('secPasteOk').split('{n}').join(String(r.saved.length)) +
-        (r.skipped && r.skipped.length ? ' ' + t('secPasteSkipped').split('{lines}').join(r.skipped.join(', ')) : ''), r.skipped && r.skipped.length ? 'err' : 'ok');
+        (r.skipped && r.skipped.length ? ' ' + t('secPasteSkipped').split('{lines}').join(r.skipped.join(', ')) : '') +
+        (keptDb.length ? ' ' + t('secPasteKeptDb').split('{keys}').join(keptDb.join(', ')) : ''), (r.skipped && r.skipped.length) || keptDb.length ? 'err' : 'ok');
       markSecChanged(scope);
       loadSecrets();
     }
@@ -11135,6 +11244,43 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         (go ? '<div class="dep-result-actions"><button class="secondary" onclick="' + go + '">' + esc(t('dfAct_' + action)) + '</button></div>' : '') +
         '<details><summary>' + esc(t('dfDetails')) + '</summary><pre>' + esc((data && data.error) || '') + '</pre></details></div>';
     }
+    function depEnvNote(env, ok) {
+      if (!env || !(env.saved || (env.keptDb && env.keptDb.length))) return '';
+      const parts = [];
+      if (env.saved) parts.push(t(ok ? 'depEnvSaved' : 'depEnvSavedFail').split('{n}').join(String(env.saved)));
+      if (env.skipped && env.skipped.length) parts.push(t('secPasteSkipped').split('{lines}').join(env.skipped.join(', ')));
+      if (env.keptDb && env.keptDb.length) parts.push(t('depEnvKeptDb').split('{keys}').join(env.keptDb.join(', ')));
+      return '<p class="ofs-note" style="margin-top:8px;">' + esc(parts.join(' ')) + '</p>';
+    }
+    function fillDbImport() {
+      const sel = document.getElementById('dbImpApp');
+      if (!sel) return;
+      const dbs = Object.values((lastStatus && lastStatus.databases) || {}).filter(function (d) { return d.engine === 'postgres'; });
+      const cur = sel.value;
+      sel.innerHTML = dbs.map(function (d) { return '<option value="' + esc(d.appName) + '">' + esc(d.appName) + '</option>'; }).join('');
+      if (cur && dbs.some(function (d) { return d.appName === cur; })) sel.value = cur;
+      document.getElementById('btnDbImp').disabled = !dbs.length;
+      if (!dbs.length) ofsMsg('dbImpMsg', t('dbImpNone'), 'ok');
+      else if (document.getElementById('dbImpMsg').textContent === t('dbImpNone')) ofsMsg('dbImpMsg', '', 'ok');
+    }
+    async function importDbUi() {
+      const appName = document.getElementById('dbImpApp').value;
+      const urlEl = document.getElementById('dbImpUrl');
+      const sourceUrl = urlEl.value.trim();
+      if (!appName || !sourceUrl) return;
+      const btn = document.getElementById('btnDbImp');
+      btn.disabled = true;
+      ofsMsg('dbImpMsg', t('dbImpRunning'), 'ok');
+      try {
+        const r = await ofsPost('/api/db/import', { appName: appName, sourceUrl: sourceUrl }, 'dbImpMsg');
+        if (!r) { if (document.getElementById('dbImpMsg').textContent === t('dbImpRunning')) ofsMsg('dbImpMsg', '', 'ok'); return; }
+        urlEl.value = '';
+        ofsMsg('dbImpMsg', t('dbImpDone').split('{n}').join(String(r.tables)).split('{v}').join(String(r.sourceVersion)).split('{s}').join(String(r.seconds)).split('{b}').join(String(r.safetyBackupId)), 'ok');
+        loadAll();
+      } finally {
+        btn.disabled = false;
+      }
+    }
     function openDeployOptions() {
       const d = document.querySelector('#tab-overview details.dep-more');
       if (!d) return;
@@ -11158,6 +11304,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const healthcheckPath = document.getElementById('depHealth').value.trim() || undefined;
       // Only send the switch when ticked: an unticked box keeps what the app already has.
       const skipHealthcheck = document.getElementById('depNoHealth').checked ? true : undefined;
+      const envEl = document.getElementById('depEnv');
+      const dotenv = envEl.value.trim();
       if (!appName || !repoSource) return;
       // Storage and e-mail go into the app's vault first, so this deploy already starts with them.
       if (document.getElementById('depStorage').checked && !(await provisionAppStorage('dep', appName))) return;
@@ -11171,16 +11319,18 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         const res = await fetch('/api/deploy', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit, healthcheckPath, skipHealthcheck })
+          body: JSON.stringify({ appName, repoSource, branch, withPostgres, withRedis, memoryLimit, cpuLimit, healthcheckPath, skipHealthcheck, dotenv: dotenv || undefined })
         });
         const data = await res.json().catch(function () { return {}; });
         const box = document.getElementById('depResult');
+        // Pasted variables are saved before the build, whatever happens next: the box holds secrets, so it empties.
+        if (data.env) { envEl.value = ''; envEl.closest('details').open = false; }
         if (!res.ok) {
           if (!data.failure && !data.error) data.error = 'HTTP ' + res.status;
-          box.innerHTML = deployResultHtml(false, appName, data);
+          box.innerHTML = deployResultHtml(false, appName, data) + depEnvNote(data.env, false);
         } else {
           if (document.getElementById('depPoll').checked) await postJson('/api/poll', { appName, on: true });
-          box.innerHTML = deployResultHtml(true, appName, data);
+          box.innerHTML = deployResultHtml(true, appName, data) + depEnvNote(data.env, true);
           showToast(t('toastDeployDone') + appName);
           loadAll();
         }

@@ -45,7 +45,8 @@ What you can do there, without a terminal:
 - **Publish** from a list of your GitHub repositories (or a folder on the server), with presets for Next.js, Django, FastAPI, Node, Go, ASP.NET, static sites, multi-service Compose and your own Dockerfile. **Ready-made apps** (Uptime Kuma, Memos, IT Tools) install in one click.
 - **Follow every deploy live**: building, testing the new version, switching, live or failed, with the running commit linked to GitHub. A failed deploy is explained in plain words and the previous version keeps serving.
 - **Give an app an address**: paste one Cloudflare token, pick the domain, and the tunnel is found or created for you; or keep it private on Tailscale.
-- **Variables like on Railway/Render**: paste a whole `.env`, values stored encrypted, "Publish again" when they change.
+- **Variables like on Railway/Render**: paste a whole `.env` on the publish form (the first start already has it) or later, values stored encrypted, "Publish again" when they change.
+- **Move an app in from Render, Railway, Neon or Supabase**: copy the tables of an outside PostgreSQL into the app's database here in one step (all or nothing, with a backup first).
 - **Databases, backups and off-site copies**: create Postgres/Redis per app, nightly encrypted backups, test-restore a backup, send copies to R2, S3, B2, Google, Wasabi, MinIO or another PaaSMCP. See database sizes and growth over 90 days.
 - **Notices** on your phone (ntfy, Discord, Slack) when an app stops or a deploy fails.
 - **Second server, judge and helpers**: pair a second server for a live copy and automatic takeover, pick a judge (arbiter) by a 6-digit code, list the PCs of your Tailscale network and **install PaaSMCP on them from the dashboard**, wake sleeping PCs (Wake-on-LAN), scale apps onto them.
@@ -305,6 +306,8 @@ paasmcp deploys my-saas
 paasmcp db-backup create my-saas postgres
 paasmcp db-backup list
 paasmcp db-backup restore <backup-id>
+# Copy an outside PostgreSQL (schema public) into the app's database here; type the address when asked
+paasmcp db-import my-saas
 paasmcp db-backup create my-saas volume      # every Docker volume of the app
 paasmcp backup test <backup-id>              # restores into a temporary DB; live data untouched
 
