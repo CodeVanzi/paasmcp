@@ -2001,7 +2001,8 @@ volumes:
     const probed: string[] = [];
     let rxTotal = 0;
     const logs: string[] = [];
-    const base = Date.UTC(2026, 10, 4, 12, 0, 0);
+    // A recent whole minute: the diary keeps 7 days, so a fixed date in the past stops being read.
+    const base = Math.floor(Date.now() / 3_600_000) * 3_600_000 - 3_600_000;
     for (let i = 0; i < 16; i++) {
       rxTotal += 15 * 1000; // 1000 B/s
       const r = await scale.scaleTick({
