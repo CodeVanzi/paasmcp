@@ -346,6 +346,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `The current data (database or volume) will be replaced by backup '${subject}'. A backup of the current state is taken first.`,
         `Os dados atuais (banco ou volume) serão substituídos pelo backup '${subject}'. Antes, é feito um backup do estado atual.`,
         params);
+    case "db.import":
+      return risk(action, subject, "confirm",
+        `The tables of '${subject}' here will be replaced by the ones of the other database (schema public). A backup of the current state is taken first, and nothing changes if the copy fails.`,
+        `As tabelas do banco de '${subject}' aqui serão trocadas pelas do outro banco (esquema public). Antes é feito um backup do estado atual, e nada muda se a cópia falhar.`,
+        params);
     case "secret.delete":
       return risk(action, subject, "confirm",
         `Removes ${String(params.keyName)} from '${subject}'. The app may stop working; the previous value is kept in the vault's deleted archive.`,

@@ -450,3 +450,31 @@ export function restoreDatabase(backupId: string): {
     safetyBackupId,
   };
 }
+
+/**
+ * Variables PaaSMCP writes for an app's own databases. A pasted .env (copied from Render, Railway…)
+ * usually carries the old provider's DATABASE_URL; saving it would point the app away from its database
+ * here without a word, so pasting keeps these and says so (a single key can still be changed on purpose).
+ */
+export function managedDbKeys(appName: string): string[] {
+  const slug = sanitizeSlug(appName);
+  const dbs = loadState().databases;
+  const keys: string[] = [];
+  if (dbs[`${slug}-postgres`]) keys.push("DATABASE_URL", "POSTGRES_URL", "LOCAL_DATABASE_URL");
+  if (dbs[`${slug}-redis`]) keys.push("REDIS_URL", "LOCAL_REDIS_URL");
+  return keys;
+}
+
+/** Splits pasted variables into the ones to save and the database ones kept as PaaSMCP set them. */
+export function withoutManagedDbKeys(
+  entries: Record<string, string>,
+  managed: string[]
+): { entries: Record<string, string>; kept: string[] } {
+  const out: Record<string, string> = {};
+  const kept: string[] = [];
+  for (const [k, v] of Object.entries(entries)) {
+    if (managed.includes(k)) kept.push(k);
+    else out[k] = v;
+  }
+  return { entries: out, kept };
+}
