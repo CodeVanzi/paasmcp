@@ -410,6 +410,15 @@ volumes:
     fs.writeFileSync(lockPath, JSON.stringify({ pid: 2 ** 22 + 12345, host: os.hostname(), at: Date.now() }));
     assert.equal(await config.withStateLock(() => "ok", 2000), "ok");
     assert.equal(fs.existsSync(lockPath), false);
+
+    // A restarted container is the same host with PID 1 again: a lock from before this process started is taken over.
+    const startedAt = Date.now() - process.uptime() * 1000;
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: os.hostname(), at: startedAt - 60_000 }));
+    assert.equal(await config.withStateLock(() => "ok", 2000), "ok");
+    // ...but one this process took while running is still respected.
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, host: os.hostname(), at: Date.now() }));
+    await assert.rejects(config.withStateLock(() => "no", 600), /lock held/);
+    fs.rmSync(lockPath, { force: true });
   });
 
   const totp = await import("./totp.js");

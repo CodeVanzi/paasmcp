@@ -625,6 +625,9 @@ function lockIsStale(): boolean {
     const info = JSON.parse(fs.readFileSync(LOCK_PATH, "utf-8")) as { pid: number; host: string; at: number };
     if (Date.now() - info.at > LOCK_STALE_MS) return true;
     if (info.host !== os.hostname()) return false; // other machine/container: only age tells
+    // Same host, written before this process started: a previous run of it (a restarted container
+    // gets the same hostname and PID 1 again), so that holder is gone even though the PID answers.
+    if (info.pid === process.pid && info.at < Date.now() - process.uptime() * 1000) return true;
     try {
       process.kill(info.pid, 0);
       return false;
