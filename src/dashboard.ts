@@ -4354,9 +4354,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "termApp": "App {app}",
           "termOpen": "Abrir terminal",
           "termClose": "Fechar",
-          "termOnNote": "Fecha sozinho depois de 15 minutos sem digitar. A IA (MCP) não tem acesso a ele.",
+          "termOnNote": "Para copiar, selecione o texto e aperte Ctrl+C (sem seleção, o Ctrl+C interrompe o comando). Para colar, Ctrl+V. Fecha sozinho depois de 15 minutos sem digitar. A IA (MCP) não tem acesso a ele.",
           "termConnecting": "Conectando…",
           "termEnded": "Terminal fechado.",
+          "termCopied": "Copiado.",
           "termDenied": "Não deu para abrir: recarregue a página e entre de novo no painel.",
           "termTooMany": "Já há 4 terminais abertos; feche um antes.",
           "termLoadFail": "Não deu para carregar a tela do terminal.",
@@ -4843,9 +4844,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "termApp": "App {app}",
           "termOpen": "Open terminal",
           "termClose": "Close",
-          "termOnNote": "Closes after 15 minutes without typing. The AI (MCP) cannot reach it.",
+          "termOnNote": "To copy, select the text and press Ctrl+C (with nothing selected, Ctrl+C stops the command). To paste, Ctrl+V. Closes after 15 minutes without typing. The AI (MCP) cannot reach it.",
           "termConnecting": "Connecting…",
           "termEnded": "Terminal closed.",
+          "termCopied": "Copied.",
           "termDenied": "Could not open it: reload the page and log in to the dashboard again.",
           "termTooMany": "4 terminals are already open; close one first.",
           "termLoadFail": "Could not load the terminal screen.",
@@ -11677,6 +11679,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         termButtons(false);
         ofsMsg('termMsg', !opened ? t('termDenied') : e.code === 4429 ? t('termTooMany') : t('termEnded'), opened && e.code !== 4429 ? 'ok' : 'err');
       };
+      // Ctrl+C copies when text is selected (otherwise it interrupts, as usual); Ctrl+Shift+C/V like Linux terminals.
+      view.attachCustomKeyEventHandler((e) => {
+        if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) return true;
+        const k = e.key.toLowerCase();
+        if (k === 'c' && (e.shiftKey || view.hasSelection())) {
+          const sel = view.getSelection();
+          if (sel && navigator.clipboard) navigator.clipboard.writeText(sel).then(() => showToast(t('termCopied'))).catch(() => {});
+          view.clearSelection();
+          e.preventDefault();
+          return false;
+        }
+        if (k === 'v') return false; // the browser pastes into the terminal
+        return true;
+      });
       view.onData((d) => send({ t: 'in', d: d }));
       view.onResize((s) => send({ t: 'resize', c: s.cols, r: s.rows }));
     }
