@@ -334,7 +334,7 @@ export function parseDotenv(text: string): { entries: Record<string, string>; sk
     }
     let value = m[2];
     if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
-      value = value.slice(1, -1).replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+      value = value.slice(1, -1).replace(/\\(n|"|\\)/g, (_m, c: string) => (c === "n" ? "\n" : c));
     } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
       value = value.slice(1, -1);
     } else {
@@ -343,4 +343,11 @@ export function parseDotenv(text: string): { entries: Record<string, string>; sk
     entries[m[1]] = value;
   });
   return { entries, skipped };
+}
+
+/** The other way: a `.env` text that parseDotenv (and Render, Railway, docker compose) read back the same. */
+export function toDotenv(entries: Record<string, string>): string {
+  return Object.entries(entries)
+    .map(([k, v]) => `${k}=${/^[A-Za-z0-9_./:@%+,=-]*$/.test(v) ? v : `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`}`)
+    .join("\n") + "\n";
 }

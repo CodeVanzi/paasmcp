@@ -484,10 +484,11 @@ export async function deployApp(opts: DeployOptions): Promise<DeployResult> {
 async function runDeploy(opts: DeployOptions, tracker: DeployTracker): Promise<DeployResult> {
   const slug = sanitizeSlug(opts.appName);
   const branch = validateBranchName(opts.branch || "main");
-  const memoryLimit = validateResourceLimit(opts.memoryLimit, "memory");
-  const cpuLimit = validateResourceLimit(opts.cpuLimit, "cpu");
   const state = loadState();
   const prior = state.apps[slug];
+  // Publishing again keeps the limits it had; "" removes one.
+  const memoryLimit = opts.memoryLimit === "" ? undefined : validateResourceLimit(opts.memoryLimit, "memory") ?? prior?.memoryLimit;
+  const cpuLimit = opts.cpuLimit === "" ? undefined : validateResourceLimit(opts.cpuLimit, "cpu") ?? prior?.cpuLimit;
   const healthcheckPath = validateHealthcheckPath(opts.healthcheckPath) ?? prior?.healthcheckPath;
   const healthcheckTimeoutSeconds =
     validateHealthcheckTimeout(opts.healthcheckTimeoutSeconds) ?? prior?.healthcheckTimeoutSeconds;
@@ -730,8 +731,8 @@ networks:
     lastCommitSha: commitSha || (opts.repoSource === existing?.repoUrl ? existing?.lastCommitSha : undefined),
     previousImageTag: previousImageSaved ? prevImg : existing?.previousImageTag,
     composePassThrough: isComposePassThrough,
-    memoryLimit: memoryLimit || existing?.memoryLimit,
-    cpuLimit: cpuLimit || existing?.cpuLimit,
+    memoryLimit,
+    cpuLimit,
     trusted,
     healthcheckPath,
     healthcheckTimeoutSeconds,
