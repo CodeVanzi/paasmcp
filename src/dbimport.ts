@@ -92,6 +92,22 @@ export function dumpImageFor(serverVersionNum: number): string {
  */
 const DROPPED_LINE = /^(SET transaction_timeout = |COMMENT ON SCHEMA public IS |ALTER SCHEMA public OWNER TO |CREATE SCHEMA public;|DROP SCHEMA IF EXISTS public;|DROP SCHEMA public;)/;
 
+/**
+ * Recent minor releases (from 14 up) keep an internal per-column `pg_attver` option and their pg_dump writes it as
+ * `ALTER TABLE ONLY t ALTER COLUMN c SET (pg_attver=N);`. Servers without that release refuse it ("unrecognized
+ * parameter"), and servers with it ignore it anyway: drop that option (and the line when nothing else is left).
+ */
+const ATTVER_LINE = /^(ALTER (?:FOREIGN )?TABLE (?:ONLY )?.+ ALTER COLUMN .+ SET \()(.*)(\);)$/;
+export function withoutAttver(line: string): string | null {
+  if (!line.includes("pg_attver")) return line;
+  const m = ATTVER_LINE.exec(line);
+  if (!m) return line;
+  const kept = m[2].split(/,\s*/).filter((o) => !/^pg_attver\s*=/.test(o.trim()));
+  return kept.length ? m[1] + kept.join(", ") + m[3] : null;
+}
+
+const keepLine = (l: string): string | null => (DROPPED_LINE.test(l) ? null : withoutAttver(l));
+
 /** Streams a dump through, dropping the lines above (whole lines only; chunks may split a line). */
 export function dumpFilter(): Transform {
   let rest = "";
@@ -100,10 +116,10 @@ export function dumpFilter(): Transform {
       const text = rest + chunk.toString("utf-8");
       const lines = text.split("\n");
       rest = lines.pop() ?? "";
-      done(null, lines.filter((l) => !DROPPED_LINE.test(l)).map((l) => l + "\n").join(""));
+      done(null, lines.map(keepLine).filter((l): l is string => l !== null).map((l) => l + "\n").join(""));
     },
     flush(done) {
-      done(null, rest && !DROPPED_LINE.test(rest) ? rest : "");
+      done(null, rest ? keepLine(rest) ?? "" : "");
     },
   });
 }
