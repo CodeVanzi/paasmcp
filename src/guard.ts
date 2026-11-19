@@ -355,6 +355,11 @@ export function assessRisk(action: string, params: Record<string, unknown>): Ris
         `The current data (database or volume) will be replaced by backup '${subject}'. A backup of the current state is taken first.`,
         `Os dados atuais (banco ou volume) serão substituídos pelo backup '${subject}'. Antes, é feito um backup do estado atual.`,
         params);
+    case "terminal.enable":
+      return risk(action, "terminal", "strong",
+        "Turns on the terminal in the dashboard: whoever is logged in to the dashboard can open a root shell on this server (and a shell inside each app). It closes after 15 minutes without typing; opening and closing are recorded, what is typed is not. Turn it off when you no longer need it.",
+        "Liga o terminal no painel: quem estiver logado no painel pode abrir um terminal de administrador (root) neste servidor e dentro de cada app. Ele fecha sozinho depois de 15 minutos sem digitar; abrir e fechar ficam registrados, o que é digitado não. Desligue quando não precisar mais.",
+        params);
     case "db.import":
       return risk(action, subject, "confirm",
         `The tables of '${subject}' here will be replaced by the ones of the other database (schema public). A backup of the current state is taken first, and nothing changes if the copy fails.`,

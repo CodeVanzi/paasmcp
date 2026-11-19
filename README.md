@@ -184,12 +184,14 @@ flowchart LR
 | :--- | :--- |
 | Free | status, logs, doctor, deploy, provision DBs, create backups, restart, rollback, expose via Tailscale or Zero Trust |
 | Confirm | destroy (to 30-day trash), restore a backup (a safety backup is taken first), delete a secret (old value archived), public exposure, exposing the dashboard, federation join/import, inviting or removing a helper PC, installing PaaSMCP on another PC, the first copies of an app on helpers (and going above its scale rule's maximum), turning on automatic scaling (and raising the maximum while it is on) |
-| Strong (type the name) | promote a mirror copy (failover), purge from trash, mark an app as trusted (keeps privileged / host network / host folders / docker.sock in its compose), publish the dashboard on the open internet (only with 2FA on) |
+| Strong (type the name) | promote a mirror copy (failover), purge from trash, mark an app as trusted (keeps privileged / host network / host folders / docker.sock in its compose), publish the dashboard on the open internet (only with 2FA on), turn on the dashboard terminal |
 | Forbidden | plaintext secrets in outputs, dashboard on the open internet without 2FA, MCP over HTTP outside loopback/Tailscale, non-loopback ports, compose `extends` / `additional_contexts`, unsigned webhooks |
 
 MCP tokens have levels: `read` (status, logs, diagnostics), `deploy` (default: also deploy, provision, back up, expose privately) and `destroy` (can *request* risky actions, which still need a person). Local stdio runs with full level because it already runs on the server.
 
 MCP calls that need confirmation return `confirmationRequired` with an `approvalId`. A person approves it in the dashboard (Pending confirmations) or with `paasmcp approve <id>` on the server, then the agent repeats the call with `approvalId`. Requests expire in 10 minutes, are bound to the exact parameters and work once. Everything is logged to `audit.log`.
+
+**Terminal in the dashboard** (System → Terminal, off by default): a root shell on the server, or a shell inside an app, in the browser. Turning it on is a strong confirmation; it opens only with a dashboard login session (never a token, never from another site, never through MCP), closes after 15 minutes without typing and when turned off, and records opening and closing (not what is typed). It adds little power to a dashboard that already holds the Docker socket, but turn it on only if you are the only person who logs in.
 
 Limit: this protects against an agent acting **through MCP**. An agent with a shell on the server and access to Docker can bypass any rule (the `docker` group is root-equivalent); run such agents as a user without Docker access.
 

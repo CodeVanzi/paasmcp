@@ -5897,5 +5897,67 @@ volumes:
     }
   });
 
+  await t.test("70. Terminal in the dashboard: off by default, a strong confirmation to turn on, only a logged-in person from the page", async () => {
+    const dashboard = await import("./dashboard.js");
+    const totp = await import("./totp.js");
+    const { WebSocket } = await import("ws");
+    const vm = await import("node:vm");
+    process.env.PAASMCP_DOCKER_SOCK = path.join(tempRoot, "no-docker.sock");
+    const dsrv = dashboard.startDashboardServer(0, "127.0.0.1");
+    await new Promise((r) => dsrv.once("listening", r));
+    const port = (dsrv.address() as { port: number }).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+    try {
+      const secret = totp.getDashboardTotpSecret();
+      const login = await fetch(`${baseUrl}/api/login`, { method: "POST", headers: { "Content-Type": "application/json", "cf-connecting-ip": "test-70" }, body: JSON.stringify({ token: dashboard.getOrCreateDashboardToken(), ...(secret ? { code: totp.totpCode(secret) } : {}) }) });
+      const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
+      assert.ok(cookie.startsWith("paasmcp_session="));
+      const post = (u: string, b: unknown) => fetch(`${baseUrl}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
+      // Answers the HTTP status of the handshake (101 = opened), and what the terminal printed before closing.
+      const connect = (q: string, headers: Record<string, string>) => new Promise<{ status: number; text: string }>((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/api/terminal?${q}`, { headers });
+        let text = "";
+        ws.on("unexpected-response", (_req, res) => { resolve({ status: res.statusCode || 0, text }); ws.terminate(); });
+        ws.on("message", (d) => { text += d.toString(); });
+        ws.on("close", () => resolve({ status: 101, text }));
+        ws.on("error", () => resolve({ status: 0, text }));
+      });
+      const page = { cookie, origin: `http://127.0.0.1:${port}` };
+
+      assert.deepEqual(await (await fetch(`${baseUrl}/api/terminal`, { headers: { cookie } })).json(), { enabled: false, open: 0 });
+      assert.equal((await connect("target=server", page)).status, 403, "off: refused");
+      const ask = await post("/api/terminal", { on: true });
+      assert.equal(ask.status, 409);
+      assert.equal((await post("/api/terminal", { on: true, confirmed: true, confirmName: "wrong" })).status, 409, "strong: the word must be typed");
+      assert.equal((await (await post("/api/terminal", { on: true, confirmed: true, confirmName: "terminal" })).json()).enabled, true);
+
+      assert.equal((await connect("target=server", { origin: page.origin })).status, 401, "no session");
+      assert.equal((await connect("target=server", { cookie: `paasmcp_token=${dashboard.getOrCreateDashboardToken()}`, origin: page.origin })).status, 401, "the token alone never opens it");
+      assert.equal((await connect("target=server", { cookie })).status, 403, "no origin");
+      assert.equal((await connect("target=server", { cookie, origin: "https://evil.example" })).status, 403, "another site");
+      assert.equal((await connect("target=no-such-app", page)).status, 400);
+      // Docker unreachable here: the terminal opens, says why in plain words, and closes.
+      const failed = await connect("target=server", page);
+      assert.equal(failed.status, 101);
+      assert.match(failed.text, /ENOENT|connect/);
+
+      assert.equal((await (await post("/api/terminal", { on: false })).json()).enabled, false, "off needs no confirmation");
+      assert.equal((await connect("target=server", page)).status, 403);
+
+      // The screen, the vendored terminal and nothing else from vendor/.
+      const html = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
+      for (const c of [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
+      assert.ok(html.includes('id="tab-terminal"') && html.includes("openTerminal()") && html.includes("checkDashboardNow()"));
+      const xt = await fetch(`${baseUrl}/vendor/xterm.js`);
+      assert.equal(xt.status, 200);
+      assert.match(xt.headers.get("content-type") || "", /javascript/);
+      assert.equal((await fetch(`${baseUrl}/vendor/xterm-LICENSE`)).status, 404);
+      assert.equal((await fetch(`${baseUrl}/vendor/../package.json`)).status, 404);
+    } finally {
+      dsrv.close();
+      delete process.env.PAASMCP_DOCKER_SOCK;
+    }
+  });
+
   fs.rmSync(tempRoot, { recursive: true, force: true });
 });
