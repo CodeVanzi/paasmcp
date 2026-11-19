@@ -73,7 +73,9 @@ import {
 } from "./federation.js";
 import { getSystemStatusSummary, resourceSnapshot } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, readFollow, setFollow } from "./selfupdate.js";
-import { startPollLoop } from "./pollloop.js";
+import { pollNow, startPollLoop } from "./pollloop.js";
+import { WebSocketServer } from "ws";
+import { attachTerminal, openTerminalCount, setTerminalEnabled, terminalEnabled, terminalTarget } from "./terminal.js";
 import { startMirrorWatchLoop } from "./mirrorwatchloop.js";
 import { startAppWatch } from "./appwatch.js";
 import { startNightlyLoop } from "./nightly.js";
@@ -283,6 +285,14 @@ function isAuthenticated(req: http.IncomingMessage, expectedToken: string): bool
   return false;
 }
 
+/** Static files served from vendor/ (fixed list: nothing else in that folder is reachable). */
+const VENDOR_FILES: Record<string, string> = {
+  "/vendor/htmx.min.js": "htmx.min.js",
+  "/vendor/xterm.js": "xterm.js",
+  "/vendor/xterm.css": "xterm.css",
+  "/vendor/xterm-addon-fit.js": "xterm-addon-fit.js",
+};
+
 function setSecurityHeaders(res: http.ServerResponse): void {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
@@ -404,11 +414,12 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       return;
     }
 
-    if (pathname === "/vendor/htmx.min.js" && req.method === "GET") {
-      const vendorPath = path.resolve(__dirname, "../vendor/htmx.min.js");
+    const vendorFile = VENDOR_FILES[pathname];
+    if (vendorFile && req.method === "GET") {
+      const vendorPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../vendor", vendorFile);
       if (fs.existsSync(vendorPath)) {
         res.writeHead(200, {
-          "Content-Type": "application/javascript; charset=utf-8",
+          "Content-Type": vendorFile.endsWith(".css") ? "text/css; charset=utf-8" : "application/javascript; charset=utf-8",
           "Cache-Control": "public, max-age=86400",
         });
         res.end(fs.readFileSync(vendorPath));
@@ -1115,6 +1126,18 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return reply({ job: startPoolJob("remove", name, (log) => removeHelper(name, { by: actor, log })) });
         }
 
+        // Terminal (terminal.ts): off by default; turning it on asks for the typed word "terminal".
+        if (pathname === "/api/terminal" && req.method === "GET") return reply({ enabled: terminalEnabled(), open: openTerminalCount() });
+        if (pathname === "/api/terminal" && req.method === "POST") {
+          const body = await readJsonBody(req);
+          if (body.on === true) confirmFromBody("terminal.enable", { appName: "terminal" }, body);
+          setTerminalEnabled(body.on === true, actor);
+          return reply({ enabled: terminalEnabled(), open: openTerminalCount() });
+        }
+
+        // "Check now" on the dashboard's row: one auto-deploy round right away (it also checks the dashboard's branch).
+        if (pathname === "/api/dashboard/check" && req.method === "POST") return reply({ started: pollNow(), controlPlane: followStatus() });
+
         if (pathname === "/api/poll" && req.method === "POST") {
           const body = await readJsonBody(req);
           if (String(body.appName || "") === DASHBOARD_APP_NAME) {
@@ -1532,6 +1555,33 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
 
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
+  });
+
+  // The terminal's WebSocket: only a logged-in person (session cookie, never a token), from this page.
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+  server.on("upgrade", (req, socket, head) => {
+    const deny = (code: number, text: string) => {
+      socket.end(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    };
+    let target: ReturnType<typeof terminalTarget>;
+    try {
+      const u = new URL(req.url || "/", "http://localhost");
+      if (u.pathname !== "/api/terminal") return deny(404, "Not Found");
+      if (!isValidSession(parseCookies(req.headers.cookie).paasmcp_session, expectedToken)) return deny(401, "Unauthorized");
+      const origin = String(req.headers.origin || "");
+      const hosts = [req.headers.host, req.headers["x-forwarded-host"]].filter(Boolean).map(String);
+      let originHost = "";
+      try { originHost = new URL(origin).host; } catch { /* no origin */ }
+      if (!originHost || !hosts.includes(originHost)) return deny(403, "Forbidden");
+      if (!terminalEnabled()) return deny(403, "Forbidden");
+      target = terminalTarget(String(u.searchParams.get("target") || ""));
+    } catch {
+      return deny(400, "Bad Request");
+    }
+    const by = (req.headers["cf-access-authenticated-user-email"] as string | undefined) || "dashboard";
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      void attachTerminal(ws, target, { image: dashboardImageTag(), by });
+    });
   });
 
   server.listen(port, host);
@@ -2801,6 +2851,11 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
           <span class="nav-label"></span>
         </button>
         <div class="nav-subs" data-subs-for="updates"></div>
+        <button class="nav-item nav-btn" onclick="goTo('terminal')" id="navTerminal">
+          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
+          <span class="nav-label"></span>
+        </button>
+        <div class="nav-subs" data-subs-for="terminal"></div>
       </div></div>
     </nav>
     <div class="nav-scrim" onclick="toggleNavDrawer(false)"></div>
@@ -3752,6 +3807,33 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           </div>
         </div>
 
+        <div class="tab-pane" id="tab-terminal">
+          <div class="card">
+            <div class="card-header">
+              <h2 data-i18n="termTitle"></h2>
+              <p class="card-desc" data-i18n="termDesc"></p>
+            </div>
+            <div id="termOff" hidden>
+              <p class="ofs-note" data-i18n="termOffNote"></p>
+              <button onclick="setTerminal(true)" data-i18n="termTurnOn"></button>
+            </div>
+            <div id="termOn" hidden>
+              <div class="form-group" style="max-width:420px;">
+                <label class="field-label" for="termTarget" data-i18n="termTargetLbl"></label>
+                <select id="termTarget"></select>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+                <button onclick="openTerminal()" id="btnTermOpen" data-i18n="termOpen"></button>
+                <button class="secondary" onclick="closeTerminal()" id="btnTermClose" data-i18n="termClose" hidden></button>
+                <button class="danger" onclick="setTerminal(false)" data-i18n="termTurnOff"></button>
+              </div>
+              <p class="ofs-note" data-i18n="termOnNote"></p>
+              <div id="termBox" hidden style="height:60vh;min-height:280px;margin-top:10px;background:#000;border-radius:8px;padding:6px;"></div>
+              <div class="ofs-msg" id="termMsg" role="status" aria-live="polite"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- TAB 5: DOCTOR & DIAGNOSTICS -->
         <div class="tab-pane" id="tab-doctor">
           <div class="card">
@@ -4247,6 +4329,28 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     // Plain-language texts (override the older technical ones and add the new screens).
     Object.assign(I18N.pt, {
+          "navTerminal": "Terminal",
+          "termTitle": "Terminal",
+          "termDesc": "Um terminal deste servidor (como administrador, root) ou de dentro de um app, aqui no navegador.",
+          "termOffNote": "Está desligado. Ligado, quem estiver logado no painel pode digitar comandos de administrador neste servidor: só ligue se você é a única pessoa com acesso ao painel. Fecha sozinho depois de 15 minutos sem digitar; abrir e fechar ficam no histórico, o que é digitado não.",
+          "termTurnOn": "Ligar o terminal",
+          "termTurnOff": "Desligar o terminal",
+          "termTargetLbl": "Abrir em",
+          "termServer": "Este servidor (root)",
+          "termApp": "App {app}",
+          "termOpen": "Abrir terminal",
+          "termClose": "Fechar",
+          "termOnNote": "Fecha sozinho depois de 15 minutos sem digitar. A IA (MCP) não tem acesso a ele.",
+          "termConnecting": "Conectando…",
+          "termEnded": "Terminal fechado.",
+          "termDenied": "Não deu para abrir: recarregue a página e entre de novo no painel.",
+          "termTooMany": "Já há 4 terminais abertos; feche um antes.",
+          "termLoadFail": "Não deu para carregar a tela do terminal.",
+          "checkNow": "Conferir agora",
+          "checkNowTitle": "Procura agora um commit novo na branch e, se houver, monta, testa e troca.",
+          "checkNowLast": "Última conferência: {when}. Clique para procurar um commit novo agora.",
+          "checkNowStarted": "Conferindo agora. Se houver commit novo, a linha mostra a montagem e o teste.",
+          "checkNowBusy": "Já está conferindo; a linha mostra o andamento.",
           "sidebarSubtitle": "Seu servidor de apps",
           "navHome": "Início",
           "navOverview": "Aplicações",
@@ -4710,6 +4814,28 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsDisabledToast": "Agendamento atualizado."
     });
     Object.assign(I18N.en, {
+          "navTerminal": "Terminal",
+          "termTitle": "Terminal",
+          "termDesc": "A terminal on this server (as administrator, root) or inside an app, right in the browser.",
+          "termOffNote": "It is off. When on, whoever is logged in to the dashboard can type administrator commands on this server: only turn it on if you are the only person with access to the dashboard. It closes after 15 minutes without typing; opening and closing are recorded, what is typed is not.",
+          "termTurnOn": "Turn the terminal on",
+          "termTurnOff": "Turn the terminal off",
+          "termTargetLbl": "Open in",
+          "termServer": "This server (root)",
+          "termApp": "App {app}",
+          "termOpen": "Open terminal",
+          "termClose": "Close",
+          "termOnNote": "Closes after 15 minutes without typing. The AI (MCP) cannot reach it.",
+          "termConnecting": "Connecting…",
+          "termEnded": "Terminal closed.",
+          "termDenied": "Could not open it: reload the page and log in to the dashboard again.",
+          "termTooMany": "4 terminals are already open; close one first.",
+          "termLoadFail": "Could not load the terminal screen.",
+          "checkNow": "Check now",
+          "checkNowTitle": "Looks for a new commit on the branch now and, if there is one, builds, tests and switches.",
+          "checkNowLast": "Last check: {when}. Click to look for a new commit now.",
+          "checkNowStarted": "Checking now. If there is a new commit, the row shows the build and the test.",
+          "checkNowBusy": "Already checking; the row shows the progress.",
           "sidebarSubtitle": "Your app server",
           "navHome": "Home",
           "navOverview": "Applications",
@@ -5671,7 +5797,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lead_agents": "Qualquer IA compatível com MCP pode cuidar do servidor por você. Ações arriscadas pedem sua confirmação.",
           "lead_email": "Um serviço de envio configurado uma vez para todos os apps.",
           "lead_doctor": "Procura problemas nos apps e no servidor em volta e diz o que fazer em cada caso.",
-          "lead_updates": "Atualizações seguras do PaaSMCP: cópia antes e volta sozinho se algo falhar."
+          "lead_updates": "Atualizações seguras do PaaSMCP: cópia antes e volta sozinho se algo falhar.",
+          "lead_terminal": "Comandos no servidor ou dentro de um app, sem sair do navegador."
     });
     Object.assign(I18N.en, {
           "navSecApps": "Apps",
@@ -5774,7 +5901,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "lead_agents": "Any MCP-compatible AI can run the server for you. Risky actions ask for your confirmation.",
           "lead_email": "One sending service, set up once for every app.",
           "lead_doctor": "Looks for problems in the apps and the server around them and says what to do.",
-          "lead_updates": "Safe PaaSMCP updates: a backup first, and an automatic roll back if something fails."
+          "lead_updates": "Safe PaaSMCP updates: a backup first, and an automatic roll back if something fails.",
+          "lead_terminal": "Commands on the server or inside an app, without leaving the browser."
           ,"navJobs": "Scheduled jobs",
           "cntJobs": "{n} jobs",
           "cntJobsOne": "1 job",
@@ -6009,7 +6137,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       'setupGithubDocsLink',
       'setupLocalDesc',
       'setupWebhookNote',
-      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'navJobs', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect', 'navChat',
+      'sidebarSubtitle', 'navHome', 'navEmail', 'navMirror', 'navPool', 'navUpdates', 'navTerminal', 'navJobs', 'homeTitle', 'navOverview', 'navVault', 'navDatabases', 'navDoctor', 'navAgents', 'navConnect', 'navChat',
       'topHealthBadge', 'btnLogout',
       'appsTitle', 'appsDesc', 'thApp', 'thStack', 'thMetrics', 'thPort', 'thDomains', 'thActions',
       'deployTitle', 'deployDesc', 'lblQuickFillDeploy', 'lblDepApp', 'lblDepRepo', 'lblDepBranch', 'lblDepMem', 'lblDepCpu', 'lblDepPg', 'lblDepRedis', 'btnDeploy',
@@ -7685,6 +7813,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (tabName === 'home') loadTutorialExtra();
       if (tabName === 'mirror') loadMirror();
       if (tabName === 'updates' && !updatesLoaded) loadUpdates();
+      if (tabName === 'terminal') loadTerminalTab();
       if (tabName === 'databases') { loadStorage(); loadOffsite(); }
       if (tabName === 'overview') loadScale();
       if (tabName === 'jobs') loadJobs();
@@ -8439,6 +8568,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           const followErr = a.runtimeType === 'paasmcp-control-plane' && cp.enabled && cp.lastError
             ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:2px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
             : '';
+          const checkNowBtn = a.runtimeType === 'paasmcp-control-plane' && cp.enabled
+            ? \`<button class="secondary" onclick="checkDashboardNow()" title="\${esc(cp.lastCheckAt ? t('checkNowLast').replace('{when}', new Date(cp.lastCheckAt).toLocaleString()) : t('checkNowTitle'))}">\${btnIcon('sync')}\${esc(t('checkNow'))}</button>\`
+            : '';
           const rollbackBtn = a.previousImageTag
             ? \`<button class="secondary" onclick="appAction('\${esc(a.name)}','rollback')" title="\${esc(t('actionRollbackTip'))}">\${btnIcon('back')}\${esc(t('actionRollback'))}</button>\`
             : '';
@@ -8473,6 +8605,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
                   <button class="secondary" onclick="appAction('\${esc(a.name)}','restart')">\${btnIcon('restart')}\${esc(t('actionRestart'))}</button>
                   \${a.repoUrl && a.runtimeType !== 'paasmcp-control-plane' ? \`<button class="secondary" onclick="redeployApp('\${esc(a.name)}')" title="\${esc(t('redeployTitle'))}">\${btnIcon('sync')}\${esc(t('actionRedeploy'))}</button>\` : ''}
                   \${rollbackBtn}
+                  \${checkNowBtn}
                   \${followBtn}
                   \${a.trashedAt
                     ? \`<span style="font-size:11px;color:var(--muted);">\${esc(t('trashedStatus') + a.trashedAt.slice(0, 10) + (a.trashDeleteOn ? t('trashDeleteOn') + new Date(a.trashDeleteOn).toLocaleDateString() : ''))}</span>
@@ -11345,7 +11478,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         return;
       }
       btn.disabled = false;
+      // A copy that ended while the page was closed still shows its result (for 30 minutes).
+      if (task && !btn.dataset.following && task.finishedAt && Date.now() - Date.parse(task.finishedAt) < 30 * 60_000 && !btn.dataset.shown) btn.dataset.following = '1';
       if (!btn.dataset.following || !task) return;
+      btn.dataset.shown = '1';
       delete btn.dataset.following;
       if (task.error) { ofsMsg('dbImpMsg', task.error, 'err'); return; }
       const r = task.result;
@@ -11428,6 +11564,86 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
 
+    // ---- Terminal (xterm.js, loaded only when this screen opens) ----
+    let termWs = null, termView = null, termFit = null, xtermLoading = null;
+    function loadXterm() {
+      if (window.Terminal && window.FitAddon) return Promise.resolve();
+      if (xtermLoading) return xtermLoading;
+      const css = document.createElement('link');
+      css.rel = 'stylesheet'; css.href = '/vendor/xterm.css';
+      document.head.appendChild(css);
+      const script = (src) => new Promise((ok, fail) => { const el = document.createElement('script'); el.src = src; el.onload = ok; el.onerror = fail; document.head.appendChild(el); });
+      xtermLoading = script('/vendor/xterm.js').then(() => script('/vendor/xterm-addon-fit.js')).catch((e) => { xtermLoading = null; throw e; });
+      return xtermLoading;
+    }
+    async function loadTerminalTab() {
+      let d = null;
+      try { const r = await fetch('/api/terminal'); if (r.ok) d = await r.json(); } catch {}
+      if (!d) return;
+      document.getElementById('termOff').hidden = d.enabled;
+      document.getElementById('termOn').hidden = !d.enabled;
+      if (!d.enabled) { closeTerminal(); return; }
+      const sel = document.getElementById('termTarget');
+      const keep = sel.value;
+      const apps = Object.values((lastStatus && lastStatus.apps) || {}).filter((a) => a.containerName && a.runtimeType !== 'paasmcp-control-plane' && !a.trashedAt);
+      sel.innerHTML = '<option value="server">' + esc(t('termServer')) + '</option>' + apps.map((a) => '<option value="' + esc(a.name) + '">' + esc(t('termApp').replace('{app}', a.name)) + '</option>').join('');
+      if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
+    }
+    async function setTerminal(on) {
+      const data = await postJson('/api/terminal', { on: on });
+      if (!data) return;
+      if (!on) closeTerminal();
+      loadTerminalTab();
+    }
+    function termButtons(open) {
+      document.getElementById('btnTermOpen').hidden = open;
+      document.getElementById('btnTermClose').hidden = !open;
+    }
+    function closeTerminal() {
+      if (termWs) { try { termWs.close(); } catch {} termWs = null; }
+      if (termView) { termView.dispose(); termView = null; termFit = null; }
+      const box = document.getElementById('termBox');
+      if (box) box.hidden = true;
+      if (document.getElementById('btnTermOpen')) termButtons(false);
+    }
+    async function openTerminal() {
+      closeTerminal();
+      try { await loadXterm(); } catch { ofsMsg('termMsg', t('termLoadFail'), 'err'); return; }
+      const box = document.getElementById('termBox');
+      box.hidden = false;
+      termView = new window.Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
+      termFit = new window.FitAddon.FitAddon();
+      termView.loadAddon(termFit);
+      termView.open(box);
+      termFit.fit();
+      termButtons(true);
+      ofsMsg('termMsg', t('termConnecting'), 'ok');
+      const target = document.getElementById('termTarget').value || 'server';
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/api/terminal?target=' + encodeURIComponent(target));
+      ws.binaryType = 'arraybuffer';
+      termWs = ws;
+      let opened = false;
+      const view = termView;
+      const send = (m) => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
+      ws.onopen = () => { opened = true; ofsMsg('termMsg', '', 'ok'); send({ t: 'resize', c: view.cols, r: view.rows }); view.focus(); };
+      ws.onmessage = (e) => { view.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data)); };
+      ws.onclose = (e) => {
+        if (termWs !== ws) return;
+        termWs = null;
+        termButtons(false);
+        ofsMsg('termMsg', !opened ? t('termDenied') : e.code === 4429 ? t('termTooMany') : t('termEnded'), opened && e.code !== 4429 ? 'ok' : 'err');
+      };
+      view.onData((d) => send({ t: 'in', d: d }));
+      view.onResize((s) => send({ t: 'resize', c: s.cols, r: s.rows }));
+    }
+    window.addEventListener('resize', () => { if (termFit && termView) { try { termFit.fit(); } catch {} } });
+
+    async function checkDashboardNow() {
+      const data = await postJson('/api/dashboard/check', {});
+      if (!data) return;
+      showToast(data.started ? t('checkNowStarted') : t('checkNowBusy'));
+      setTimeout(loadAll, 4000);
+    }
     async function toggleFollow(on) {
       const data = await postJson('/api/poll', { appName: 'paasmcp-dashboard', on });
       if (!data) return;

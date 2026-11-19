@@ -411,6 +411,8 @@ export interface PaaSState {
   activeTunnel?: ActiveTunnelConfig;
   /** Peer side: this server runs the connector of that origin's tunnel. */
   activeTunnelCopy?: { fromNodeId: string; tokenHash: string; at: string; hostnames?: string[] };
+  /** Terminal in the dashboard (terminal.ts): off unless the owner turned it on. */
+  terminal?: { enabled: boolean; updatedAt: string; by: string };
   /** Images moved by 'paasmcp update apply' (see updater.ts PINNED). */
   versions?: Partial<Record<"postgres" | "redis" | "garage", string>>;
   federation?: FederationConfig;

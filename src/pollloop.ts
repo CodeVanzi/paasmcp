@@ -11,23 +11,28 @@ export function pollIntervalSeconds(): number {
   return Number.isFinite(n) && n >= 30 ? n : 120;
 }
 
+let running = false;
+
+/** One round now (the same `paasmcp poll run`); false when a round is already going. */
+export function pollNow(): boolean {
+  if (running) return false;
+  running = true;
+  const cli = path.join(path.dirname(new URL(import.meta.url).pathname), "cli.js");
+  execFile(process.execPath, [cli, "poll", "run"], { timeout: 45 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    running = false;
+    if (err) {
+      console.error(`[poll] ${String(stderr || err.message).trim().split("\n").slice(-3).join(" | ")}`);
+      return;
+    }
+    const out = stdout.trim();
+    if (/"deployed":\s*\[\s*\{|"status":\s*"(updated|swapping|failed)"|"errors":\s*\[\s*\{/.test(out)) console.log(`[poll] ${out.replace(/\s+/g, " ").slice(0, 2000)}`);
+  });
+  return true;
+}
+
 export function startPollLoop(): () => void {
   if (process.env.PAASMCP_IN_DASHBOARD !== "1" || process.env.PAASMCP_DASHBOARD_POLL === "0") return () => {};
-  const cli = path.join(path.dirname(new URL(import.meta.url).pathname), "cli.js");
-  let running = false;
-  const round = () => {
-    if (running) return;
-    running = true;
-    execFile(process.execPath, [cli, "poll", "run"], { timeout: 45 * 60 * 1000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
-      running = false;
-      if (err) {
-        console.error(`[poll] ${String(stderr || err.message).trim().split("\n").slice(-3).join(" | ")}`);
-        return;
-      }
-      const out = stdout.trim();
-      if (/"deployed":\s*\[\s*\{|"status":\s*"(updated|swapping|failed)"|"errors":\s*\[\s*\{/.test(out)) console.log(`[poll] ${out.replace(/\s+/g, " ").slice(0, 2000)}`);
-    });
-  };
+  const round = () => { pollNow(); };
   const first = setTimeout(round, 60_000);
   const timer = setInterval(round, pollIntervalSeconds() * 1000);
   first.unref();
