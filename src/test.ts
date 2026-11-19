@@ -5940,7 +5940,7 @@ volumes:
       });
       const page = { cookie, origin: `http://127.0.0.1:${port}` };
 
-      assert.deepEqual(await (await fetch(`${baseUrl}/api/terminal`, { headers: { cookie } })).json(), { enabled: false, open: 0 });
+      assert.deepEqual(await (await fetch(`${baseUrl}/api/terminal`, { headers: { cookie } })).json(), { enabled: false, open: 0, sessions: [] });
       assert.equal((await connect("target=server", page)).status, 403, "off: refused");
       const ask = await post("/api/terminal", { on: true });
       assert.equal(ask.status, 409);
@@ -5967,6 +5967,7 @@ volumes:
       const xt = await fetch(`${baseUrl}/vendor/xterm.js`);
       assert.equal(xt.status, 200);
       assert.match(xt.headers.get("content-type") || "", /javascript/);
+      assert.equal((await fetch(`${baseUrl}/vendor/xterm-addon-web-links.js`)).status, 200);
       assert.equal((await fetch(`${baseUrl}/vendor/xterm-LICENSE`)).status, 404);
       assert.equal((await fetch(`${baseUrl}/vendor/../package.json`)).status, 404);
     } finally {

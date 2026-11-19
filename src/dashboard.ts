@@ -75,7 +75,7 @@ import { getSystemStatusSummary, resourceSnapshot } from "./mcp-server.js";
 import { followedCode, followStatus, originOf, readFollow, setFollow } from "./selfupdate.js";
 import { pollNow, startPollLoop } from "./pollloop.js";
 import { WebSocketServer } from "ws";
-import { attachTerminal, openTerminalCount, setTerminalEnabled, terminalEnabled, terminalTarget } from "./terminal.js";
+import { attachTerminal, openTerminalCount, setTerminalEnabled, terminalEnabled, terminalSessions, terminalTarget } from "./terminal.js";
 import { startMirrorWatchLoop } from "./mirrorwatchloop.js";
 import { startAppWatch } from "./appwatch.js";
 import { startNightlyLoop } from "./nightly.js";
@@ -291,6 +291,7 @@ const VENDOR_FILES: Record<string, string> = {
   "/vendor/xterm.js": "xterm.js",
   "/vendor/xterm.css": "xterm.css",
   "/vendor/xterm-addon-fit.js": "xterm-addon-fit.js",
+  "/vendor/xterm-addon-web-links.js": "xterm-addon-web-links.js",
 };
 
 function setSecurityHeaders(res: http.ServerResponse): void {
@@ -1127,7 +1128,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
         }
 
         // Terminal (terminal.ts): off by default; turning it on asks for the typed word "terminal".
-        if (pathname === "/api/terminal" && req.method === "GET") return reply({ enabled: terminalEnabled(), open: openTerminalCount() });
+        if (pathname === "/api/terminal" && req.method === "GET") return reply({ enabled: terminalEnabled(), open: openTerminalCount(), sessions: terminalSessions() });
         if (pathname === "/api/terminal" && req.method === "POST") {
           const body = await readJsonBody(req);
           if (body.on === true) confirmFromBody("terminal.enable", { appName: "terminal" }, body);
@@ -1564,6 +1565,7 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       socket.end(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
     };
     let target: ReturnType<typeof terminalTarget>;
+    let sessionId: string | undefined;
     try {
       const u = new URL(req.url || "/", "http://localhost");
       if (u.pathname !== "/api/terminal") return deny(404, "Not Found");
@@ -1575,12 +1577,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
       if (!originHost || !hosts.includes(originHost)) return deny(403, "Forbidden");
       if (!terminalEnabled()) return deny(403, "Forbidden");
       target = terminalTarget(String(u.searchParams.get("target") || ""));
+      const sid = String(u.searchParams.get("session") || "");
+      if (/^[0-9a-f]{24}$/.test(sid)) sessionId = sid;
     } catch {
       return deny(400, "Bad Request");
     }
     const by = (req.headers["cf-access-authenticated-user-email"] as string | undefined) || "dashboard";
     wss.handleUpgrade(req, socket, head, (ws) => {
-      void attachTerminal(ws, target, { image: dashboardImageTag(), by });
+      void attachTerminal(ws, target, { image: dashboardImageTag(), by, sessionId });
     });
   });
 
@@ -3824,11 +3828,17 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
                 <button onclick="openTerminal()" id="btnTermOpen" data-i18n="termOpen"></button>
-                <button class="secondary" onclick="closeTerminal()" id="btnTermClose" data-i18n="termClose" hidden></button>
                 <button class="danger" onclick="setTerminal(false)" data-i18n="termTurnOff"></button>
               </div>
               <p class="ofs-note" data-i18n="termOnNote"></p>
+              <div id="termWaiting" hidden></div>
+              <div id="termStrip" hidden style="margin-top:10px;" role="tablist"></div>
               <div id="termBox" hidden style="height:60vh;min-height:280px;margin-top:10px;background:#000;border-radius:8px;padding:6px;"></div>
+              <div id="termTools" hidden><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;">
+                <button class="secondary" onclick="termCopyAll()" data-i18n="termCopyAll"></button>
+                <button class="secondary" onclick="termToEnd()" data-i18n="termToEnd"></button>
+                <button class="secondary" onclick="closeTerminal()" data-i18n="termClose"></button>
+              </div></div>
               <div class="ofs-msg" id="termMsg" role="status" aria-live="polite"></div>
             </div>
           </div>
@@ -4352,12 +4362,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "termTargetLbl": "Abrir em",
           "termServer": "Este servidor (root)",
           "termApp": "App {app}",
-          "termOpen": "Abrir terminal",
+          "termOpen": "Abrir um terminal",
           "termClose": "Fechar",
-          "termOnNote": "Para copiar, selecione o texto e aperte Ctrl+C (sem seleção, o Ctrl+C interrompe o comando). Para colar, Ctrl+V. Fecha sozinho depois de 15 minutos sem digitar. A IA (MCP) não tem acesso a ele.",
+          "termOnNote": "Fechar a aba ou perder a conexão não encerra o shell: abra o mesmo lugar de novo para continuar de onde parou. Para copiar, selecione o texto e aperte Ctrl+C (sem seleção, o Ctrl+C interrompe o comando); Ctrl+Shift+A seleciona tudo, Ctrl+V cola e Shift+PageUp/PageDown rola o histórico. O shell termina com exit, com Fechar ou depois de 15 minutos sem digitar. A IA (MCP) não tem acesso a ele.",
           "termConnecting": "Conectando…",
           "termEnded": "Terminal fechado.",
           "termCopied": "Copiado.",
+          "termCopyAll": "Copiar tudo",
+          "termTabEnded": "fechado",
+          "termToEnd": "Ir para o fim",
+          "termWaiting": "Terminal ainda aberto em {where}.",
+          "termResume": "Continuar",
+          "termResumed": "Reconectado: o que apareceu enquanto você estava fora está acima.",
+          "termReconnecting": "A conexão caiu; reconectando…",
+          "termElsewhere": "Este terminal foi aberto em outra aba.",
           "termDenied": "Não deu para abrir: recarregue a página e entre de novo no painel.",
           "termTooMany": "Já há 4 terminais abertos; feche um antes.",
           "termLoadFail": "Não deu para carregar a tela do terminal.",
@@ -4842,12 +4860,20 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "termTargetLbl": "Open in",
           "termServer": "This server (root)",
           "termApp": "App {app}",
-          "termOpen": "Open terminal",
+          "termOpen": "Open a terminal",
           "termClose": "Close",
-          "termOnNote": "To copy, select the text and press Ctrl+C (with nothing selected, Ctrl+C stops the command). To paste, Ctrl+V. Closes after 15 minutes without typing. The AI (MCP) cannot reach it.",
+          "termOnNote": "Closing the tab or losing the connection does not end the shell: open the same place again to continue where you left off. To copy, select the text and press Ctrl+C (with nothing selected, Ctrl+C stops the command); Ctrl+Shift+A selects everything, Ctrl+V pastes and Shift+PageUp/PageDown scrolls the history. The shell ends with exit, with Close, or after 15 minutes without typing. The AI (MCP) cannot reach it.",
           "termConnecting": "Connecting…",
           "termEnded": "Terminal closed.",
           "termCopied": "Copied.",
+          "termCopyAll": "Copy all",
+          "termTabEnded": "closed",
+          "termToEnd": "Jump to the end",
+          "termWaiting": "A terminal is still open on {where}.",
+          "termResume": "Continue",
+          "termResumed": "Reconnected: what it printed while you were away is above.",
+          "termReconnecting": "The connection dropped; reconnecting…",
+          "termElsewhere": "This terminal was opened in another tab.",
           "termDenied": "Could not open it: reload the page and log in to the dashboard again.",
           "termTooMany": "4 terminals are already open; close one first.",
           "termLoadFail": "Could not load the terminal screen.",
@@ -11611,81 +11637,127 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     // ---- Terminal (xterm.js, loaded only when this screen opens) ----
-    let termWs = null, termView = null, termFit = null, xtermLoading = null;
+    // Each shell lives on the server: closing the browser tab or losing the network only detaches it, and this
+    // browser keeps its id to come back to it. Several can be open at once, one tab each.
+    let xtermLoading = null, termTabs = [], termActive = null, termSeq = 0;
     function loadXterm() {
-      if (window.Terminal && window.FitAddon) return Promise.resolve();
+      if (window.Terminal && window.FitAddon && window.WebLinksAddon) return Promise.resolve();
       if (xtermLoading) return xtermLoading;
       const css = document.createElement('link');
       css.rel = 'stylesheet'; css.href = '/vendor/xterm.css';
       document.head.appendChild(css);
       const script = (src) => new Promise((ok, fail) => { const el = document.createElement('script'); el.src = src; el.onload = ok; el.onerror = fail; document.head.appendChild(el); });
-      xtermLoading = script('/vendor/xterm.js').then(() => script('/vendor/xterm-addon-fit.js')).catch((e) => { xtermLoading = null; throw e; });
+      xtermLoading = script('/vendor/xterm.js').then(() => script('/vendor/xterm-addon-fit.js')).then(() => script('/vendor/xterm-addon-web-links.js')).catch((e) => { xtermLoading = null; throw e; });
       return xtermLoading;
     }
+    // [{id, target}] of the shells this browser opened.
+    function termIds() { try { const v = JSON.parse(localStorage.getItem('paasmcp_terms') || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } }
+    function termKeep(id, target) {
+      const ids = termIds().filter((x) => x.id !== id);
+      if (target) ids.push({ id: id, target: target });
+      try { localStorage.setItem('paasmcp_terms', JSON.stringify(ids)); } catch {}
+    }
+    function termName(v) { return v === 'server' ? t('termServer') : t('termApp').replace('{app}', v); }
     async function loadTerminalTab() {
       let d = null;
       try { const r = await fetch('/api/terminal'); if (r.ok) d = await r.json(); } catch {}
       if (!d) return;
       document.getElementById('termOff').hidden = d.enabled;
       document.getElementById('termOn').hidden = !d.enabled;
-      if (!d.enabled) { closeTerminal(); return; }
+      if (!d.enabled) { closeAllTerminals(); return; }
       const sel = document.getElementById('termTarget');
       const keep = sel.value;
       const apps = Object.values((lastStatus && lastStatus.apps) || {}).filter((a) => a.containerName && a.runtimeType !== 'paasmcp-control-plane' && !a.trashedAt);
-      sel.innerHTML = '<option value="server">' + esc(t('termServer')) + '</option>' + apps.map((a) => '<option value="' + esc(a.name) + '">' + esc(t('termApp').replace('{app}', a.name)) + '</option>').join('');
+      sel.innerHTML = '<option value="server">' + esc(t('termServer')) + '</option>' + apps.map((a) => '<option value="' + esc(a.name) + '">' + esc(termName(a.name)) + '</option>').join('');
       if (keep && [...sel.options].some((o) => o.value === keep)) sel.value = keep;
+      // Shells still running that this page is not showing: one click goes back to each; forget the ones that ended.
+      const live = d.sessions || [];
+      const mine = termIds();
+      for (const x of mine) if (!live.some((l) => l.id === x.id)) termKeep(x.id, null);
+      const waiting = live.filter((x) => mine.some((m) => m.id === x.id) && !termTabs.some((tab) => tab.sid === x.id));
+      const box = document.getElementById('termWaiting');
+      box.hidden = !waiting.length;
+      box.innerHTML = waiting.map((x) => '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;font-size:14px;"><span>' + esc(t('termWaiting').replace('{where}', termName(x.target))) + '</span><button class="secondary" data-id="' + esc(x.id) + '" data-target="' + esc(x.target) + '" onclick="openTerminal(this.dataset.target, this.dataset.id)">' + esc(t('termResume')) + '</button></div>').join('');
     }
     async function setTerminal(on) {
       const data = await postJson('/api/terminal', { on: on });
       if (!data) return;
-      if (!on) closeTerminal();
+      if (!on) closeAllTerminals();
       loadTerminalTab();
     }
-    function termButtons(open) {
-      document.getElementById('btnTermOpen').hidden = open;
-      document.getElementById('btnTermClose').hidden = !open;
+    function termRender() {
+      const strip = document.getElementById('termStrip');
+      strip.hidden = !termTabs.length;
+      strip.innerHTML = termTabs.map((tab) => '<button class="' + (tab === termActive ? '' : 'secondary') + '" style="padding:4px 10px;" onclick="termShow(' + tab.key + ')">' + esc(termName(tab.target)) + (tab.ws ? '' : ' (' + esc(t('termTabEnded')) + ')') + '</button>').join('');
+      for (const tab of termTabs) tab.el.hidden = tab !== termActive;
+      document.getElementById('termBox').hidden = !termTabs.length;
+      document.getElementById('termTools').hidden = !termActive;
+      if (termActive) { try { termActive.fit.fit(); } catch {} termActive.view.focus(); }
     }
-    function closeTerminal() {
-      if (termWs) { try { termWs.close(); } catch {} termWs = null; }
-      if (termView) { termView.dispose(); termView = null; termFit = null; }
-      const box = document.getElementById('termBox');
-      if (box) box.hidden = true;
-      if (document.getElementById('btnTermOpen')) termButtons(false);
+    function termShow(key) {
+      termActive = termTabs.find((x) => x.key === key) || termActive;
+      termRender();
+      ofsMsg('termMsg', termActive && termActive.msg || '', 'ok');
     }
-    async function openTerminal() {
-      closeTerminal();
+    // Close button: ends the shell on the server too.
+    function closeTerminal() { if (termActive) termDrop(termActive, true); }
+    function termDrop(tab, end) {
+      clearTimeout(tab.timer);
+      const ws = tab.ws;
+      tab.ws = null;
+      if (ws) {
+        try { if (end && ws.readyState === 1) ws.send(JSON.stringify({ t: 'close' })); } catch {}
+        try { ws.close(); } catch {}
+      }
+      if (end && tab.sid) termKeep(tab.sid, null);
+      tab.view.dispose();
+      tab.el.remove();
+      termTabs = termTabs.filter((x) => x !== tab);
+      if (termActive === tab) termActive = termTabs[termTabs.length - 1] || null;
+      termRender();
+      loadTerminalTab();
+    }
+    // Leaves this page's view of every shell (they keep running on the server, except when turned off).
+    function closeAllTerminals() { for (const tab of [...termTabs]) termDrop(tab, false); }
+    function termCopy(text) {
+      if (text && navigator.clipboard) navigator.clipboard.writeText(text).then(() => showToast(t('termCopied'))).catch(() => {});
+    }
+    function termCopyAll() {
+      if (!termActive) return;
+      const v = termActive.view;
+      v.selectAll();
+      termCopy(v.getSelection());
+      v.clearSelection();
+      v.focus();
+    }
+    function termToEnd() { if (termActive) { termActive.view.scrollToBottom(); termActive.view.focus(); } }
+    async function openTerminal(target, sid) {
       try { await loadXterm(); } catch { ofsMsg('termMsg', t('termLoadFail'), 'err'); return; }
-      const box = document.getElementById('termBox');
-      box.hidden = false;
-      termView = new window.Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
-      termFit = new window.FitAddon.FitAddon();
-      termView.loadAddon(termFit);
-      termView.open(box);
-      termFit.fit();
-      termButtons(true);
-      ofsMsg('termMsg', t('termConnecting'), 'ok');
-      const target = document.getElementById('termTarget').value || 'server';
-      const ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/api/terminal?target=' + encodeURIComponent(target));
-      ws.binaryType = 'arraybuffer';
-      termWs = ws;
-      let opened = false;
-      const view = termView;
-      const send = (m) => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); };
-      ws.onopen = () => { opened = true; ofsMsg('termMsg', '', 'ok'); send({ t: 'resize', c: view.cols, r: view.rows }); view.focus(); };
-      ws.onmessage = (e) => { view.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data)); };
-      ws.onclose = (e) => {
-        if (termWs !== ws) return;
-        termWs = null;
-        termButtons(false);
-        ofsMsg('termMsg', !opened ? t('termDenied') : e.code === 4429 ? t('termTooMany') : t('termEnded'), opened && e.code !== 4429 ? 'ok' : 'err');
-      };
-      // Ctrl+C copies when text is selected (otherwise it interrupts, as usual); Ctrl+Shift+C/V like Linux terminals.
+      target = target || document.getElementById('termTarget').value || 'server';
+      const el = document.createElement('div');
+      el.style.cssText = 'height:100%;';
+      document.getElementById('termBox').appendChild(el);
+      const view = new window.Terminal({ cursorBlink: true, fontSize: 14, scrollback: 5000 });
+      const fit = new window.FitAddon.FitAddon();
+      view.loadAddon(fit);
+      view.loadAddon(new window.WebLinksAddon.WebLinksAddon((e, uri) => { if (/^https?:/i.test(uri)) window.open(uri, '_blank', 'noopener'); }));
+      const tab = { key: ++termSeq, target: target, sid: sid || '', view: view, fit: fit, el: el, ws: null, retry: 0, timer: null, msg: '' };
+      termTabs.push(tab);
+      termActive = tab;
+      document.getElementById('termBox').hidden = false;
+      view.open(el);
+      termRender();
+      // Ctrl+C copies when text is selected (otherwise it interrupts, as usual). Like Linux terminals:
+      // Ctrl+Shift+C copies, Ctrl+Shift+A selects everything, Shift+PageUp/PageDown scroll, Ctrl+Shift+Home/End jump.
       view.attachCustomKeyEventHandler((e) => {
-        if (e.type !== 'keydown' || !e.ctrlKey || e.altKey || e.metaKey) return true;
+        if (e.type !== 'keydown' || e.altKey || e.metaKey) return true;
         const k = e.key.toLowerCase();
+        if (e.shiftKey && !e.ctrlKey && (k === 'pageup' || k === 'pagedown')) { view.scrollPages(k === 'pageup' ? -1 : 1); e.preventDefault(); return false; }
+        if (!e.ctrlKey) return true;
+        if (e.shiftKey && (k === 'home' || k === 'end')) { if (k === 'home') view.scrollToTop(); else view.scrollToBottom(); e.preventDefault(); return false; }
+        if (e.shiftKey && k === 'a') { view.selectAll(); e.preventDefault(); return false; }
         if (k === 'c' && (e.shiftKey || view.hasSelection())) {
-          const sel = view.getSelection();
-          if (sel && navigator.clipboard) navigator.clipboard.writeText(sel).then(() => showToast(t('termCopied'))).catch(() => {});
+          termCopy(view.getSelection());
           view.clearSelection();
           e.preventDefault();
           return false;
@@ -11693,10 +11765,58 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         if (k === 'v') return false; // the browser pastes into the terminal
         return true;
       });
-      view.onData((d) => send({ t: 'in', d: d }));
-      view.onResize((s) => send({ t: 'resize', c: s.cols, r: s.rows }));
+      view.onData((d) => { if (tab.ws && tab.ws.readyState === 1) tab.ws.send(JSON.stringify({ t: 'in', d: d })); });
+      view.onResize((sz) => { if (tab.ws && tab.ws.readyState === 1) tab.ws.send(JSON.stringify({ t: 'resize', c: sz.cols, r: sz.rows })); });
+      termConnect(tab);
     }
-    window.addEventListener('resize', () => { if (termFit && termView) { try { termFit.fit(); } catch {} } });
+    function termSay(tab, text, kind) {
+      tab.msg = text;
+      if (tab === termActive) ofsMsg('termMsg', text, kind || 'ok');
+    }
+    function termConnect(tab) {
+      termSay(tab, t(tab.retry ? 'termReconnecting' : 'termConnecting'));
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/api/terminal?target=' + encodeURIComponent(tab.target) + (tab.sid ? '&session=' + encodeURIComponent(tab.sid) : ''));
+      ws.binaryType = 'arraybuffer';
+      tab.ws = ws;
+      let opened = false, started = false;
+      const resuming = !!tab.sid;
+      ws.onopen = () => { opened = true; ws.send(JSON.stringify({ t: 'resize', c: tab.view.cols, r: tab.view.rows })); if (tab === termActive) tab.view.focus(); };
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          let m = null;
+          try { m = JSON.parse(e.data); } catch {}
+          if (m && m.t === 'session') {
+            started = true;
+            tab.retry = 0;
+            tab.sid = m.id;
+            termKeep(m.id, tab.target);
+            termSay(tab, m.resumed ? t('termResumed') : '');
+            termRender();
+            loadTerminalTab();
+          }
+          return;
+        }
+        // Coming back to a shell: the server sends what it kept, so start from a clean screen.
+        if (!started && resuming) tab.view.reset();
+        tab.view.write(new Uint8Array(e.data));
+      };
+      ws.onclose = (e) => {
+        if (tab.ws !== ws) return;
+        tab.ws = null;
+        // The network dropped (not the server ending it): try again a few times, the shell is still there.
+        if (opened && started && e.code === 1006 && tab.retry < 5 && termTabs.includes(tab)) {
+          tab.retry++;
+          termSay(tab, t('termReconnecting'), 'err');
+          tab.timer = setTimeout(() => { if (termTabs.includes(tab)) termConnect(tab); }, 2000 * tab.retry);
+          return;
+        }
+        if (tab.sid && (e.code === 1000 || !started)) termKeep(tab.sid, null);
+        termSay(tab, !opened ? t('termDenied') : e.code === 4429 ? t('termTooMany') : e.code === 4409 ? t('termElsewhere') : t('termEnded'), opened && e.code !== 4429 ? 'ok' : 'err');
+        termRender();
+        loadTerminalTab();
+      };
+    }
+    window.addEventListener('resize', () => { if (termActive) { try { termActive.fit.fit(); } catch {} } });
 
     async function checkDashboardNow() {
       const data = await postJson('/api/dashboard/check', {});
