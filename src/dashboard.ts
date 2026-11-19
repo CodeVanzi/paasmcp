@@ -4340,6 +4340,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     // Plain-language texts (override the older technical ones and add the new screens).
     Object.assign(I18N.pt, {
           "dlgCancel": "Cancelar",
+          "appPollOnTitle": "Confere a branch {branch} a cada 2 minutos e publica sozinho cada commit novo (testa antes de trocar). Clique para parar.",
+          "appPollOffTitle": "Não está atualizando sozinho. Clique para conferir a branch {branch} a cada 2 minutos e publicar cada commit novo.",
           "dlgOk": "Confirmar",
           "navTerminal": "Terminal",
           "termTitle": "Terminal",
@@ -4827,6 +4829,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     });
     Object.assign(I18N.en, {
           "dlgCancel": "Cancel",
+          "appPollOnTitle": "Checks branch {branch} every 2 minutes and publishes each new commit by itself (tested before switching). Click to stop.",
+          "appPollOffTitle": "Not updating by itself. Click to check branch {branch} every 2 minutes and publish each new commit.",
           "dlgOk": "Confirm",
           "navTerminal": "Terminal",
           "termTitle": "Terminal",
@@ -8578,7 +8582,9 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           const cp = s.controlPlane || {};
           const followBtn = a.runtimeType === 'paasmcp-control-plane'
             ? \`<button class="secondary" style="\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${btnIcon('sync')}\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
-            : '';
+            : a.repoUrl && a.repoUrl.charAt(0) !== '/' && !a.trashedAt
+              ? \`<button class="secondary" style="\${a.autoDeploy ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleAppPoll('\${esc(a.name)}', \${a.autoDeploy ? 'false' : 'true'})" title="\${esc(t(a.autoDeploy ? 'appPollOnTitle' : 'appPollOffTitle').replace('{branch}', a.branch || 'main'))}">\${btnIcon('sync')}\${esc(a.autoDeploy ? t('followOn') : t('followOff'))}</button>\`
+              : '';
           const followErr = a.runtimeType === 'paasmcp-control-plane' && cp.enabled && cp.lastError
             ? \`<div style="font-size:11px;color:var(--danger, #dc2626);margin-top:2px;">\${esc(t('followFailed').replace('{step}', cp.lastError.step).replace('{commit}', String(cp.lastError.commit).slice(0, 7)))}</div>\`
             : '';
@@ -11681,6 +11687,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!data) return;
       showToast(data.started ? t('checkNowStarted') : t('checkNowBusy'));
       setTimeout(loadAll, 4000);
+    }
+    async function toggleAppPoll(appName, on) {
+      const data = await postJson('/api/poll', { appName: appName, on: on });
+      if (!data) return;
+      showToast(on ? t('followOn') : t('followOff'));
+      loadAll();
     }
     async function toggleFollow(on) {
       const data = await postJson('/api/poll', { appName: 'paasmcp-dashboard', on });
