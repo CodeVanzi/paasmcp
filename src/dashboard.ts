@@ -31,7 +31,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { DOCKER_NETWORK, HOMELAB_ROOT, HOST_HOSTNAME_FILE, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
+import { DOCKER_NETWORK, HOMELAB_ROOT, HOST_HOSTNAME_FILE, PAAS_DATA_DIR, loadState, sanitizeSlug, saveState, tailscaleSocketDir, validateResourceLimit, withStateLock, WATCHTOWER_OFF_COMPOSE } from "./config.js";
 import { getDashboardTotpSecret, isDashboardTwoFactorEnabled, verifyTotp } from "./totp.js";
 import {
   authorizeHuman,
@@ -88,6 +88,7 @@ import {
   setSecretEntries,
   timingSafeCompare,
   parseDotenv,
+  toDotenv,
   listSecretScopes,
 } from "./vault.js";
 import { listSecretDetails } from "./vaultdocs.js";
@@ -620,6 +621,25 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           return true;
         }
 
+        // Show what was saved (one key, or the whole scope as a .env to use elsewhere). Only a person logged in to
+        // the page (never the token alone, never MCP), and each look goes to the audit (key names, never values).
+        if (pathname === "/api/secrets/reveal" && req.method === "POST") {
+          if (!isValidSession(parseCookies(req.headers.cookie).paasmcp_session, expectedToken)) {
+            res.writeHead(403, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Showing values needs a dashboard login (the token alone is not enough)." }));
+            return true;
+          }
+          const body = await readJsonBody(req);
+          const scope = String(body.scope || "system");
+          const all = getSecrets(scope);
+          const key = body.key === undefined ? undefined : String(body.key);
+          if (key !== undefined && !(key in all)) throw new Error(`No key '${key}' in ${scope}.`);
+          audit({ event: "secret.reveal", scope: sanitizeSlug(scope), key: key ?? "*", by: actor });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(key !== undefined ? { scope, key, value: all[key] } : { scope, dotenv: toDotenv(all) }));
+          return true;
+        }
+
         // A key's description (what it is and what it is for). Text only: the value never travels here.
         if (pathname === "/api/secrets/description" && req.method === "POST") {
           const body = await readJsonBody(req);
@@ -903,9 +923,14 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const app = loadState().apps[slug];
           if (!app) throw new Error(`App '${slug}' not found.`);
           if (!app.repoUrl || app.runtimeType === "paasmcp-control-plane") throw new Error(`App '${slug}' has no code source to publish again.`);
+          // Changed limits (memory "1g", CPU "2"; "" removes one) apply by publishing again.
+          const limits: { memoryLimit?: string; cpuLimit?: string } = {};
+          if (typeof body.memoryLimit === "string") limits.memoryLimit = body.memoryLimit.trim() === "" ? "" : validateResourceLimit(body.memoryLimit, "memory");
+          if (typeof body.cpuLimit === "string") limits.cpuLimit = body.cpuLimit.trim() === "" ? "" : validateResourceLimit(body.cpuLimit, "cpu");
+          if (Object.keys(limits).length) audit({ event: "app.limits", app: slug, ...limits, by: actor });
           let result;
           try {
-            result = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, trigger: "dashboard" });
+            result = await deployApp({ appName: slug, repoSource: app.repoUrl, branch: app.branch, trusted: app.trusted, trigger: "dashboard", ...limits });
           } catch (err) {
             return deployFailed(err);
           }
@@ -3243,6 +3268,8 @@ export function renderDashboardHtml(authed: boolean, cfEmail?: string, twoFactor
             <div id="secApply"></div>
             <h3 class="ofs-h" data-i18n="secListTitle"></h3>
             <div id="secretsList"></div>
+            <div style="margin-top:8px;"><button class="secondary" onclick="downloadSecrets()" data-i18n="secDownload"></button>
+              <p class="ofs-note" data-i18n="secRevealNote"></p></div>
             <h3 class="ofs-h" style="margin-top:18px;" data-i18n="secAddTitle"></h3>
             <div class="form-grid">
               <div>
@@ -4083,7 +4110,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         exposeTitle: "🌐 Expor Aplicação (Cloudflare Tunnel / Zero Trust / Tailscale)",
         exposeDesc: "Configura rota no Cloudflare Tunnel + DNS CNAME proxied + política Zero Trust sem abrir nenhuma porta no roteador.",
         vaultTitle: "Variáveis de cada app",
-        vaultDesc: "O que o código do app lê como variável de ambiente: chaves de serviços (Stripe, OpenAI...), senhas e endereços. Fica cifrado no disco e não aparece inteiro de novo depois de salvo.",
+        vaultDesc: "O que o código do app lê como variável de ambiente: chaves de serviços (Stripe, OpenAI...), senhas e endereços. Fica cifrado no disco; a lista mostra mascarado, e Mostrar ou Editar trazem o valor salvo.",
         lblSecScope: "De qual app?",
         lblSecKey: "Nome (letras, números e _)",
         lblSecVal: "Valor",
@@ -4228,7 +4255,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         exposeTitle: "🌐 Expose Application (Cloudflare Tunnel / Zero Trust / Tailscale)",
         exposeDesc: "Configures Cloudflare Tunnel routing + proxied DNS CNAME + Zero Trust policy without opening router ports.",
         vaultTitle: "Each app's variables",
-        vaultDesc: "What the app's code reads as environment variables: service keys (Stripe, OpenAI...), passwords and addresses. Encrypted on disk and never shown in full again after saving.",
+        vaultDesc: "What the app's code reads as environment variables: service keys (Stripe, OpenAI...), passwords and addresses. Encrypted on disk; the list shows it masked, and Show or Edit bring back the saved value.",
         lblSecScope: "Which app?",
         lblSecKey: "Name (letters, digits and _)",
         lblSecVal: "Value",
@@ -6555,8 +6582,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "secApplyNote": "O app lê estas variáveis quando é publicado. Depois de mudar algo, publique de novo.",
       "secApplyChanged": "Você mudou variáveis deste app. Elas valem depois de publicar de novo.",
       "secListTitle": "Salvas",
+      "secShow": "Mostrar",
+      "secHide": "Esconder",
+      "secCopied": "Valor copiado.",
+      "secDownload": "Baixar como .env",
+      "secRevealNote": "Mostrar e baixar só funcionam com o login do painel (a IA não vê os valores), e cada vez fica no histórico. O .env baixado serve para colar em outro lugar, como o Render; guarde-o com cuidado.",
       "secAddTitle": "Adicionar ou trocar uma",
-      "secChange": "Trocar",
+      "secChange": "Editar",
       "secDescLabel": "Para que serve (opcional)",
       "secDescPh": "ex: chave da Stripe da loja, conta de produção",
       "secDescBtn": "Descrever",
@@ -6602,8 +6634,13 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "secApplyNote": "The app reads these variables when it is published. After changing something, publish again.",
       "secApplyChanged": "You changed this app's variables. They take effect after publishing again.",
       "secListTitle": "Saved",
+      "secShow": "Show",
+      "secHide": "Hide",
+      "secCopied": "Value copied.",
+      "secDownload": "Download as .env",
+      "secRevealNote": "Show and download work only with a dashboard login (the AI never sees the values), and each time is recorded. The downloaded .env can be pasted elsewhere, like Render; keep it safe.",
       "secAddTitle": "Add or change one",
-      "secChange": "Change",
+      "secChange": "Edit",
       "secDescLabel": "What it is for (optional)",
       "secDescPh": "e.g.: the shop's Stripe key, live account",
       "secDescBtn": "Describe",
@@ -6952,6 +6989,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "mode_tailscale": "só a minha rede",
       "mode_local": "rede de casa",
       "limitsLabel": "Limite: {mem} de memória, {cpu} CPU",
+      "limitsEdit": "Alterar limites",
+      "limitsAdd": "Pôr limites",
+      "limitsMemAsk": "Memória máxima de {app}, como 512m, 1g ou 2g. Vazio = sem limite. Para valer, o app é publicado de novo (com o código atual do branch e as mesmas variáveis).",
+      "limitsCpuAsk": "CPUs de {app}, como 0.5, 1 ou 2. Vazio = sem limite.",
+      "limitsSaved": "Limites aplicados: o app foi publicado de novo.",
+      "deployStillRunning": "A publicação continua no servidor; a linha do app mostra quando terminar.",
       "expListTitle": "Endereços publicados",
       "btnUnexpose": "Tirar do ar",
       "toastUnexposed": "Endereço tirado do ar: "
@@ -6964,6 +7007,12 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "mode_tailscale": "my network only",
       "mode_local": "home network",
       "limitsLabel": "Limit: {mem} memory, {cpu} CPU",
+      "limitsEdit": "Change limits",
+      "limitsAdd": "Set limits",
+      "limitsMemAsk": "Maximum memory for {app}, like 512m, 1g or 2g. Empty = no limit. To apply, the app is published again (current code of its branch, same variables).",
+      "limitsCpuAsk": "CPUs for {app}, like 0.5, 1 or 2. Empty = no limit.",
+      "limitsSaved": "Limits applied: the app was published again.",
+      "deployStillRunning": "Publishing goes on on the server; the app's row shows when it ends.",
       "expListTitle": "Published addresses",
       "btnUnexpose": "Take offline",
       "toastUnexposed": "Address taken offline: "
@@ -8604,9 +8653,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           const metricHtml = m
             ? \`<span><strong>CPU:</strong> \${esc(m.cpuPercent)}</span> · <span><strong>RAM:</strong> \${esc(m.memUsage)}</span>\`
             : \`<span style="color:var(--muted);">\${esc(a.status === 'stopped' ? t('stoppedStatus') : t('onDemandStatus'))}</span>\`;
-          const limitsHtml = (a.memoryLimit || a.cpuLimit)
-            ? \`<span>\${esc(t('limitsLabel').split('{mem}').join(a.memoryLimit || '-').split('{cpu}').join(a.cpuLimit || '-'))}</span>\`
-            : '';
+          const canLimit = a.repoUrl && a.runtimeType !== 'paasmcp-control-plane' && !a.trashedAt;
+          const limitsHtml = ((a.memoryLimit || a.cpuLimit)
+            ? '<span>' + esc(t('limitsLabel').split('{mem}').join(a.memoryLimit || '-').split('{cpu}').join(a.cpuLimit || '-')) + '</span>'
+            : '') + (canLimit ? ' <button class="secondary" style="padding:1px 8px;font-size:11px;" data-app="' + esc(a.name) + '" onclick="editLimits(this.dataset.app)">' + esc(t(a.memoryLimit || a.cpuLimit ? 'limitsEdit' : 'limitsAdd')) + '</button>' : '');
           const cp = s.controlPlane || {};
           const followBtn = a.runtimeType === 'paasmcp-control-plane'
             ? \`<button class="secondary" style="\${cp.enabled ? 'border-color:var(--success, #16a34a);' : ''}" onclick="toggleFollow(\${cp.enabled ? 'false' : 'true'})" title="\${esc(cp.enabled ? t('followOnTitle').replace('{branch}', cp.branch || 'main') : t('followOffTitle'))}">\${btnIcon('sync')}\${esc(cp.enabled ? t('followOn') : t('followOff'))}</button>\`
@@ -11169,11 +11219,39 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
             return '<div class="sec-row"><div class="sec-main"><span class="sec-k"><strong>' + esc(k) + '</strong> <code>' + esc(e[1]) + '</code></span>' +
               descHtml + '<div class="sec-dates">' + esc(created) + ' · ' + esc(updated) + '</div>' +
               '<div class="sec-edit" id="secEdit-' + esc(k) + '" style="display:none;"></div></div>' +
-              '<span class="sec-act"><button class="secondary" onclick="editSecretDesc(&#39;' + esc(k) + '&#39;)">' + esc(t(d.description || sugg ? 'secDescEditBtn' : 'secDescBtn')) + '</button>' +
+              '<span class="sec-act"><button class="secondary" onclick="revealSecret(&#39;' + esc(k) + '&#39;, this)">' + esc(t('secShow')) + '</button>' +
+              '<button class="secondary" onclick="editSecretDesc(&#39;' + esc(k) + '&#39;)">' + esc(t(d.description || sugg ? 'secDescEditBtn' : 'secDescBtn')) + '</button>' +
               '<button class="secondary" onclick="editSecret(&#39;' + esc(k) + '&#39;)">' + esc(t('secChange')) + '</button>' +
               '<button class="danger" onclick="delSecret(&#39;' + esc(scope) + '&#39;,&#39;' + esc(k) + '&#39;)">' + esc(t('btnRemoveSecret')) + '</button></span></div>';
           }).join('')
         : '<div style="color:var(--muted);font-size:12.5px">' + esc(t('emptySecrets')) + '</div>';
+    }
+    // The saved value, in place of the masked one (and copied); Hide puts the mask back.
+    async function revealSecret(key, btn) {
+      const row = btn.closest('.sec-row');
+      const code = row && row.querySelector('.sec-k code');
+      if (!code) return;
+      if (btn.dataset.shown) { code.textContent = btn.dataset.masked; delete btn.dataset.shown; btn.textContent = t('secShow'); return; }
+      const scope = document.getElementById('secScope').value || 'system';
+      const r = await postJson('/api/secrets/reveal', { scope: scope, key: key });
+      if (!r) return;
+      btn.dataset.masked = code.textContent;
+      btn.dataset.shown = '1';
+      code.textContent = r.value;
+      btn.textContent = t('secHide');
+      if (navigator.clipboard) navigator.clipboard.writeText(r.value).then(() => showToast(t('secCopied'))).catch(() => {});
+    }
+    // Every variable of this app as a .env file, to paste in another host (Render, Railway…) or keep.
+    async function downloadSecrets() {
+      const scope = document.getElementById('secScope').value || 'system';
+      const r = await postJson('/api/secrets/reveal', { scope: scope });
+      if (!r) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([r.dotenv], { type: 'text/plain' }));
+      a.download = scope + '.env';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
     }
     function secWhen(iso) {
       try { return new Date(iso).toLocaleString(currentLang === 'pt' ? 'pt-BR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }); } catch { return String(iso || ''); }
@@ -11209,10 +11287,15 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       showToast(t('toastSecDescSaved'));
       loadSecrets();
     }
-    function editSecret(key) {
+    // Change: the form opens with the key and its current value, to edit only what is needed.
+    async function editSecret(key) {
+      const scope = document.getElementById('secScope').value || 'system';
+      const r = await postJson('/api/secrets/reveal', { scope: scope, key: key });
       document.getElementById('secKey').value = key;
       const v = document.getElementById('secVal');
-      v.value = '';
+      v.value = r ? r.value : '';
+      if (r) v.type = 'text';
+      v.scrollIntoView({ block: 'center' });
       v.focus();
     }
     function markSecChanged(scope) {
@@ -11235,6 +11318,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (!res.ok) { loadSecrets(); return alert(data.error); }
       document.getElementById('secKey').value = '';
       document.getElementById('secVal').value = '';
+      document.getElementById('secVal').type = 'password';
       document.getElementById('secDesc').value = '';
       showToast(t('toastSecretSaved'));
       markSecChanged(scope);
@@ -11272,6 +11356,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       setTimeout(pollDeploys, 800);
       const res = await fetch('/api/apps/redeploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appName: name }) });
       const data = await res.json().catch(function () { return {}; });
+      if (res.status === 524) { showToast(t('deployStillRunning')); loadAll(); return; }
       if (!res.ok) {
         const kind = data.failure && I18N.en['df_' + data.failure.kind] ? data.failure.kind : 'other';
         alert(t('df_' + kind) + '\\n' + t('dfh_' + kind) + '\\n\\n' + String(data.error || ('HTTP ' + res.status)).slice(-1500));
@@ -11281,6 +11366,31 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       showToast(t('toastDeployDone') + name);
       loadAll();
       renderSecApply();
+    }
+
+    // Memory and CPU of an app: they apply by publishing it again (current code of its branch, same variables).
+    async function editLimits(name) {
+      const app = lastStatus && lastStatus.apps && lastStatus.apps[name];
+      if (!app) return;
+      const mem = await askText(t('limitsMemAsk').split('{app}').join(name), app.memoryLimit || '');
+      if (mem === null) return;
+      const cpu = await askText(t('limitsCpuAsk').split('{app}').join(name), app.cpuLimit || '');
+      if (cpu === null) return;
+      if (mem.trim() === (app.memoryLimit || '') && cpu.trim() === (app.cpuLimit || '')) return;
+      showToast(t('toastDeploying'));
+      setTimeout(pollDeploys, 800);
+      const res = await fetch('/api/apps/redeploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appName: name, memoryLimit: mem.trim(), cpuLimit: cpu.trim() }) });
+      const data = await res.json().catch(function () { return {}; });
+      // A long build outlives the tunnel's 100 s: it goes on here, and the app's row shows how it ends.
+      if (res.status === 524) { showToast(t('deployStillRunning')); loadAll(); return; }
+      if (!res.ok) {
+        const kind = data.failure && I18N.en['df_' + data.failure.kind] ? data.failure.kind : 'other';
+        alert(data.failure ? t('df_' + kind) + '\\n' + t('dfh_' + kind) + '\\n\\n' + String(data.error || '').slice(-1500) : String(data.error || ('HTTP ' + res.status)));
+        loadAll();
+        return;
+      }
+      showToast(t('limitsSaved'));
+      loadAll();
     }
 
     async function createDb() {
