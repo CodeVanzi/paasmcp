@@ -13,7 +13,8 @@ import { audit } from "./guard.js";
  * - an app: `docker exec` of a shell in that app's container.
  * Only a person logged in to the dashboard opens it (never a token, never MCP). Sessions close after
  * 15 minutes without typing, and when the terminal is turned off. Opening and closing are audited;
- * what is typed is not stored anywhere.
+ * what is typed is not. A shell's last 2 MB of output stay in memory while it runs (so a page can come back
+ * to it) and are never written to disk.
  */
 
 const DOCKER_SOCK = () => process.env.PAASMCP_DOCKER_SOCK || "/var/run/docker.sock";
@@ -27,14 +28,12 @@ export function terminalEnabled(): boolean {
   return loadState().terminal?.enabled === true;
 }
 
-const sessions = new Set<{ close: (reason: string) => void }>();
-
 export function setTerminalEnabled(on: boolean, by: string): void {
   const state = loadState();
   state.terminal = { enabled: on, updatedAt: new Date().toISOString(), by };
   saveState(state);
   audit({ event: on ? "terminal.enabled" : "terminal.disabled", by });
-  if (!on) for (const s of [...sessions]) s.close("turned off");
+  if (!on) for (const s of [...sessions.values()]) s.close("turned off");
 }
 
 /** "server", or the slug of an app here that has a container. */
@@ -102,7 +101,8 @@ async function openServerShell(image: string): Promise<Pty> {
   const name = `paasmcp-terminal-${crypto.randomBytes(4).toString("hex")}`;
   const { json } = await dockerApi("POST", `/containers/create?name=${name}`, {
     Image: image,
-    Cmd: ["nsenter", "-t", hostPid(), "-m", "-u", "-i", "-n", "-p", "--", "/bin/sh", "-c", SHELL],
+    // -S/-G: root with no extra groups (the helper image's groups have other meanings, or none, on the host).
+    Cmd: ["nsenter", "-t", hostPid(), "-m", "-u", "-i", "-n", "-p", "-S", "0", "-G", "0", "--", "/bin/sh", "-c", SHELL],
     Env: ["TERM=xterm-256color", "HOME=/root"],
     Tty: true,
     OpenStdin: true,
@@ -146,45 +146,84 @@ async function openAppShell(container: string): Promise<Pty> {
   };
 }
 
+const HISTORY_BYTES = 2 * 1024 * 1024;
+// What the shell asked the terminal (where is the cursor? what are you?): replayed, it would get a fresh answer
+// typed at the prompt. Bytes as latin1 so nothing else changes.
+const QUERIES = /\x1b\[[0-9;?>=]*[cn]|\x1b\][0-9]+;\?(?:\x07|\x1b\\)/g;
+
+interface Session {
+  id: string;
+  target: string;
+  by: string;
+  startedAt: string;
+  history: Buffer[];
+  historyBytes: number;
+  ws?: WebSocket;
+  onMessage: (raw: unknown) => void;
+  close: (reason: string) => void;
+}
+const sessions = new Map<string, Session>();
+
+/** Open shells (attached to a page or waiting for it to come back). */
+export function terminalSessions(): { id: string; target: string; attached: boolean; startedAt: string }[] {
+  return [...sessions.values()].map((s) => ({ id: s.id, target: s.target, attached: !!s.ws, startedAt: s.startedAt }));
+}
+
+function note(ws: WebSocket | undefined, text: string): void {
+  try { ws?.send(Buffer.from(`\r\n\x1b[33m[${text}]\x1b[0m\r\n`)); } catch { /* gone */ }
+}
+
 /**
- * Joins a browser WebSocket to a shell. Browser → server: JSON {t:"in",d} (typed text) or {t:"resize",c,r}.
- * Server → browser: the terminal's bytes (binary frames).
+ * Joins a browser WebSocket to a shell. The shell lives here, not in the page: closing the tab or losing the
+ * network only detaches it, and opening it again (same `sessionId`) shows what it printed meanwhile.
+ * It ends with `exit`, the page's Close (`{t:"close"}`), 15 minutes without typing, or turning the terminal off.
+ * Browser → server: JSON {t:"in",d} (typed text), {t:"resize",c,r} or {t:"close"}.
+ * Server → browser: the terminal's bytes (binary frames) and {t:"session",id,resumed} (text).
  */
-export async function attachTerminal(ws: WebSocket, target: ReturnType<typeof terminalTarget>, opts: { image: string; by: string }): Promise<void> {
+export async function attachTerminal(
+  ws: WebSocket,
+  target: ReturnType<typeof terminalTarget>,
+  opts: { image: string; by: string; sessionId?: string }
+): Promise<void> {
+  const label = target.kind === "server" ? "server" : target.app;
+  const existing = opts.sessionId ? sessions.get(opts.sessionId) : undefined;
+  if (existing && existing.target === label && existing.by === opts.by) return join(existing, ws, true);
   if (sessions.size >= MAX_SESSIONS) {
     ws.close(4429, "Too many terminals open");
     return;
   }
-  const label = target.kind === "server" ? "server" : target.app;
   const started = Date.now();
   let pty: Pty | undefined;
   let closed = false;
   let idle: NodeJS.Timeout | undefined;
-  const session = {
+  const session: Session = {
+    id: crypto.randomBytes(12).toString("hex"),
+    target: label,
+    by: opts.by,
+    startedAt: new Date(started).toISOString(),
+    history: [],
+    historyBytes: 0,
+    onMessage: () => {},
     close: (reason: string) => {
       if (closed) return;
       closed = true;
       clearTimeout(idle);
-      sessions.delete(session);
+      sessions.delete(session.id);
       pty?.stop();
-      try {
-        if (reason === "idle") ws.send(Buffer.from("\r\n\x1b[33m[closed after 15 minutes without typing]\x1b[0m\r\n"));
-        if (reason === "turned off") ws.send(Buffer.from("\r\n\x1b[33m[the terminal was turned off]\x1b[0m\r\n"));
-      } catch { /* already gone */ }
-      ws.close(1000, reason.slice(0, 100));
+      if (reason === "idle") note(session.ws, "closed after 15 minutes without typing");
+      if (reason === "turned off") note(session.ws, "the terminal was turned off");
+      session.ws?.close(1000, reason.slice(0, 100));
       audit({ event: "terminal.close", target: label, reason, seconds: Math.round((Date.now() - started) / 1000), by: opts.by });
     },
   };
-  sessions.add(session);
+  sessions.set(session.id, session);
   const touch = () => {
     clearTimeout(idle);
     idle = setTimeout(() => session.close("idle"), TERMINAL_IDLE_MS());
   };
   touch();
-  ws.on("close", () => session.close("closed"));
-  ws.on("error", () => session.close("error"));
   let size: [number, number] | undefined;
-  ws.on("message", (raw) => {
+  const onMessage = (raw: unknown) => {
     let msg: { t?: string; d?: unknown; c?: unknown; r?: unknown };
     try { msg = JSON.parse(String(raw)); } catch { return; }
     if (msg.t === "in" && typeof msg.d === "string" && msg.d.length <= 64 * 1024) {
@@ -196,23 +235,57 @@ export async function attachTerminal(ws: WebSocket, target: ReturnType<typeof te
         size = [c, r];
         pty?.resize(c, r);
       }
-    }
-  });
+    } else if (msg.t === "close") session.close("closed");
+  };
+  session.onMessage = onMessage;
+  session.ws = ws;
+  ws.on("message", onMessage);
+  // Until the shell is open, a page that goes away ends it (nothing to come back to yet).
+  const early = () => { if (!pty) session.close("closed"); };
+  ws.on("close", early);
   try {
     pty = target.kind === "server" ? await openServerShell(opts.image) : await openAppShell(target.container);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    try { ws.send(Buffer.from(`\r\n\x1b[31m${msg}\x1b[0m\r\n`)); } catch { /* gone */ }
+    note(session.ws, err instanceof Error ? err.message : String(err));
     session.close("failed");
     return;
   }
   if (closed) { pty.stop(); return; }
   audit({ event: "terminal.open", target: label, by: opts.by });
-  pty.stream.on("data", (d: Buffer) => { if (ws.readyState === ws.OPEN) ws.send(d); });
-  pty.stream.on("end", () => session.close("ended"));
-  pty.stream.on("close", () => session.close("ended"));
-  pty.stream.on("error", () => session.close("ended"));
+  pty.stream.on("data", (d: Buffer) => {
+    session.history.push(d);
+    session.historyBytes += d.length;
+    while (session.historyBytes > HISTORY_BYTES && session.history.length > 1) session.historyBytes -= session.history.shift()!.length;
+    if (session.ws && session.ws.readyState === session.ws.OPEN) session.ws.send(d);
+  });
+  for (const ev of ["end", "close", "error"]) pty.stream.on(ev, () => session.close("ended"));
   if (size) pty.resize(size[0], size[1]);
+  ws.off("close", early);
+  join(session, ws, false);
+}
+
+function join(session: Session, ws: WebSocket, resumed: boolean): void {
+  const onMessage = session.onMessage;
+  const old = session.ws;
+  if (old && old !== ws) {
+    old.off("message", onMessage);
+    note(old, "opened in another tab");
+    old.close(4409, "Opened elsewhere");
+  }
+  session.ws = ws;
+  if (resumed) {
+    ws.on("message", onMessage);
+    const replay = Buffer.concat(session.history).toString("latin1").replace(QUERIES, "");
+    if (replay) ws.send(Buffer.from(replay, "latin1"));
+  }
+  ws.send(JSON.stringify({ t: "session", id: session.id, resumed }));
+  // The page went away (tab closed, network lost): the shell keeps running until it comes back or goes idle.
+  ws.on("close", () => {
+    if (session.ws !== ws) return;
+    ws.off("message", onMessage);
+    session.ws = undefined;
+  });
+  ws.on("error", () => { /* followed by close */ });
 }
 
 export const openTerminalCount = () => sessions.size;

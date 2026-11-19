@@ -48,12 +48,17 @@ const cookie = (login.headers.get("set-cookie") || "").split(";")[0];
 const post = (u, b) => fetch(`${base}${u}`, { method: "POST", headers: { cookie, "Content-Type": "application/json" }, body: JSON.stringify(b) });
 await post("/api/terminal", { on: true, confirmed: true, confirmName: "terminal" });
 
-function open(target) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/terminal?target=${target}`, { headers: { cookie, origin: base } });
-  const s = { ws, out: "", closed: false };
+function open(target, session) {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/api/terminal?target=${target}${session ? `&session=${session}` : ""}`, { headers: { cookie, origin: base } });
+  const s = { ws, out: "", closed: false, code: 0, id: "", resumed: undefined };
   // Answer "where is the cursor?" like a real terminal (xterm.js) does; busybox sh waits for it.
-  ws.on("message", (d) => { const t = d.toString(); s.out += t; if (t.includes("\x1b[6n")) ws.send(JSON.stringify({ t: "in", d: "\x1b[1;1R" })); });
-  ws.on("close", () => { s.closed = true; });
+  ws.on("message", (d, binary) => {
+    const t = d.toString();
+    if (!binary) { const m = JSON.parse(t); if (m.t === "session") { s.id = m.id; s.resumed = m.resumed; } return; }
+    s.out += t;
+    if (t.includes("\x1b[6n")) ws.send(JSON.stringify({ t: "in", d: "\x1b[1;1R" }));
+  });
+  ws.on("close", (code) => { s.closed = true; s.code = code; });
   s.send = (d) => ws.send(JSON.stringify({ t: "in", d }));
   s.until = async (re, ms = 20000) => {
     const end = Date.now() + ms;
@@ -68,8 +73,8 @@ const host = execFileSync("hostname", { encoding: "utf-8" }).trim();
 const a = await open("server");
 a.ws.send(JSON.stringify({ t: "resize", c: 132, r: 41 }));
 await new Promise((r) => setTimeout(r, 1500));
-a.send("echo ID=$(id -u) HOST=$(hostname) SIZE=$(stty size) N=$((6*7))\r");
-await a.until(/ID=0 HOST=\S+ SIZE=41 132 N=42/);
+a.send("echo ID=$(id -u) GROUPS=$(id -G) HOST=$(hostname) SIZE=$(stty size) N=$((6*7))\r");
+await a.until(/ID=0 GROUPS=0 HOST=\S+ SIZE=41 132 N=42/);
 if (!a.out.includes(`HOST=${host}`)) fail(`not the host: ${a.out.slice(-300)}`);
 ok(`root on ${host}, 132x41`);
 a.send("exit\r");
@@ -79,11 +84,39 @@ if (!a.closed) fail("exit did not close the terminal");
 ok("exit closes it");
 
 console.log("2. App shell: inside the app's container");
-const b = await open("term-app");
+let b = await open("term-app");
 await b.until(/[#$] /);
 b.send("cat /etc/os-release | grep ^ID= ; echo APPHOST=$(hostname)\r");
 await b.until(/ID=alpine[\s\S]*APPHOST=\w+/);
 ok("alpine container");
+
+console.log("2b. Closing the page only detaches: opening it again shows what it printed meanwhile");
+b.send("printf '\\033[6n'; sleep 1; echo MARK-$((3+4))\r");
+await b.until(/MARK-7/);
+const sid = b.id;
+if (!/^[0-9a-f]{24}$/.test(sid)) fail(`no session id: ${sid}`);
+b.ws.close();
+for (let i = 0; i < 30 && !b.closed; i++) await new Promise((r) => setTimeout(r, 100));
+await new Promise((r) => setTimeout(r, 500));
+const listed = await (await fetch(`${base}/api/terminal`, { headers: { cookie } })).json();
+if (!listed.sessions.some((x) => x.id === sid && !x.attached)) fail(`not kept: ${JSON.stringify(listed)}`);
+const b2 = await open("term-app", sid);
+await b2.until(/MARK-7/, 5000);
+for (let i = 0; i < 30 && b2.resumed === undefined; i++) await new Promise((r) => setTimeout(r, 100));
+if (b2.resumed !== true || b2.id !== sid) fail(`not resumed: ${b2.resumed} ${b2.id}`);
+if (b2.out.includes("\x1b[6n")) fail("a terminal query was replayed");
+b2.send("echo AGAIN-$((5+5))\r");
+await b2.until(/AGAIN-10/);
+ok("kept, replayed without the old query, and still typing");
+
+console.log("2c. Opened in another tab: the first one is told and let go");
+const b3 = await open("term-app", sid);
+for (let i = 0; i < 30 && !b2.closed; i++) await new Promise((r) => setTimeout(r, 100));
+if (b2.code !== 4409) fail(`first tab not let go: ${b2.code}`);
+b3.send("echo THIRD-$((2*3))\r");
+await b3.until(/THIRD-6/);
+ok("moved to the new tab");
+b = b3;
 
 console.log("3. Idle: closes by itself (4 s in this lab, 15 min for real)");
 await b.until(/without typing/, 10000);
@@ -97,6 +130,16 @@ await new Promise((r) => setTimeout(r, 1500));
 await post("/api/terminal", { on: false });
 await c.until(/turned off/, 5000);
 ok("closed when turned off");
+
+console.log("4b. Close on the page ends the shell on the server");
+await post("/api/terminal", { on: true, confirmed: true, confirmName: "terminal" });
+const d = await open("term-app");
+await d.until(/[#$] /);
+d.ws.send(JSON.stringify({ t: "close" }));
+for (let i = 0; i < 30 && !d.closed; i++) await new Promise((r) => setTimeout(r, 100));
+const after = await (await fetch(`${base}/api/terminal`, { headers: { cookie } })).json();
+if (after.sessions.length) fail(`still open: ${JSON.stringify(after.sessions)}`);
+ok("ended, nothing waiting");
 
 console.log("5. Nothing left behind, and the audit has open/close but no typed text");
 await new Promise((r) => setTimeout(r, 3000));
