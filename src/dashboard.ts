@@ -4028,6 +4028,16 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     </div>
 
     <div class="toast" id="toast"></div>
+    <dialog id="askDlg" aria-labelledby="askDlgText" style="max-width:min(560px,92vw);border:1px solid var(--border);border-radius:12px;padding:18px 20px;background:var(--card, var(--bg));color:var(--text, inherit);">
+      <form method="dialog">
+        <p id="askDlgText" style="white-space:pre-wrap;margin:0 0 12px;font-size:14px;line-height:1.45;"></p>
+        <input id="askDlgInput" autocomplete="off" spellcheck="false" style="width:100%;margin-bottom:12px;font-size:16px;" hidden />
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button type="submit" value="cancel" class="secondary" id="askDlgCancel"></button>
+          <button type="submit" value="ok" id="askDlgOk"></button>
+        </div>
+      </form>
+    </dialog>
 
   <script>
     let currentLang = localStorage.getItem('paasmcp_lang') || ((navigator.language || '').toLowerCase().startsWith('pt') ? 'pt' : 'en');
@@ -4329,6 +4339,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     // Plain-language texts (override the older technical ones and add the new screens).
     Object.assign(I18N.pt, {
+          "dlgCancel": "Cancelar",
+          "dlgOk": "Confirmar",
           "navTerminal": "Terminal",
           "termTitle": "Terminal",
           "termDesc": "Um terminal deste servidor (como administrador, root) ou de dentro de um app, aqui no navegador.",
@@ -4814,6 +4826,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
           "jobsDisabledToast": "Agendamento atualizado."
     });
     Object.assign(I18N.en, {
+          "dlgCancel": "Cancel",
+          "dlgOk": "Confirm",
           "navTerminal": "Terminal",
           "termTitle": "Terminal",
           "termDesc": "A terminal on this server (as administrator, root) or inside an app, right in the browser.",
@@ -7408,7 +7422,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function installTemplate(id, btn) {
       const tp = (tplData || []).find(function (x) { return x.id === id; });
       if (!tp) return;
-      const name = (prompt(t('tplNamePrompt'), id) || '').trim().toLowerCase();
+      const name = ((await askText(t('tplNamePrompt'), id)) || '').trim().toLowerCase();
       if (!name) return;
       const box = document.getElementById('tplResult');
       box.innerHTML = '';
@@ -8678,6 +8692,30 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
         (peers.length || copyOnly.length ? '<p class="card-desc" style="margin-top:6px;">' + esc(t('prFromPeers')) + ' <a href="javascript:void(0)" data-go-tab="connect" data-go-sub="pcs">' + esc(t('prFromPeersLink')) + '</a></p>' : '');
     }
 
+    // Confirmations in the page itself: the browser's own confirm()/prompt() can be blocked (many in a row, or a
+    // page shown inside another app), and then the button silently does nothing.
+    // withInput: answers the typed text (null on cancel); otherwise true/false.
+    function askDialog(message, withInput, initial) {
+      const dlg = document.getElementById('askDlg');
+      const input = document.getElementById('askDlgInput');
+      document.getElementById('askDlgText').textContent = message;
+      document.getElementById('askDlgCancel').textContent = t('dlgCancel');
+      document.getElementById('askDlgOk').textContent = t('dlgOk');
+      input.hidden = !withInput;
+      input.value = initial || '';
+      return new Promise((resolve) => {
+        dlg.onclose = () => {
+          const ok = dlg.returnValue === 'ok';
+          resolve(withInput ? (ok ? input.value : null) : ok);
+        };
+        dlg.returnValue = '';
+        dlg.showModal();
+        (withInput ? input : document.getElementById('askDlgOk')).focus();
+      });
+    }
+    const askConfirm = (message) => askDialog(message, false);
+    const askText = (message, initial) => askDialog(message, true, initial);
+
     // Server answers 409 for risky actions: show its warning, ask the person, and resend with the confirmation.
     const rawFetch = window.fetch.bind(window);
     window.fetch = async (input, init) => {
@@ -8688,10 +8726,10 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       const warning = (info.warning && (info.warning[currentLang] || info.warning.en)) || '';
       const body = JSON.parse(init.body);
       if (info.level === 'strong') {
-        const typed = prompt(warning + '\\n\\n' + t('typeNameToConfirm') + info.subject);
+        const typed = await askText(warning + '\\n\\n' + t('typeNameToConfirm') + info.subject);
         if (typed === null) return res;
         body.confirmName = typed.trim();
-      } else if (!confirm(warning)) {
+      } else if (!(await askConfirm(warning))) {
         return res;
       }
       body.confirmed = true;
@@ -8719,7 +8757,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     async function decideApproval(id, approve, level, subject) {
       let confirmName;
       if (approve && level === 'strong') {
-        confirmName = prompt(t('typeNameToConfirm') + subject);
+        confirmName = await askText(t('typeNameToConfirm') + subject);
         if (confirmName === null) return;
       }
       const res = await fetch('/api/approvals/decide', {
@@ -8927,7 +8965,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       let res = await fetch('/api/assistant/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       let data = await res.json().catch(function () { return {}; });
       if (res.status === 409 && data.confirmationRequired) {
-        if (!confirm((currentLang === 'pt' ? data.warning.pt : data.warning.en))) return;
+        if (!await askConfirm((currentLang === 'pt' ? data.warning.pt : data.warning.en))) return;
         body.confirmed = true;
         res = await fetch('/api/assistant/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         data = await res.json().catch(function () { return {}; });
@@ -8936,8 +8974,8 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAssistant();
     }
     async function aisRemove() {
-      if (!confirm(t('aisRemoveConfirm'))) return;
-      const r = await postJson('/api/assistant/remove', { deleteModels: confirm(t('aisRemoveModels')) });
+      if (!await askConfirm(t('aisRemoveConfirm'))) return;
+      const r = await postJson('/api/assistant/remove', { deleteModels: await askConfirm(t('aisRemoveModels')) });
       if (r) { showToast(t('aisRemoved')); loadAssistant(); }
     }
     function aisBody() {
@@ -10110,7 +10148,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAll();
     }
     async function ntClear() {
-      if (!confirm(t('ntOffConfirm'))) return;
+      if (!await askConfirm(t('ntOffConfirm'))) return;
       await fetch('/api/connections/notify', { method: 'DELETE' });
       ofsMsg('ntMsg', '', '');
       loadConnections();
@@ -10867,7 +10905,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       loadAiTokens();
     }
     async function revokeAiToken(id) {
-      if (!confirm(t('aiRevokeConfirm'))) return;
+      if (!await askConfirm(t('aiRevokeConfirm'))) return;
       const res = await fetch('/api/tokens', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
       if (res.ok) loadAiTokens();
     }
@@ -11041,7 +11079,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       if (data) { showToast(t('jobsDisabledToast')); loadJobsList(); }
     }
     async function removeJobUi(name) {
-      if (!confirm(t('jobsRemoveConfirm'))) return;
+      if (!await askConfirm(t('jobsRemoveConfirm'))) return;
       const data = await postJson('/api/jobs/remove', { name });
       if (data) { showToast(t('jobsRemove')); loadJobsList(); loadAll(); }
     }
@@ -11195,7 +11233,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
     }
 
     async function redeployApp(name) {
-      if (!confirm(t('redeployConfirm').split('{app}').join(name))) return;
+      if (!await askConfirm(t('redeployConfirm').split('{app}').join(name))) return;
       showToast(t('toastDeploying'));
       setTimeout(pollDeploys, 800);
       const res = await fetch('/api/apps/redeploy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appName: name }) });
