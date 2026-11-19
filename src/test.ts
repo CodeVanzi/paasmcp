@@ -5781,6 +5781,20 @@ volumes:
       assert.equal(ask.status, 409);
       const askBody = await ask.text();
       assert.ok(askBody.includes("confirmationRequired") && !askBody.includes("secretpw"));
+      // Confirmed: answers at once (a proxy cuts long requests) and the copy runs in the background.
+      const started = await post("/api/db/import", { appName: "no-db-app", sourceUrl: "postgres://u:secretpw@h/d", confirmed: true });
+      const startedText = await started.text();
+      assert.equal(started.status, 202, startedText);
+      assert.ok(!startedText.includes("secretpw"));
+      let task: { done: boolean; error?: string } | null = null;
+      for (let i = 0; i < 50 && !task?.done; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        const polled = await fetch(`${baseUrl}/api/db/import`, { headers: { cookie } });
+        const polledText = await polled.text();
+        assert.ok(!polledText.includes("secretpw"));
+        task = JSON.parse(polledText).task;
+      }
+      assert.ok(task?.done && /no PostgreSQL database here yet/.test(task.error || ""), JSON.stringify(task));
       await assert.rejects(imp.importExternalPostgres("no-db-app", "postgres://u:p@h/d"), /no PostgreSQL database here yet/);
 
       const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
