@@ -5738,6 +5738,13 @@ volumes:
     let out = "";
     for await (const c of Readable.from(chunks).pipe(imp.dumpFilter())) out += c.toString();
     assert.equal(out, "SET statement_timeout = 0;\nCREATE TABLE a (id int);\nSELECT 1;");
+    // The per-column pg_attver option of newer minor releases is dropped; other column options stay.
+    assert.equal(imp.withoutAttver("ALTER TABLE ONLY public.users ALTER COLUMN banned_at SET (pg_attver=22138904);"), null);
+    assert.equal(imp.withoutAttver("ALTER TABLE ONLY public.t ALTER COLUMN c SET (n_distinct=100, pg_attver=7);"), "ALTER TABLE ONLY public.t ALTER COLUMN c SET (n_distinct=100);");
+    assert.equal(imp.withoutAttver("INSERT INTO notes VALUES ('pg_attver=1');"), "INSERT INTO notes VALUES ('pg_attver=1');");
+    let out2 = "";
+    for await (const c of Readable.from(["CREATE TABLE u (id int);\nALTER TABLE ONLY public.u ALTER COLUMN id SET (pg_at", "tver=5);\nSELECT 2;"]).pipe(imp.dumpFilter())) out2 += c.toString();
+    assert.equal(out2, "CREATE TABLE u (id int);\nSELECT 2;");
 
     // The app's own database addresses stay when a copied .env is pasted.
     const st = config.loadState();
