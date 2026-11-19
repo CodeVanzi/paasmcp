@@ -4350,12 +4350,38 @@ volumes:
       assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: "X=" + "y".repeat(300 * 1024) })).status, 500);
       const many = Array.from({ length: 301 }, (_, i) => `K${i}=v`).join("\n");
       assert.equal((await post("/api/secrets", { scope: "env-test-app", dotenv: many })).status, 500);
+      // The owner sees what was saved: one key, or all of them as a .env that reads back the same.
+      const one = await post("/api/secrets/reveal", { scope: "env-test-app", key: "B_KEY" });
+      assert.equal(one.headers.get("cache-control"), "no-store");
+      assert.equal((await one.json()).value, "secret value 2");
+      vault.setSecretEntries("env-test-app", { C_KEY: 'a "b" \\n\nc' });
+      const dot = (await (await post("/api/secrets/reveal", { scope: "env-test-app" })).json()).dotenv as string;
+      assert.deepEqual(vault.parseDotenv(dot).entries, vault.getSecrets("env-test-app"), ".env round trip");
+      assert.equal((await post("/api/secrets/reveal", { scope: "env-test-app", key: "NOPE" })).status, 500);
+      const tokenOnly = await fetch(`${baseUrl}/api/secrets/reveal`, { method: "POST", headers: { authorization: `Bearer ${dashboard.getOrCreateDashboardToken()}`, "Content-Type": "application/json" }, body: JSON.stringify({ scope: "env-test-app", key: "B_KEY" }) });
+      assert.ok(tokenOnly.status === 403 || tokenOnly.status === 401, "the token alone never shows values");
+      assert.ok(!(await tokenOnly.text()).includes("secret value 2"));
+      const auditText = fs.readFileSync(path.join(config.PAAS_DATA_DIR, "audit.log"), "utf-8");
+      assert.match(auditText, /secret\.reveal/);
+      assert.ok(!auditText.includes("secret value 2"), "the audit has key names, never values");
+      vault.deleteSecretKey("env-test-app", "C_KEY");
       const missing = await post("/api/apps/redeploy", { appName: "no-such-app" });
       assert.equal(missing.status, 500);
       assert.match((await missing.json()).error, /not found/);
+      // Limits are checked before anything is published.
+      const st44 = config.loadState();
+      st44.apps["limits-app"] = { name: "limits-app", containerName: "paasmcp-limits-app", localPort: 4998, repoUrl: "https://github.com/example/x.git", branch: "main", createdAt: new Date().toISOString() } as never;
+      config.saveState(st44);
+      const badMem = await post("/api/apps/redeploy", { appName: "limits-app", memoryLimit: "lots" });
+      assert.match((await badMem.json()).error, /Invalid memory limit/);
+      const badCpu = await post("/api/apps/redeploy", { appName: "limits-app", cpuLimit: "999" });
+      assert.match((await badCpu.json()).error, /Invalid CPU limit/);
+      const st44b = config.loadState();
+      delete st44b.apps["limits-app"];
+      config.saveState(st44b);
       const page = await (await fetch(`${baseUrl}/`, { headers: { cookie } })).text();
       for (const c of [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1])) new vm.Script(c);
-      assert.ok(page.includes("saveDotenv(") && page.includes("redeployApp(") && page.includes('<select id="secScope"'));
+      assert.ok(page.includes("saveDotenv(") && page.includes("redeployApp(") && page.includes('<select id="secScope"') && page.includes("revealSecret(") && page.includes("downloadSecrets()") && page.includes("editLimits("));
     } finally {
       dsrv.close();
       vault.deleteSecretKey("env-test-app", "A_KEY");
