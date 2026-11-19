@@ -51,7 +51,7 @@ import {
   restoreDatabase,
   withoutManagedDbKeys,
 } from "./database.js";
-import { importExternalPostgres, parsePostgresUrl } from "./dbimport.js";
+import { importExternalPostgres, parsePostgresUrl, type ImportResult } from "./dbimport.js";
 import {
   AppLifecycleAction,
   deployApp,
@@ -151,6 +151,18 @@ interface DashboardJobTask {
   error?: string;
 }
 let dashboardJobTask: DashboardJobTask | undefined;
+
+/** "Bring data from another database" runs here while the screen polls GET /api/db/import. */
+interface DbImportTask {
+  id: string;
+  app: string;
+  startedAt: string;
+  done: boolean;
+  finishedAt?: string;
+  result?: ImportResult;
+  error?: string;
+}
+let dbImportTask: DbImportTask | undefined;
 
 function startDashboardJobTask(action: DashboardJobTask["action"], name: string, fn: () => Promise<unknown>): DashboardJobTask {
   if (dashboardJobTask && !dashboardJobTask.done) throw new Error(`Wait for the current job task to finish (${dashboardJobTask.action} ${dashboardJobTask.name}).`);
@@ -682,10 +694,27 @@ export function startDashboardServer(port = 4099, host = "127.0.0.1"): http.Serv
           const sourceUrl = String(body.sourceUrl || "");
           parsePostgresUrl(sourceUrl); // a wrong address is refused before the confirmation
           confirmFromBody("db.import", { appName }, body);
-          const result = await importExternalPostgres(appName, sourceUrl);
-          audit({ event: "db.import", app: appName, tables: result.tables, sourceVersion: result.sourceVersion, by: actor });
+          // A big database takes longer than a proxy waits (Cloudflare cuts at 100 s): copy in the background, outside
+          // the state lock, and let the screen poll. The task keeps no address (it holds a password).
+          if (dbImportTask && !dbImportTask.done) throw new Error(`A copy into '${dbImportTask.app}' is still running; wait for it to finish.`);
+          const task: DbImportTask = { id: crypto.randomBytes(4).toString("hex"), app: appName, startedAt: new Date().toISOString(), done: false };
+          dbImportTask = task;
+          void Promise.resolve()
+            .then(() => importExternalPostgres(appName, sourceUrl))
+            .then((result) => {
+              task.result = result;
+              audit({ event: "db.import", app: appName, tables: result.tables, sourceVersion: result.sourceVersion, by: actor });
+            })
+            .catch((err) => { task.error = err instanceof Error ? err.message : String(err); })
+            .finally(() => { task.done = true; task.finishedAt = new Date().toISOString(); });
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ task }));
+          return true;
+        }
+
+        if (pathname === "/api/db/import" && req.method === "GET") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(result));
+          res.end(JSON.stringify({ task: dbImportTask || null }));
           return true;
         }
 
@@ -6386,7 +6415,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "dbImpUrl": "Endereço do banco de origem",
       "dbImpNote": "Copia só o esquema public, onde ficam as tabelas do Django, Rails, Prisma e da maioria dos apps. As tabelas daqui são trocadas pelas de lá, em um passo só: se der erro, nada muda. Antes, o painel faz um backup do banco daqui. O endereço é usado uma vez e não fica salvo. Faça antes de abrir o app para o público, porque o que for gravado na origem depois não vem junto.",
       "dbImpBtn": "Copiar os dados",
-      "dbImpRunning": "Copiando… pode levar alguns minutos.",
+      "dbImpRunning": "Copiando no servidor… pode levar alguns minutos. Pode fechar esta página: a cópia continua e o resultado aparece aqui ao voltar.",
       "dbImpDone": "Pronto: {n} tabelas vieram do PostgreSQL {v} em {s} s. Backup de antes: {b}.",
       "dbImpNone": "Nenhum app tem banco PostgreSQL aqui ainda. Publique o app marcando PostgreSQL (ou crie o banco acima) e depois volte aqui.",
       "actionRedeploy": "Publicar de novo",
@@ -6433,7 +6462,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       "dbImpUrl": "Address of the source database",
       "dbImpNote": "Only the public schema is copied, where Django, Rails, Prisma and most apps keep their tables. The tables here are replaced by those over there in a single step: if anything fails, nothing changes. A backup of the database here is taken first. The address is used once and not saved. Do it before opening the app to the public, since what is written at the source afterwards does not come along.",
       "dbImpBtn": "Copy the data",
-      "dbImpRunning": "Copying… this can take a few minutes.",
+      "dbImpRunning": "Copying on the server… this can take a few minutes. You can close this page: the copy goes on and the result shows here when you come back.",
       "dbImpDone": "Done: {n} tables came from PostgreSQL {v} in {s} s. Backup from before: {b}.",
       "dbImpNone": "No app has a PostgreSQL database here yet. Publish the app with PostgreSQL ticked (or create the database above), then come back.",
       "actionRedeploy": "Publish again",
@@ -11289,13 +11318,39 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
       ofsMsg('dbImpMsg', t('dbImpRunning'), 'ok');
       try {
         const r = await ofsPost('/api/db/import', { appName: appName, sourceUrl: sourceUrl }, 'dbImpMsg');
-        if (!r) { if (document.getElementById('dbImpMsg').textContent === t('dbImpRunning')) ofsMsg('dbImpMsg', '', 'ok'); return; }
+        if (!r) { if (document.getElementById('dbImpMsg').textContent === t('dbImpRunning')) ofsMsg('dbImpMsg', '', 'ok'); btn.disabled = false; return; }
         urlEl.value = '';
-        ofsMsg('dbImpMsg', t('dbImpDone').split('{n}').join(String(r.tables)).split('{v}').join(String(r.sourceVersion)).split('{s}').join(String(r.seconds)).split('{b}').join(String(r.safetyBackupId)), 'ok');
-        loadAll();
-      } finally {
+        btn.dataset.following = '1';
+        pollDbImport();
+      } catch (e) {
         btn.disabled = false;
+        throw e;
       }
+    }
+    // The copy runs on the server; this follows it (also after a page reload) until it ends.
+    async function pollDbImport() {
+      const btn = document.getElementById('btnDbImp');
+      if (!btn) return;
+      let task;
+      try {
+        const res = await fetch('/api/db/import');
+        if (res.ok) task = (await res.json()).task;
+      } catch { /* a network blip: try again */ }
+      if (task === undefined) { if (btn.dataset.following) setTimeout(pollDbImport, 5000); return; }
+      if (task && !task.done) {
+        btn.disabled = true;
+        btn.dataset.following = '1';
+        ofsMsg('dbImpMsg', t('dbImpRunning'), 'ok');
+        setTimeout(pollDbImport, 3000);
+        return;
+      }
+      btn.disabled = false;
+      if (!btn.dataset.following || !task) return;
+      delete btn.dataset.following;
+      if (task.error) { ofsMsg('dbImpMsg', task.error, 'err'); return; }
+      const r = task.result;
+      ofsMsg('dbImpMsg', t('dbImpDone').split('{n}').join(String(r.tables)).split('{v}').join(String(r.sourceVersion)).split('{s}').join(String(r.seconds)).split('{b}').join(String(r.safetyBackupId)), 'ok');
+      loadAll();
     }
     function openDeployOptions() {
       const d = document.querySelector('#tab-overview details.dep-more');
@@ -11416,6 +11471,7 @@ git clone &lt;repository-url&gt; paasmcp &amp;&amp; cd paasmcp &amp;&amp; npm in
 
     applyPreferences();
     loadAll();
+    pollDbImport();
     pollDeploys();
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pollDeploys(); });
   </script>
